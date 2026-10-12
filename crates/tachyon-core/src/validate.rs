@@ -20,33 +20,22 @@ pub struct FieldError {
 /// Validates a document and returns what should be stored.
 ///
 /// With `existing = None` this is a create, and missing fields get their default.
-/// With `existing = Some` this is an update: keys in `input` replace existing ones,
-/// `null` removes a key, and the merged result is validated as a whole.
+/// With `existing = Some` this is an update: groups merge key by key, everything else
+/// (lists, rows, `json` values) is replaced, and the merged result is validated as a whole.
+/// Either way `null` means "no value" at any depth, except inside `json` fields, where it's data.
 pub fn validate_document(
     fields: &[Field],
     input: &Value,
     existing: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, Vec<FieldError>> {
-    let fields = &data_fields(fields);
+    let fields: &[Field] = &data_fields(fields);
     let Value::Object(input) = input else {
         return Err(vec![error(String::new(), "expected a JSON object")]);
     };
     let mut doc = existing.cloned().unwrap_or_default();
-    for (key, value) in input {
-        if value.is_null() {
-            doc.remove(key);
-        } else {
-            doc.insert(key.clone(), value.clone());
-        }
-    }
+    merge(fields, &mut doc, input);
     if existing.is_none() {
-        for f in fields {
-            if let Some(default) = &f.default
-                && !doc.contains_key(&f.name)
-            {
-                doc.insert(f.name.clone(), default.clone());
-            }
-        }
+        apply_defaults(fields, &mut doc);
         for f in fields {
             if let FieldKind::Slug { from: Some(source) } = &f.kind
                 && !doc.contains_key(&f.name)
@@ -72,6 +61,112 @@ pub fn validate_document(
     }
     normalize(fields, &mut doc);
     Ok(doc)
+}
+
+/// Writes `input` over `doc`: `null` removes a key, groups merge, anything else replaces.
+fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Value>) {
+    for (key, value) in input {
+        let field = fields.iter().find(|f| &f.name == key);
+        match (field.map(|f| &f.kind), value, doc.get_mut(key)) {
+            (_, Value::Null, _) => {
+                doc.remove(key);
+            }
+            (
+                Some(FieldKind::Group { fields }),
+                Value::Object(patch),
+                Some(Value::Object(current)),
+            ) => merge(fields, current, patch),
+            _ => {
+                let mut value = value.clone();
+                if let Some(f) = field {
+                    strip_nulls(f, &mut value);
+                    // What replaces the stored value whole (rows, or a group the document
+                    // didn't have) is new, so it gets its defaults.
+                    match (&f.kind, &mut value) {
+                        (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                            for row in rows {
+                                if let Value::Object(row) = row {
+                                    apply_defaults(fields, row);
+                                }
+                            }
+                        }
+                        (FieldKind::Group { fields }, Value::Object(group)) => {
+                            apply_defaults(fields, group)
+                        }
+                        _ => {}
+                    }
+                }
+                doc.insert(key.clone(), value);
+            }
+        }
+    }
+}
+
+/// Drops `null` keys inside groups and array rows. A `json` field's nulls are its own data.
+fn strip_nulls(f: &Field, value: &mut Value) {
+    match (&f.kind, value) {
+        (FieldKind::Group { fields }, Value::Object(obj)) => strip_object(fields, obj),
+        (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+            for row in rows {
+                if let Value::Object(obj) = row {
+                    strip_object(fields, obj);
+                }
+            }
+        }
+        _ => {}
+    }
+}
+
+fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
+    obj.retain(|_, v| !v.is_null());
+    for f in fields {
+        if let Some(v) = obj.get_mut(&f.name) {
+            strip_nulls(f, v);
+        }
+    }
+}
+
+/// Fills missing values that have a default, inside groups and array rows too. A missing
+/// group is created when something inside it has a default.
+pub(crate) fn apply_defaults(fields: &[Field], obj: &mut Map<String, Value>) {
+    for f in fields {
+        match (&f.kind, obj.get_mut(&f.name)) {
+            (FieldKind::Group { fields }, None) if f.default.is_some() => {
+                let mut group = f.default.clone().unwrap_or_default();
+                if let Value::Object(inner) = &mut group {
+                    apply_defaults(fields, inner);
+                }
+                obj.insert(f.name.clone(), group);
+            }
+            (_, None) if f.default.is_some() => {
+                obj.insert(f.name.clone(), f.default.clone().unwrap_or_default());
+            }
+            (FieldKind::Group { fields }, None) => {
+                let inner = defaults(fields);
+                if !inner.is_empty() {
+                    obj.insert(f.name.clone(), Value::Object(inner));
+                }
+            }
+            (FieldKind::Group { fields }, Some(Value::Object(inner))) => {
+                apply_defaults(fields, inner)
+            }
+            (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+                for row in rows {
+                    if let Value::Object(row) = row {
+                        apply_defaults(fields, row);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// What a new document holds before anyone types anything: every default, nested ones included.
+pub fn defaults(fields: &[Field]) -> Map<String, Value> {
+    let mut out = Map::new();
+    apply_defaults(&data_fields(fields), &mut out);
+    out
 }
 
 fn contains_nul(v: &Value) -> bool {
@@ -136,9 +231,24 @@ fn check_object(
             Some(Value::String(s)) if f.required && s.trim().is_empty() => {
                 errors.push(error(path, "is required"))
             }
+            Some(Value::Array(items)) if f.required && items.is_empty() && is_list(&f.kind) => {
+                errors.push(error(path, "is required"))
+            }
             Some(v) => check_value(f, v, &path, errors),
         }
     }
+}
+
+/// Fields whose value is a list, where an empty list means nothing was chosen.
+fn is_list(kind: &FieldKind) -> bool {
+    matches!(
+        kind,
+        FieldKind::Text { has_many: true, .. }
+            | FieldKind::Number { has_many: true, .. }
+            | FieldKind::Relationship { has_many: true, .. }
+            | FieldKind::Select { multiple: true, .. }
+            | FieldKind::Array { .. }
+    )
 }
 
 pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<FieldError>) {
@@ -472,7 +582,7 @@ pub struct RelationRef {
 
 /// Every relationship ID in a validated document, in schema order.
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
-    let fields = &data_fields(fields);
+    let fields: &[Field] = &data_fields(fields);
     fn walk(fields: &[Field], obj: &Map<String, Value>, prefix: &str, out: &mut Vec<RelationRef>) {
         for f in fields {
             let Some(value) = obj.get(&f.name) else {
@@ -1161,5 +1271,163 @@ mod tests {
                 "{bad}"
             );
         }
+    }
+
+    fn update(fields: &[Field], existing: Value, patch: Value) -> Value {
+        let Value::Object(existing) = existing else {
+            panic!("existing must be an object")
+        };
+        Value::Object(validate_document(fields, &patch, Some(&existing)).expect("should be valid"))
+    }
+
+    fn page_fields() -> Vec<Field> {
+        fields(json!([
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "description", "type": "text"}
+            ]},
+            {"name": "tags", "type": "text", "hasMany": true},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "label", "type": "text"},
+                {"name": "url", "type": "url"}
+            ]},
+            {"name": "meta", "type": "json"}
+        ]))
+    }
+
+    #[test]
+    fn update_merges_groups_and_replaces_lists() {
+        let f = page_fields();
+        assert_eq!(
+            update(
+                &f,
+                json!({"seo": {"title": "a", "description": "d"}, "tags": ["a", "b"]}),
+                json!({"seo": {"title": "x"}, "tags": ["c"]})
+            ),
+            json!({"seo": {"title": "x", "description": "d"}, "tags": ["c"]})
+        );
+    }
+
+    #[test]
+    fn null_clears_a_field_at_any_depth() {
+        let f = page_fields();
+        assert_eq!(
+            update(
+                &f,
+                json!({"seo": {"title": "a", "description": "d"}}),
+                json!({"seo": {"description": null}})
+            ),
+            json!({"seo": {"title": "a"}})
+        );
+        assert_eq!(
+            Value::Object(ok(
+                &f,
+                json!({"seo": {"title": "t", "description": null},
+                       "links": [{"label": null, "url": "https://example.com"}]})
+            )),
+            json!({"seo": {"title": "t"}, "links": [{"url": "https://example.com"}]})
+        );
+    }
+
+    #[test]
+    fn nulls_inside_json_fields_are_kept() {
+        let f = page_fields();
+        assert_eq!(
+            Value::Object(ok(&f, json!({"meta": {"a": null}}))),
+            json!({"meta": {"a": null}})
+        );
+        assert_eq!(
+            update(
+                &f,
+                json!({"meta": {"a": 1, "b": 2}}),
+                json!({"meta": {"a": null}})
+            ),
+            json!({"meta": {"a": null}}),
+            "json values are replaced, not merged"
+        );
+    }
+
+    #[test]
+    fn defaults_fill_groups_and_rows() {
+        let f = fields(json!([
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "index", "type": "boolean", "default": true},
+                {"name": "title", "type": "text"}
+            ]},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "label", "type": "text"},
+                {"name": "external", "type": "boolean", "default": false}
+            ]}
+        ]));
+        assert_eq!(
+            Value::Object(ok(&f, json!({"links": [{"label": "a"}]}))),
+            json!({"seo": {"index": true}, "links": [{"label": "a", "external": false}]})
+        );
+        assert_eq!(
+            update(
+                &f,
+                json!({"seo": {"title": "t"}, "links": []}),
+                json!({"links": [{"label": "b"}]})
+            ),
+            json!({"seo": {"title": "t"}, "links": [{"label": "b", "external": false}]}),
+            "rows sent in an update get their defaults; groups keep what's stored"
+        );
+    }
+
+    #[test]
+    fn required_lists_reject_empty() {
+        let f = fields(json!([
+            {"name": "tags", "type": "text", "hasMany": true, "required": true},
+            {"name": "related", "type": "relationship", "relationTo": "posts", "hasMany": true, "required": true},
+            {"name": "colours", "type": "select", "options": ["red"], "multiple": true, "required": true},
+            {"name": "rows", "type": "array", "required": true, "fields": [{"name": "x", "type": "text"}]}
+        ]));
+        assert_eq!(
+            errs(
+                &f,
+                json!({"tags": [], "related": [], "colours": [], "rows": []})
+            ),
+            vec![
+                e("tags", "is required"),
+                e("related", "is required"),
+                e("colours", "is required"),
+                e("rows", "is required"),
+            ]
+        );
+    }
+
+    #[test]
+    fn date_times_keep_milliseconds_consistently() {
+        // Stored values and filter values go through the same function, so they always agree.
+        let stored = normalize_date_time("2026-10-12T09:30:00.123456Z").unwrap();
+        assert_eq!(stored, "2026-10-12T09:30:00.123Z");
+        assert_eq!(
+            normalize_date_time("2026-10-12T11:30:00.123999+02:00").as_deref(),
+            Some(stored.as_str())
+        );
+    }
+
+    #[test]
+    fn groups_new_to_a_document_get_their_defaults() {
+        let f = fields(json!([
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "index", "type": "boolean", "default": true},
+                {"name": "title", "type": "text"}
+            ]},
+            {"name": "card", "type": "group", "default": {"a": "x"}, "fields": [
+                {"name": "a", "type": "text"},
+                {"name": "b", "type": "text", "default": "bd"}
+            ]}
+        ]));
+        assert_eq!(
+            update(&f, json!({}), json!({"seo": {"title": "new"}})),
+            json!({"seo": {"title": "new", "index": true}}),
+            "a group the update creates is as new as a row"
+        );
+        assert_eq!(
+            Value::Object(ok(&f, json!({}))),
+            json!({"seo": {"index": true}, "card": {"a": "x", "b": "bd"}}),
+            "a group's own default still gets its children's defaults"
+        );
     }
 }

@@ -7,15 +7,18 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tachyon_core::diff::Renames;
-use tachyon_core::{CollectionKind, CollectionSchema, FieldError, SchemaError};
+use tachyon_core::{
+    CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
+};
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::indexes::reconcile_indexes;
 use tachyon_db::schema_change::{self, ChangeError};
 
+use crate::documents::json_body;
 use crate::{ApiError, AppState};
 
 fn to_json(c: &Collection) -> Value {
-    json!({ "id": c.id, "schemaVersion": c.schema_version, "schema": &c.schema.0 })
+    json!({ "id": c.id, "schemaVersion": c.schema_version, "schema": c.schema.to_compact_json() })
 }
 
 fn schema_error(e: SchemaError) -> ApiError {
@@ -26,8 +29,8 @@ fn schema_error(e: SchemaError) -> ApiError {
 }
 
 fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
-    let schema =
-        CollectionSchema::deserialize(value).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let schema = CollectionSchema::deserialize(value)
+        .map_err(|e| ApiError::BadRequest(explain_parse_error(value, &e)))?;
     // Unknown keys first: a typo such as `nmae` should be named, not reported as a bad name.
     schema
         .reject_unknown_options(value)
@@ -36,9 +39,11 @@ fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
     Ok(schema)
 }
 
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
-    body.map(|Json(v)| v)
-        .map_err(|e| ApiError::BadRequest(e.body_text()))
+/// Logged here so the cause survives even if the reload after it fails too.
+fn log_index_failure(indexed: &Result<(), tachyon_db::DbError>, slug: &str) {
+    if let Err(error) = indexed {
+        tracing::warn!(%error, collection = slug, "couldn't build indexes; startup will retry");
+    }
 }
 
 pub async fn list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
@@ -69,8 +74,11 @@ pub async fn create(
         }
     }
     let created = collections::create(&state.pool, &schema).await?;
-    reconcile_indexes(&state.pool, created.id).await?;
+    // The schema is saved either way, so serve it even if its indexes failed to build.
+    let indexed = reconcile_indexes(&state.pool, created.id).await;
+    log_index_failure(&indexed, &schema.slug);
     state.schemas.reload(&state.pool).await?;
+    indexed?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }
 
@@ -143,7 +151,9 @@ pub async fn update(
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;
-    reconcile_indexes(&state.pool, c.id).await?;
+    let indexed = reconcile_indexes(&state.pool, c.id).await;
+    log_index_failure(&indexed, &slug);
     state.schemas.reload(&state.pool).await?;
+    indexed?;
     Ok(Json(json!({ "collection": to_json(&c), "preview": p })))
 }

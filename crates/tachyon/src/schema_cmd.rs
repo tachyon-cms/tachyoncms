@@ -2,18 +2,19 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_core::diff::{Change, Renames};
-use tachyon_core::{CollectionKind, CollectionSchema};
+use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::schema_change::{self, ChangeError, Preview};
 use tachyon_db::{collections, indexes};
 
 /// Every collection's schema as a pretty JSON bundle.
 pub async fn export(pool: &PgPool) -> anyhow::Result<String> {
     let all = collections::list(pool).await?;
-    let schemas: Vec<&CollectionSchema> = all.iter().map(|c| &c.schema.0).collect();
+    let schemas: Vec<Value> = all.iter().map(|c| c.schema.to_compact_json()).collect();
     Ok(serde_json::to_string_pretty(&json!({ "collections": schemas }))? + "\n")
 }
 
@@ -40,12 +41,21 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
         .get("collections")
         .and_then(Value::as_array)
         .context("the schema file needs a \"collections\" list")?;
+    let mut seen = std::collections::HashSet::new();
+    for slug in items
+        .iter()
+        .filter_map(|i| i.get("slug").and_then(Value::as_str))
+    {
+        if !seen.insert(slug) {
+            bail!("`{slug}` appears more than once in the file");
+        }
+    }
     items
         .iter()
         .map(|item| {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
-            let schema: CollectionSchema = serde_json::from_value(item.clone())
-                .with_context(|| format!("{slug}: can't read this collection"))?;
+            let schema = CollectionSchema::deserialize(item)
+                .map_err(|e| anyhow!("{slug}: {}", explain_parse_error(item, &e)))?;
             schema
                 .reject_unknown_options(item)
                 .with_context(|| slug.to_owned())?;
@@ -85,6 +95,16 @@ fn describe(slug: &str, p: &Preview) -> String {
     if !p.duplicates.is_empty() {
         line += &format!("\n  duplicate values in: {}", p.duplicates.join(", "));
     }
+    let mut indexes = Vec::new();
+    if !p.indexes.create.is_empty() {
+        indexes.push(format!("create {}", p.indexes.create.join(", ")));
+    }
+    if !p.indexes.drop.is_empty() {
+        indexes.push(format!("drop {}", p.indexes.drop.join(", ")));
+    }
+    if !indexes.is_empty() {
+        line += &format!("\n  indexes: {}", indexes.join("; "));
+    }
     line
 }
 
@@ -103,6 +123,9 @@ pub async fn run(
     for slug in renames.keys() {
         if !wanted.iter().any(|s| &s.slug == slug) {
             bail!("--rename {slug}: that collection isn't in the file");
+        }
+        if is_new(slug) {
+            bail!("--rename {slug}: the file creates {slug}, so it has no fields to rename yet");
         }
     }
     for s in &wanted {
@@ -227,6 +250,7 @@ mod tests {
             .await
             .unwrap();
         let file = export(&pool).await.unwrap();
+        assert!(!file.contains("false") && !file.contains("null"), "{file}");
         let out = run(&pool, &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
@@ -315,6 +339,49 @@ mod tests {
                 .fields
                 .len(),
             1
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn diffs_say_which_indexes_change(pool: PgPool) {
+        collections::create(&pool, &posts(json!([{"name": "title", "type": "text"}])))
+            .await
+            .unwrap();
+        let file = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "title", "type": "text", "unique": true}
+        ]}]})
+        .to_string();
+        let plan = run(&pool, &file, &BTreeMap::new(), None).await.unwrap();
+        assert!(
+            plan.contains("\n  indexes: create title (unique)"),
+            "{plan}"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn duplicate_slugs_and_renames_on_new_collections_are_refused(pool: PgPool) {
+        let twice = json!({"collections": [
+            {"slug": "posts", "fields": []}, {"slug": "posts", "fields": []}
+        ]})
+        .to_string();
+        let err = run(&pool, &twice, &BTreeMap::new(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "`posts` appears more than once in the file");
+
+        let new = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "headline", "type": "text"}
+        ]}]})
+        .to_string();
+        let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
+        let err = run(&pool, &new, &renames, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "--rename posts: the file creates posts, so it has no fields to rename yet"
         );
     }
 }

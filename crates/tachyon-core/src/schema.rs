@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,12 +13,22 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "admin", "auth", "globals", "media", "search", "graphql", "plugins",
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
     pub slug: String,
     #[serde(default)]
     pub kind: CollectionKind,
     pub fields: Vec<Field>,
+    /// `data()`'s answer, worked out on first use. Schemas are built once and read many
+    /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
+    #[serde(skip)]
+    data: OnceLock<Vec<Field>>,
+}
+
+impl PartialEq for CollectionSchema {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.slug, self.kind, &self.fields) == (&other.slug, other.kind, &other.fields)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -52,10 +64,17 @@ pub struct Field {
     /// Index this field so filters and sorts on it stay fast.
     #[serde(default)]
     pub filterable: bool,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "null_as_default")]
     pub admin: Admin,
     #[serde(flatten)]
     pub kind: FieldKind,
+}
+
+/// `null` reads as the default, like a missing key.
+fn null_as_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(
+    d: D,
+) -> Result<T, D::Error> {
+    Ok(Option::<T>::deserialize(d)?.unwrap_or_default())
 }
 
 /// How the admin shows a field. Presentation only: the API stores these but never enforces them.
@@ -208,12 +227,29 @@ pub enum FieldKind {
 }
 
 /// A choice in a `select` or `radio`: a bare value, or a label shown to editors plus the stored value.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize)]
 #[serde(untagged)]
 pub enum SelectOption {
     Value(String),
     Labeled { label: String, value: String },
 }
+
+impl<'de> Deserialize<'de> for SelectOption {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        let text = |v: Option<&Value>| v.and_then(Value::as_str).map(str::to_owned);
+        match Value::deserialize(d)? {
+            Value::String(value) => Ok(Self::Value(value)),
+            // Extra keys are left for `reject_unknown_options`, which names them.
+            Value::Object(o) => match (text(o.get("label")), text(o.get("value"))) {
+                (Some(label), Some(value)) => Ok(Self::Labeled { label, value }),
+                _ => Err(serde::de::Error::custom(OPTION_SHAPE)),
+            },
+            _ => Err(serde::de::Error::custom(OPTION_SHAPE)),
+        }
+    }
+}
+
+const OPTION_SHAPE: &str = "each option must be text, or {\"label\": \"…\", \"value\": \"…\"}";
 
 impl SelectOption {
     pub fn value(&self) -> &str {
@@ -265,14 +301,28 @@ pub struct Tab {
 }
 
 /// The fields as stored data sees them: rows, collapsibles and unnamed tabs dissolve into
-/// their parent, and named tabs become groups. Applies at every level.
-// NOTE: allocates on every call; fine for schemas of a few dozen fields.
-pub fn data_fields(fields: &[Field]) -> Vec<Field> {
+/// their parent, and named tabs become groups. Applies at every level. Borrows when there's
+/// no layout to dissolve, so calling it on fields that are already data costs nothing.
+pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
+    fn has_layout(fields: &[Field]) -> bool {
+        fields.iter().any(|f| match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => has_layout(fields),
+            kind => kind.is_layout(),
+        })
+    }
+    if has_layout(fields) {
+        Cow::Owned(flatten(fields))
+    } else {
+        Cow::Borrowed(fields)
+    }
+}
+
+fn flatten(fields: &[Field]) -> Vec<Field> {
     let mut out = Vec::new();
     for f in fields {
         match &f.kind {
             FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
-                out.extend(data_fields(fields))
+                out.extend(flatten(fields))
             }
             FieldKind::Tabs { tabs } => {
                 for tab in tabs {
@@ -286,16 +336,16 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             kind: FieldKind::Group {
-                                fields: data_fields(&tab.fields),
+                                fields: flatten(&tab.fields),
                             },
                         }),
-                        None => out.extend(data_fields(&tab.fields)),
+                        None => out.extend(flatten(&tab.fields)),
                     }
                 }
             }
             FieldKind::Group { fields } => out.push(Field {
                 kind: FieldKind::Group {
-                    fields: data_fields(fields),
+                    fields: flatten(fields),
                 },
                 ..f.clone()
             }),
@@ -305,7 +355,7 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
                 max_rows,
             } => out.push(Field {
                 kind: FieldKind::Array {
-                    fields: data_fields(fields),
+                    fields: flatten(fields),
                     min_rows: *min_rows,
                     max_rows: *max_rows,
                 },
@@ -317,33 +367,148 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
     out
 }
 
-/// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
-/// Admin options any field can carry, data or layout. `root` is the data shape.
-fn check_admin(admin: &Admin, root: &[Field]) -> Result<(), String> {
-    if let Some(condition) = &admin.condition
-        && find_field(root, &condition.field).is_none()
-    {
-        return Err(format!(
-            "admin.condition refers to `{}`, which isn't a field",
-            condition.field
-        ));
+/// Drops keys that hold their default from a serialized field list: `null`, `false`, an
+/// empty `name`, admin options left as they were. `default` values and options are data,
+/// so they're kept whole.
+fn compact_fields(fields: &mut Value) {
+    let Value::Array(fields) = fields else { return };
+    for field in fields {
+        let Value::Object(f) = field else { continue };
+        f.retain(|key, v| match key.as_str() {
+            "default" | "options" => !v.is_null(),
+            "name" => v.as_str().is_some_and(|n| !n.is_empty()),
+            _ => !v.is_null() && *v != Value::Bool(false),
+        });
+        if let Some(Value::Object(admin)) = f.get_mut("admin") {
+            admin.retain(|key, v| {
+                !v.is_null() && *v != Value::Bool(false) && !(key == "position" && v == "main")
+            });
+            if admin.is_empty() {
+                f.remove("admin");
+            }
+        }
+        if let Some(inner) = f.get_mut("fields") {
+            compact_fields(inner);
+        }
+        if let Some(Value::Array(tabs)) = f.get_mut("tabs") {
+            for tab in tabs {
+                if let Value::Object(t) = tab {
+                    t.retain(|_, v| !v.is_null());
+                    if let Some(inner) = t.get_mut("fields") {
+                        compact_fields(inner);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Admin options any field can carry, data or layout. `root` is the data shape; `inside`
+/// holds the data paths the field itself covers, which its condition can't depend on.
+fn check_admin(
+    admin: &Admin,
+    root: &[Field],
+    inside: &[String],
+    layout: bool,
+) -> Result<(), String> {
+    if let Some(condition) = &admin.condition {
+        let target = &condition.field;
+        let Some(f) = find_field(root, target) else {
+            return Err(format!(
+                "admin.condition refers to `{target}`, which isn't a field"
+            ));
+        };
+        // A field inside a list exists once per row, so only fields in that same row can
+        // depend on it.
+        let mut reach = String::new();
+        let mut current = root;
+        for segment in target.split('.') {
+            reach = join(&reach, segment);
+            let Some(step) = current.iter().find(|f| f.name == segment) else {
+                break;
+            };
+            current = match &step.kind {
+                FieldKind::Array { fields, .. } if reach != *target => {
+                    if !inside.iter().any(|p| p.starts_with(&format!("{reach}."))) {
+                        return Err(format!(
+                            "admin.condition can't reach into the list `{reach}` from outside it"
+                        ));
+                    }
+                    fields
+                }
+                FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+                _ => &[],
+            };
+        }
+        if inside
+            .iter()
+            .any(|p| target == p || target.starts_with(&format!("{p}.")))
+        {
+            return Err(if layout {
+                "admin.condition can't depend on a field inside it".into()
+            } else {
+                "admin.condition can't depend on the field itself".into()
+            });
+        }
+        match (&f.kind, &condition.test) {
+            (FieldKind::Group { .. }, _) => {
+                return Err(format!(
+                    "admin.condition must point at a field with a value, not the group `{target}`"
+                ));
+            }
+            (FieldKind::Array { .. }, ConditionTest::Exists(_)) => {}
+            (FieldKind::Array { .. }, _) => {
+                return Err(format!(
+                    "admin.condition on the array `{target}` can only test exists"
+                ));
+            }
+            _ => {}
+        }
     }
     if let Some(width) = &admin.width
-        && !(width.ends_with('%') || width.ends_with("px"))
+        && !is_size(width)
     {
-        return Err("admin.width must look like 50% or 240px".into());
+        return Err("admin.width must be a size like 50% or 240px".into());
     }
     Ok(())
 }
 
-fn check_layout(fields: &[Field], root: &[Field]) -> Result<(), SchemaError> {
-    for f in fields {
+/// A positive width in pixels, or a percentage up to 100.
+fn is_size(width: &str) -> bool {
+    let (number, max) = if let Some(n) = width.strip_suffix('%') {
+        (n, 100.0)
+    } else if let Some(n) = width.strip_suffix("px") {
+        (n, f64::MAX)
+    } else {
+        return false;
+    };
+    // Digits with an optional fraction, like CSS writes them: no signs, exponents or bare dots.
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(whole) && digits(fraction) && number.parse::<f64>().is_ok_and(|v| v > 0.0 && v <= max)
+}
+
+/// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
+/// `loc` is where these fields sit in the JSON (`fields.0.fields`), which names a layout
+/// field in errors since it has no name; `prefix` is their data path.
+fn check_layout(
+    fields: &[Field],
+    root: &[Field],
+    loc: &str,
+    prefix: &str,
+) -> Result<(), SchemaError> {
+    for (i, f) in fields.iter().enumerate() {
+        let here = format!("{loc}.{i}");
         if f.kind.is_layout() {
             let invalid = |message: String| SchemaError::InvalidField {
-                field: String::new(),
+                field: here.clone(),
                 message,
             };
-            check_admin(&f.admin, root).map_err(invalid)?;
+            let inside: Vec<String> = data_fields(std::slice::from_ref(f))
+                .iter()
+                .map(|d| join(prefix, &d.name))
+                .collect();
+            check_admin(&f.admin, root, &inside, true).map_err(invalid)?;
             let kind = f.kind.name();
             if !f.name.is_empty() {
                 return Err(invalid(format!("{kind} fields don't take a name")));
@@ -353,34 +518,105 @@ fn check_layout(fields: &[Field], root: &[Field]) -> Result<(), SchemaError> {
                     "{kind} fields can't be required, unique, filterable or have a default"
                 )));
             }
-            if matches!(f.kind, FieldKind::Collapsible { .. })
-                && f.label.as_deref().is_none_or(|l| l.trim().is_empty())
-            {
-                return Err(invalid("collapsible fields need a label".into()));
-            }
-            if let FieldKind::Tabs { tabs } = &f.kind {
-                if tabs.is_empty() {
+            match &f.kind {
+                FieldKind::Collapsible { .. }
+                    if f.label.as_deref().is_none_or(|l| l.trim().is_empty()) =>
+                {
+                    return Err(invalid("collapsible fields need a label".into()));
+                }
+                FieldKind::Row { .. } | FieldKind::Tabs { .. } if f.label.is_some() => {
+                    return Err(invalid(format!("{kind} fields don't take a label")));
+                }
+                FieldKind::Tabs { tabs } if tabs.is_empty() => {
                     return Err(invalid("tabs needs at least one tab".into()));
                 }
-                if tabs.iter().any(|t| t.label.trim().is_empty()) {
+                FieldKind::Tabs { tabs } if tabs.iter().any(|t| t.label.trim().is_empty()) => {
                     return Err(invalid("every tab needs a label".into()));
                 }
+                _ => {}
             }
         }
         match &f.kind {
-            FieldKind::Row { fields }
-            | FieldKind::Collapsible { fields, .. }
-            | FieldKind::Group { fields }
-            | FieldKind::Array { fields, .. } => check_layout(fields, root)?,
+            FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
+                check_layout(fields, root, &format!("{here}.fields"), prefix)?
+            }
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => check_layout(
+                fields,
+                root,
+                &format!("{here}.fields"),
+                &join(prefix, &f.name),
+            )?,
             FieldKind::Tabs { tabs } => {
-                for tab in tabs {
-                    check_layout(&tab.fields, root)?;
+                for (t, tab) in tabs.iter().enumerate() {
+                    let prefix = match &tab.name {
+                        Some(name) => join(prefix, name),
+                        None => prefix.to_owned(),
+                    };
+                    check_layout(
+                        &tab.fields,
+                        root,
+                        &format!("{here}.tabs.{t}.fields"),
+                        &prefix,
+                    )?;
                 }
             }
             _ => {}
         }
     }
     Ok(())
+}
+
+fn join(prefix: &str, name: &str) -> String {
+    if prefix.is_empty() {
+        name.to_owned()
+    } else {
+        format!("{prefix}.{name}")
+    }
+}
+
+/// Turns a failure to read a schema into a message naming the field at fault, such as
+/// "field `seo.kind`: each option must be text…". Falls back to serde's own message.
+pub fn explain_parse_error(raw: &Value, e: &serde_json::Error) -> String {
+    fn locate(fields: Option<&Value>, loc: &str, names: &str) -> Option<String> {
+        let Some(Value::Array(items)) = fields else {
+            return None;
+        };
+        for (i, item) in items.iter().enumerate() {
+            let here = format!("{loc}.{i}");
+            let name = item.get("name").and_then(Value::as_str).unwrap_or_default();
+            let label = if name.is_empty() {
+                here.clone()
+            } else {
+                join(names, name)
+            };
+            // Children first, so the deepest field at fault is named.
+            let inner_names = if name.is_empty() { names } else { &label };
+            if let Some(found) = locate(item.get("fields"), &format!("{here}.fields"), inner_names)
+            {
+                return Some(found);
+            }
+            if let Some(Value::Array(tabs)) = item.get("tabs") {
+                for (t, tab) in tabs.iter().enumerate() {
+                    let tab_names = match tab.get("name").and_then(Value::as_str) {
+                        Some(n) => join(names, n),
+                        None => names.to_owned(),
+                    };
+                    if let Some(found) = locate(
+                        tab.get("fields"),
+                        &format!("{here}.tabs.{t}.fields"),
+                        &tab_names,
+                    ) {
+                        return Some(found);
+                    }
+                }
+            }
+            if let Err(e) = Field::deserialize(item) {
+                return Some(format!("field `{label}`: {e}"));
+            }
+        }
+        None
+    }
+    locate(raw.get("fields"), "fields", "").unwrap_or_else(|| e.to_string())
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -467,6 +703,22 @@ impl Field {
 }
 
 impl CollectionSchema {
+    /// The data shape (see `data_fields`), worked out once per schema.
+    pub fn data(&self) -> &[Field] {
+        self.data
+            .get_or_init(|| data_fields(&self.fields).into_owned())
+    }
+
+    /// The schema as JSON without options left at their defaults: what people read and
+    /// keep in files. Parses back to an equal schema.
+    pub fn to_compact_json(&self) -> Value {
+        let mut v = serde_json::to_value(self).expect("schemas always serialize");
+        if let Some(fields) = v.get_mut("fields") {
+            compact_fields(fields);
+        }
+        v
+    }
+
     /// Every collection slug a relationship field points at, nested ones included.
     pub fn relation_targets(&self) -> Vec<&str> {
         fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
@@ -503,9 +755,9 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        let data = data_fields(&self.fields);
-        check_layout(&self.fields, &data)?;
-        check_fields(&data, true, &data)
+        let data = self.data();
+        check_layout(&self.fields, data, "fields", "")?;
+        check_fields(data, true, data, "")
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -514,7 +766,7 @@ impl CollectionSchema {
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
         let known = serde_json::to_value(self).expect("schemas always serialize");
         unknown_key(input, &known, "")?;
-        unknown_in_fields(&self.fields, input.get("fields"))
+        unknown_in_fields(&self.fields, input.get("fields"), "fields")
     }
 }
 
@@ -530,13 +782,24 @@ fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaEr
     Ok(())
 }
 
-fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), SchemaError> {
+fn unknown_in_fields(
+    fields: &[Field],
+    input: Option<&Value>,
+    loc: &str,
+) -> Result<(), SchemaError> {
     let Some(Value::Array(raw)) = input else {
         return Ok(());
     };
-    for (f, raw) in fields.iter().zip(raw) {
+    for (i, (f, raw)) in fields.iter().zip(raw).enumerate() {
+        let here = format!("{loc}.{i}");
+        // Layout fields have no name, so they're named by where they sit.
+        let label = if f.name.is_empty() {
+            here.clone()
+        } else {
+            f.name.clone()
+        };
         let known = serde_json::to_value(f).expect("fields always serialize");
-        unknown_key(raw, &known, &f.name)?;
+        unknown_key(raw, &known, &label)?;
         // Nested objects that parsing could also drop keys from: admin, its condition
         // (which holds exactly one test), and labelled options.
         let mut nested = vec![
@@ -559,7 +822,7 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
                 && let Some(option) = r.keys().find(|key| !k.contains_key(*key))
             {
                 return Err(SchemaError::UnknownOption {
-                    field: f.name.clone(),
+                    field: label.clone(),
                     option: format!("{prefix}.{option}"),
                 });
             }
@@ -569,24 +832,28 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
             | FieldKind::Array { fields, .. }
             | FieldKind::Row { fields }
             | FieldKind::Collapsible { fields, .. } => {
-                unknown_in_fields(fields, raw.get("fields"))?
+                unknown_in_fields(fields, raw.get("fields"), &format!("{here}.fields"))?
             }
             FieldKind::Tabs { tabs } => {
                 if let (Some(Value::Array(raw_tabs)), Some(Value::Array(known_tabs))) =
                     (raw.get("tabs"), known.get("tabs"))
                 {
-                    for (i, ((tab, raw_tab), known_tab)) in
+                    for (t, ((tab, raw_tab), known_tab)) in
                         tabs.iter().zip(raw_tabs).zip(known_tabs).enumerate()
                     {
                         if let (Value::Object(r), Value::Object(k)) = (raw_tab, known_tab)
                             && let Some(option) = r.keys().find(|key| !k.contains_key(*key))
                         {
                             return Err(SchemaError::UnknownOption {
-                                field: f.name.clone(),
-                                option: format!("tabs.{i}.{option}"),
+                                field: label.clone(),
+                                option: format!("tabs.{t}.{option}"),
                             });
                         }
-                        unknown_in_fields(&tab.fields, raw_tab.get("fields"))?;
+                        unknown_in_fields(
+                            &tab.fields,
+                            raw_tab.get("fields"),
+                            &format!("{here}.tabs.{t}.fields"),
+                        )?;
                     }
                 }
             }
@@ -619,7 +886,12 @@ fn is_identifier(s: &str, allow_upper: bool) -> bool {
         && chars.all(|c| ok(c) || c.is_ascii_digit() || c == '_')
 }
 
-fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(), SchemaError> {
+fn check_fields(
+    fields: &[Field],
+    top_level: bool,
+    root: &[Field],
+    prefix: &str,
+) -> Result<(), SchemaError> {
     let mut seen = HashSet::new();
     for f in fields {
         if !is_identifier(&f.name, true) {
@@ -756,11 +1028,11 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
                 }
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                check_fields(fields, false, root)?
+                check_fields(fields, false, root, &join(prefix, &f.name))?
             }
             _ => {}
         }
-        check_admin(&f.admin, root).map_err(invalid)?;
+        check_admin(&f.admin, root, &[join(prefix, &f.name)], false).map_err(invalid)?;
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
             crate::validate::check_value(f, default, &f.name, &mut errors);
@@ -1053,7 +1325,7 @@ mod tests {
             bad_width.check(),
             Err(SchemaError::InvalidField {
                 field: "t".into(),
-                message: "admin.width must look like 50% or 240px".into()
+                message: "admin.width must be a size like 50% or 240px".into()
             })
         );
     }
@@ -1223,23 +1495,50 @@ mod tests {
         let cases = [
             (
                 json!([{"type": "row", "name": "r", "fields": []}]),
-                "",
+                "fields.0",
                 "row fields don't take a name",
             ),
             (
                 json!([{"type": "row", "required": true, "fields": []}]),
-                "",
+                "fields.0",
                 "row fields can't be required, unique, filterable or have a default",
             ),
             (
                 json!([{"type": "tabs", "tabs": []}]),
-                "",
+                "fields.0",
                 "tabs needs at least one tab",
             ),
             (
                 json!([{"type": "tabs", "tabs": [{"label": "", "fields": []}]}]),
-                "",
+                "fields.0",
                 "every tab needs a label",
+            ),
+            (
+                json!([{"type": "row", "label": "R", "fields": []}]),
+                "fields.0",
+                "row fields don't take a label",
+            ),
+            (
+                json!([{"type": "tabs", "label": "T", "tabs": [{"label": "A", "fields": []}]}]),
+                "fields.0",
+                "tabs fields don't take a label",
+            ),
+            (
+                json!([{"name": "seo", "type": "group", "fields": [
+                    {"name": "title", "type": "text"},
+                    {"type": "collapsible", "label": "More", "fields": [
+                        {"type": "row", "name": "oops", "fields": []}
+                    ]}
+                ]}]),
+                "fields.0.fields.1.fields.0",
+                "row fields don't take a name",
+            ),
+            (
+                json!([{"type": "tabs", "tabs": [{"label": "A", "fields": [
+                    {"type": "row", "unique": true, "fields": []}
+                ]}]}]),
+                "fields.0.tabs.0.fields.0",
+                "row fields can't be required, unique, filterable or have a default",
             ),
         ];
         for (fields, field, message) in cases {
@@ -1280,7 +1579,7 @@ mod tests {
             ),
             (
                 json!({"type": "tabs", "tabs": [{"label": "A", "fields": [], "icon": "x"}]}),
-                "",
+                "fields.0",
                 "tabs.0.icon",
             ),
             (
@@ -1310,14 +1609,14 @@ mod tests {
             ),
             (
                 json!({"type": "collapsible", "label": "C", "admin": {"width": "banana"}, "fields": []}),
-                "admin.width must look like 50% or 240px",
+                "admin.width must be a size like 50% or 240px",
             ),
         ] {
             let s = schema(json!({"slug": "posts", "fields": [field]}));
             assert_eq!(
                 s.check(),
                 Err(SchemaError::InvalidField {
-                    field: String::new(),
+                    field: "fields.0".into(),
                     message: message.into()
                 })
             );
@@ -1371,5 +1670,192 @@ mod tests {
                     .into()
             })
         );
+    }
+
+    fn check_err(fields: Value) -> String {
+        match schema(json!({"slug": "posts", "fields": fields})).check() {
+            Err(e) => e.to_string(),
+            Ok(()) => "ok".into(),
+        }
+    }
+
+    #[test]
+    fn option_shape_errors_name_the_field() {
+        let message =
+            "field `kind`: each option must be text, or {\"label\": \"…\", \"value\": \"…\"}";
+        for options in [
+            json!([1]),
+            json!([{"value": "a"}]),
+            json!([{"label": "A", "value": 2}]),
+        ] {
+            let raw = json!({"slug": "posts", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "seo", "type": "group", "fields": [{"name": "kind", "type": "select", "options": options}]}
+            ]});
+            let e = CollectionSchema::deserialize(&raw).unwrap_err();
+            assert_eq!(
+                explain_parse_error(&raw, &e),
+                message.replace("`kind`", "`seo.kind`")
+            );
+        }
+        let raw = json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "kind", "type": "radio", "options": [true]}]}
+        ]});
+        let e = CollectionSchema::deserialize(&raw).unwrap_err();
+        assert_eq!(explain_parse_error(&raw, &e), message);
+        let raw = json!({"slug": "posts", "fields": [{"name": "x", "type": "bogus"}]});
+        let e = CollectionSchema::deserialize(&raw).unwrap_err();
+        assert!(explain_parse_error(&raw, &e).starts_with("field `x`: unknown variant `bogus`"));
+        let raw = json!({"slug": "posts", "fields": [{"type": "row", "fields": "nope"}]});
+        let e = CollectionSchema::deserialize(&raw).unwrap_err();
+        assert!(explain_parse_error(&raw, &e).starts_with("field `fields.0`: "));
+    }
+
+    #[test]
+    fn admin_null_means_defaults() {
+        let input =
+            json!({"slug": "posts", "fields": [{"name": "t", "type": "text", "admin": null}]});
+        let s = schema(input.clone());
+        assert_eq!(s.fields[0].admin, Admin::default());
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+    }
+
+    #[test]
+    fn width_must_be_a_real_size() {
+        for (width, ok) in [
+            ("50%", true),
+            ("240px", true),
+            ("33.3%", true),
+            ("100%", true),
+            ("half%", false),
+            ("0px", false),
+            ("150%", false),
+            ("-5%", false),
+            ("%", false),
+            ("NaNpx", false),
+            ("infpx", false),
+            ("50.px", false),
+            ("1e2px", false),
+            ("+50%", false),
+            (".5%", false),
+            ("12.5px", true),
+        ] {
+            let result =
+                check_err(json!([{"name": "t", "type": "text", "admin": {"width": width}}]));
+            assert_eq!(result == "ok", ok, "{width}: {result}");
+        }
+    }
+
+    #[test]
+    fn conditions_cant_point_at_themselves_or_groups() {
+        let cases = [
+            (
+                json!([{"name": "t", "type": "text", "admin": {"condition": {"field": "t", "exists": true}}}]),
+                "field `t`: admin.condition can't depend on the field itself",
+            ),
+            (
+                json!([{"name": "seo", "type": "group", "admin": {"condition": {"field": "seo.on", "equals": true}},
+                        "fields": [{"name": "on", "type": "boolean"}]}]),
+                "field `seo`: admin.condition can't depend on the field itself",
+            ),
+            (
+                json!([{"name": "seo", "type": "group", "fields": [{"name": "on", "type": "boolean"}]},
+                       {"name": "t", "type": "text", "admin": {"condition": {"field": "seo", "exists": true}}}]),
+                "field `t`: admin.condition must point at a field with a value, not the group `seo`",
+            ),
+            (
+                json!([{"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
+                       {"name": "t", "type": "text", "admin": {"condition": {"field": "links", "equals": 1}}}]),
+                "field `t`: admin.condition on the array `links` can only test exists",
+            ),
+            (
+                json!([{"type": "row", "admin": {"condition": {"field": "a", "exists": true}},
+                        "fields": [{"name": "a", "type": "text"}]}]),
+                "field `fields.0`: admin.condition can't depend on a field inside it",
+            ),
+            (
+                json!([{"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
+                       {"name": "t", "type": "text", "admin": {"condition": {"field": "links.url", "exists": true}}}]),
+                "field `t`: admin.condition can't reach into the list `links` from outside it",
+            ),
+        ];
+        for (fields, message) in cases {
+            assert_eq!(check_err(fields), message);
+        }
+        assert_eq!(
+            check_err(json!([
+                {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
+                {"name": "t", "type": "text", "admin": {"condition": {"field": "links", "exists": true}}},
+                {"name": "seo", "type": "group", "fields": [
+                    {"name": "on", "type": "boolean"},
+                    {"name": "title", "type": "text", "admin": {"condition": {"field": "seo.on", "equals": true}}}
+                ]},
+                {"name": "rows", "type": "array", "fields": [
+                    {"name": "kind", "type": "text"},
+                    {"name": "extra", "type": "text", "admin": {"condition": {"field": "rows.kind", "equals": "x"}}}
+                ]}
+            ])),
+            "ok"
+        );
+    }
+
+    #[test]
+    fn data_fields_borrow_when_nothing_dissolves() {
+        let plain = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert!(matches!(
+            data_fields(&plain.fields),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let nested_row = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [
+                {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+            ]}
+        ]}));
+        let flat = data_fields(&nested_row.fields);
+        assert!(matches!(flat, std::borrow::Cow::Owned(_)));
+        assert!(matches!(data_fields(&flat), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_schemas_data_shape_is_worked_out_once() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert!(std::ptr::eq(s.data(), s.data()));
+        assert_eq!(s.data()[0].name, "title");
+        assert_eq!(s, s.clone(), "the cache doesn't affect equality");
+        let fresh = schema(json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert_eq!(s, fresh);
+    }
+
+    #[test]
+    fn compact_json_drops_defaults_and_round_trips() {
+        let input = json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [
+                {"name": "title", "type": "text", "required": true, "maxLength": 80},
+                {"name": "kind", "type": "select", "options": ["a", {"label": "B", "value": "b"}]}
+            ]},
+            {"name": "body", "type": "textarea", "admin": {"description": "Main text"}},
+            {"name": "meta", "type": "json", "default": {"x": null, "y": false}}
+        ]});
+        let s = schema(input);
+        let compact = s.to_compact_json();
+        assert_eq!(
+            compact,
+            json!({"slug": "posts", "kind": "collection", "fields": [
+                {"type": "row", "fields": [
+                    {"name": "title", "type": "text", "required": true, "maxLength": 80},
+                    {"name": "kind", "type": "select", "options": ["a", {"label": "B", "value": "b"}]}
+                ]},
+                {"name": "body", "type": "textarea", "admin": {"description": "Main text"}},
+                {"name": "meta", "type": "json", "default": {"x": null, "y": false}}
+            ]})
+        );
+        assert_eq!(schema(compact.clone()), s);
+        assert_eq!(s.reject_unknown_options(&compact), Ok(()));
     }
 }

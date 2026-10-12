@@ -66,7 +66,7 @@ pub(crate) fn list_params(raw: Option<&str>, c: &Collection) -> Result<ListParam
         raw,
         &["limit", "page", "after", "count", "depth", "where", "sort"],
     )?;
-    let fields = &c.schema.fields;
+    let fields = c.schema.data();
 
     let limit = number(&params, "limit")?.unwrap_or(DEFAULT_LIMIT);
     if limit < 1 {

@@ -340,3 +340,56 @@ async fn turning_a_link_into_a_list_keeps_it_protected(pool: PgPool) {
         "author.0"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn renaming_onto_a_removed_field_moves_the_data(pool: PgPool) {
+    let s = seed(&pool).await;
+    let new = posts(json!([
+        {"name": "summary", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": "authors"}
+    ]));
+    let r: Renames = [("title".to_owned(), "summary".to_owned())]
+        .into_iter()
+        .collect();
+    let p = preview(&pool, "posts", &new, &r, &[]).await.unwrap();
+    assert!(p.needs_confirmation, "the old summary's data goes");
+    apply(&pool, "posts", &new, &r, true).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    assert_eq!(doc.data.0["summary"], "Hello");
+    assert!(!doc.data.0.contains_key("title"));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn previews_list_index_changes(pool: PgPool) {
+    seed(&pool).await;
+    let indexed = posts(json!([
+        {"name": "title", "type": "text", "unique": true, "filterable": true},
+        {"name": "author", "type": "relationship", "relationTo": "authors"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let p = preview(&pool, "posts", &indexed, &Renames::new(), &[])
+        .await
+        .unwrap();
+    assert_eq!(
+        p.indexes.create,
+        ["title (unique)", "title (filter)", "title (filter desc)"]
+    );
+    assert!(p.indexes.drop.is_empty());
+
+    let (c, _) = apply(&pool, "posts", &indexed, &Renames::new(), false)
+        .await
+        .unwrap();
+    tachyon_db::indexes::reconcile_indexes(&pool, c.id)
+        .await
+        .unwrap();
+    let plain = posts(json!([
+        {"name": "title", "type": "text", "filterable": true},
+        {"name": "author", "type": "relationship", "relationTo": "authors"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let p = preview(&pool, "posts", &plain, &Renames::new(), &[])
+        .await
+        .unwrap();
+    assert!(p.indexes.create.is_empty());
+    assert_eq!(p.indexes.drop, ["title (unique)"]);
+}

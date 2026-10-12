@@ -8,7 +8,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use tachyon_core::query::value_kind;
-use tachyon_core::{CollectionKind, FieldError, data_fields, validate_document};
+use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 use tachyon_db::indexes::{IndexKind, index_name};
@@ -16,7 +16,7 @@ use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
 use crate::params::{depth_param, list_params};
-use crate::populate::{populate, prepare, to_value};
+use crate::populate::{link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -30,7 +30,7 @@ pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>
 
 /// Turns a unique-index rejection into a field error, when the index belongs to one of `c`'s fields.
 pub(crate) fn unique_error(c: &Collection, e: ApiError) -> ApiError {
-    let fields = data_fields(&c.schema.fields);
+    let fields = c.schema.data();
     if let ApiError::Unique(constraint) = &e
         && let Some(f) = fields.iter().find(|f| {
             f.is_unique()
@@ -52,8 +52,13 @@ fn parse_id(id: &str) -> Result<Uuid, ApiError> {
 }
 
 pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
-    body.map(|Json(v)| v)
-        .map_err(|e| ApiError::BadRequest(e.body_text()))
+    body.map(|Json(v)| v).map_err(|e| {
+        if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
+            ApiError::BodyTooLarge
+        } else {
+            ApiError::BadRequest(e.body_text())
+        }
+    })
 }
 
 pub async fn list(
@@ -118,14 +123,15 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    let data = validate_document(&c.schema.fields, &json_body(body)?, None)
+    let data = validate_document(c.schema.data(), &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
+    let targets = link_targets(&state, &c).await?;
     let doc = documents::insert(
         &state.pool,
         c.id,
         c.schema_version,
         None,
-        &prepare(&state, &c, data),
+        &prepare(&targets, &c, data)?,
     )
     .await
     .map_err(|e| unique_error(&c, e.into()))?;
@@ -154,10 +160,11 @@ pub async fn update(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let patch = json_body(body)?;
+    let targets = link_targets(&state, &c).await?;
     let doc = documents::update(&state.pool, c.id, c.schema_version, id, |current| {
-        validate_document(&c.schema.fields, &patch, Some(current))
-            .map(|data| prepare(&state, &c, data))
-            .map_err(ApiError::Validation)
+        let data = validate_document(c.schema.data(), &patch, Some(current))
+            .map_err(ApiError::Validation)?;
+        prepare(&targets, &c, data)
     })
     .await
     .map_err(|e| unique_error(&c, e))?;

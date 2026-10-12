@@ -80,6 +80,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Serve => {
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
             tracing::info!(addr = %config.listen, "listening");
+            if let Some(warning) = config::exposure_warning(config.listen) {
+                tracing::warn!("{warning}");
+            }
             axum::serve(listener, tachyon_api::router(pool).await?)
                 .with_graceful_shutdown(shutdown())
                 .await?;

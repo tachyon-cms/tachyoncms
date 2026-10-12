@@ -76,7 +76,9 @@ async fn filter_queries_can_use_the_index(pool: PgPool) {
         .await
         .unwrap();
     reconcile_indexes(&pool, c.id).await.unwrap();
-    let name = index_name(c.id, "price", IndexKind::Filter, ValueKind::Number);
+    // Either direction's index serves a range filter; the planner picks.
+    let names = [IndexKind::Filter, IndexKind::FilterDesc]
+        .map(|kind| index_name(c.id, "price", kind, ValueKind::Number));
 
     let mut conn = pool.acquire().await.unwrap();
     sqlx::query("SET enable_seqscan = off")
@@ -93,7 +95,11 @@ async fn filter_queries_can_use_the_index(pool: PgPool) {
         .fetch_all(&mut *conn)
         .await
         .unwrap();
-    assert!(plan.iter().any(|line| line.contains(&name)), "{plan:#?}");
+    assert!(
+        plan.iter()
+            .any(|line| names.iter().any(|n| line.contains(n))),
+        "{plan:#?}"
+    );
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -179,4 +185,96 @@ async fn unique_fields_inside_layout_are_indexed(pool: PgPool) {
     reconcile_indexes(&pool, c.id).await.unwrap();
     let name = index_name(c.id, "slug", IndexKind::Unique, ValueKind::Text);
     assert_eq!(index_state(&pool, &name).await, Some(true));
+}
+
+async fn plan(pool: &PgPool, sql: String) -> Vec<String> {
+    let mut conn = pool.acquire().await.unwrap();
+    sqlx::query("SET enable_seqscan = off")
+        .execute(&mut *conn)
+        .await
+        .unwrap();
+    sqlx::query_scalar(sqlx::AssertSqlSafe(format!("EXPLAIN {sql}")))
+        .fetch_all(&mut *conn)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn sorts_both_ways_can_use_an_index(pool: PgPool) {
+    let c = collections::create(&pool, &filterable_price())
+        .await
+        .unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
+    let price = tachyon_db::query::field_expr(&["price".to_owned()], ValueKind::Number);
+    for (direction, kind) in [("ASC", IndexKind::Filter), ("DESC", IndexKind::FilterDesc)] {
+        let name = index_name(c.id, "price", kind, ValueKind::Number);
+        let lines = plan(
+            &pool,
+            format!(
+                "SELECT id FROM documents WHERE collection_id = '{}' AND deleted_at IS NULL \
+                 ORDER BY {price} {direction} NULLS LAST, id DESC LIMIT 10",
+                c.id
+            ),
+        )
+        .await;
+        assert!(
+            lines.iter().any(|line| line.contains(&name))
+                && !lines.iter().any(|l| l.contains("Sort")),
+            "{direction}: {lines:#?}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unique_filterable_fields_get_sort_indexes_too(pool: PgPool) {
+    let c = collections::create(
+        &pool,
+        &schema(json!({"name": "price", "type": "number", "unique": true, "filterable": true})),
+    )
+    .await
+    .unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
+    for kind in [IndexKind::Unique, IndexKind::Filter, IndexKind::FilterDesc] {
+        let name = index_name(c.id, "price", kind, ValueKind::Number);
+        assert_eq!(index_state(&pool, &name).await, Some(true), "{kind:?}");
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_cancelled_reconcile_releases_its_lock(pool: PgPool) {
+    let c = collections::create(&pool, &filterable_price())
+        .await
+        .unwrap();
+    // An open writer makes CREATE INDEX CONCURRENTLY wait, so the reconcile is mid-build
+    // (holding its advisory lock) when the caller gives up on it.
+    let mut writer = pool.begin().await.unwrap();
+    documents::insert(&pool, c.id, 1, None, &doc("x"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE documents SET updated_at = now()")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        reconcile_indexes(&pool, c.id),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the build should still be waiting");
+    writer.commit().await.unwrap();
+
+    let key = i64::from_le_bytes(c.id.as_bytes()[..8].try_into().unwrap());
+    let mut free = false;
+    for _ in 0..100 {
+        free = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if free {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(free, "the lock outlived the cancelled reconcile");
 }

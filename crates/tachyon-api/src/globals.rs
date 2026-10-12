@@ -6,15 +6,15 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
-use serde_json::{Map, Value};
-use tachyon_core::{CollectionKind, data_fields, validate_document};
+use serde_json::Value;
+use tachyon_core::{CollectionKind, defaults, validate_document};
 use tachyon_db::DbError;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 
 use crate::documents::{json_body, unique_error};
 use crate::params::depth_param;
-use crate::populate::{populate, prepare, to_value};
+use crate::populate::{link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -51,13 +51,7 @@ pub async fn get(
     let c = global(&state, path)?;
     match documents::get(&state.pool, c.id, c.id).await {
         Ok(doc) => respond(&state, c, &doc, depth).await,
-        Err(DbError::NotFound) => {
-            let defaults: Map<String, Value> = data_fields(&c.schema.fields)
-                .iter()
-                .filter_map(|f| Some((f.name.clone(), f.default.clone()?)))
-                .collect();
-            Ok(Json(Value::Object(defaults)))
-        }
+        Err(DbError::NotFound) => Ok(Json(Value::Object(defaults(c.schema.data())))),
         Err(e) => Err(e.into()),
     }
 }
@@ -69,12 +63,13 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
     let patch = json_body(body)?;
+    let targets = link_targets(&state, &c).await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
         let updated = documents::update(&state.pool, c.id, c.schema_version, c.id, |current| {
-            let data = validate_document(&c.schema.fields, &patch, Some(current))
+            let data = validate_document(c.schema.data(), &patch, Some(current))
                 .map_err(ApiError::Validation)?;
-            Ok(prepare(&state, &c, data))
+            prepare(&targets, &c, data)
         })
         .await;
         match updated {
@@ -83,13 +78,13 @@ pub async fn update(
             Err(e) => return Err(unique_error(&c, e)),
         }
         let data =
-            validate_document(&c.schema.fields, &patch, None).map_err(ApiError::Validation)?;
+            validate_document(c.schema.data(), &patch, None).map_err(ApiError::Validation)?;
         match documents::insert(
             &state.pool,
             c.id,
             c.schema_version,
             Some(c.id),
-            &prepare(&state, &c, data),
+            &prepare(&targets, &c, data)?,
         )
         .await
         {

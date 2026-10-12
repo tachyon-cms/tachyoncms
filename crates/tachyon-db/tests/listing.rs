@@ -501,3 +501,49 @@ async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool)
         "{refused:?}"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn big_integers_filter_and_page_exactly(pool: PgPool) {
+    let c = collections::create(&pool, &schema()).await.unwrap().id;
+    for price in [9007199254740993_u64, 9007199254740992] {
+        let data = json!({"price": price}).as_object().unwrap().clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let prices = |page: &query::Page| -> Vec<u64> {
+        page.docs
+            .iter()
+            .map(|d| d.data.0["price"].as_u64().unwrap())
+            .collect()
+    };
+    let f = filter("where[price][equals]=9007199254740993");
+    let page = query::list(&pool, c, &q(Some(&f), None)).await.unwrap();
+    assert_eq!(prices(&page), [9007199254740993]);
+
+    let s = sort("-price");
+    let first = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            limit: 1,
+            ..q(None, Some(&s))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(prices(&first), [9007199254740993]);
+    let next = Cursor::decode(&first.next.unwrap().encode()).unwrap();
+    let second = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            limit: 1,
+            after: Some(&next),
+            ..q(None, Some(&s))
+        },
+    )
+    .await
+    .unwrap();
+    assert_eq!(prices(&second), [9007199254740992]);
+}

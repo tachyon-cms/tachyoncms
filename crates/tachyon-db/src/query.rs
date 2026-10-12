@@ -118,7 +118,7 @@ fn bind(qb: &mut QueryBuilder<Postgres>, target: &Target, value: &Scalar) {
         (Target::CreatedAt | Target::UpdatedAt, Scalar::Text(s)) => {
             qb.push_bind(OffsetDateTime::parse(s, &Rfc3339).expect("parser normalized the date"));
         }
-        // Bound as text: Rust prints the shortest exact form, where float8→numeric keeps 15 digits.
+        // Bound as text, which Postgres reads exactly; float8→numeric would keep 15 digits.
         (_, Scalar::Number(n)) => {
             qb.push_bind(n.to_string()).push("::numeric");
         }
@@ -414,7 +414,7 @@ fn sort_value(sort: Option<&Sort>, doc: &Document) -> Option<Scalar> {
                 v = v.get(segment)?.clone();
             }
             match (kind, &v) {
-                (ValueKind::Number, Value::Number(n)) => n.as_f64().map(Scalar::Number),
+                (ValueKind::Number, Value::Number(n)) => Some(Scalar::Number(n.clone())),
                 (ValueKind::Boolean, Value::Bool(b)) => Some(Scalar::Bool(*b)),
                 (_, Value::String(s)) => Some(Scalar::Text(s.clone())),
                 _ => None,

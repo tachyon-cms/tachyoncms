@@ -13,14 +13,13 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::diff::{Renames, SchemaDiff, diff, migrate_document, relink};
 use tachyon_core::{
-    CollectionKind, CollectionSchema, FieldError, SchemaError, data_fields, relations,
-    validate_document,
+    CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
 };
 use uuid::Uuid;
 
 use crate::collections::Collection;
 use crate::documents::{Relation, sync_relations};
-use crate::indexes::{ddl, existing_indexes, wanted_indexes};
+use crate::indexes::{Wanted, ddl, existing_indexes, wanted_indexes};
 use crate::{DEFAULT_TENANT, DbError};
 
 const BATCH: i64 = 500;
@@ -40,6 +39,14 @@ pub struct Preview {
     pub needs_confirmation: bool,
     /// Live documents that lose a link because its collection is no longer allowed.
     pub cleared: i64,
+    pub indexes: IndexChanges,
+}
+
+/// Indexes the change builds and drops, labelled like `title (unique)`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IndexChanges {
+    pub create: Vec<String>,
+    pub drop: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +95,23 @@ pub async fn apply(
     confirm: bool,
 ) -> Result<(Collection, Preview), ChangeError> {
     run(pool, slug, new, renames, &[], Some(confirm)).await
+}
+
+fn index_changes(id: Uuid, old: &CollectionSchema, new: &CollectionSchema) -> IndexChanges {
+    let (before, after) = (wanted_indexes(id, old), wanted_indexes(id, new));
+    let missing_from = |list: &[Wanted], w: &Wanted| !list.iter().any(|o| o.name == w.name);
+    IndexChanges {
+        create: after
+            .iter()
+            .filter(|w| missing_from(&before, w))
+            .map(Wanted::label)
+            .collect(),
+        drop: before
+            .iter()
+            .filter(|w| missing_from(&after, w))
+            .map(Wanted::label)
+            .collect(),
+    }
 }
 
 struct Row {
@@ -192,8 +216,9 @@ async fn run(
         duplicates: Vec::new(),
         needs_confirmation: false,
         cleared: 0,
+        indexes: index_changes(current.id, &current.schema.0, new),
     };
-    let data = data_fields(&new.fields);
+    let data = new.data();
     let unique: Vec<&str> = data
         .iter()
         .filter(|f| f.is_unique())
@@ -211,12 +236,12 @@ async fn run(
         after = Some(last.id);
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
-            let mut migrated = migrate_document(&new.fields, renames, &row.data);
+            let mut migrated = migrate_document(new.data(), renames, &row.data);
             if relink(&mut migrated, &links) {
                 p.cleared += 1;
             }
             if let Err(errors) =
-                validate_document(&new.fields, &Value::Object(Map::new()), Some(&migrated))
+                validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
             {
                 p.invalid += 1;
                 if p.examples.len() < MAX_EXAMPLES {
@@ -255,12 +280,11 @@ async fn run(
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows {
-            let mut migrated = migrate_document(&new.fields, renames, &row.data);
+            let mut migrated = migrate_document(new.data(), renames, &row.data);
             relink(&mut migrated, &links);
             // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
-            let stored =
-                validate_document(&new.fields, &Value::Object(Map::new()), Some(&migrated))
-                    .unwrap_or(migrated);
+            let stored = validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
+                .unwrap_or(migrated);
             if stored != row.data {
                 sqlx::query!(
                     "UPDATE documents SET published = $2 WHERE id = $1",
@@ -272,7 +296,7 @@ async fn run(
             }
             // Deleted documents keep their old link rows; they re-sync when restored and saved (M4).
             if row.live {
-                let links: Vec<Relation> = relations(&new.fields, &stored)
+                let links: Vec<Relation> = relations(new.data(), &stored)
                     .into_iter()
                     .filter_map(|r| {
                         Some(Relation {

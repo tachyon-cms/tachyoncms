@@ -159,8 +159,21 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
         FieldKind::Point => ValueKind::Point,
-        FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
-        _ => ValueKind::Text,
+        FieldKind::Text { .. }
+        | FieldKind::Textarea { .. }
+        | FieldKind::Email
+        | FieldKind::Url
+        | FieldKind::Select { .. }
+        | FieldKind::Radio { .. }
+        | FieldKind::Code { .. }
+        | FieldKind::Slug { .. }
+        | FieldKind::Relationship { .. } => ValueKind::Text,
+        FieldKind::Json
+        | FieldKind::Group { .. }
+        | FieldKind::Array { .. }
+        | FieldKind::Row { .. }
+        | FieldKind::Collapsible { .. }
+        | FieldKind::Tabs { .. } => return None,
     })
 }
 
@@ -235,7 +248,8 @@ impl Op {
 #[derive(Debug, Clone, PartialEq)]
 pub enum Scalar {
     Text(String),
-    Number(f64),
+    /// Exact as sent: whole numbers beyond 2^53 keep every digit.
+    Number(serde_json::Number),
     Bool(bool),
 }
 
@@ -510,29 +524,24 @@ fn list(v: &Value) -> Option<Vec<Value>> {
     (!items.is_empty() && items.len() <= MAX_LIST).then_some(items)
 }
 
+/// A JSON number, or text that reads as one. Never NaN or infinite: JSON can't hold those.
+fn number(v: &Value) -> Option<serde_json::Number> {
+    match v {
+        Value::Number(n) => Some(n.clone()),
+        Value::String(s) => s.trim().parse().ok(),
+        _ => None,
+    }
+}
+
 fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, String> {
     let kind = field.map(|f| &f.kind);
     match (target.kind(), kind) {
-        (ValueKind::List, Some(FieldKind::Number { .. })) => {
-            let n = match v {
-                Value::Number(n) => n.as_f64(),
-                Value::String(s) => s.parse::<f64>().ok(),
-                _ => None,
-            };
-            n.filter(|n| n.is_finite())
-                .map(Scalar::Number)
-                .ok_or_else(|| "expected a number".into())
-        }
-        (ValueKind::Number, _) => {
-            let n = match v {
-                Value::Number(n) => n.as_f64(),
-                Value::String(s) => s.parse::<f64>().ok(),
-                _ => None,
-            };
-            n.filter(|n| n.is_finite())
-                .map(Scalar::Number)
-                .ok_or_else(|| "expected a number".into())
-        }
+        (ValueKind::List, Some(FieldKind::Number { .. })) => number(v)
+            .map(Scalar::Number)
+            .ok_or_else(|| "expected a number".into()),
+        (ValueKind::Number, _) => number(v)
+            .map(Scalar::Number)
+            .ok_or_else(|| "expected a number".into()),
         (ValueKind::Boolean, _) => parse_bool(v)
             .map(Scalar::Bool)
             .ok_or_else(|| "expected true or false".into()),
@@ -663,7 +672,7 @@ impl Cursor {
             Value::Null => None,
             Value::String(s) if s.contains('\0') => return None,
             Value::String(s) => Some(Scalar::Text(s.clone())),
-            Value::Number(n) => Some(Scalar::Number(n.as_f64()?)),
+            Value::Number(n) => Some(Scalar::Number(n.clone())),
             Value::Bool(b) => Some(Scalar::Bool(*b)),
             _ => return None,
         };
@@ -776,7 +785,7 @@ mod tests {
             cond(
                 field("price", ValueKind::Number),
                 Op::Gt,
-                Operand::One(Scalar::Number(5.0))
+                Operand::One(Scalar::Number(5.into()))
             )
         );
         assert_eq!(
@@ -976,7 +985,7 @@ mod tests {
     #[test]
     fn cursors_round_trip_and_reject_garbage() {
         let c = Cursor {
-            value: Some(Scalar::Number(9.5)),
+            value: Some(Scalar::Number(serde_json::Number::from_f64(9.5).unwrap())),
             id: Uuid::nil(),
         };
         assert_eq!(Cursor::decode(&c.encode()), Some(c.clone()));
@@ -1054,7 +1063,7 @@ mod tests {
             cond(
                 field("scores", ValueKind::List),
                 Op::Contains,
-                Operand::One(Scalar::Number(3.0))
+                Operand::One(Scalar::Number(3.into()))
             )
         );
         assert_eq!(
@@ -1170,5 +1179,47 @@ mod tests {
         let id = "0199d5c4-0000-7000-8000-00000000000a";
         let w = parse_query(&format!("where[g.relationTo][contains]={id}")).unwrap();
         assert!(parse_filter(&f, &w["where"]).is_ok());
+    }
+
+    #[test]
+    fn numbers_keep_their_exact_value() {
+        let big = |qs: &str| match filter(qs).unwrap() {
+            Filter::Cond(c) => c.value,
+            other => panic!("{other:?}"),
+        };
+        let exact: serde_json::Number = "9007199254740993".parse().unwrap();
+        assert_eq!(
+            big("where[price][equals]=9007199254740993"),
+            Operand::One(Scalar::Number(exact.clone()))
+        );
+        let cursor = Cursor {
+            value: Some(Scalar::Number(exact)),
+            id: Uuid::nil(),
+        };
+        assert_eq!(Cursor::decode(&cursor.encode()), Some(cursor));
+        assert!(filter("where[price][equals]=1e400").is_err());
+        // Numbers are read as JSON writes them, so these spellings aren't numbers.
+        // (`%2B` is a plus sign; a bare `+` in a query string means a space.)
+        for odd in ["%2B5", ".5", "5.", "0x10", "NaN", "inf"] {
+            assert!(
+                filter(&format!("where[price][equals]={odd}")).is_err(),
+                "{odd}"
+            );
+        }
+        assert!(filter("where[price][equals]=-0.5e3").is_ok());
+    }
+
+    #[test]
+    fn layout_kinds_have_no_value_kind() {
+        let schema: crate::CollectionSchema =
+            serde_json::from_value(json!({"slug": "p", "fields": [
+                {"type": "row", "fields": []},
+                {"type": "collapsible", "label": "C", "fields": []},
+                {"type": "tabs", "tabs": [{"label": "A", "fields": []}]}
+            ]}))
+            .unwrap();
+        for f in &schema.fields {
+            assert_eq!(value_kind(&f.kind), None, "{}", f.kind.name());
+        }
     }
 }
