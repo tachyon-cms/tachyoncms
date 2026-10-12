@@ -1,5 +1,6 @@
 //! Content model and validation for TachyonCMS. This crate does no I/O.
 
+pub mod query;
 pub mod schema;
 pub mod validate;
 
