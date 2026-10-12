@@ -27,6 +27,16 @@ pub fn router(pool: PgPool) -> Router {
             "/api/admin/collections",
             get(collections::list).post(collections::create),
         )
+        .route(
+            "/api/{collection}",
+            get(documents::list).post(documents::create),
+        )
+        .route(
+            "/api/{collection}/{id}",
+            get(documents::get)
+                .patch(documents::update)
+                .delete(documents::delete),
+        )
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(TimeoutLayer::with_status_code(
