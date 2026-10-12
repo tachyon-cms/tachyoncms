@@ -10,6 +10,9 @@ pub enum ApiError {
     NotFound,
     MethodNotAllowed,
     BadRequest(String),
+    PayloadTooLarge,
+    /// The request ran past its time limit.
+    Timeout,
     Conflict(String),
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
@@ -63,6 +66,18 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
+            Self::PayloadTooLarge => (
+                StatusCode::PAYLOAD_TOO_LARGE,
+                "Payload too large",
+                Some("the request body is over 10 MB".to_owned()),
+                None,
+            ),
+            Self::Timeout => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service unavailable",
+                Some("the request took too long; try again".to_owned()),
+                None,
+            ),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
             Self::Unique(_) => (
                 StatusCode::CONFLICT,

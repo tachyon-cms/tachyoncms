@@ -12,6 +12,7 @@ use tachyon_db::collections::{self, Collection};
 use tachyon_db::indexes::reconcile_indexes;
 use tachyon_db::schema_change::{self, ChangeError};
 
+use crate::documents::json_body;
 use crate::{ApiError, AppState};
 
 fn to_json(c: &Collection) -> Value {
@@ -34,11 +35,6 @@ fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
         .and_then(|()| schema.check())
         .map_err(schema_error)?;
     Ok(schema)
-}
-
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
-    body.map(|Json(v)| v)
-        .map_err(|e| ApiError::BadRequest(e.body_text()))
 }
 
 pub async fn list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {

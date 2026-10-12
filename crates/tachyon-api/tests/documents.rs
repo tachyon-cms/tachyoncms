@@ -283,3 +283,11 @@ async fn patching_part_of_a_group_keeps_the_rest(pool: PgPool) {
         json!({"title": "New", "description": "Kept"})
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn oversized_bodies_get_413_problem_json(pool: PgPool) {
+    let app = app_with_posts(pool).await;
+    let big = format!(r#"{{"title": "{}"}}"#, "x".repeat(11 * 1024 * 1024));
+    let res = send(&app, "POST", "/api/posts", Some(&big)).await;
+    assert_problem(&res, 413);
+}
