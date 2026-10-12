@@ -17,7 +17,7 @@ We think you can have both. Here's what we're building toward:
 
 ## What works today
 
-- Define collections and their fields over the API. There are 11 field types, plus nested groups and repeatable arrays.
+- Define collections and their fields over the API: text (one value or a list), textarea, number (one or a list), checkbox, date, email, URL, select and radio (with labels), slug, relationship, code, JSON, groups and repeatable arrays. Every field can carry admin hints such as a description, a placeholder, a sidebar position or a condition for when it shows.
 - Create, read, update and delete documents, with validation errors that tell you exactly which field is wrong (`seo.title`, `links.0.url`).
 - Paginated lists, newest first.
 - Errors in the standard [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) format, each with a request ID you can find in the logs.

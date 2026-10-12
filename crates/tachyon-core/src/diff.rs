@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError};
+use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, find_field};
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
 pub type Renames = BTreeMap<String, String>;
@@ -85,7 +85,7 @@ pub fn diff(
         ));
     }
     for from in renames.keys() {
-        if find(&old.fields, from).is_none() {
+        if find_field(&old.fields, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
@@ -196,7 +196,34 @@ fn options(f: &Field) -> Field {
 }
 
 fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
+    use FieldKind::{Code, Number, Radio, Select, Text, Textarea};
     match (a, b) {
+        // Turning `hasMany` on or off changes the stored shape.
+        (Text { has_many: x, .. }, Text { has_many: y, .. }) => x == y,
+        (Number { has_many: x, .. }, Number { has_many: y, .. }) => x == y,
+        // Same stored shape, so a change between them is an option change.
+        (
+            Text {
+                has_many: false, ..
+            }
+            | Textarea { .. }
+            | Code { .. },
+            Text {
+                has_many: false, ..
+            }
+            | Textarea { .. }
+            | Code { .. },
+        ) => true,
+        (
+            Radio { .. }
+            | Select {
+                multiple: false, ..
+            },
+            Radio { .. }
+            | Select {
+                multiple: false, ..
+            },
+        ) => true,
         (FieldKind::Select { multiple: x, .. }, FieldKind::Select { multiple: y, .. }) => x == y,
         (FieldKind::Date { date_only: x }, FieldKind::Date { date_only: y }) => x == y,
         (
@@ -211,20 +238,6 @@ fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
         ) => r1 == r2 && h1 == h2,
         _ => a.name() == b.name(),
     }
-}
-
-fn find<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
-    let mut current = fields;
-    let mut found = None;
-    for segment in path.split('.') {
-        let f = current.iter().find(|f| f.name == segment)?;
-        current = match &f.kind {
-            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-            _ => &[],
-        };
-        found = Some(f);
-    }
-    found
 }
 
 fn join(prefix: &str, key: &str) -> String {
@@ -570,5 +583,38 @@ mod tests {
         assert!(clear_at(&mut doc, "rows.who"));
         assert!(!clear_at(&mut doc, "missing"));
         assert_eq!(Value::Object(doc), json!({"rows": [{}, {}]}));
+    }
+    #[test]
+    fn same_shaped_types_change_options_not_type() {
+        let old = schema(json!({"slug": "posts", "fields": [
+            {"name": "body", "type": "text"},
+            {"name": "size", "type": "select", "options": ["s", "l"]}
+        ]}));
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"name": "body", "type": "code"},
+            {"name": "size", "type": "radio", "options": ["s", "l"]}
+        ]}));
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::OptionsChanged {
+                    path: "body".into()
+                },
+                Change::OptionsChanged {
+                    path: "size".into()
+                },
+            ]
+        );
+        assert!(!d.is_destructive());
+    }
+    #[test]
+    fn toggling_has_many_is_a_type_change() {
+        let old = schema(json!({"slug": "posts", "fields": [{"name": "tags", "type": "text"}]}));
+        let new = schema(
+            json!({"slug": "posts", "fields": [{"name": "tags", "type": "text", "hasMany": true}]}),
+        );
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert!(d.is_destructive(), "{:?}", d.changes);
     }
 }

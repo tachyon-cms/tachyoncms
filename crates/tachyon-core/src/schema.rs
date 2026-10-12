@@ -51,8 +51,57 @@ pub struct Field {
     /// Index this field so filters and sorts on it stay fast.
     #[serde(default)]
     pub filterable: bool,
+    #[serde(default)]
+    pub admin: Admin,
     #[serde(flatten)]
     pub kind: FieldKind,
+}
+
+/// How the admin shows a field. Presentation only: the API stores these but never enforces them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Admin {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub position: Position,
+    /// Such as `50%` or `240px`.
+    #[serde(default)]
+    pub width: Option<String>,
+    /// Show the field only when another field matches.
+    #[serde(default)]
+    pub condition: Option<Condition>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Position {
+    #[default]
+    Main,
+    Sidebar,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Condition {
+    /// Dotted path from the top of the document, such as `kind` or `seo.enabled`.
+    pub field: String,
+    #[serde(flatten)]
+    pub test: ConditionTest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConditionTest {
+    Equals(Value),
+    NotEquals(Value),
+    In(Vec<Value>),
+    Exists(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -67,8 +116,17 @@ pub enum FieldKind {
         min_length: Option<usize>,
         #[serde(default)]
         max_length: Option<usize>,
+        /// Store a list of values instead of one.
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
     },
     Textarea {
+        #[serde(default)]
+        min_length: Option<usize>,
         #[serde(default)]
         max_length: Option<usize>,
     },
@@ -79,7 +137,15 @@ pub enum FieldKind {
         max: Option<f64>,
         #[serde(default)]
         integer: bool,
+        /// Store a list of values instead of one.
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
     },
+    #[serde(alias = "checkbox")]
     Boolean,
     Date {
         #[serde(default)]
@@ -88,9 +154,17 @@ pub enum FieldKind {
     Email,
     Url,
     Select {
-        options: Vec<String>,
+        options: Vec<SelectOption>,
         #[serde(default)]
         multiple: bool,
+    },
+    Radio {
+        options: Vec<SelectOption>,
+    },
+    Code {
+        /// For the admin's editor highlighting, such as `rust` or `html`.
+        #[serde(default)]
+        language: Option<String>,
     },
     Slug {
         /// A text field to generate the slug from when none is given.
@@ -113,6 +187,22 @@ pub enum FieldKind {
         #[serde(default)]
         max_rows: Option<usize>,
     },
+}
+
+/// A choice in a `select` or `radio`: a bare value, or a label shown to editors plus the stored value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SelectOption {
+    Value(String),
+    Labeled { label: String, value: String },
+}
+
+impl SelectOption {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Value(v) | Self::Labeled { value: v, .. } => v,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -150,6 +240,8 @@ impl FieldKind {
             Self::Email => "email",
             Self::Url => "url",
             Self::Select { .. } => "select",
+            Self::Radio { .. } => "radio",
+            Self::Code { .. } => "code",
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
             Self::Json => "json",
@@ -162,7 +254,9 @@ impl FieldKind {
     pub fn is_indexable(&self) -> bool {
         match self {
             Self::Select { multiple, .. } => !multiple,
-            Self::Relationship { has_many, .. } => !has_many,
+            Self::Relationship { has_many, .. }
+            | Self::Text { has_many, .. }
+            | Self::Number { has_many, .. } => !has_many,
             Self::Json | Self::Group { .. } | Self::Array { .. } => false,
             _ => true,
         }
@@ -204,7 +298,7 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        check_fields(&self.fields, true)
+        check_fields(&self.fields, true, &self.fields)
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -236,11 +330,53 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
     for (f, raw) in fields.iter().zip(raw) {
         let known = serde_json::to_value(f).expect("fields always serialize");
         unknown_key(raw, &known, &f.name)?;
+        // Nested objects that parsing could also drop keys from: admin, its condition
+        // (which holds exactly one test), and labelled options.
+        let mut nested = vec![
+            ("admin".to_owned(), raw.get("admin"), known.get("admin")),
+            (
+                "admin.condition".to_owned(),
+                raw.pointer("/admin/condition"),
+                known.pointer("/admin/condition"),
+            ),
+        ];
+        if let (Some(Value::Array(raw_options)), Some(Value::Array(known_options))) =
+            (raw.get("options"), known.get("options"))
+        {
+            for (i, (r, k)) in raw_options.iter().zip(known_options).enumerate() {
+                nested.push((format!("options.{i}"), Some(r), Some(k)));
+            }
+        }
+        for (prefix, raw_part, known_part) in nested {
+            if let (Some(Value::Object(r)), Some(Value::Object(k))) = (raw_part, known_part)
+                && let Some(option) = r.keys().find(|key| !k.contains_key(*key))
+            {
+                return Err(SchemaError::UnknownOption {
+                    field: f.name.clone(),
+                    option: format!("{prefix}.{option}"),
+                });
+            }
+        }
         if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &f.kind {
             unknown_in_fields(fields, raw.get("fields"))?;
         }
     }
     Ok(())
+}
+
+/// The field at a dotted path, looking through groups and arrays.
+pub(crate) fn find_field<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
+    let mut current = fields;
+    let mut found = None;
+    for segment in path.split('.') {
+        let f = current.iter().find(|f| f.name == segment)?;
+        current = match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+            _ => &[],
+        };
+        found = Some(f);
+    }
+    found
 }
 
 fn is_identifier(s: &str, allow_upper: bool) -> bool {
@@ -251,7 +387,7 @@ fn is_identifier(s: &str, allow_upper: bool) -> bool {
         && chars.all(|c| ok(c) || c.is_ascii_digit() || c == '_')
 }
 
-fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
+fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(), SchemaError> {
     let mut seen = HashSet::new();
     for f in fields {
         if !is_identifier(&f.name, true) {
@@ -276,8 +412,10 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
         if (f.unique || f.filterable) && !f.kind.is_indexable() {
             let what = match f.kind {
                 FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
-                FieldKind::Relationship { .. } => {
-                    "relationship fields with multiple values".to_owned()
+                FieldKind::Relationship { .. }
+                | FieldKind::Text { .. }
+                | FieldKind::Number { .. } => {
+                    format!("{} fields with multiple values", f.kind.name())
                 }
                 _ => format!("{} fields", f.kind.name()),
             };
@@ -287,6 +425,7 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
             FieldKind::Text {
                 min_length: Some(a),
                 max_length: Some(b),
+                ..
             } if a > b => {
                 return Err(invalid("minLength is greater than maxLength".into()));
             }
@@ -297,8 +436,49 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
             } if a > b => {
                 return Err(invalid("min is greater than max".into()));
             }
-            FieldKind::Select { options, .. } if options.is_empty() => {
-                return Err(invalid("select needs at least one option".into()));
+            FieldKind::Text {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            }
+            | FieldKind::Number {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            } if (min_rows.is_some() || max_rows.is_some())
+                && (!has_many || min_rows > max_rows && max_rows.is_some()) =>
+            {
+                return Err(invalid(if *has_many {
+                    "minRows is greater than maxRows".into()
+                } else {
+                    "minRows and maxRows only apply with hasMany".into()
+                }));
+            }
+            FieldKind::Select { options, .. } | FieldKind::Radio { options } => {
+                if options.is_empty() {
+                    return Err(invalid(format!(
+                        "{} needs at least one option",
+                        f.kind.name()
+                    )));
+                }
+                let mut values = HashSet::new();
+                if let Some(dup) = options
+                    .iter()
+                    .map(SelectOption::value)
+                    .find(|v| !values.insert(*v))
+                {
+                    return Err(invalid(format!(
+                        "option values must be unique; `{dup}` appears twice"
+                    )));
+                }
+            }
+            FieldKind::Textarea {
+                min_length: Some(a),
+                max_length: Some(b),
+            } if a > b => {
+                return Err(invalid("minLength is greater than maxLength".into()));
             }
             FieldKind::Array {
                 min_rows: Some(a),
@@ -308,9 +488,16 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
                 return Err(invalid("minRows is greater than maxRows".into()));
             }
             FieldKind::Slug { from: Some(source) }
-                if !fields
-                    .iter()
-                    .any(|s| &s.name == source && matches!(s.kind, FieldKind::Text { .. })) =>
+                if !fields.iter().any(|s| {
+                    &s.name == source
+                        && matches!(
+                            s.kind,
+                            FieldKind::Text {
+                                has_many: false,
+                                ..
+                            }
+                        )
+                }) =>
             {
                 return Err(invalid(format!(
                     "from must name a top-level text field, not `{source}`"
@@ -322,9 +509,22 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
                 )));
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                check_fields(fields, false)?
+                check_fields(fields, false, root)?
             }
             _ => {}
+        }
+        if let Some(condition) = &f.admin.condition
+            && find_field(root, &condition.field).is_none()
+        {
+            return Err(invalid(format!(
+                "admin.condition refers to `{}`, which isn't a field",
+                condition.field
+            )));
+        }
+        if let Some(width) = &f.admin.width
+            && !(width.ends_with('%') || width.ends_with("px"))
+        {
+            return Err(invalid("admin.width must look like 50% or 240px".into()));
         }
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
@@ -358,7 +558,10 @@ mod tests {
             s.fields[0].kind,
             FieldKind::Text {
                 min_length: None,
-                max_length: Some(120)
+                max_length: Some(120),
+                has_many: false,
+                min_rows: None,
+                max_rows: None,
             }
         );
         assert!(s.fields[0].required);
@@ -561,6 +764,178 @@ mod tests {
             Err(SchemaError::InvalidField {
                 field: "author".into(),
                 message: "relationTo `Authors!` isn't a valid collection slug".into(),
+            })
+        );
+    }
+    #[test]
+    fn admin_options_round_trip_and_are_checked() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "kind", "type": "select", "options": ["article", "video"]},
+            {"name": "videoUrl", "type": "url", "admin": {
+                "description": "Paste the YouTube link",
+                "position": "sidebar",
+                "width": "50%",
+                "condition": {"field": "kind", "equals": "video"}
+            }}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        let admin = &s.fields[1].admin;
+        assert_eq!(admin.position, Position::Sidebar);
+        assert_eq!(
+            admin.condition,
+            Some(Condition {
+                field: "kind".into(),
+                test: ConditionTest::Equals(json!("video"))
+            })
+        );
+        assert_eq!(s.fields[0].admin, Admin::default(), "admin is optional");
+
+        let typo = json!({"slug": "posts", "fields": [{"name": "t", "type": "text", "admin": {"descripton": "x"}}]});
+        assert_eq!(
+            schema(typo.clone()).reject_unknown_options(&typo),
+            Err(SchemaError::UnknownOption {
+                field: "t".into(),
+                option: "admin.descripton".into()
+            })
+        );
+
+        let dangling = schema(json!({"slug": "posts", "fields": [
+            {"name": "t", "type": "text", "admin": {"condition": {"field": "nope", "exists": true}}}
+        ]}));
+        assert_eq!(
+            dangling.check(),
+            Err(SchemaError::InvalidField {
+                field: "t".into(),
+                message: "admin.condition refers to `nope`, which isn't a field".into()
+            })
+        );
+        let bad_width = schema(json!({"slug": "posts", "fields": [
+            {"name": "t", "type": "text", "admin": {"width": "half"}}
+        ]}));
+        assert_eq!(
+            bad_width.check(),
+            Err(SchemaError::InvalidField {
+                field: "t".into(),
+                message: "admin.width must look like 50% or 240px".into()
+            })
+        );
+    }
+    #[test]
+    fn labelled_options_radio_checkbox_and_code_parse() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "stage", "type": "select", "options": ["draft", {"label": "Ready to go", "value": "ready"}]},
+            {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}, {"label": "Large", "value": "l"}]},
+            {"name": "featured", "type": "checkbox"},
+            {"name": "snippet", "type": "code", "language": "rust"},
+            {"name": "intro", "type": "textarea", "minLength": 10}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(
+            s.fields[2].kind,
+            FieldKind::Boolean,
+            "checkbox is stored as boolean"
+        );
+        assert_eq!(
+            s.fields[3].kind,
+            FieldKind::Code {
+                language: Some("rust".into())
+            }
+        );
+        let FieldKind::Select { options, .. } = &s.fields[0].kind else {
+            panic!()
+        };
+        assert_eq!(
+            options.iter().map(SelectOption::value).collect::<Vec<_>>(),
+            ["draft", "ready"]
+        );
+
+        let dup = schema(
+            json!({"slug": "posts", "fields": [{"name": "r", "type": "radio", "options": ["a", {"label": "A", "value": "a"}]}]}),
+        );
+        assert_eq!(
+            dup.check(),
+            Err(SchemaError::InvalidField {
+                field: "r".into(),
+                message: "option values must be unique; `a` appears twice".into()
+            })
+        );
+    }
+    #[test]
+    fn has_many_fields_cant_be_indexed() {
+        let s = schema(
+            json!({"slug": "posts", "fields": [{"name": "tags", "type": "text", "hasMany": true, "filterable": true}]}),
+        );
+        assert_eq!(
+            s.check(),
+            Err(SchemaError::InvalidField {
+                field: "tags".into(),
+                message: "text fields with multiple values can't be unique or filterable".into()
+            })
+        );
+    }
+
+    #[test]
+    fn stray_keys_in_conditions_and_options_are_rejected() {
+        let cases = [
+            (
+                json!({"name": "t", "type": "text", "admin": {"condition": {"field": "t", "equals": "a", "bogus": 1}}}),
+                "admin.condition.bogus",
+            ),
+            (
+                json!({"name": "t", "type": "text", "admin": {"condition": {"field": "t", "equals": "a", "in": ["b"]}}}),
+                "admin.condition.in",
+            ),
+            (
+                json!({"name": "c", "type": "select", "options": [{"label": "A", "value": "a", "color": "red"}]}),
+                "options.0.color",
+            ),
+        ];
+        for (field, option) in cases {
+            let name = field["name"].as_str().unwrap().to_owned();
+            let input = json!({"slug": "posts", "fields": [field]});
+            assert_eq!(
+                schema(input.clone()).reject_unknown_options(&input),
+                Err(SchemaError::UnknownOption {
+                    field: name,
+                    option: option.into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn row_limits_need_has_many_and_must_be_ordered() {
+        for (field, message) in [
+            (
+                json!({"name": "t", "type": "text", "hasMany": true, "minRows": 3, "maxRows": 1}),
+                "minRows is greater than maxRows",
+            ),
+            (
+                json!({"name": "t", "type": "number", "minRows": 2}),
+                "minRows and maxRows only apply with hasMany",
+            ),
+        ] {
+            let s = schema(json!({"slug": "posts", "fields": [field]}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: "t".into(),
+                    message: message.into()
+                })
+            );
+        }
+        let slug_from_list = schema(json!({"slug": "posts", "fields": [
+            {"name": "tags", "type": "text", "hasMany": true},
+            {"name": "slug", "type": "slug", "from": "tags"}
+        ]}));
+        assert_eq!(
+            slug_from_list.check(),
+            Err(SchemaError::InvalidField {
+                field: "slug".into(),
+                message: "from must name a top-level text field, not `tags`".into()
             })
         );
     }

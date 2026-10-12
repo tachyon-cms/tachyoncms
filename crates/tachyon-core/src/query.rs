@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind};
+use crate::schema::{Field, FieldKind, SelectOption};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -125,11 +125,13 @@ pub enum ValueKind {
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
 pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
     Some(match kind {
+        FieldKind::Select { multiple: true, .. }
+        | FieldKind::Text { has_many: true, .. }
+        | FieldKind::Number { has_many: true, .. }
+        | FieldKind::Relationship { has_many: true, .. } => ValueKind::List,
         FieldKind::Number { .. } => ValueKind::Number,
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
-        FieldKind::Select { multiple: true, .. }
-        | FieldKind::Relationship { has_many: true, .. } => ValueKind::List,
         FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
         _ => ValueKind::Text,
     })
@@ -413,6 +415,16 @@ fn list(v: &Value) -> Option<Vec<Value>> {
 fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, String> {
     let kind = field.map(|f| &f.kind);
     match (target.kind(), kind) {
+        (ValueKind::List, Some(FieldKind::Number { .. })) => {
+            let n = match v {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.parse::<f64>().ok(),
+                _ => None,
+            };
+            n.filter(|n| n.is_finite())
+                .map(Scalar::Number)
+                .ok_or_else(|| "expected a number".into())
+        }
         (ValueKind::Number, _) => {
             let n = match v {
                 Value::Number(n) => n.as_f64(),
@@ -443,11 +455,14 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
                 .ok_or("expected a document ID")?;
             Ok(Scalar::Text(id.to_string()))
         }
-        (_, Some(FieldKind::Select { options, .. })) => v
+        (_, Some(FieldKind::Select { options, .. } | FieldKind::Radio { options })) => v
             .as_str()
-            .filter(|s| options.iter().any(|o| o == s))
+            .filter(|s| options.iter().any(|o| o.value() == *s))
             .map(|s| Scalar::Text(s.to_owned()))
-            .ok_or_else(|| format!("expected one of: {}", options.join(", "))),
+            .ok_or_else(|| {
+                let values: Vec<&str> = options.iter().map(SelectOption::value).collect();
+                format!("expected one of: {}", values.join(", "))
+            }),
         _ => v
             .as_str()
             .map(|s| Scalar::Text(s.to_owned()))
@@ -573,7 +588,10 @@ mod tests {
             {"name": "author", "type": "relationship", "relationTo": "authors"},
             {"name": "seo", "type": "group", "fields": [{"name": "title", "type": "text"}]},
             {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
-            {"name": "data", "type": "json"}
+            {"name": "data", "type": "json"},
+            {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}]},
+            {"name": "snippet", "type": "code"},
+            {"name": "scores", "type": "number", "hasMany": true}
         ]))
         .unwrap()
     }
@@ -876,5 +894,43 @@ mod tests {
     fn nul_characters_are_rejected() {
         assert!(parse_query("where[title][equals]=a%00b").is_err());
         assert!(parse_query("a%00=1").is_err());
+    }
+    #[test]
+    fn radio_and_code_filter_like_text() {
+        assert_eq!(
+            filter("where[size][equals]=s").unwrap(),
+            cond(
+                field("size", ValueKind::Text),
+                Op::Equals,
+                Operand::One(text("s"))
+            )
+        );
+        assert_eq!(
+            filter("where[size][equals]=Small").unwrap_err(),
+            "where[size][equals]: expected one of: s"
+        );
+        assert_eq!(
+            filter("where[snippet][like]=fn").unwrap(),
+            cond(
+                field("snippet", ValueKind::Text),
+                Op::Like,
+                Operand::One(text("fn"))
+            )
+        );
+    }
+    #[test]
+    fn number_lists_take_numbers() {
+        assert_eq!(
+            filter("where[scores][contains]=3").unwrap(),
+            cond(
+                field("scores", ValueKind::List),
+                Op::Contains,
+                Operand::One(Scalar::Number(3.0))
+            )
+        );
+        assert_eq!(
+            filter("where[scores][contains]=x").unwrap_err(),
+            "where[scores][contains]: expected a number"
+        );
     }
 }
