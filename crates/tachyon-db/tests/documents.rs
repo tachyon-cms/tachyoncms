@@ -2,6 +2,7 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_db::documents::{Prepared, Relation};
+use tachyon_db::query::{self, ListQuery};
 use tachyon_db::{DbError, collections, documents};
 use uuid::Uuid;
 
@@ -54,7 +55,20 @@ async fn list_pages_newest_first(pool: PgPool) {
             .await
             .unwrap();
     }
-    let page = documents::list(&pool, c, 2, 0, true).await.unwrap();
+    let page = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: None,
+            sort: None,
+            limit: 2,
+            offset: 0,
+            after: None,
+            count: true,
+        },
+    )
+    .await
+    .unwrap();
     let titles: Vec<_> = page
         .docs
         .iter()
@@ -63,7 +77,20 @@ async fn list_pages_newest_first(pool: PgPool) {
     assert_eq!(titles, [json!("three"), json!("two")]);
     assert_eq!(page.total, Some(3));
 
-    let rest = documents::list(&pool, c, 2, 2, false).await.unwrap();
+    let rest = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: None,
+            sort: None,
+            limit: 2,
+            offset: 2,
+            after: None,
+            count: false,
+        },
+    )
+    .await
+    .unwrap();
     assert_eq!(rest.docs.len(), 1);
     assert_eq!(rest.total, None);
 }
@@ -106,11 +133,22 @@ async fn delete_hides_the_document(pool: PgPool) {
         Err(DbError::NotFound)
     ));
     assert!(
-        documents::list(&pool, c, 10, 0, false)
-            .await
-            .unwrap()
-            .docs
-            .is_empty()
+        query::list(
+            &pool,
+            c,
+            &ListQuery {
+                filter: None,
+                sort: None,
+                limit: 10,
+                offset: 0,
+                after: None,
+                count: false
+            }
+        )
+        .await
+        .unwrap()
+        .docs
+        .is_empty()
     );
     assert!(matches!(
         documents::delete(&pool, c, doc.id).await,

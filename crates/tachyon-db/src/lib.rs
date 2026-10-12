@@ -2,6 +2,7 @@
 
 pub mod collections;
 pub mod documents;
+pub mod query;
 
 pub use sqlx::PgPool;
 use uuid::Uuid;

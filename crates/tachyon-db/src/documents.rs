@@ -56,13 +56,6 @@ pub struct Reference {
     pub path: String,
 }
 
-#[derive(Debug)]
-pub struct Page {
-    pub docs: Vec<Document>,
-    /// Only counted when asked for, because counting a large collection is slow.
-    pub total: Option<i64>,
-}
-
 pub async fn insert(
     pool: &PgPool,
     collection_id: Uuid,
@@ -128,44 +121,6 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document
             (r.collection_id, doc)
         })
         .collect())
-}
-
-pub async fn list(
-    pool: &PgPool,
-    collection_id: Uuid,
-    limit: i64,
-    offset: i64,
-    count: bool,
-) -> Result<Page, DbError> {
-    let docs = sqlx::query_as!(
-        Document,
-        r#"SELECT id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>"
-           FROM documents
-           WHERE tenant_id = $1 AND collection_id = $2 AND deleted_at IS NULL
-           ORDER BY id DESC
-           LIMIT $3 OFFSET $4"#,
-        DEFAULT_TENANT,
-        collection_id,
-        limit,
-        offset,
-    )
-    .fetch_all(pool)
-    .await?;
-    let total = if count {
-        Some(
-            sqlx::query_scalar!(
-                r#"SELECT count(*) AS "n!" FROM documents
-                   WHERE tenant_id = $1 AND collection_id = $2 AND deleted_at IS NULL"#,
-                DEFAULT_TENANT,
-                collection_id,
-            )
-            .fetch_one(pool)
-            .await?,
-        )
-    } else {
-        None
-    };
-    Ok(Page { docs, total })
 }
 
 /// Locks the document, passes its current data to `apply`, and stores what `apply` returns.
