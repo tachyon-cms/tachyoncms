@@ -19,6 +19,7 @@ We think you can have both. Here's what we're building toward:
 
 - Define collections and their fields over the API: text (one value or a list), textarea, number (one or a list), checkbox, date, email, URL, select and radio (with labels), slug, relationship (to one collection or several), code, map points you can search by distance (`near` returns the nearest first and pages with `page`), JSON, groups and repeatable arrays, arranged in rows, collapsible sections and tabs that shape the editing screen without changing your data. Every field can carry admin hints such as a description, a placeholder, a sidebar position or a condition for when it shows.
 - Create, read, update and delete documents, with validation errors that tell you exactly which field is wrong (`seo.title`, `links.0.url`).
+- Send only what changed. An update to `seo.title` leaves the rest of `seo` alone, lists are replaced whole, and `null` clears a field wherever it sits.
 - Paginated lists, newest first.
 - Errors in the standard [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) format, each with a request ID you can find in the logs.
 - Soft delete, UUIDv7 IDs, and date-times stored in UTC.

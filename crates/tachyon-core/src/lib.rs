@@ -10,6 +10,6 @@ pub use schema::{
     RelationTo, SchemaError, SelectOption, Tab, data_fields,
 };
 pub use validate::{
-    FieldError, RelationRef, map_relations, normalize_date_time, relations, slugify,
+    FieldError, RelationRef, defaults, map_relations, normalize_date_time, relations, slugify,
     validate_document,
 };

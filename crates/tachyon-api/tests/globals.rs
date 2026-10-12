@@ -74,3 +74,31 @@ async fn globals_and_collections_dont_mix(pool: PgPool) {
     assert_problem(&send(&app, "GET", "/api/globals/posts", None).await, 404);
     assert_problem(&send(&app, "GET", "/api/globals/nope", None).await, 404);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn globals_show_nested_defaults_before_first_save(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "settings", "kind": "global", "fields": [
+        {"name": "seo", "type": "group", "fields": [
+            {"name": "index", "type": "boolean", "default": true}
+        ]},
+        {"type": "tabs", "tabs": [
+            {"name": "footer", "label": "Footer", "fields": [
+                {"name": "note", "type": "text", "default": "Made with care"}
+            ]}
+        ]}
+    ]});
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let empty = send(&app, "GET", "/api/globals/settings", None).await;
+    assert_eq!(
+        empty.json,
+        json!({"seo": {"index": true}, "footer": {"note": "Made with care"}})
+    );
+}

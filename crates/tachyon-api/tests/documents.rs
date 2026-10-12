@@ -245,3 +245,41 @@ async fn saves_against_a_changed_schema_are_409(pool: PgPool) {
         "This collection's fields just changed. Reload and try again."
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn patching_part_of_a_group_keeps_the_rest(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "pages", "fields": [
+        {"name": "seo", "type": "group", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "description", "type": "text"}
+        ]}
+    ]});
+    send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    let created = send(
+        &app,
+        "POST",
+        "/api/pages",
+        Some(r#"{"seo": {"title": "Old", "description": "Kept"}}"#),
+    )
+    .await;
+    let id = created.json["id"].as_str().unwrap().to_owned();
+    let patched = send(
+        &app,
+        "PATCH",
+        &format!("/api/pages/{id}"),
+        Some(r#"{"seo": {"title": "New"}}"#),
+    )
+    .await;
+    assert_eq!(patched.status, 200, "{}", patched.json);
+    assert_eq!(
+        patched.json["seo"],
+        json!({"title": "New", "description": "Kept"})
+    );
+}
