@@ -2,6 +2,7 @@ mod common;
 
 use axum::http::Request;
 use common::{assert_problem, send, send_with};
+use serde_json::json;
 use sqlx::PgPool;
 
 const POSTS: &str =
@@ -143,6 +144,26 @@ async fn misspelt_keys_are_named_before_other_schema_errors(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(
         res.json["errors"][0]["message"],
-        "field ``: unknown option `nmae`"
+        "field `fields.0`: unknown option `nmae`"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_options_name_the_field(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "posts", "fields": [
+        {"name": "kind", "type": "select", "options": [1, 2]}
+    ]});
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    assert_problem(&res, 400);
+    assert_eq!(
+        res.json["detail"],
+        "field `kind`: each option must be text, or {\"label\": \"…\", \"value\": \"…\"}"
     );
 }

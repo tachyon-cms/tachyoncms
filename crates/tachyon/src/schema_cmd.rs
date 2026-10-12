@@ -2,11 +2,12 @@
 
 use std::collections::BTreeMap;
 
-use anyhow::{Context, bail};
+use anyhow::{Context, anyhow, bail};
+use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_core::diff::{Change, Renames};
-use tachyon_core::{CollectionKind, CollectionSchema};
+use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::schema_change::{self, ChangeError, Preview};
 use tachyon_db::{collections, indexes};
 
@@ -53,8 +54,8 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
         .iter()
         .map(|item| {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
-            let schema: CollectionSchema = serde_json::from_value(item.clone())
-                .with_context(|| format!("{slug}: can't read this collection"))?;
+            let schema = CollectionSchema::deserialize(item)
+                .map_err(|e| anyhow!("{slug}: {}", explain_parse_error(item, &e)))?;
             schema
                 .reject_unknown_options(item)
                 .with_context(|| slug.to_owned())?;

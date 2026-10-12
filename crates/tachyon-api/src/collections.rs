@@ -7,7 +7,9 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tachyon_core::diff::Renames;
-use tachyon_core::{CollectionKind, CollectionSchema, FieldError, SchemaError};
+use tachyon_core::{
+    CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
+};
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::indexes::reconcile_indexes;
 use tachyon_db::schema_change::{self, ChangeError};
@@ -27,8 +29,8 @@ fn schema_error(e: SchemaError) -> ApiError {
 }
 
 fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
-    let schema =
-        CollectionSchema::deserialize(value).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    let schema = CollectionSchema::deserialize(value)
+        .map_err(|e| ApiError::BadRequest(explain_parse_error(value, &e)))?;
     // Unknown keys first: a typo such as `nmae` should be named, not reported as a bad name.
     schema
         .reject_unknown_options(value)
