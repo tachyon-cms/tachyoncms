@@ -311,6 +311,8 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             (!ok).then(|| "expected a list of document IDs".into())
         }
         FieldKind::Json => None,
+        // Never reached: validation only sees the data shape, where layout has dissolved.
+        FieldKind::Row { .. } | FieldKind::Collapsible { .. } | FieldKind::Tabs { .. } => None,
         FieldKind::Group { .. } => Some("expected an object".into()),
         FieldKind::Array { .. } => Some("expected a list".into()),
     }
