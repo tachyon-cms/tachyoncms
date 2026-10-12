@@ -48,8 +48,13 @@ pub fn field_expr(path: &[String], kind: ValueKind) -> String {
     let path = path.join(",");
     match kind {
         ValueKind::Text | ValueKind::Date => format!("(published #>> '{{{path}}}')"),
-        ValueKind::Number => format!("((published #>> '{{{path}}}'))::numeric"),
-        ValueKind::Boolean => format!("((published #>> '{{{path}}}'))::boolean"),
+        // Guarded casts: values left behind by a retype read as NULL instead of failing the query.
+        ValueKind::Number => format!(
+            "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'number' THEN (published #>> '{{{path}}}')::numeric END)"
+        ),
+        ValueKind::Boolean => format!(
+            "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'boolean' THEN (published #>> '{{{path}}}')::boolean END)"
+        ),
         ValueKind::List => format!("(published #> '{{{path}}}')"),
     }
 }
@@ -332,7 +337,7 @@ mod tests {
         };
         assert_eq!(
             order_by(Some(&price)),
-            "((published #>> '{price}'))::numeric DESC NULLS LAST, id DESC"
+            "(CASE WHEN jsonb_typeof(published #> '{price}') = 'number' THEN (published #>> '{price}')::numeric END) DESC NULLS LAST, id DESC"
         );
     }
 }

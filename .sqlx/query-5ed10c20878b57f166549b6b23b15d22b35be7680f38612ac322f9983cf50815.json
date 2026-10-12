@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, schema AS \"schema: Json<CollectionSchema>\", schema_version, created_at, updated_at\n           FROM collections WHERE tenant_id = $1 AND slug = $2\n           FOR UPDATE",
+  "query": "SELECT id, schema AS \"schema: Json<CollectionSchema>\", schema_version, created_at, updated_at\n               FROM collections WHERE tenant_id = $1 AND slug = $2\n               FOR UPDATE",
   "describe": {
     "columns": [
       {
@@ -73,5 +73,5 @@
       false
     ]
   },
-  "hash": "dee78c08f9fb5cfd18826e708002287db678daa8d084da03c182c57f2dae76c0"
+  "hash": "5ed10c20878b57f166549b6b23b15d22b35be7680f38612ac322f9983cf50815"
 }

@@ -68,7 +68,7 @@ pub async fn create(
         }
     }
     let created = collections::create(&state.pool, &schema).await?;
-    reconcile_indexes(&state.pool, created.id, &created.schema.0).await?;
+    reconcile_indexes(&state.pool, created.id).await?;
     state.schemas.reload(&state.pool).await?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }
@@ -142,7 +142,7 @@ pub async fn update(
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;
-    reconcile_indexes(&state.pool, c.id, &c.schema.0).await?;
+    reconcile_indexes(&state.pool, c.id).await?;
     state.schemas.reload(&state.pool).await?;
     Ok(Json(json!({ "collection": to_json(&c), "preview": p })))
 }

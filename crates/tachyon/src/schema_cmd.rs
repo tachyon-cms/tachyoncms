@@ -66,6 +66,9 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::Renamed { from, to } => format!("rename {from} to {to}"),
             Change::TypeChanged { path, from, to } => format!("change {path} from {from} to {to}"),
             Change::OptionsChanged { path } => format!("update options on {path}"),
+            Change::Retargeted { path, from, to } => {
+                format!("point {path} at {to} instead of {from}, clearing its links")
+            }
         })
         .collect();
     let mut line = format!("~ change {slug}: {}", changes.join("; "));
@@ -162,15 +165,32 @@ pub async fn run(
         );
     }
 
-    // New collections first, so changed ones can point at them.
-    for s in wanted.iter().filter(|s| is_new(&s.slug)) {
-        let c = collections::create(pool, s).await?;
-        indexes::reconcile_indexes(pool, c.id, &c.schema.0).await?;
+    // Each collection commits on its own. If one fails, say exactly what already went in.
+    let mut done = Vec::new();
+    let result: anyhow::Result<()> = async {
+        // New collections first, so changed ones can point at them.
+        for s in wanted.iter().filter(|s| is_new(&s.slug)) {
+            let c = collections::create(pool, s).await?;
+            indexes::reconcile_indexes(pool, c.id).await?;
+            done.push(format!("+ created {}", s.slug));
+        }
+        for s in wanted.iter().filter(|s| !is_new(&s.slug)) {
+            let r = renames.get(&s.slug).unwrap_or(&none);
+            // `yes` again here: the in-transaction check decides, not the earlier preview.
+            let (c, _) = schema_change::apply(pool, &s.slug, s, r, yes).await?;
+            indexes::reconcile_indexes(pool, c.id).await?;
+            done.push(format!("~ changed {}", s.slug));
+        }
+        Ok(())
     }
-    for s in wanted.iter().filter(|s| !is_new(&s.slug)) {
-        let r = renames.get(&s.slug).unwrap_or(&none);
-        let (c, _) = schema_change::apply(pool, &s.slug, s, r, true).await?;
-        indexes::reconcile_indexes(pool, c.id, &c.schema.0).await?;
+    .await;
+    if let Err(e) = result {
+        let applied = if done.is_empty() {
+            "  nothing".to_owned()
+        } else {
+            done.join("\n")
+        };
+        bail!("{report}\n\nStopped part-way: {e}\nAlready applied:\n{applied}");
     }
     Ok(format!("{report}\n\nApplied."))
 }

@@ -1,3 +1,5 @@
+use std::time::Duration;
+
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
@@ -188,4 +190,109 @@ async fn unique_over_duplicates_is_refused_even_when_confirmed(pool: PgPool) {
             .schema_version,
         1
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn swapped_renames_keep_both_values(pool: PgPool) {
+    let s = seed(&pool).await;
+    let same = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": "authors"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let swap: Renames = [
+        ("title".to_owned(), "summary".to_owned()),
+        ("summary".to_owned(), "title".to_owned()),
+    ]
+    .into_iter()
+    .collect();
+    apply(&pool, "posts", &same, &swap, true).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    assert_eq!(
+        (doc.data.0["title"].as_str(), doc.data.0["summary"].as_str()),
+        (Some("S"), Some("Hello"))
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn equal_numbers_count_as_duplicates(pool: PgPool) {
+    let items = collections::create(
+        &pool,
+        &schema(json!({"slug": "items", "fields": [{"name": "n", "type": "number"}]})),
+    )
+    .await
+    .unwrap()
+    .id;
+    for n in [json!(1), json!(1.0)] {
+        let data = json!({"n": n}).as_object().unwrap().clone();
+        documents::insert(&pool, items, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let unique = schema(
+        json!({"slug": "items", "fields": [{"name": "n", "type": "number", "unique": true}]}),
+    );
+    let Err(ChangeError::Duplicates(p)) =
+        apply(&pool, "items", &unique, &Renames::new(), true).await
+    else {
+        panic!("1 and 1.0 are the same number")
+    };
+    assert_eq!(p.duplicates, ["n"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn retargeting_a_link_clears_it_after_confirmation(pool: PgPool) {
+    let s = seed(&pool).await;
+    collections::create(
+        &pool,
+        &schema(json!({"slug": "tags", "fields": [{"name": "name", "type": "text"}]})),
+    )
+    .await
+    .unwrap();
+    let new = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": "tags"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let p = preview(&pool, "posts", &new, &Renames::new(), &[])
+        .await
+        .unwrap();
+    assert_eq!(p.cleared, 1, "the preview must say which links go");
+    assert!(p.needs_confirmation);
+    apply(&pool, "posts", &new, &Renames::new(), true)
+        .await
+        .unwrap();
+    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    assert!(doc.data.0.get("author").is_none());
+    assert!(
+        documents::references(&pool, s.ann)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn previews_never_wait_for_writers(pool: PgPool) {
+    let s = seed(&pool).await;
+    // A save in progress holds the collection row the way check_schema does.
+    let mut writer = pool.begin().await.unwrap();
+    sqlx::query("SELECT 1 FROM collections WHERE id = $1 FOR KEY SHARE")
+        .bind(s.posts)
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let same = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": "authors"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    tokio::time::timeout(
+        Duration::from_secs(3),
+        preview(&pool, "posts", &same, &Renames::new(), &[]),
+    )
+    .await
+    .expect("preview waited for a lock")
+    .unwrap();
+    writer.rollback().await.unwrap();
 }

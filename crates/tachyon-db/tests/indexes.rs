@@ -28,6 +28,15 @@ fn doc(slug: &str) -> Prepared {
     )
 }
 
+async fn set_schema(pool: &PgPool, id: uuid::Uuid, schema: &CollectionSchema) {
+    sqlx::query("UPDATE collections SET schema = $2 WHERE id = $1")
+        .bind(id)
+        .bind(sqlx::types::Json(schema))
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
 async fn index_state(pool: &PgPool, name: &str) -> Option<bool> {
     sqlx::query_scalar("SELECT i.indisvalid FROM pg_index i JOIN pg_class c ON c.oid = i.indexrelid WHERE c.relname = $1")
         .bind(name)
@@ -41,7 +50,7 @@ async fn unique_fields_reject_duplicates_among_live_documents(pool: PgPool) {
     let c = collections::create(&pool, &filterable_price())
         .await
         .unwrap();
-    reconcile_indexes(&pool, c.id, &c.schema.0).await.unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
 
     let first = documents::insert(&pool, c.id, 1, None, &doc("hello"))
         .await
@@ -66,7 +75,7 @@ async fn filter_queries_can_use_the_index(pool: PgPool) {
     let c = collections::create(&pool, &filterable_price())
         .await
         .unwrap();
-    reconcile_indexes(&pool, c.id, &c.schema.0).await.unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
     let name = index_name(c.id, "price", IndexKind::Filter, ValueKind::Number);
 
     let mut conn = pool.acquire().await.unwrap();
@@ -76,8 +85,9 @@ async fn filter_queries_can_use_the_index(pool: PgPool) {
         .unwrap();
     let sql = format!(
         "EXPLAIN SELECT id FROM documents WHERE collection_id = '{}' AND deleted_at IS NULL \
-         AND ((published #>> '{{price}}'))::numeric > 0",
-        c.id
+         AND {} > 0",
+        c.id,
+        tachyon_db::query::field_expr(&["price".to_owned()], ValueKind::Number)
     );
     let plan: Vec<String> = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
         .fetch_all(&mut *conn)
@@ -91,30 +101,34 @@ async fn reconcile_drops_stale_indexes_and_rebuilds_broken_ones(pool: PgPool) {
     let c = collections::create(&pool, &filterable_price())
         .await
         .unwrap();
-    reconcile_indexes(&pool, c.id, &c.schema.0).await.unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
     let number_ix = index_name(c.id, "price", IndexKind::Filter, ValueKind::Number);
     assert_eq!(index_state(&pool, &number_ix).await, Some(true));
 
     // Retyped: the old expression index goes, a new one takes its place.
     let as_text = schema(json!({"name": "price", "type": "text", "filterable": true}));
-    reconcile_indexes(&pool, c.id, &as_text).await.unwrap();
+    set_schema(&pool, c.id, &as_text).await;
+    reconcile_indexes(&pool, c.id).await.unwrap();
     let text_ix = index_name(c.id, "price", IndexKind::Filter, ValueKind::Text);
     assert_eq!(index_state(&pool, &number_ix).await, None);
     assert_eq!(index_state(&pool, &text_ix).await, Some(true));
 
     // No longer filterable: dropped.
     let plain = schema(json!({"name": "price", "type": "text"}));
-    reconcile_indexes(&pool, c.id, &plain).await.unwrap();
+    set_schema(&pool, c.id, &plain).await;
+    reconcile_indexes(&pool, c.id).await.unwrap();
     assert_eq!(index_state(&pool, &text_ix).await, None);
 
     // Left invalid (as a failed CONCURRENTLY build would): rebuilt.
-    reconcile_indexes(&pool, c.id, &as_text).await.unwrap();
+    set_schema(&pool, c.id, &as_text).await;
+    reconcile_indexes(&pool, c.id).await.unwrap();
     sqlx::query("UPDATE pg_index SET indisvalid = false WHERE indexrelid = $1::regclass")
         .bind(&text_ix)
         .execute(&pool)
         .await
         .unwrap();
-    reconcile_indexes(&pool, c.id, &as_text).await.unwrap();
+    set_schema(&pool, c.id, &as_text).await;
+    reconcile_indexes(&pool, c.id).await.unwrap();
     assert_eq!(index_state(&pool, &text_ix).await, Some(true));
 }
 
@@ -136,4 +150,21 @@ fn index_names_are_short_and_stable() {
         name,
         index_name(id, long, IndexKind::Unique, ValueKind::Number)
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn reconcile_leaves_indexes_it_did_not_create_alone(pool: PgPool) {
+    let c = collections::create(&pool, &filterable_price())
+        .await
+        .unwrap();
+    let sql = format!(
+        "CREATE INDEX custom_ix ON documents (id) WHERE collection_id = '{}'",
+        c.id
+    );
+    sqlx::query(sqlx::AssertSqlSafe(sql))
+        .execute(&pool)
+        .await
+        .unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
+    assert_eq!(index_state(&pool, "custom_ix").await, Some(true));
 }

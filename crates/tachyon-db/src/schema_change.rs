@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
-use tachyon_core::diff::{Renames, SchemaDiff, diff, migrate_document};
+use tachyon_core::diff::{Change, Renames, SchemaDiff, clear_at, diff, migrate_document};
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
 };
@@ -19,6 +19,7 @@ use uuid::Uuid;
 
 use crate::collections::Collection;
 use crate::documents::{Relation, sync_relations};
+use crate::indexes::{ddl, existing_indexes, wanted_indexes};
 use crate::{DEFAULT_TENANT, DbError};
 
 const BATCH: i64 = 500;
@@ -36,6 +37,8 @@ pub struct Preview {
     /// Unique fields whose values aren't unique across live documents.
     pub duplicates: Vec<String>,
     pub needs_confirmation: bool,
+    /// Live documents whose links are cleared because their field now points elsewhere.
+    pub cleared: i64,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -132,16 +135,29 @@ async fn run(
 ) -> Result<(Collection, Preview), ChangeError> {
     new.check().map_err(ChangeError::Invalid)?;
     let mut tx = pool.begin().await?;
-    let current = sqlx::query_as!(
-        Collection,
-        r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
-           FROM collections WHERE tenant_id = $1 AND slug = $2
-           FOR UPDATE"#,
-        DEFAULT_TENANT,
-        slug,
-    )
-    .fetch_optional(&mut *tx)
-    .await?
+    // Only a real change locks the collection; a preview reads without blocking saves.
+    let current = if write.is_some() {
+        sqlx::query_as!(
+            Collection,
+            r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
+               FROM collections WHERE tenant_id = $1 AND slug = $2
+               FOR UPDATE"#,
+            DEFAULT_TENANT,
+            slug,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+    } else {
+        sqlx::query_as!(
+            Collection,
+            r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
+               FROM collections WHERE tenant_id = $1 AND slug = $2"#,
+            DEFAULT_TENANT,
+            slug,
+        )
+        .fetch_optional(&mut *tx)
+        .await?
+    }
     .ok_or(ChangeError::NotFound)?;
     let changes = diff(&current.schema.0, new, renames).map_err(ChangeError::Invalid)?;
 
@@ -174,12 +190,23 @@ async fn run(
         examples: Vec::new(),
         duplicates: Vec::new(),
         needs_confirmation: false,
+        cleared: 0,
     };
     let unique: Vec<&str> = new
         .fields
         .iter()
         .filter(|f| f.is_unique())
         .map(|f| f.name.as_str())
+        .collect();
+    // Links of a relationship that now points at another collection can't be kept.
+    let retargeted: Vec<String> = p
+        .diff
+        .changes
+        .iter()
+        .filter_map(|c| match c {
+            Change::Retargeted { path, .. } => Some(path.clone()),
+            _ => None,
+        })
         .collect();
     let mut seen: HashMap<&str, HashSet<String>> = HashMap::new();
     let mut duplicates = BTreeSet::new();
@@ -190,7 +217,10 @@ async fn run(
         after = Some(last.id);
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
-            let migrated = migrate_document(&new.fields, renames, &row.data);
+            let mut migrated = migrate_document(&new.fields, renames, &row.data);
+            if clear_links(&mut migrated, &retargeted) {
+                p.cleared += 1;
+            }
             if let Err(errors) =
                 validate_document(&new.fields, &Value::Object(Map::new()), Some(&migrated))
             {
@@ -201,7 +231,7 @@ async fn run(
             }
             for field in &unique {
                 if let Some(value) = migrated.get(*field)
-                    && !seen.entry(*field).or_default().insert(value.to_string())
+                    && !seen.entry(*field).or_default().insert(unique_key(value))
                 {
                     duplicates.insert((*field).to_owned());
                 }
@@ -231,7 +261,8 @@ async fn run(
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows {
-            let migrated = migrate_document(&new.fields, renames, &row.data);
+            let mut migrated = migrate_document(&new.fields, renames, &row.data);
+            clear_links(&mut migrated, &retargeted);
             // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
             let stored =
                 validate_document(&new.fields, &Value::Object(Map::new()), Some(&migrated))
@@ -262,6 +293,36 @@ async fn run(
         }
     }
 
+    // Build new unique indexes inside the transaction: a value that slipped past the scan
+    // (or arrived in between) rolls the whole change back instead of leaving a unique field
+    // without its constraint.
+    // NOTE: a plain CREATE INDEX blocks writes to `documents` while it builds; fine at
+    // today's sizes, revisit with the M4 job queue.
+    let existing = existing_indexes(&mut tx, current.id).await?;
+    for w in wanted_indexes(current.id, new)
+        .into_iter()
+        .filter(|w| w.unique)
+    {
+        if existing.iter().any(|e| e.name == w.name && e.valid) {
+            continue;
+        }
+        if existing.iter().any(|e| e.name == w.name) {
+            ddl(&mut tx, format!("DROP INDEX {}", w.name)).await?;
+        }
+        match ddl(
+            &mut tx,
+            format!("CREATE UNIQUE INDEX {} {}", w.name, w.definition),
+        )
+        .await
+        {
+            Err(DbError::Sqlx(sqlx::Error::Database(e))) if e.is_unique_violation() => {
+                p.duplicates = vec![w.field];
+                return Err(ChangeError::Duplicates(p));
+            }
+            result => result?,
+        }
+    }
+
     let updated = sqlx::query_as!(
         Collection,
         r#"UPDATE collections
@@ -278,4 +339,18 @@ async fn run(
         .await?;
     tx.commit().await?;
     Ok((updated, p))
+}
+
+fn clear_links(doc: &mut Map<String, Value>, paths: &[String]) -> bool {
+    paths
+        .iter()
+        .fold(false, |any, path| clear_at(doc, path) | any)
+}
+
+/// How a unique index sees a value: numbers by numeric value, so 1 and 1.0 collide.
+fn unique_key(value: &Value) -> String {
+    match value {
+        Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), |f| f.to_string()),
+        other => other.to_string(),
+    }
 }

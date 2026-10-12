@@ -38,6 +38,12 @@ pub enum Change {
     OptionsChanged {
         path: String,
     },
+    /// A relationship now points at another collection; its existing links are cleared.
+    Retargeted {
+        path: String,
+        from: String,
+        to: String,
+    },
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
@@ -52,9 +58,12 @@ impl SchemaDiff {
 
     /// Removing or retyping a field can lose data.
     pub fn is_destructive(&self) -> bool {
-        self.changes
-            .iter()
-            .any(|c| matches!(c, Change::Removed { .. } | Change::TypeChanged { .. }))
+        self.changes.iter().any(|c| {
+            matches!(
+                c,
+                Change::Removed { .. } | Change::TypeChanged { .. } | Change::Retargeted { .. }
+            )
+        })
     }
 }
 
@@ -139,6 +148,20 @@ fn compare(
                 }
                 compare(a, b, &old_path, &new_path, renames, out)?;
             }
+            (
+                FieldKind::Relationship {
+                    relation_to: from,
+                    has_many: h1,
+                },
+                FieldKind::Relationship {
+                    relation_to: to,
+                    has_many: h2,
+                },
+            ) if h1 == h2 && from != to => out.push(Change::Retargeted {
+                path: new_path,
+                from: from.clone(),
+                to: to.clone(),
+            }),
             _ if !same_type(&o.kind, &n.kind) => out.push(Change::TypeChanged {
                 path: new_path,
                 from: o.kind.name(),
@@ -221,12 +244,26 @@ pub fn migrate_document(
     doc: &Map<String, Value>,
 ) -> Map<String, Value> {
     let mut doc = doc.clone();
-    // Deepest first, so a renamed group's children are still found under its old name.
-    let mut ordered: Vec<(&String, &String)> = renames.iter().collect();
-    ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.matches('.').count()));
-    for (from, to) in ordered {
-        let segments: Vec<&str> = from.split('.').collect();
-        rename_in(&mut doc, &segments, to);
+    // Renames are grouped by the object they happen in and applied deepest first, so a
+    // renamed group's children are still found under its old name. Within one object every
+    // source is taken out before any target goes in, so swaps and chains keep their data.
+    let mut by_parent: BTreeMap<&str, Vec<(&str, &str)>> = BTreeMap::new();
+    for (from, to) in renames {
+        let (parent, name) = from.rsplit_once('.').unwrap_or(("", from.as_str()));
+        by_parent
+            .entry(parent)
+            .or_default()
+            .push((name, to.as_str()));
+    }
+    let mut parents: Vec<(&str, Vec<(&str, &str)>)> = by_parent.into_iter().collect();
+    parents.sort_by_key(|(parent, _)| std::cmp::Reverse(depth(parent)));
+    for (parent, batch) in parents {
+        let segments: Vec<&str> = if parent.is_empty() {
+            Vec::new()
+        } else {
+            parent.split('.').collect()
+        };
+        rename_batch(&mut doc, &segments, &batch);
     }
     prune(new, &mut doc);
     for f in new {
@@ -239,26 +276,57 @@ pub fn migrate_document(
     doc
 }
 
-fn rename_in(obj: &mut Map<String, Value>, segments: &[&str], to: &str) {
+fn depth(path: &str) -> usize {
+    if path.is_empty() {
+        0
+    } else {
+        path.matches('.').count() + 1
+    }
+}
+
+fn rename_batch(obj: &mut Map<String, Value>, segments: &[&str], batch: &[(&str, &str)]) {
     match segments {
-        [name] => {
-            if let Some(value) = obj.remove(*name) {
+        [] => {
+            let taken: Vec<(&str, Value)> = batch
+                .iter()
+                .filter_map(|(from, to)| obj.remove(*from).map(|value| (*to, value)))
+                .collect();
+            for (to, value) in taken {
                 obj.insert(to.to_owned(), value);
             }
         }
         [head, rest @ ..] => match obj.get_mut(*head) {
-            Some(Value::Object(inner)) => rename_in(inner, rest, to),
+            Some(Value::Object(inner)) => rename_batch(inner, rest, batch),
             Some(Value::Array(rows)) => {
                 for row in rows {
                     if let Value::Object(inner) = row {
-                        rename_in(inner, rest, to);
+                        rename_batch(inner, rest, batch);
                     }
                 }
             }
             _ => {}
         },
-        [] => {}
     }
+}
+
+/// Removes the value at a dotted path, in every array row along the way.
+/// Returns whether anything was removed.
+pub fn clear_at(doc: &mut Map<String, Value>, path: &str) -> bool {
+    fn walk(obj: &mut Map<String, Value>, segments: &[&str]) -> bool {
+        match segments {
+            [name] => obj.remove(*name).is_some(),
+            [head, rest @ ..] => match obj.get_mut(*head) {
+                Some(Value::Object(inner)) => walk(inner, rest),
+                Some(Value::Array(rows)) => rows.iter_mut().fold(false, |any, row| match row {
+                    Value::Object(inner) => walk(inner, rest) | any,
+                    _ => any,
+                }),
+                _ => false,
+            },
+            [] => false,
+        }
+    }
+    walk(doc, &path.split('.').collect::<Vec<_>>())
 }
 
 fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
@@ -446,5 +514,61 @@ mod tests {
                 "featured": false
             })
         );
+    }
+
+    #[test]
+    fn swapped_and_chained_renames_keep_every_value() {
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"name": "a", "type": "text"}, {"name": "b", "type": "text"}, {"name": "c", "type": "text"}
+        ]}));
+        let doc = json!({"a": "A", "b": "B"});
+        let swap = migrate_document(
+            &new.fields,
+            &renames(&[("a", "b"), ("b", "a")]),
+            doc.as_object().unwrap(),
+        );
+        assert_eq!(Value::Object(swap), json!({"a": "B", "b": "A"}));
+        let chain = migrate_document(
+            &new.fields,
+            &renames(&[("a", "b"), ("b", "c")]),
+            doc.as_object().unwrap(),
+        );
+        assert_eq!(Value::Object(chain), json!({"b": "A", "c": "B"}));
+
+        let rows = schema(
+            json!({"slug": "p", "fields": [{"name": "rows", "type": "array", "fields": [
+                {"name": "x", "type": "text"}, {"name": "y", "type": "text"}
+            ]}]}),
+        );
+        let doc = json!({"rows": [{"x": "1", "y": "2"}]});
+        let out = migrate_document(
+            &rows.fields,
+            &renames(&[("rows.x", "y"), ("rows.y", "x")]),
+            doc.as_object().unwrap(),
+        );
+        assert_eq!(Value::Object(out), json!({"rows": [{"x": "2", "y": "1"}]}));
+
+        let old = schema(
+            json!({"slug": "posts", "fields": [{"name": "a", "type": "text"}, {"name": "b", "type": "text"}]}),
+        );
+        assert_eq!(
+            diff(&old, &old, &renames(&[("a", "b"), ("b", "a")]))
+                .unwrap()
+                .changes
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn clear_at_removes_values_everywhere_on_a_path() {
+        let mut doc = json!({"who": "x", "rows": [{"who": "y"}, {}]})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(clear_at(&mut doc, "who"));
+        assert!(clear_at(&mut doc, "rows.who"));
+        assert!(!clear_at(&mut doc, "missing"));
+        assert_eq!(Value::Object(doc), json!({"rows": [{}, {}]}));
     }
 }
