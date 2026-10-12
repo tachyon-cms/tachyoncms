@@ -4,6 +4,7 @@
 use std::collections::BTreeMap;
 
 use serde::Serialize;
+use serde_json::{Map, Value};
 
 use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError};
 
@@ -211,10 +212,76 @@ fn join(prefix: &str, key: &str) -> String {
     }
 }
 
+/// Reshapes a stored document for a new schema: applies renames, drops values the new
+/// schema has no field for, and fills in new fields' defaults. Values whose type changed
+/// are left alone; validation reports them.
+pub fn migrate_document(
+    new: &[Field],
+    renames: &Renames,
+    doc: &Map<String, Value>,
+) -> Map<String, Value> {
+    let mut doc = doc.clone();
+    // Deepest first, so a renamed group's children are still found under its old name.
+    let mut ordered: Vec<(&String, &String)> = renames.iter().collect();
+    ordered.sort_by_key(|(from, _)| std::cmp::Reverse(from.matches('.').count()));
+    for (from, to) in ordered {
+        let segments: Vec<&str> = from.split('.').collect();
+        rename_in(&mut doc, &segments, to);
+    }
+    prune(new, &mut doc);
+    for f in new {
+        if let Some(default) = &f.default
+            && !doc.contains_key(&f.name)
+        {
+            doc.insert(f.name.clone(), default.clone());
+        }
+    }
+    doc
+}
+
+fn rename_in(obj: &mut Map<String, Value>, segments: &[&str], to: &str) {
+    match segments {
+        [name] => {
+            if let Some(value) = obj.remove(*name) {
+                obj.insert(to.to_owned(), value);
+            }
+        }
+        [head, rest @ ..] => match obj.get_mut(*head) {
+            Some(Value::Object(inner)) => rename_in(inner, rest, to),
+            Some(Value::Array(rows)) => {
+                for row in rows {
+                    if let Value::Object(inner) = row {
+                        rename_in(inner, rest, to);
+                    }
+                }
+            }
+            _ => {}
+        },
+        [] => {}
+    }
+}
+
+fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
+    obj.retain(|key, _| fields.iter().any(|f| &f.name == key));
+    for f in fields {
+        match (&f.kind, obj.get_mut(&f.name)) {
+            (FieldKind::Group { fields }, Some(Value::Object(inner))) => prune(fields, inner),
+            (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+                for row in rows {
+                    if let Value::Object(inner) = row {
+                        prune(fields, inner);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use serde_json::{Value, json};
+    use serde_json::json;
 
     fn schema(v: Value) -> CollectionSchema {
         serde_json::from_value(v).unwrap()
@@ -348,5 +415,36 @@ mod tests {
             let err = diff(&old, &schema(new), &renames(&pairs)).unwrap_err();
             assert_eq!(err.to_string(), message);
         }
+    }
+    #[test]
+    fn migrate_document_renames_prunes_and_fills_defaults() {
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"name": "headline", "type": "text"},
+            {"name": "meta", "type": "group", "fields": [{"name": "headline", "type": "text"}]},
+            {"name": "links", "type": "array", "fields": [{"name": "href", "type": "url"}]},
+            {"name": "featured", "type": "boolean", "default": false}
+        ]}));
+        let doc = json!({
+            "title": "T",
+            "seo": {"title": "S", "junk": 1},
+            "links": [{"url": "https://a.example", "old": 1}, {"url": "https://b.example"}],
+            "summary": "gone"
+        });
+        let r = renames(&[
+            ("title", "headline"),
+            ("seo", "meta"),
+            ("seo.title", "headline"),
+            ("links.url", "href"),
+        ]);
+        let out = migrate_document(&new.fields, &r, doc.as_object().unwrap());
+        assert_eq!(
+            Value::Object(out),
+            json!({
+                "headline": "T",
+                "meta": {"headline": "S"},
+                "links": [{"href": "https://a.example"}, {"href": "https://b.example"}],
+                "featured": false
+            })
+        );
     }
 }
