@@ -117,6 +117,8 @@ pub enum SchemaError {
     DuplicateField(String),
     #[error("field `{field}`: {message}")]
     InvalidField { field: String, message: String },
+    #[error("field `{field}`: unknown option `{option}`")]
+    UnknownOption { field: String, option: String },
 }
 
 impl CollectionSchema {
@@ -130,6 +132,41 @@ impl CollectionSchema {
         }
         check_fields(&self.fields, true)
     }
+
+    /// Rejects keys in the original JSON that parsing would silently drop, such as a
+    /// misspelt `maxLenght`. Every option this model understands survives a round trip,
+    /// so anything missing after re-serialising is unknown.
+    pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
+        let known = serde_json::to_value(self).expect("schemas always serialize");
+        unknown_key(input, &known, "")?;
+        unknown_in_fields(&self.fields, input.get("fields"))
+    }
+}
+
+fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaError> {
+    if let (Value::Object(input), Value::Object(known)) = (input, known)
+        && let Some(option) = input.keys().find(|k| !known.contains_key(*k))
+    {
+        return Err(SchemaError::UnknownOption {
+            field: field.into(),
+            option: option.clone(),
+        });
+    }
+    Ok(())
+}
+
+fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), SchemaError> {
+    let Some(Value::Array(raw)) = input else {
+        return Ok(());
+    };
+    for (f, raw) in fields.iter().zip(raw) {
+        let known = serde_json::to_value(f).expect("fields always serialize");
+        unknown_key(raw, &known, &f.name)?;
+        if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &f.kind {
+            unknown_in_fields(fields, raw.get("fields"))?;
+        }
+    }
+    Ok(())
 }
 
 fn is_identifier(s: &str, allow_upper: bool) -> bool {
@@ -274,6 +311,32 @@ mod tests {
             dup.check(),
             Err(SchemaError::DuplicateField("title".into()))
         );
+    }
+
+    #[test]
+    fn rejects_unknown_options() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [{"name": "t", "type": "text", "maxLenght": 3}]}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(
+            s.reject_unknown_options(&input),
+            Err(SchemaError::UnknownOption {
+                field: "t".into(),
+                option: "maxLenght".into()
+            })
+        );
+        let top = json!({"slug": "posts", "labels": {}, "fields": []});
+        assert_eq!(
+            schema(top.clone()).reject_unknown_options(&top),
+            Err(SchemaError::UnknownOption {
+                field: String::new(),
+                option: "labels".into()
+            })
+        );
+        let fine =
+            json!({"slug": "posts", "fields": [{"name": "t", "type": "text", "maxLength": 3}]});
+        assert_eq!(schema(fine.clone()).reject_unknown_options(&fine), Ok(()));
     }
 
     #[test]

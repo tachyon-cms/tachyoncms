@@ -56,7 +56,8 @@ mod tests {
 
     #[test]
     fn database_url_is_required() {
-        Jail::expect_with(|_| {
+        Jail::expect_with(|jail| {
+            jail.clear_env();
             assert!(Config::load("missing.toml").is_err());
             Ok(())
         });

@@ -47,10 +47,52 @@ pub fn validate_document(
     }
     let mut errors = Vec::new();
     check_object(fields, &doc, "", &mut errors);
-    if errors.is_empty() {
-        Ok(doc)
-    } else {
-        Err(errors)
+    // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500.
+    for (key, value) in &doc {
+        if key.contains('\0') || contains_nul(value) {
+            errors.push(error(key.clone(), "must not contain the NUL character"));
+        }
+    }
+    if !errors.is_empty() {
+        return Err(errors);
+    }
+    normalize_dates(fields, &mut doc);
+    Ok(doc)
+}
+
+fn contains_nul(v: &Value) -> bool {
+    match v {
+        Value::String(s) => s.contains('\0'),
+        Value::Array(items) => items.iter().any(contains_nul),
+        Value::Object(obj) => obj.iter().any(|(k, v)| k.contains('\0') || contains_nul(v)),
+        _ => false,
+    }
+}
+
+/// Date-times are stored in UTC, whatever offset the client sent.
+fn normalize_dates(fields: &[Field], obj: &mut Map<String, Value>) {
+    for f in fields {
+        let Some(value) = obj.get_mut(&f.name) else {
+            continue;
+        };
+        match (&f.kind, value) {
+            (FieldKind::Date { date_only: false }, Value::String(s)) => {
+                if let Ok(t) = time::OffsetDateTime::parse(s, &Rfc3339)
+                    && let Ok(utc) = t.to_offset(time::UtcOffset::UTC).format(&Rfc3339)
+                {
+                    *s = utc;
+                }
+            }
+            (FieldKind::Group { fields }, Value::Object(inner)) => normalize_dates(fields, inner),
+            (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                for row in rows {
+                    if let Value::Object(inner) = row {
+                        normalize_dates(fields, inner);
+                    }
+                }
+            }
+            _ => {}
+        }
     }
 }
 
@@ -453,6 +495,35 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"seo": "x"})),
             vec![e("seo", "expected an object")]
+        );
+    }
+
+    #[test]
+    fn rejects_nul_characters_anywhere() {
+        let f = fields(json!([{"name": "t", "type": "text"}, {"name": "data", "type": "json"}]));
+        assert_eq!(
+            errs(&f, json!({"t": "a\u{0}b"})),
+            vec![e("t", "must not contain the NUL character")]
+        );
+        assert_eq!(
+            errs(&f, json!({"data": {"k\u{0}": ["x\u{0}"]}})),
+            vec![e("data", "must not contain the NUL character")]
+        );
+    }
+
+    #[test]
+    fn date_times_are_stored_in_utc() {
+        let f = fields(json!([
+            {"name": "at", "type": "date"},
+            {"name": "times", "type": "array", "fields": [{"name": "at", "type": "date"}]}
+        ]));
+        let doc = ok(
+            &f,
+            json!({"at": "2026-10-12T09:30:00+02:00", "times": [{"at": "2026-10-12T00:15:00-01:00"}]}),
+        );
+        assert_eq!(
+            Value::Object(doc),
+            json!({"at": "2026-10-12T07:30:00Z", "times": [{"at": "2026-10-12T01:15:00Z"}]})
         );
     }
 

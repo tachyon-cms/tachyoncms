@@ -4,6 +4,7 @@ use axum::Json;
 use axum::extract::State;
 use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
+use serde::Deserialize;
 use serde_json::{Value, json};
 use tachyon_core::{CollectionSchema, FieldError};
 use tachyon_db::collections::{self, Collection};
@@ -28,14 +29,17 @@ pub async fn create(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Json(body) = body.map_err(|e| ApiError::BadRequest(e.body_text()))?;
-    let schema: CollectionSchema =
-        serde_json::from_value(body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
-    schema.check().map_err(|e| {
-        ApiError::Validation(vec![FieldError {
-            path: String::new(),
-            message: e.to_string(),
-        }])
-    })?;
+    let schema =
+        CollectionSchema::deserialize(&body).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    schema
+        .check()
+        .and_then(|()| schema.reject_unknown_options(&body))
+        .map_err(|e| {
+            ApiError::Validation(vec![FieldError {
+                path: String::new(),
+                message: e.to_string(),
+            }])
+        })?;
     let created = collections::create(&state.pool, &schema).await?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }

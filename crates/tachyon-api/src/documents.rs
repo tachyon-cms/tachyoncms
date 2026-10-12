@@ -1,7 +1,7 @@
 //! `/api/{collection}` and `/api/{collection}/{id}`.
 
 use axum::Json;
-use axum::extract::rejection::{JsonRejection, QueryRejection};
+use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
 use axum::extract::{Path, Query, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
@@ -41,9 +41,10 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError
 
 pub async fn list(
     State(state): State<AppState>,
-    Path(slug): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     params: Result<Query<ListParams>, QueryRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let Query(params) = params.map_err(|e| ApiError::BadRequest(e.body_text()))?;
     let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
     let page = params.page.unwrap_or(1);
@@ -69,9 +70,10 @@ pub async fn list(
 
 pub async fn create(
     State(state): State<AppState>,
-    Path(slug): Path<String>,
+    path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Document>), ApiError> {
+    let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug).await?;
     let data = validate_document(&c.schema.fields, &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
@@ -83,8 +85,9 @@ pub async fn create(
 
 pub async fn get(
     State(state): State<AppState>,
-    Path((slug, id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<Document>, ApiError> {
+    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug).await?;
     Ok(Json(documents::get(&state.pool, c.id, id).await?))
@@ -92,9 +95,10 @@ pub async fn get(
 
 pub async fn update(
     State(state): State<AppState>,
-    Path((slug, id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Document>, ApiError> {
+    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug).await?;
     let patch = json_body(body)?;
@@ -107,8 +111,9 @@ pub async fn update(
 
 pub async fn delete(
     State(state): State<AppState>,
-    Path((slug, id)): Path<(String, String)>,
+    path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
+    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug).await?;
     documents::delete(&state.pool, c.id, id).await?;

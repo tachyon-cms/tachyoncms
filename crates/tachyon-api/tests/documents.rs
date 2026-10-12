@@ -93,6 +93,24 @@ async fn validation_errors_are_422_with_paths(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unsupported_methods_are_problem_405(pool: PgPool) {
+    let app = app_with_posts(pool).await;
+    assert_problem(&send(&app, "PUT", "/api/posts", Some("{}")).await, 405);
+    assert_problem(
+        &send(&app, "DELETE", "/api/admin/collections", None).await,
+        405,
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn nul_characters_are_422_not_500(pool: PgPool) {
+    let app = app_with_posts(pool).await;
+    let res = send(&app, "POST", "/api/posts", Some(r#"{"title": "a\u0000b"}"#)).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "title");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn malformed_json_is_400(pool: PgPool) {
     let app = app_with_posts(pool).await;
     assert_problem(
@@ -111,6 +129,12 @@ async fn bad_identifiers_are_404(pool: PgPool) {
         404,
     );
     assert_problem(&send(&app, "GET", "/api/posts/not-a-uuid", None).await, 404);
+    assert_problem(&send(&app, "GET", "/api/%FF", None).await, 404);
+    assert_problem(&send(&app, "GET", "/api/posts/%FF", None).await, 404);
+    assert_problem(
+        &send(&app, "DELETE", "/api/posts/not-a-uuid", None).await,
+        404,
+    );
     assert_problem(&send(&app, "GET", missing, None).await, 404);
     assert_problem(&send(&app, "PATCH", missing, Some("{}")).await, 404);
     assert_problem(&send(&app, "DELETE", missing, None).await, 404);

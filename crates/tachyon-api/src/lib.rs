@@ -37,6 +37,7 @@ pub fn router(pool: PgPool) -> Router {
                 .patch(documents::update)
                 .delete(documents::delete),
         )
+        .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
         .fallback(|| async { ApiError::NotFound })
         .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
         .layer(TimeoutLayer::with_status_code(

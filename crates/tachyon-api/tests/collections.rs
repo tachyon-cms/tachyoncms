@@ -43,6 +43,18 @@ async fn invalid_schemas_are_422(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unknown_field_options_are_422(pool: PgPool) {
+    let app = tachyon_api::router(pool);
+    let body = r#"{"slug": "posts", "fields": [{"name": "t", "type": "text", "unique": true}]}"#;
+    let res = send(&app, "POST", "/api/admin/collections", Some(body)).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "field `t`: unknown option `unique`"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn malformed_bodies_are_400(pool: PgPool) {
     let app = tachyon_api::router(pool);
     for body in [

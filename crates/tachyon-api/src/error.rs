@@ -8,6 +8,7 @@ use tachyon_db::DbError;
 #[derive(Debug)]
 pub enum ApiError {
     NotFound,
+    MethodNotAllowed,
     BadRequest(String),
     Conflict(String),
     Validation(Vec<FieldError>),
@@ -29,6 +30,12 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let (status, title, detail, errors) = match self {
             Self::NotFound => (StatusCode::NOT_FOUND, "Not found", None, None),
+            Self::MethodNotAllowed => (
+                StatusCode::METHOD_NOT_ALLOWED,
+                "Method not allowed",
+                None,
+                None,
+            ),
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
             Self::Validation(e) => (
