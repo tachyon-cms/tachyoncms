@@ -3,6 +3,7 @@
 mod collections;
 mod documents;
 mod error;
+mod globals;
 mod params;
 mod populate;
 mod request_id;
@@ -35,6 +36,10 @@ pub async fn router(pool: PgPool) -> Result<Router, DbError> {
         .route(
             "/api/admin/collections",
             get(collections::list).post(collections::create),
+        )
+        .route(
+            "/api/globals/{slug}",
+            get(globals::get).patch(globals::update),
         )
         .route(
             "/api/{collection}",

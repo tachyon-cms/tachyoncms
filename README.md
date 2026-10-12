@@ -22,6 +22,7 @@ We think you can have both. Here's what we're building toward:
 - Paginated lists, newest first.
 - Errors in the standard [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) format, each with a request ID you can find in the logs.
 - Soft delete, UUIDv7 IDs, and date-times stored in UTC.
+- Filter (`where[price][gt]=10`), sort (`sort=-price`) and page through results with cursors; link documents with relationship fields and get them back populated (`depth=2`); edit singleton globals such as site settings.
 
 ## Try it
 
@@ -61,8 +62,8 @@ curl localhost:3000/api/posts
 
 | Milestone | What it adds |
 |---|---|
-| 1 | Schemas, validation, REST CRUD **(done)** |
-| 2 | Filters, sorting, relationships, globals |
+| 1 | Schemas, validation, REST CRUD |
+| 2 | Filters, sorting, relationships, globals **(done)** |
 | 3 | Auth, sessions, API keys, access rules |
 | 4 | Drafts, versions, scheduled publishing, Trash |
 | 5 | Localization and full-text search |
