@@ -43,7 +43,7 @@ async fn main() -> anyhow::Result<()> {
     if let Command::Serve = cli.command {
         let listener = tokio::net::TcpListener::bind(config.listen).await?;
         tracing::info!(addr = %config.listen, "listening");
-        axum::serve(listener, tachyon_api::router(pool))
+        axum::serve(listener, tachyon_api::router(pool).await?)
             .with_graceful_shutdown(shutdown())
             .await?;
     }

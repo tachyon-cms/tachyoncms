@@ -41,5 +41,6 @@ pub async fn create(
             }])
         })?;
     let created = collections::create(&state.pool, &schema).await?;
+    state.schemas.reload(&state.pool).await?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }

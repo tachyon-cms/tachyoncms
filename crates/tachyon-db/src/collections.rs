@@ -18,7 +18,8 @@ pub struct Collection {
 }
 
 pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collection, DbError> {
-    sqlx::query_as!(
+    let mut tx = pool.begin().await?;
+    let created = sqlx::query_as!(
         Collection,
         r#"INSERT INTO collections (id, tenant_id, slug, kind, schema)
            VALUES ($1, $2, $3, $4, $5)
@@ -29,14 +30,20 @@ pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collecti
         schema.kind.as_str(),
         Json(schema) as _,
     )
-    .fetch_one(pool)
+    .fetch_one(&mut *tx)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(ref db) if db.is_unique_violation() => {
             DbError::Conflict(format!("collection `{}`", schema.slug))
         }
         e => e.into(),
-    })
+    })?;
+    // Delivered to every listening server when the transaction commits.
+    sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", schema.slug)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(created)
 }
 
 pub async fn get_by_slug(pool: &PgPool, slug: &str) -> Result<Collection, DbError> {
