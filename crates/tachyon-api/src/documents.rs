@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use tachyon_core::query::value_kind;
 use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
@@ -30,10 +31,11 @@ pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>
 /// Turns a unique-index rejection into a field error, when the index belongs to one of `c`'s fields.
 pub(crate) fn unique_error(c: &Collection, e: ApiError) -> ApiError {
     if let ApiError::Unique(constraint) = &e
-        && let Some(f) =
-            c.schema.fields.iter().find(|f| {
-                f.is_unique() && index_name(c.id, &f.name, IndexKind::Unique) == *constraint
-            })
+        && let Some(f) = c.schema.fields.iter().find(|f| {
+            f.is_unique()
+                && value_kind(&f.kind)
+                    .is_some_and(|v| index_name(c.id, &f.name, IndexKind::Unique, v) == *constraint)
+        })
     {
         return ApiError::Validation(vec![FieldError {
             path: f.name.clone(),

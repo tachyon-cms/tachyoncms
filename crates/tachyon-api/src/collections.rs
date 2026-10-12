@@ -54,8 +54,7 @@ pub async fn create(
         }
     }
     let created = collections::create(&state.pool, &schema).await?;
-    // NOTE: indexes are built after the row commits; schema apply (M2b) reconciles any that failed.
-    tachyon_db::indexes::create_field_indexes(&state.pool, created.id, &created.schema.0).await?;
+    tachyon_db::indexes::reconcile_indexes(&state.pool, created.id, &created.schema.0).await?;
     state.schemas.reload(&state.pool).await?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }
