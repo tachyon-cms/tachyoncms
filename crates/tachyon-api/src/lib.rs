@@ -15,7 +15,7 @@ use std::time::Duration;
 use axum::Router;
 use axum::extract::DefaultBodyLimit;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use sqlx::PgPool;
 use tachyon_db::DbError;
 use tower_http::timeout::TimeoutLayer;
@@ -36,6 +36,14 @@ pub async fn router(pool: PgPool) -> Result<Router, DbError> {
         .route(
             "/api/admin/collections",
             get(collections::list).post(collections::create),
+        )
+        .route(
+            "/api/admin/collections/{slug}",
+            get(collections::get_one).put(collections::update),
+        )
+        .route(
+            "/api/admin/collections/{slug}/preview",
+            post(collections::preview),
         )
         .route(
             "/api/globals/{slug}",
