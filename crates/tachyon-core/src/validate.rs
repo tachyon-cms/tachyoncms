@@ -220,6 +220,7 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
                 (!allowed(v)).then(|| format!("expected one of: {list}"))
             }
         }
+        FieldKind::Slug { .. } | FieldKind::Relationship { .. } => None,
         FieldKind::Json => None,
         FieldKind::Group { .. } => Some("expected an object".into()),
         FieldKind::Array { .. } => Some("expected a list".into()),

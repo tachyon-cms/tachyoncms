@@ -1741,6 +1741,7 @@ dependencies = [
  "thiserror",
  "time",
  "url",
+ "uuid",
 ]
 
 [[package]]
