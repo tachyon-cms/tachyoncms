@@ -1,6 +1,9 @@
 //! The `tachyon` binary.
 
 mod config;
+mod schema_cmd;
+
+use std::path::PathBuf;
 
 use clap::{Parser, Subcommand};
 use sqlx::PgPool;
@@ -24,12 +27,45 @@ enum Command {
     Serve,
     /// Run pending migrations and exit.
     Migrate,
+    /// Keep collection schemas in a JSON file: export, compare, apply.
+    Schema {
+        #[command(subcommand)]
+        command: SchemaCommand,
+    },
+}
+
+#[derive(Subcommand)]
+enum SchemaCommand {
+    /// Write every collection's schema as JSON.
+    Export {
+        /// File to write. Prints to stdout when omitted.
+        #[arg(short, long)]
+        out: Option<PathBuf>,
+    },
+    /// Show what applying a schema file would change, without changing anything.
+    Diff {
+        file: PathBuf,
+        /// Rename a field instead of removing it and adding a new one: collection:field=new_name
+        #[arg(long = "rename")]
+        renames: Vec<String>,
+    },
+    /// Apply a schema file. Changes that delete or retype data need --yes.
+    Apply {
+        file: PathBuf,
+        /// Rename a field instead of removing it and adding a new one: collection:field=new_name
+        #[arg(long = "rename")]
+        renames: Vec<String>,
+        /// Go ahead with changes that delete or retype data.
+        #[arg(long)]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     tracing_subscriber::fmt()
         .json()
+        .with_writer(std::io::stderr)
         .with_env_filter(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info")),
         )
@@ -40,12 +76,37 @@ async fn main() -> anyhow::Result<()> {
     let pool = PgPool::connect(&config.database_url).await?;
     tachyon_db::MIGRATOR.run(&pool).await?;
 
-    if let Command::Serve = cli.command {
-        let listener = tokio::net::TcpListener::bind(config.listen).await?;
-        tracing::info!(addr = %config.listen, "listening");
-        axum::serve(listener, tachyon_api::router(pool).await?)
-            .with_graceful_shutdown(shutdown())
-            .await?;
+    match cli.command {
+        Command::Serve => {
+            let listener = tokio::net::TcpListener::bind(config.listen).await?;
+            tracing::info!(addr = %config.listen, "listening");
+            axum::serve(listener, tachyon_api::router(pool).await?)
+                .with_graceful_shutdown(shutdown())
+                .await?;
+        }
+        Command::Migrate => {}
+        Command::Schema { command } => match command {
+            SchemaCommand::Export { out } => {
+                let json = schema_cmd::export(&pool).await?;
+                match out {
+                    Some(path) => std::fs::write(path, json)?,
+                    None => print!("{json}"),
+                }
+            }
+            SchemaCommand::Diff { file, renames } => {
+                let text = std::fs::read_to_string(file)?;
+                let renames = schema_cmd::parse_renames(&renames)?;
+                println!("{}", schema_cmd::run(&pool, &text, &renames, None).await?);
+            }
+            SchemaCommand::Apply { file, renames, yes } => {
+                let text = std::fs::read_to_string(file)?;
+                let renames = schema_cmd::parse_renames(&renames)?;
+                println!(
+                    "{}",
+                    schema_cmd::run(&pool, &text, &renames, Some(yes)).await?
+                );
+            }
+        },
     }
     Ok(())
 }

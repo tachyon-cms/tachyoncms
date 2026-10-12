@@ -15,11 +15,15 @@ impl Config {
     // figment's own error type; this runs once at startup.
     #[allow(clippy::result_large_err)]
     pub fn load(path: &str) -> Result<Self, figment::Error> {
-        Figment::new()
+        let config: Self = Figment::new()
             .merge(Serialized::default("listen", "127.0.0.1:3000"))
             .merge(Toml::file(path))
             .merge(Env::prefixed("TACHYON_"))
-            .extract()
+            .extract()?;
+        if config.database_url.trim().is_empty() {
+            return Err("database_url is empty".to_owned().into());
+        }
+        Ok(config)
     }
 }
 
@@ -57,7 +61,8 @@ mod tests {
     #[test]
     fn database_url_is_required() {
         Jail::expect_with(|jail| {
-            jail.clear_env();
+            // Clearing the whole environment would race with tests that need DATABASE_URL.
+            jail.set_env("TACHYON_DATABASE_URL", "");
             assert!(Config::load("missing.toml").is_err());
             Ok(())
         });

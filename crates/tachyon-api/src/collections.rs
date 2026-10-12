@@ -127,7 +127,7 @@ pub async fn preview(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let (slug, req, schema) = change_request(path, body)?;
-    let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames)
+    let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
         .await
         .map_err(change_error)?;
     Ok(Json(json!(p)))

@@ -69,8 +69,11 @@ pub async fn preview(
     slug: &str,
     new: &CollectionSchema,
     renames: &Renames,
+    pending: &[&str],
 ) -> Result<Preview, ChangeError> {
-    run(pool, slug, new, renames, None).await.map(|(_, p)| p)
+    run(pool, slug, new, renames, pending, None)
+        .await
+        .map(|(_, p)| p)
 }
 
 pub async fn apply(
@@ -80,7 +83,7 @@ pub async fn apply(
     renames: &Renames,
     confirm: bool,
 ) -> Result<(Collection, Preview), ChangeError> {
-    run(pool, slug, new, renames, Some(confirm)).await
+    run(pool, slug, new, renames, &[], Some(confirm)).await
 }
 
 struct Row {
@@ -124,6 +127,7 @@ async fn run(
     slug: &str,
     new: &CollectionSchema,
     renames: &Renames,
+    pending: &[&str],
     write: Option<bool>,
 ) -> Result<(Collection, Preview), ChangeError> {
     new.check().map_err(ChangeError::Invalid)?;
@@ -155,7 +159,7 @@ async fn run(
         .collect();
     targets.insert(slug.to_owned(), current.id);
     for target in new.relation_targets() {
-        if !targets.contains_key(target) {
+        if !targets.contains_key(target) && !pending.contains(&target) {
             return Err(ChangeError::Invalid(SchemaError::InvalidChange(format!(
                 "relationTo `{target}` doesn't match an existing collection"
             ))));

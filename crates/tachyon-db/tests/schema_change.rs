@@ -88,7 +88,9 @@ async fn preview_reports_without_touching_anything(pool: PgPool) {
         {"name": "summary", "type": "textarea"},
         {"name": "rating", "type": "number", "required": true}
     ]));
-    let p = preview(&pool, "posts", &new, &renamed()).await.unwrap();
+    let p = preview(&pool, "posts", &new, &renamed(), &[])
+        .await
+        .unwrap();
     assert_eq!((p.documents, p.invalid), (1, 1));
     assert_eq!(p.examples[0].id, s.post);
     assert_eq!(p.examples[0].errors[0].path, "rating");
