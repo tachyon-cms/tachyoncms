@@ -2,9 +2,9 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
-use tachyon_db::collections;
 use tachyon_db::documents::{self, Prepared};
 use tachyon_db::query::{self, ListQuery};
+use tachyon_db::{DbError, collections};
 use uuid::Uuid;
 
 fn schema() -> CollectionSchema {
@@ -423,5 +423,81 @@ async fn near_without_a_sort_returns_nearest_first(pool: PgPool) {
         titles(&pool, c, q(Some(&f), Some(&by_title))).await,
         ["Greenwich", "Paris", "Trafalgar"],
         "an explicit sort wins"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [("A", json!([0.0, 0.0])), ("B", json!([0.001, 0.0]))] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = parse_filter(
+        &s.fields,
+        &parse_query("where[at][near]=0,0").unwrap()["where"],
+    )
+    .unwrap();
+    let page = |offset| ListQuery {
+        filter: Some(&f),
+        sort: None,
+        limit: 1,
+        offset,
+        after: None,
+        count: false,
+    };
+    let first = query::list(&pool, c, &page(0)).await.unwrap();
+    assert!(first.has_more);
+    let last = query::list(&pool, c, &page(1)).await.unwrap();
+    assert!(!last.has_more);
+
+    let exact = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: None,
+            sort: None,
+            limit: 2,
+            offset: 0,
+            after: None,
+            count: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !exact.has_more && exact.next.is_none(),
+        "a page that ends exactly at the last document says so"
+    );
+
+    let cursor = Cursor {
+        value: None,
+        id: Uuid::nil(),
+    };
+    let refused = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: Some(&f),
+            sort: None,
+            limit: 1,
+            offset: 0,
+            after: Some(&cursor),
+            count: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(DbError::InvalidQuery(_))),
+        "{refused:?}"
     );
 }

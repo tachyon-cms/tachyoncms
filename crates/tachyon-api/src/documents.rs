@@ -87,6 +87,7 @@ pub async fn list(
     if p.after.is_none() {
         body["page"] = page.into();
     }
+    body["hasNextPage"] = found.has_more.into();
     if let Some(next) = found.next {
         body["nextCursor"] = next.encode().into();
     }

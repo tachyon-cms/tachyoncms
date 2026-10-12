@@ -82,7 +82,9 @@ pub enum Filter {
 
 impl Filter {
     /// The point of a `near` condition that every result must meet (top level or inside
-    /// `and`), which orders results by distance when no sort is given.
+    /// `and`), which orders results by distance when no sort is given. A `near` inside `or`
+    /// doesn't qualify, since other branches can match rows that aren't near anything. With
+    /// several qualifying conditions the first one (in field-name order) sets the order.
     pub fn near(&self) -> Option<(&[String], f64, f64)> {
         match self {
             Filter::Cond(Cond {
@@ -544,10 +546,21 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .and_then(normalize_date_time)
             .map(Scalar::Text)
             .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
-        (_, Some(FieldKind::Relationship { relation_to, .. }))
+        // The `relationTo` part of a polymorphic link: the path is the field's own name
+        // followed by `relationTo` (a field merely named `relationTo` doesn't count).
+        (_, Some(f_kind @ FieldKind::Relationship { relation_to, .. }))
             if relation_to.is_polymorphic()
-                && matches!(target, Target::Field { path, .. }
-                    if path.len() > 1 && path.last().map(String::as_str) == Some("relationTo")) =>
+                && matches!(
+                    f_kind,
+                    FieldKind::Relationship {
+                        has_many: false,
+                        ..
+                    }
+                )
+                && matches!((target, field), (Target::Field { path, .. }, Some(f))
+                    if path.len() >= 2
+                        && path[path.len() - 1] == "relationTo"
+                        && path[path.len() - 2] == f.name) =>
         {
             v.as_str()
                 .filter(|s| relation_to.allows(s))
@@ -1143,6 +1156,19 @@ mod tests {
         .unwrap();
         let id = "0199d5c4-0000-7000-8000-00000000000a";
         let w = parse_query(&format!("where[relationTo][equals]={id}")).unwrap();
+        assert!(parse_filter(&f, &w["where"]).is_ok());
+    }
+
+    #[test]
+    fn a_nested_link_list_named_relation_to_filters_by_id() {
+        let f: Vec<Field> = serde_json::from_value(json!([
+            {"name": "g", "type": "group", "fields": [
+                {"name": "relationTo", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true}
+            ]}
+        ]))
+        .unwrap();
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let w = parse_query(&format!("where[g.relationTo][contains]={id}")).unwrap();
         assert!(parse_filter(&f, &w["where"]).is_ok());
     }
 }

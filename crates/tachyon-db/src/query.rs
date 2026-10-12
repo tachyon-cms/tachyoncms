@@ -30,6 +30,8 @@ pub struct Page {
     pub total: Option<i64>,
     /// Where the next page starts, when this one came back full.
     pub next: Option<Cursor>,
+    /// Whether at least one more document follows this page.
+    pub has_more: bool,
 }
 
 fn assert_identifier(segment: &str) {
@@ -303,6 +305,19 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         None => ("id".to_owned(), true),
     };
 
+    // With `near` and no explicit sort, nearest first. Distance isn't a stored value a cursor
+    // can resume from, so those results page by number only.
+    let near = q
+        .sort
+        .is_none()
+        .then(|| q.filter.and_then(Filter::near))
+        .flatten();
+    if near.is_some() && q.after.is_some() {
+        return Err(DbError::InvalidQuery(
+            "results near a point are ordered by distance; page through them with page, not after",
+        ));
+    }
+
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, status, created_at, updated_at, published AS data FROM documents",
     );
@@ -311,12 +326,6 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         qb.push(" AND ");
         push_after(&mut qb, q.sort, &sort_expr, descending, cursor);
     }
-    // With `near` and no explicit sort, nearest first (pages by number; no cursor).
-    let near = q
-        .sort
-        .is_none()
-        .then(|| q.filter.and_then(Filter::near))
-        .flatten();
     match near {
         Some((path, lng, lat)) => {
             qb.push(" ORDER BY ");
@@ -327,8 +336,15 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
             qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
         }
     }
-    qb.push_bind(q.limit).push(" OFFSET ").push_bind(q.offset);
-    let docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
+    // One extra row says whether another page follows, without a separate count.
+    qb.push_bind(q.limit.saturating_add(1))
+        .push(" OFFSET ")
+        .push_bind(q.offset);
+    let mut docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
+    let has_more = usize::try_from(q.limit).is_ok_and(|limit| docs.len() > limit);
+    if has_more {
+        docs.truncate(usize::try_from(q.limit).unwrap_or(docs.len()));
+    }
 
     let total = if q.count {
         let mut qb = QueryBuilder::<Postgres>::new("SELECT count(*) FROM documents");
@@ -338,9 +354,7 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         None
     };
 
-    let full =
-        near.is_none() && q.limit > 0 && i64::try_from(docs.len()).is_ok_and(|n| n == q.limit);
-    let next = if full {
+    let next = if has_more && near.is_none() {
         docs.last().map(|last| Cursor {
             value: sort_value(q.sort, last),
             id: last.id,
@@ -348,7 +362,12 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
     } else {
         None
     };
-    Ok(Page { docs, total, next })
+    Ok(Page {
+        docs,
+        total,
+        next,
+        has_more,
+    })
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.

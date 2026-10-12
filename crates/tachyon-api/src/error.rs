@@ -33,6 +33,7 @@ impl From<DbError> for ApiError {
             DbError::Referenced(n) => Self::Conflict(format!(
                 "{n} other documents link to this one; remove those links first"
             )),
+            DbError::InvalidQuery(message) => Self::BadRequest(message.to_owned()),
             DbError::SchemaChanged => Self::Conflict(
                 "This collection's fields just changed. Reload and try again.".into(),
             ),

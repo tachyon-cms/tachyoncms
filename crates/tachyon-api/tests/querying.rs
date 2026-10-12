@@ -206,3 +206,20 @@ async fn near_pages_by_number_not_cursor(pool: PgPool) {
         "results near a point are ordered by distance; page through them with page, not after"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn lists_say_whether_another_page_follows(pool: PgPool) {
+    let app = app(pool).await;
+    let first = send(&app, "GET", "/api/items?limit=2", None).await.json;
+    assert_eq!(first["hasNextPage"], true);
+    let last = send(&app, "GET", "/api/items?limit=2&page=2", None)
+        .await
+        .json;
+    assert_eq!(last["hasNextPage"], false);
+    let exact = send(&app, "GET", "/api/items?limit=3", None).await.json;
+    assert_eq!(exact["hasNextPage"], false);
+    assert!(
+        exact.get("nextCursor").is_none(),
+        "no cursor to an empty page"
+    );
+}

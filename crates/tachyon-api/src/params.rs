@@ -93,11 +93,6 @@ pub(crate) fn list_params(raw: Option<&str>, c: &Collection) -> Result<ListParam
     let after = single(&params, "after")?
         .map(|s| Cursor::decode(s).ok_or_else(|| bad("after isn't a valid cursor")))
         .transpose()?;
-    if after.is_some() && sort.is_none() && filter.as_ref().and_then(Filter::near).is_some() {
-        return Err(bad(
-            "results near a point are ordered by distance; page through them with page, not after",
-        ));
-    }
     if let Some(cursor) = &after {
         if page.is_some() {
             return Err(bad("use either page or after, not both"));

@@ -68,7 +68,7 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::OptionsChanged { path } => format!("update options on {path}"),
             Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::Relinked { path, from, to } => {
-                format!("let {path} link to {to} as well as {from}, keeping its links")
+                format!("change what {path} links to from {from} to {to}, keeping its links")
             }
             Change::Retargeted { path, from, to } => {
                 format!("point {path} at {to} instead of {from}, clearing links that no longer fit")
