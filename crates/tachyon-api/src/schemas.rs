@@ -10,6 +10,7 @@ use sqlx::PgPool;
 use sqlx::postgres::PgListener;
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
+use uuid::Uuid;
 
 pub const CHANNEL: &str = "tachyon_schema";
 
@@ -39,6 +40,10 @@ impl Schemas {
 
     pub fn get(&self, slug: &str) -> Option<Arc<Collection>> {
         self.by_slug.load().get(slug).cloned()
+    }
+
+    pub fn get_by_id(&self, id: Uuid) -> Option<Arc<Collection>> {
+        self.by_slug.load().values().find(|c| c.id == id).cloned()
     }
 }
 

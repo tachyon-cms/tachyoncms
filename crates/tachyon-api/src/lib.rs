@@ -4,6 +4,7 @@ mod collections;
 mod documents;
 mod error;
 mod params;
+mod populate;
 mod request_id;
 mod schemas;
 
@@ -44,6 +45,10 @@ pub async fn router(pool: PgPool) -> Result<Router, DbError> {
             get(documents::get)
                 .patch(documents::update)
                 .delete(documents::delete),
+        )
+        .route(
+            "/api/{collection}/{id}/references",
+            get(documents::references),
         )
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed })
         .fallback(|| async { ApiError::NotFound })
