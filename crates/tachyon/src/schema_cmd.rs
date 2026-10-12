@@ -66,6 +66,7 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::Renamed { from, to } => format!("rename {from} to {to}"),
             Change::TypeChanged { path, from, to } => format!("change {path} from {from} to {to}"),
             Change::OptionsChanged { path } => format!("update options on {path}"),
+            Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::Retargeted { path, from, to } => {
                 format!("point {path} at {to} instead of {from}, clearing its links")
             }
