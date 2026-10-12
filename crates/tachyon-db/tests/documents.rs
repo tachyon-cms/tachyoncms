@@ -389,9 +389,7 @@ async fn rows_cant_point_across_tenants(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    let is_fk_violation = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
-        matches!(r, Err(sqlx::Error::Database(ref e)) if e.is_foreign_key_violation())
-    };
+    let is_fk_violation = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| matches!(r, Err(sqlx::Error::Database(ref e)) if e.is_foreign_key_violation());
 
     let doc_in_other_tenant = sqlx::query(
         "INSERT INTO documents (id, tenant_id, collection_id, published) VALUES ($1, $2, $3, '{}')",

@@ -1383,4 +1383,15 @@ mod tests {
             ]
         );
     }
+
+    #[test]
+    fn date_times_keep_milliseconds_consistently() {
+        // Stored values and filter values go through the same function, so they always agree.
+        let stored = normalize_date_time("2026-10-12T09:30:00.123456Z").unwrap();
+        assert_eq!(stored, "2026-10-12T09:30:00.123Z");
+        assert_eq!(
+            normalize_date_time("2026-10-12T11:30:00.123999+02:00").as_deref(),
+            Some(stored.as_str())
+        );
+    }
 }
