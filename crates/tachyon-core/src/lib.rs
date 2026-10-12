@@ -5,7 +5,10 @@ pub mod query;
 pub mod schema;
 pub mod validate;
 
-pub use schema::{CollectionKind, CollectionSchema, Field, FieldKind, SchemaError};
+pub use schema::{
+    Admin, CollectionKind, CollectionSchema, Condition, ConditionTest, Field, FieldKind, Position,
+    SchemaError,
+};
 pub use validate::{
     FieldError, RelationRef, map_relations, normalize_date_time, relations, slugify,
     validate_document,

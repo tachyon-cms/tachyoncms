@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError};
+use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, find_field};
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
 pub type Renames = BTreeMap<String, String>;
@@ -85,7 +85,7 @@ pub fn diff(
         ));
     }
     for from in renames.keys() {
-        if find(&old.fields, from).is_none() {
+        if find_field(&old.fields, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
@@ -211,20 +211,6 @@ fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
         ) => r1 == r2 && h1 == h2,
         _ => a.name() == b.name(),
     }
-}
-
-fn find<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
-    let mut current = fields;
-    let mut found = None;
-    for segment in path.split('.') {
-        let f = current.iter().find(|f| f.name == segment)?;
-        current = match &f.kind {
-            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-            _ => &[],
-        };
-        found = Some(f);
-    }
-    found
 }
 
 fn join(prefix: &str, key: &str) -> String {

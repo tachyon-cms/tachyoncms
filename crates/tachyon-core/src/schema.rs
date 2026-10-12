@@ -51,8 +51,57 @@ pub struct Field {
     /// Index this field so filters and sorts on it stay fast.
     #[serde(default)]
     pub filterable: bool,
+    #[serde(default)]
+    pub admin: Admin,
     #[serde(flatten)]
     pub kind: FieldKind,
+}
+
+/// How the admin shows a field. Presentation only: the API stores these but never enforces them.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Admin {
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub placeholder: Option<String>,
+    #[serde(default)]
+    pub hidden: bool,
+    #[serde(default)]
+    pub read_only: bool,
+    #[serde(default)]
+    pub position: Position,
+    /// Such as `50%` or `240px`.
+    #[serde(default)]
+    pub width: Option<String>,
+    /// Show the field only when another field matches.
+    #[serde(default)]
+    pub condition: Option<Condition>,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Position {
+    #[default]
+    Main,
+    Sidebar,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Condition {
+    /// Dotted path from the top of the document, such as `kind` or `seo.enabled`.
+    pub field: String,
+    #[serde(flatten)]
+    pub test: ConditionTest,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum ConditionTest {
+    Equals(Value),
+    NotEquals(Value),
+    In(Vec<Value>),
+    Exists(bool),
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -204,7 +253,7 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        check_fields(&self.fields, true)
+        check_fields(&self.fields, true, &self.fields)
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -236,11 +285,35 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
     for (f, raw) in fields.iter().zip(raw) {
         let known = serde_json::to_value(f).expect("fields always serialize");
         unknown_key(raw, &known, &f.name)?;
+        if let (Some(Value::Object(raw_admin)), Some(Value::Object(known_admin))) =
+            (raw.get("admin"), known.get("admin"))
+            && let Some(option) = raw_admin.keys().find(|k| !known_admin.contains_key(*k))
+        {
+            return Err(SchemaError::UnknownOption {
+                field: f.name.clone(),
+                option: format!("admin.{option}"),
+            });
+        }
         if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &f.kind {
             unknown_in_fields(fields, raw.get("fields"))?;
         }
     }
     Ok(())
+}
+
+/// The field at a dotted path, looking through groups and arrays.
+pub(crate) fn find_field<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
+    let mut current = fields;
+    let mut found = None;
+    for segment in path.split('.') {
+        let f = current.iter().find(|f| f.name == segment)?;
+        current = match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+            _ => &[],
+        };
+        found = Some(f);
+    }
+    found
 }
 
 fn is_identifier(s: &str, allow_upper: bool) -> bool {
@@ -251,7 +324,7 @@ fn is_identifier(s: &str, allow_upper: bool) -> bool {
         && chars.all(|c| ok(c) || c.is_ascii_digit() || c == '_')
 }
 
-fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
+fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(), SchemaError> {
     let mut seen = HashSet::new();
     for f in fields {
         if !is_identifier(&f.name, true) {
@@ -322,9 +395,22 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
                 )));
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                check_fields(fields, false)?
+                check_fields(fields, false, root)?
             }
             _ => {}
+        }
+        if let Some(condition) = &f.admin.condition
+            && find_field(root, &condition.field).is_none()
+        {
+            return Err(invalid(format!(
+                "admin.condition refers to `{}`, which isn't a field",
+                condition.field
+            )));
+        }
+        if let Some(width) = &f.admin.width
+            && !(width.ends_with('%') || width.ends_with("px"))
+        {
+            return Err(invalid("admin.width must look like 50% or 240px".into()));
         }
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
@@ -561,6 +647,61 @@ mod tests {
             Err(SchemaError::InvalidField {
                 field: "author".into(),
                 message: "relationTo `Authors!` isn't a valid collection slug".into(),
+            })
+        );
+    }
+    #[test]
+    fn admin_options_round_trip_and_are_checked() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "kind", "type": "select", "options": ["article", "video"]},
+            {"name": "videoUrl", "type": "url", "admin": {
+                "description": "Paste the YouTube link",
+                "position": "sidebar",
+                "width": "50%",
+                "condition": {"field": "kind", "equals": "video"}
+            }}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        let admin = &s.fields[1].admin;
+        assert_eq!(admin.position, Position::Sidebar);
+        assert_eq!(
+            admin.condition,
+            Some(Condition {
+                field: "kind".into(),
+                test: ConditionTest::Equals(json!("video"))
+            })
+        );
+        assert_eq!(s.fields[0].admin, Admin::default(), "admin is optional");
+
+        let typo = json!({"slug": "posts", "fields": [{"name": "t", "type": "text", "admin": {"descripton": "x"}}]});
+        assert_eq!(
+            schema(typo.clone()).reject_unknown_options(&typo),
+            Err(SchemaError::UnknownOption {
+                field: "t".into(),
+                option: "admin.descripton".into()
+            })
+        );
+
+        let dangling = schema(json!({"slug": "posts", "fields": [
+            {"name": "t", "type": "text", "admin": {"condition": {"field": "nope", "exists": true}}}
+        ]}));
+        assert_eq!(
+            dangling.check(),
+            Err(SchemaError::InvalidField {
+                field: "t".into(),
+                message: "admin.condition refers to `nope`, which isn't a field".into()
+            })
+        );
+        let bad_width = schema(json!({"slug": "posts", "fields": [
+            {"name": "t", "type": "text", "admin": {"width": "half"}}
+        ]}));
+        assert_eq!(
+            bad_width.check(),
+            Err(SchemaError::InvalidField {
+                field: "t".into(),
+                message: "admin.width must look like 50% or 240px".into()
             })
         );
     }
