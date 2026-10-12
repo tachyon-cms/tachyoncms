@@ -80,6 +80,22 @@ pub enum Filter {
     Cond(Cond),
 }
 
+impl Filter {
+    /// The point of a `near` condition that every result must meet (top level or inside
+    /// `and`), which orders results by distance when no sort is given.
+    pub fn near(&self) -> Option<(&[String], f64, f64)> {
+        match self {
+            Filter::Cond(Cond {
+                target: Target::Field { path, .. },
+                op: Op::Near,
+                value: Operand::Near { lng, lat, .. },
+            }) => Some((path, *lng, *lat)),
+            Filter::All(parts) => parts.iter().find_map(Filter::near),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cond {
     pub target: Target,
@@ -460,7 +476,8 @@ fn parse_near(v: &Value) -> Result<Operand, ()> {
         _ => return Err(()),
     };
     let in_range = (-180.0..=180.0).contains(&lng) && (-90.0..=90.0).contains(&lat);
-    let distances_ok = [max, min].into_iter().flatten().all(|d| d >= 0.0);
+    let distances_ok = [max, min].into_iter().flatten().all(|d| d >= 0.0)
+        && !matches!((min, max), (Some(min), Some(max)) if min > max);
     if in_range && distances_ok {
         Ok(Operand::Near { lng, lat, max, min })
     } else {
@@ -1096,7 +1113,15 @@ mod tests {
                 }
             )
         );
-        for bad in ["1", "200,0", "0,95", "0,0,-5", "0,0,NaN", "a,b"] {
+        for bad in [
+            "1",
+            "200,0",
+            "0,95",
+            "0,0,-5",
+            "0,0,NaN",
+            "a,b",
+            "0,0,10,20",
+        ] {
             assert_eq!(
                 filter(&format!("where[spot][near]={bad}")).unwrap_err(),
                 "where[spot][near]: expected longitude,latitude[,maxDistance[,minDistance]] in metres",

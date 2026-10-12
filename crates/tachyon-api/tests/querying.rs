@@ -172,3 +172,37 @@ async fn hostile_cursors_dates_and_nuls_are_400s(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(res.json["errors"][0]["path"], "at");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_pages_by_number_not_cursor(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "places", "fields": [{"name": "at", "type": "point"}]});
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string())
+        )
+        .await
+        .status,
+        201
+    );
+    let cursor = tachyon_core::query::Cursor {
+        value: None,
+        id: uuid::Uuid::nil(),
+    }
+    .encode();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/places?where[at][near]=0,0&after={cursor}"),
+        None,
+    )
+    .await;
+    assert_problem(&res, 400);
+    assert_eq!(
+        res.json["detail"],
+        "results near a point are ordered by distance; page through them with page, not after"
+    );
+}

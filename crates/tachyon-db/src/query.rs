@@ -80,6 +80,25 @@ fn coordinate(path: &[String], index: usize) -> String {
     )
 }
 
+/// Metres from a stored point to (`lng`, `lat`): haversine on a sphere of the mean earth
+/// radius, accurate to well under 1% for finding nearby places.
+fn push_distance(qb: &mut QueryBuilder<Postgres>, path: &[String], lng: f64, lat: f64) {
+    let (x, y) = (coordinate(path, 0), coordinate(path, 1));
+    qb.push("(6371008.8 * 2 * asin(least(1, sqrt(power(sin(radians((")
+        .push(&y)
+        .push(" - ");
+    qb.push_bind(lat);
+    qb.push(") / 2)), 2) + cos(radians(");
+    qb.push_bind(lat);
+    qb.push(")) * cos(radians(")
+        .push(&y)
+        .push(")) * power(sin(radians((")
+        .push(&x)
+        .push(" - ");
+    qb.push_bind(lng);
+    qb.push(") / 2)), 2)))))");
+}
+
 fn expr(target: &Target) -> String {
     match target {
         Target::Id => "id".into(),
@@ -230,39 +249,21 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
             let Target::Field { path, .. } = &c.target else {
                 unreachable!("near only targets fields")
             };
-            let (x, y) = (coordinate(path, 0), coordinate(path, 1));
-            // NOTE: haversine on a sphere of the mean earth radius; good to well under 1% for
-            // finding nearby places. Results aren't ordered by distance yet.
-            let distance = |qb: &mut QueryBuilder<Postgres>| {
-                qb.push("(6371008.8 * 2 * asin(least(1, sqrt(power(sin(radians((")
-                    .push(&y)
-                    .push(" - ");
-                qb.push_bind(*lat);
-                qb.push(") / 2)), 2) + cos(radians(");
-                qb.push_bind(*lat);
-                qb.push(")) * cos(radians(")
-                    .push(&y)
-                    .push(")) * power(sin(radians((")
-                    .push(&x)
-                    .push(" - ");
-                qb.push_bind(*lng);
-                qb.push(") / 2)), 2)))))");
-            };
             // Both coordinates must be real numbers: `least()` ignores NULLs, so a broken
             // value would otherwise come out as a distance.
             qb.push("(")
-                .push(&x)
+                .push(coordinate(path, 0))
                 .push(" IS NOT NULL AND ")
-                .push(&y)
+                .push(coordinate(path, 1))
                 .push(" IS NOT NULL");
             if let Some(max) = max {
                 qb.push(" AND ");
-                distance(qb);
+                push_distance(qb, path, *lng, *lat);
                 qb.push(" <= ").push_bind(*max);
             }
             if let Some(min) = min {
                 qb.push(" AND ");
-                distance(qb);
+                push_distance(qb, path, *lng, *lat);
                 qb.push(" >= ").push_bind(*min);
             }
             qb.push(")");
@@ -310,7 +311,22 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         qb.push(" AND ");
         push_after(&mut qb, q.sort, &sort_expr, descending, cursor);
     }
-    qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
+    // With `near` and no explicit sort, nearest first (pages by number; no cursor).
+    let near = q
+        .sort
+        .is_none()
+        .then(|| q.filter.and_then(Filter::near))
+        .flatten();
+    match near {
+        Some((path, lng, lat)) => {
+            qb.push(" ORDER BY ");
+            push_distance(&mut qb, path, lng, lat);
+            qb.push(" ASC NULLS LAST, id DESC LIMIT ");
+        }
+        None => {
+            qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
+        }
+    }
     qb.push_bind(q.limit).push(" OFFSET ").push_bind(q.offset);
     let docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
 
@@ -322,7 +338,8 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         None
     };
 
-    let full = q.limit > 0 && i64::try_from(docs.len()).is_ok_and(|n| n == q.limit);
+    let full =
+        near.is_none() && q.limit > 0 && i64::try_from(docs.len()).is_ok_and(|n| n == q.limit);
     let next = if full {
         docs.last().map(|last| Cursor {
             value: sort_value(q.sort, last),

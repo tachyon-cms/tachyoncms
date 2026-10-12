@@ -388,3 +388,40 @@ async fn near_ignores_values_that_are_not_points(pool: PgPool) {
         );
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_without_a_sort_returns_nearest_first(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Paris", json!([2.3522, 48.8566])),
+        ("Trafalgar", json!([-0.1281, 51.5080])),
+        ("Greenwich", json!([-0.0015, 51.4779])),
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = parse_filter(
+        &s.fields,
+        &parse_query("where[at][near]=-0.1276,51.5072").unwrap()["where"],
+    )
+    .unwrap();
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), None)).await,
+        ["Trafalgar", "Greenwich", "Paris"]
+    );
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich", "Paris", "Trafalgar"],
+        "an explicit sort wins"
+    );
+}
