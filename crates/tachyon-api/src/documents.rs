@@ -1,32 +1,46 @@
 //! `/api/{collection}` and `/api/{collection}/{id}`.
 
 use axum::Json;
-use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use serde::Deserialize;
 use serde_json::{Value, json};
-use tachyon_core::validate_document;
-use tachyon_db::collections::{self, Collection};
+use std::sync::Arc;
+
+use tachyon_core::{CollectionKind, FieldError, validate_document};
+use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
+use tachyon_db::indexes::{IndexKind, index_name};
+use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
+use crate::params::{depth_param, list_params};
+use crate::populate::{populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
-const DEFAULT_LIMIT: i64 = 10;
-const MAX_LIMIT: i64 = 100;
-
-#[derive(Deserialize)]
-pub struct ListParams {
-    limit: Option<i64>,
-    page: Option<i64>,
-    #[serde(default)]
-    count: bool,
+/// A collection (not a global) by slug, from the in-memory cache.
+pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>, ApiError> {
+    state
+        .schemas
+        .get(slug)
+        .filter(|c| c.schema.kind == CollectionKind::Collection)
+        .ok_or(ApiError::NotFound)
 }
 
-// NOTE(M2): one schema lookup per request; M2 replaces it with the ArcSwap cache refreshed by LISTEN/NOTIFY.
-async fn collection(state: &AppState, slug: &str) -> Result<Collection, ApiError> {
-    Ok(collections::get_by_slug(&state.pool, slug).await?)
+/// Turns a unique-index rejection into a field error, when the index belongs to one of `c`'s fields.
+pub(crate) fn unique_error(c: &Collection, e: ApiError) -> ApiError {
+    if let ApiError::Unique(constraint) = &e
+        && let Some(f) =
+            c.schema.fields.iter().find(|f| {
+                f.is_unique() && index_name(c.id, &f.name, IndexKind::Unique) == *constraint
+            })
+    {
+        return ApiError::Validation(vec![FieldError {
+            path: f.name.clone(),
+            message: "must be unique; another document already uses this value".into(),
+        }]);
+    }
+    e
 }
 
 /// A malformed ID can't match any document, so it's a 404 rather than a 400.
@@ -34,7 +48,7 @@ fn parse_id(id: &str) -> Result<Uuid, ApiError> {
     id.parse().map_err(|_| ApiError::NotFound)
 }
 
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
+pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
     body.map(|Json(v)| v)
         .map_err(|e| ApiError::BadRequest(e.body_text()))
 }
@@ -42,71 +56,102 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError
 pub async fn list(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
-    params: Result<Query<ListParams>, QueryRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    let Query(params) = params.map_err(|e| ApiError::BadRequest(e.body_text()))?;
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
-    let page = params.page.unwrap_or(1);
-    if limit < 1 {
-        return Err(ApiError::BadRequest("limit must be at least 1".into()));
-    }
-    if page < 1 {
-        return Err(ApiError::BadRequest("page must be at least 1".into()));
-    }
-    let limit = limit.min(MAX_LIMIT);
+    let c = collection(&state, &slug)?;
+    let p = list_params(raw.as_deref(), &c)?;
+    let page = p.page.unwrap_or(1);
     let offset = (page - 1)
-        .checked_mul(limit)
+        .checked_mul(p.limit)
         .ok_or_else(|| ApiError::BadRequest("page is too large".into()))?;
-
-    let c = collection(&state, &slug).await?;
-    let found = documents::list(&state.pool, c.id, limit, offset, params.count).await?;
-    let mut body = json!({ "docs": found.docs, "page": page, "limit": limit });
+    let q = ListQuery {
+        filter: p.filter.as_ref(),
+        sort: p.sort.as_ref(),
+        limit: p.limit,
+        offset: if p.after.is_some() { 0 } else { offset },
+        after: p.after.as_ref(),
+        count: p.count,
+    };
+    let found = query::list(&state.pool, c.id, &q).await?;
+    let docs = found
+        .docs
+        .iter()
+        .map(|d| Ok((to_value(d)?, c.clone())))
+        .collect::<Result<Vec<_>, ApiError>>()?;
+    let docs = populate(&state, docs, p.depth).await?;
+    let mut body = json!({ "docs": docs, "limit": p.limit });
+    if p.after.is_none() {
+        body["page"] = page.into();
+    }
+    if let Some(next) = found.next {
+        body["nextCursor"] = next.encode().into();
+    }
     if let Some(total) = found.total {
         body["totalDocs"] = total.into();
     }
     Ok(Json(body))
 }
 
+/// The document as JSON, with its relationships populated to `depth`.
+async fn respond(
+    state: &AppState,
+    c: Arc<Collection>,
+    doc: &Document,
+    depth: u8,
+) -> Result<Json<Value>, ApiError> {
+    Ok(Json(
+        populate(state, vec![(to_value(doc)?, c)], depth)
+            .await?
+            .remove(0),
+    ))
+}
+
 pub async fn create(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<(StatusCode, Json<Document>), ApiError> {
+) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    let c = collection(&state, &slug).await?;
+    let c = collection(&state, &slug)?;
     let data = validate_document(&c.schema.fields, &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
-    Ok((
-        StatusCode::CREATED,
-        Json(documents::insert(&state.pool, c.id, &data).await?),
-    ))
+    let doc = documents::insert(&state.pool, c.id, None, &prepare(&state, &c, data))
+        .await
+        .map_err(|e| unique_error(&c, e.into()))?;
+    Ok((StatusCode::CREATED, respond(&state, c, &doc, 1).await?))
 }
 
 pub async fn get(
     State(state): State<AppState>,
     path: Result<Path<(String, String)>, PathRejection>,
-) -> Result<Json<Document>, ApiError> {
+    RawQuery(raw): RawQuery,
+) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    let depth = depth_param(raw.as_deref())?;
     let id = parse_id(&id)?;
-    let c = collection(&state, &slug).await?;
-    Ok(Json(documents::get(&state.pool, c.id, id).await?))
+    let c = collection(&state, &slug)?;
+    let doc = documents::get(&state.pool, c.id, id).await?;
+    respond(&state, c, &doc, depth).await
 }
 
 pub async fn update(
     State(state): State<AppState>,
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<Document>, ApiError> {
+) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
-    let c = collection(&state, &slug).await?;
+    let c = collection(&state, &slug)?;
     let patch = json_body(body)?;
     let doc = documents::update(&state.pool, c.id, id, |current| {
-        validate_document(&c.schema.fields, &patch, Some(current)).map_err(ApiError::Validation)
+        validate_document(&c.schema.fields, &patch, Some(current))
+            .map(|data| prepare(&state, &c, data))
+            .map_err(ApiError::Validation)
     })
-    .await?;
-    Ok(Json(doc))
+    .await
+    .map_err(|e| unique_error(&c, e))?;
+    respond(&state, c, &doc, 1).await
 }
 
 pub async fn delete(
@@ -115,7 +160,20 @@ pub async fn delete(
 ) -> Result<StatusCode, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
-    let c = collection(&state, &slug).await?;
+    let c = collection(&state, &slug)?;
     documents::delete(&state.pool, c.id, id).await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+pub async fn references(
+    State(state): State<AppState>,
+    path: Result<Path<(String, String)>, PathRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    let id = parse_id(&id)?;
+    let c = collection(&state, &slug)?;
+    documents::get(&state.pool, c.id, id).await?;
+    Ok(Json(
+        json!({ "docs": documents::references(&state.pool, id).await? }),
+    ))
 }

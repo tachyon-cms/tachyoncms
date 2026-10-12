@@ -6,7 +6,7 @@ use axum::extract::rejection::JsonRejection;
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tachyon_core::{CollectionSchema, FieldError};
+use tachyon_core::{CollectionKind, CollectionSchema, FieldError};
 use tachyon_db::collections::{self, Collection};
 
 use crate::{ApiError, AppState};
@@ -40,6 +40,22 @@ pub async fn create(
                 message: e.to_string(),
             }])
         })?;
+    for target in schema.relation_targets() {
+        let ok = target == schema.slug
+            || state
+                .schemas
+                .get(target)
+                .is_some_and(|c| c.schema.kind == CollectionKind::Collection);
+        if !ok {
+            return Err(ApiError::Validation(vec![FieldError {
+                path: String::new(),
+                message: format!("relationTo `{target}` doesn't match an existing collection"),
+            }]));
+        }
+    }
     let created = collections::create(&state.pool, &schema).await?;
+    // NOTE: indexes are built after the row commits; schema apply (M2b) reconciles any that failed.
+    tachyon_db::indexes::create_field_indexes(&state.pool, created.id, &created.schema.0).await?;
+    state.schemas.reload(&state.pool).await?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) AS \"n!\" FROM documents\n                   WHERE tenant_id = $1 AND collection_id = $2 AND deleted_at IS NULL",
+  "query": "SELECT count(*) AS \"n!\" FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -12,7 +12,6 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid",
         "Uuid"
       ]
     },
@@ -20,5 +19,5 @@
       null
     ]
   },
-  "hash": "b0872d4b50f6f9996ad98eb46136e04b1013c318b9961740e0b8f84f9ef634a5"
+  "hash": "03fc040e1612ede6526932cf1a0676b1d1eca6b01178e3ba5f9ef80c53a94ae7"
 }

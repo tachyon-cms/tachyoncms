@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM relations WHERE from_doc = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d09a0a2efcdb555fc451b0b78990541ddd70bdc87dee1e8612c95b9b0d0a8f42"
+}

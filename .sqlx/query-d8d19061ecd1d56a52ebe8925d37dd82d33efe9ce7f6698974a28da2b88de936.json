@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, status, created_at, updated_at, published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND deleted_at IS NULL\n           ORDER BY id DESC\n           LIMIT $3 OFFSET $4",
+  "query": "SELECT id, collection_id, status, created_at, updated_at,\n                  published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -16,6 +16,17 @@
       },
       {
         "ordinal": 1,
+        "name": "collection_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -26,7 +37,7 @@
         }
       },
       {
-        "ordinal": 2,
+        "ordinal": 3,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -37,7 +48,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 4,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -48,7 +59,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 5,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -62,9 +73,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Uuid",
-        "Int8",
-        "Int8"
+        "UuidArray"
       ]
     },
     "nullable": [
@@ -72,8 +81,9 @@
       false,
       false,
       false,
+      false,
       true
     ]
   },
-  "hash": "d44bdf5f17de38b855a5d230cdb9a054fe599eb279d5d01f9ec314e866683b7a"
+  "hash": "d8d19061ecd1d56a52ebe8925d37dd82d33efe9ce7f6698974a28da2b88de936"
 }

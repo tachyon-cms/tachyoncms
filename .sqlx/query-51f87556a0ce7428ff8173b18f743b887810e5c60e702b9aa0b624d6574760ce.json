@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO relations (tenant_id, from_doc, field_path, to_doc)\n         SELECT $1, $2, path, id FROM unnest($3::text[], $4::uuid[]) AS t(path, id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "TextArray",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "51f87556a0ce7428ff8173b18f743b887810e5c60e702b9aa0b624d6574760ce"
+}

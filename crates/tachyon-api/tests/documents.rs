@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 async fn app_with_posts(pool: PgPool) -> Router {
-    let app = tachyon_api::router(pool);
+    let app = tachyon_api::router(pool).await.unwrap();
     let schema = json!({"slug": "posts", "fields": [
         {"name": "title", "type": "text", "required": true, "maxLength": 100},
         {"name": "summary", "type": "textarea"}
@@ -194,4 +194,38 @@ async fn patch_null_removes_optional_but_not_required(pool: PgPool) {
     let res = send(&app, "PATCH", &url, Some(r#"{"title": null}"#)).await;
     assert_problem(&res, 422);
     assert_eq!(send(&app, "GET", &url, None).await.json["title"], "T");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unique_values_are_field_errors(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = r#"{"slug": "pages", "fields": [{"name": "title", "type": "text"}, {"name": "slug", "type": "slug", "from": "title"}]}"#;
+    assert_eq!(
+        send(&app, "POST", "/api/admin/collections", Some(schema))
+            .await
+            .status,
+        201
+    );
+
+    let first = send(&app, "POST", "/api/pages", Some(r#"{"title": "About us"}"#)).await;
+    assert_eq!(first.json["slug"], "about-us");
+    let dup = send(
+        &app,
+        "POST",
+        "/api/pages",
+        Some(r#"{"title": "About Us!"}"#),
+    )
+    .await;
+    assert_problem(&dup, 422);
+    assert_eq!(
+        dup.json["errors"][0],
+        json!({"path": "slug", "message": "must be unique; another document already uses this value"})
+    );
+
+    let other = send(&app, "POST", "/api/pages", Some(r#"{"title": "Team"}"#)).await;
+    let url = format!("/api/pages/{}", other.json["id"].as_str().unwrap());
+    assert_problem(
+        &send(&app, "PATCH", &url, Some(r#"{"slug": "about-us"}"#)).await,
+        422,
+    );
 }

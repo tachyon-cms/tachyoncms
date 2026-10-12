@@ -12,6 +12,8 @@ pub enum ApiError {
     BadRequest(String),
     Conflict(String),
     Validation(Vec<FieldError>),
+    /// A unique index rejected the write; handlers turn this into a field error when they can.
+    Unique(String),
     /// The cause is logged, never sent to the client.
     Internal(String),
 }
@@ -21,6 +23,14 @@ impl From<DbError> for ApiError {
         match e {
             DbError::NotFound => Self::NotFound,
             DbError::Conflict(what) => Self::Conflict(format!("{what} already exists")),
+            DbError::Validation(errors) => Self::Validation(errors),
+            DbError::UniqueViolation(constraint) => Self::Unique(constraint),
+            DbError::Referenced(1) => {
+                Self::Conflict("1 other document links to this one; remove that link first".into())
+            }
+            DbError::Referenced(n) => Self::Conflict(format!(
+                "{n} other documents link to this one; remove those links first"
+            )),
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
     }
@@ -38,6 +48,12 @@ impl IntoResponse for ApiError {
             ),
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
+            Self::Unique(_) => (
+                StatusCode::CONFLICT,
+                "Conflict",
+                Some("a document with this value already exists".to_owned()),
+                None,
+            ),
             Self::Validation(e) => (
                 StatusCode::UNPROCESSABLE_ENTITY,
                 "Validation failed",

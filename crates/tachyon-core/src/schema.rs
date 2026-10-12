@@ -45,6 +45,12 @@ pub struct Field {
     pub required: bool,
     #[serde(default)]
     pub default: Option<Value>,
+    /// No two live documents in the collection may share this value.
+    #[serde(default)]
+    pub unique: bool,
+    /// Index this field so filters and sorts on it stay fast.
+    #[serde(default)]
+    pub filterable: bool,
     #[serde(flatten)]
     pub kind: FieldKind,
 }
@@ -86,6 +92,16 @@ pub enum FieldKind {
         #[serde(default)]
         multiple: bool,
     },
+    Slug {
+        /// A text field to generate the slug from when none is given.
+        #[serde(default)]
+        from: Option<String>,
+    },
+    Relationship {
+        relation_to: String,
+        #[serde(default)]
+        has_many: bool,
+    },
     Json,
     Group {
         fields: Vec<Field>,
@@ -121,7 +137,63 @@ pub enum SchemaError {
     UnknownOption { field: String, option: String },
 }
 
+impl FieldKind {
+    pub fn name(&self) -> &'static str {
+        match self {
+            Self::Text { .. } => "text",
+            Self::Textarea { .. } => "textarea",
+            Self::Number { .. } => "number",
+            Self::Boolean => "boolean",
+            Self::Date { .. } => "date",
+            Self::Email => "email",
+            Self::Url => "url",
+            Self::Select { .. } => "select",
+            Self::Slug { .. } => "slug",
+            Self::Relationship { .. } => "relationship",
+            Self::Json => "json",
+            Self::Group { .. } => "group",
+            Self::Array { .. } => "array",
+        }
+    }
+
+    /// A single comparable value, so it can carry a B-tree index.
+    pub fn is_indexable(&self) -> bool {
+        match self {
+            Self::Select { multiple, .. } => !multiple,
+            Self::Relationship { has_many, .. } => !has_many,
+            Self::Json | Self::Group { .. } | Self::Array { .. } => false,
+            _ => true,
+        }
+    }
+}
+
+impl Field {
+    pub fn is_unique(&self) -> bool {
+        self.unique || matches!(self.kind, FieldKind::Slug { .. })
+    }
+}
+
 impl CollectionSchema {
+    /// Every collection slug a relationship field points at, nested ones included.
+    pub fn relation_targets(&self) -> Vec<&str> {
+        fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
+            for f in fields {
+                match &f.kind {
+                    FieldKind::Relationship { relation_to, .. } => out.push(relation_to),
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        walk(fields, out)
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(&self.fields, &mut out);
+        out.sort_unstable();
+        out.dedup();
+        out
+    }
+
     /// Checks the schema is usable before it's stored.
     pub fn check(&self) -> Result<(), SchemaError> {
         if !is_identifier(&self.slug, false) {
@@ -193,6 +265,22 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
             field: f.name.clone(),
             message,
         };
+        let indexed = f.unique || f.filterable || matches!(f.kind, FieldKind::Slug { .. });
+        if indexed && !top_level {
+            return Err(invalid(
+                "unique, filterable and slug fields must be at the top level".into(),
+            ));
+        }
+        if (f.unique || f.filterable) && !f.kind.is_indexable() {
+            let what = match f.kind {
+                FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
+                FieldKind::Relationship { .. } => {
+                    "relationship fields with multiple values".to_owned()
+                }
+                _ => format!("{} fields", f.kind.name()),
+            };
+            return Err(invalid(format!("{what} can't be unique or filterable")));
+        }
         match &f.kind {
             FieldKind::Text {
                 min_length: Some(a),
@@ -216,6 +304,20 @@ fn check_fields(fields: &[Field], top_level: bool) -> Result<(), SchemaError> {
                 ..
             } if a > b => {
                 return Err(invalid("minRows is greater than maxRows".into()));
+            }
+            FieldKind::Slug { from: Some(source) }
+                if !fields
+                    .iter()
+                    .any(|s| &s.name == source && matches!(s.kind, FieldKind::Text { .. })) =>
+            {
+                return Err(invalid(format!(
+                    "from must name a top-level text field, not `{source}`"
+                )));
+            }
+            FieldKind::Relationship { relation_to, .. } if !is_identifier(relation_to, false) => {
+                return Err(invalid(format!(
+                    "relationTo `{relation_to}` isn't a valid collection slug"
+                )));
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                 check_fields(fields, false)?
@@ -374,5 +476,90 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn parses_slug_relationship_and_index_flags() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text", "filterable": true},
+            {"name": "slug", "type": "slug", "from": "title"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "related", "type": "relationship", "relationTo": "posts", "hasMany": true},
+            {"name": "meta", "type": "group", "fields": [
+                {"name": "editor", "type": "relationship", "relationTo": "authors"}
+            ]}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        assert!(s.fields[0].filterable);
+        assert!(s.fields[1].is_unique(), "slugs are always unique");
+        assert_eq!(
+            s.fields[2].kind,
+            FieldKind::Relationship {
+                relation_to: "authors".into(),
+                has_many: false
+            }
+        );
+        assert_eq!(s.relation_targets(), ["authors", "posts"]);
+    }
+
+    #[test]
+    fn index_flags_need_a_top_level_scalar() {
+        let cases = [
+            (
+                json!({"name": "data", "type": "json", "unique": true}),
+                "json fields can't be unique or filterable",
+            ),
+            (
+                json!({"name": "tags", "type": "select", "options": ["a"], "multiple": true, "filterable": true}),
+                "select fields with multiple values can't be unique or filterable",
+            ),
+        ];
+        for (field, message) in cases {
+            let name = field["name"].as_str().unwrap().to_owned();
+            let s = schema(json!({"slug": "posts", "fields": [field]}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: name,
+                    message: message.into()
+                })
+            );
+        }
+        let nested = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [{"name": "t", "type": "text", "unique": true}]}
+        ]}));
+        assert_eq!(
+            nested.check(),
+            Err(SchemaError::InvalidField {
+                field: "t".into(),
+                message: "unique, filterable and slug fields must be at the top level".into(),
+            })
+        );
+    }
+
+    #[test]
+    fn slug_and_relationship_options_are_checked() {
+        let bad_from = schema(
+            json!({"slug": "posts", "fields": [{"name": "slug", "type": "slug", "from": "nope"}]}),
+        );
+        assert_eq!(
+            bad_from.check(),
+            Err(SchemaError::InvalidField {
+                field: "slug".into(),
+                message: "from must name a top-level text field, not `nope`".into(),
+            })
+        );
+        let bad_target = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "Authors!"}
+        ]}));
+        assert_eq!(
+            bad_target.check(),
+            Err(SchemaError::InvalidField {
+                field: "author".into(),
+                message: "relationTo `Authors!` isn't a valid collection slug".into(),
+            })
+        );
     }
 }

@@ -14,6 +14,7 @@ tachyon-db = { path = "crates/tachyon-db" }
 tachyon-api = { path = "crates/tachyon-api" }
 
 anyhow = "1.0.104"
+arc-swap = "1.9.2"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 figment = { version = "0.10.19", features = ["toml", "env"] }
@@ -23,7 +24,7 @@ serde_json = "1.0.154"
 sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "time", "json"] }
 thiserror = "2.0.21"
 time = { version = "0.3.55", features = ["serde-well-known", "parsing", "macros"] }
-tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal", "time"] }
 tower = { version = "0.5.3", features = ["util"] }
 tower-http = { version = "0.7.1", features = ["timeout"] }
 tracing = "0.1.44"
