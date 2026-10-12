@@ -6,7 +6,7 @@ use time::macros::format_description;
 
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, SelectOption};
+use crate::schema::{Field, FieldKind, SelectOption, data_fields};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
@@ -27,6 +27,7 @@ pub fn validate_document(
     input: &Value,
     existing: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, Vec<FieldError>> {
+    let fields = &data_fields(fields);
     let Value::Object(input) = input else {
         return Err(vec![error(String::new(), "expected a JSON object")]);
     };
@@ -442,6 +443,7 @@ pub struct RelationRef {
 
 /// Every relationship ID in a validated document, in schema order.
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
+    let fields = &data_fields(fields);
     fn walk(fields: &[Field], obj: &Map<String, Value>, prefix: &str, out: &mut Vec<RelationRef>) {
         for f in fields {
             let Some(value) = obj.get(&f.name) else {
@@ -501,6 +503,14 @@ pub fn map_relations(
     doc: &mut Map<String, Value>,
     f: &mut impl FnMut(&str) -> Option<Value>,
 ) {
+    map_inner(&data_fields(fields), doc, f)
+}
+
+fn map_inner(
+    fields: &[Field],
+    doc: &mut Map<String, Value>,
+    f: &mut impl FnMut(&str) -> Option<Value>,
+) {
     for field in fields {
         let Some(value) = doc.get_mut(&field.name) else {
             continue;
@@ -517,11 +527,11 @@ pub fn map_relations(
                     replace_id(slot, f);
                 }
             }
-            (FieldKind::Group { fields }, Value::Object(inner)) => map_relations(fields, inner, f),
+            (FieldKind::Group { fields }, Value::Object(inner)) => map_inner(fields, inner, f),
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                 for row in rows {
                     if let Value::Object(inner) = row {
-                        map_relations(fields, inner, f);
+                        map_inner(fields, inner, f);
                     }
                 }
             }
@@ -977,6 +987,30 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"scores": [1.5]})),
             vec![e("scores.0", "expected a whole number")]
+        );
+    }
+    #[test]
+    fn layout_fields_validate_as_flat_data() {
+        let f = fields(json!([
+            {"type": "row", "fields": [{"name": "title", "type": "text", "required": true}]},
+            {"type": "tabs", "tabs": [
+                {"label": "A", "fields": [{"name": "body", "type": "textarea"}]},
+                {"name": "meta", "label": "B", "fields": [{"name": "author", "type": "relationship", "relationTo": "authors"}]}
+            ]}
+        ]));
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let doc = ok(
+            &f,
+            json!({"title": "T", "body": "B", "meta": {"author": id}}),
+        );
+        assert_eq!(relations(&f, &doc)[0].path, "meta.author");
+        assert_eq!(
+            errs(&f, json!({"body": "B"})),
+            vec![e("title", "is required")]
+        );
+        assert_eq!(
+            errs(&f, json!({"title": "T", "row": {}})),
+            vec![e("row", "unknown field")]
         );
     }
 }

@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, find_field};
+use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, data_fields, find_field};
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
 pub type Renames = BTreeMap<String, String>;
@@ -256,6 +256,7 @@ pub fn migrate_document(
     renames: &Renames,
     doc: &Map<String, Value>,
 ) -> Map<String, Value> {
+    let new = &data_fields(new);
     let mut doc = doc.clone();
     // Renames are grouped by the object they happen in and applied deepest first, so a
     // renamed group's children are still found under its old name. Within one object every

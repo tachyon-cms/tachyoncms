@@ -3,8 +3,8 @@
 
 use sqlx::types::Json;
 use sqlx::{AssertSqlSafe, PgConnection, PgPool};
-use tachyon_core::CollectionSchema;
 use tachyon_core::query::{ValueKind, value_kind};
+use tachyon_core::{CollectionSchema, data_fields};
 use uuid::Uuid;
 
 use crate::DbError;
@@ -58,8 +58,7 @@ pub(crate) struct Wanted {
 
 pub(crate) fn wanted_indexes(collection_id: Uuid, schema: &CollectionSchema) -> Vec<Wanted> {
     let scope = format!("WHERE collection_id = '{collection_id}' AND deleted_at IS NULL");
-    schema
-        .fields
+    data_fields(&schema.fields)
         .iter()
         .filter_map(|f| {
             let kind = value_kind(&f.kind)?;
