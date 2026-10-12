@@ -1,0 +1,45 @@
+name: Bug report
+description: Something doesn't work the way the docs or README say it should.
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for taking the time to report this. Found a security issue? Please don't file it here. Use [private reporting](https://github.com/tachyon-cms/tachyoncms/security/advisories/new) instead.
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: What you did, what you expected, and what you got instead.
+      placeholder: I sent a PATCH with `{"title": null}` and expected a 422, but got a 500.
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: The smallest set of requests or commands that shows the problem. Include the schema if it matters.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Error response or logs
+      description: Paste the response body (it includes a `requestId`) and any matching log lines. Remove any secrets first.
+      render: text
+  - type: input
+    id: version
+    attributes:
+      label: Version or commit
+      placeholder: main @ a1b2c3d
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Environment
+      description: OS, Postgres version, and how you're running it (cargo, Docker).
+      placeholder: macOS 26, Postgres 17, cargo run
+    validations:
+      required: true

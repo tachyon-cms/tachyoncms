@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions and ideas
+    url: https://github.com/tachyon-cms/tachyoncms/discussions
+    about: Ask how something works or float an idea before it becomes a feature request.
+  - name: Report a security vulnerability
+    url: https://github.com/tachyon-cms/tachyoncms/security/advisories/new
+    about: Please report security issues privately, not in a public issue.

@@ -1,0 +1,34 @@
+name: Feature request
+description: Suggest something TachyonCMS should do.
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the [roadmap in the README](https://github.com/tachyon-cms/tachyoncms#roadmap) first, because it may already be planned. For open-ended ideas, [Discussions](https://github.com/tachyon-cms/tachyoncms/discussions) is a better fit.
+  - type: textarea
+    id: problem
+    attributes:
+      label: What are you trying to do?
+      description: Describe the problem or the job, not the solution yet. Who hits this, and how often?
+      placeholder: Our editors keep publishing posts without a featured image, and we only find out after they go live.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: What would help?
+      description: How you picture it working. Rough is fine.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: What do you do today instead?
+      description: Workarounds, or how another CMS handles it.
+  - type: checkboxes
+    id: contribute
+    attributes:
+      label: Contributing
+      options:
+        - label: I'd be willing to open a pull request for this.
