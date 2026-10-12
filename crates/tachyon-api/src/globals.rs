@@ -7,7 +7,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
 use serde_json::{Map, Value};
-use tachyon_core::{CollectionKind, validate_document};
+use tachyon_core::{CollectionKind, data_fields, validate_document};
 use tachyon_db::DbError;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
@@ -52,9 +52,7 @@ pub async fn get(
     match documents::get(&state.pool, c.id, c.id).await {
         Ok(doc) => respond(&state, c, &doc, depth).await,
         Err(DbError::NotFound) => {
-            let defaults: Map<String, Value> = c
-                .schema
-                .fields
+            let defaults: Map<String, Value> = data_fields(&c.schema.fields)
                 .iter()
                 .filter_map(|f| Some((f.name.clone(), f.default.clone()?)))
                 .collect();

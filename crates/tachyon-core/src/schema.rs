@@ -38,6 +38,7 @@ impl CollectionKind {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct Field {
+    #[serde(default)]
     pub name: String,
     #[serde(default)]
     pub label: Option<String>,
@@ -187,6 +188,21 @@ pub enum FieldKind {
         #[serde(default)]
         max_rows: Option<usize>,
     },
+    /// Puts its fields side by side in the admin. No effect on data.
+    Row {
+        fields: Vec<Field>,
+    },
+    /// A titled section the editor can fold away (titled by the field's `label`). No effect on data.
+    Collapsible {
+        #[serde(default)]
+        initially_collapsed: bool,
+        fields: Vec<Field>,
+    },
+    /// Tabs in the admin. A tab with a `name` nests its fields like a group; one without
+    /// a name has no effect on data.
+    Tabs {
+        tabs: Vec<Tab>,
+    },
 }
 
 /// A choice in a `select` or `radio`: a bare value, or a label shown to editors plus the stored value.
@@ -203,6 +219,134 @@ impl SelectOption {
             Self::Value(v) | Self::Labeled { value: v, .. } => v,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Tab {
+    #[serde(default)]
+    pub name: Option<String>,
+    pub label: String,
+    pub fields: Vec<Field>,
+}
+
+/// The fields as stored data sees them: rows, collapsibles and unnamed tabs dissolve into
+/// their parent, and named tabs become groups. Applies at every level.
+// NOTE: allocates on every call; fine for schemas of a few dozen fields.
+pub fn data_fields(fields: &[Field]) -> Vec<Field> {
+    let mut out = Vec::new();
+    for f in fields {
+        match &f.kind {
+            FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
+                out.extend(data_fields(fields))
+            }
+            FieldKind::Tabs { tabs } => {
+                for tab in tabs {
+                    match &tab.name {
+                        Some(name) => out.push(Field {
+                            name: name.clone(),
+                            label: Some(tab.label.clone()),
+                            required: false,
+                            default: None,
+                            unique: false,
+                            filterable: false,
+                            admin: Admin::default(),
+                            kind: FieldKind::Group {
+                                fields: data_fields(&tab.fields),
+                            },
+                        }),
+                        None => out.extend(data_fields(&tab.fields)),
+                    }
+                }
+            }
+            FieldKind::Group { fields } => out.push(Field {
+                kind: FieldKind::Group {
+                    fields: data_fields(fields),
+                },
+                ..f.clone()
+            }),
+            FieldKind::Array {
+                fields,
+                min_rows,
+                max_rows,
+            } => out.push(Field {
+                kind: FieldKind::Array {
+                    fields: data_fields(fields),
+                    min_rows: *min_rows,
+                    max_rows: *max_rows,
+                },
+                ..f.clone()
+            }),
+            _ => out.push(f.clone()),
+        }
+    }
+    out
+}
+
+/// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
+/// Admin options any field can carry, data or layout. `root` is the data shape.
+fn check_admin(admin: &Admin, root: &[Field]) -> Result<(), String> {
+    if let Some(condition) = &admin.condition
+        && find_field(root, &condition.field).is_none()
+    {
+        return Err(format!(
+            "admin.condition refers to `{}`, which isn't a field",
+            condition.field
+        ));
+    }
+    if let Some(width) = &admin.width
+        && !(width.ends_with('%') || width.ends_with("px"))
+    {
+        return Err("admin.width must look like 50% or 240px".into());
+    }
+    Ok(())
+}
+
+fn check_layout(fields: &[Field], root: &[Field]) -> Result<(), SchemaError> {
+    for f in fields {
+        if f.kind.is_layout() {
+            let invalid = |message: String| SchemaError::InvalidField {
+                field: String::new(),
+                message,
+            };
+            check_admin(&f.admin, root).map_err(invalid)?;
+            let kind = f.kind.name();
+            if !f.name.is_empty() {
+                return Err(invalid(format!("{kind} fields don't take a name")));
+            }
+            if f.required || f.default.is_some() || f.unique || f.filterable {
+                return Err(invalid(format!(
+                    "{kind} fields can't be required, unique, filterable or have a default"
+                )));
+            }
+            if matches!(f.kind, FieldKind::Collapsible { .. })
+                && f.label.as_deref().is_none_or(|l| l.trim().is_empty())
+            {
+                return Err(invalid("collapsible fields need a label".into()));
+            }
+            if let FieldKind::Tabs { tabs } = &f.kind {
+                if tabs.is_empty() {
+                    return Err(invalid("tabs needs at least one tab".into()));
+                }
+                if tabs.iter().any(|t| t.label.trim().is_empty()) {
+                    return Err(invalid("every tab needs a label".into()));
+                }
+            }
+        }
+        match &f.kind {
+            FieldKind::Row { fields }
+            | FieldKind::Collapsible { fields, .. }
+            | FieldKind::Group { fields }
+            | FieldKind::Array { fields, .. } => check_layout(fields, root)?,
+            FieldKind::Tabs { tabs } => {
+                for tab in tabs {
+                    check_layout(&tab.fields, root)?;
+                }
+            }
+            _ => {}
+        }
+    }
+    Ok(())
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -247,7 +391,17 @@ impl FieldKind {
             Self::Json => "json",
             Self::Group { .. } => "group",
             Self::Array { .. } => "array",
+            Self::Row { .. } => "row",
+            Self::Collapsible { .. } => "collapsible",
+            Self::Tabs { .. } => "tabs",
         }
+    }
+
+    pub fn is_layout(&self) -> bool {
+        matches!(
+            self,
+            Self::Row { .. } | Self::Collapsible { .. } | Self::Tabs { .. }
+        )
     }
 
     /// A single comparable value, so it can carry a B-tree index.
@@ -257,7 +411,12 @@ impl FieldKind {
             Self::Relationship { has_many, .. }
             | Self::Text { has_many, .. }
             | Self::Number { has_many, .. } => !has_many,
-            Self::Json | Self::Group { .. } | Self::Array { .. } => false,
+            Self::Json
+            | Self::Group { .. }
+            | Self::Array { .. }
+            | Self::Row { .. }
+            | Self::Collapsible { .. }
+            | Self::Tabs { .. } => false,
             _ => true,
         }
     }
@@ -276,8 +435,14 @@ impl CollectionSchema {
             for f in fields {
                 match &f.kind {
                     FieldKind::Relationship { relation_to, .. } => out.push(relation_to),
-                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                        walk(fields, out)
+                    FieldKind::Group { fields }
+                    | FieldKind::Array { fields, .. }
+                    | FieldKind::Row { fields }
+                    | FieldKind::Collapsible { fields, .. } => walk(fields, out),
+                    FieldKind::Tabs { tabs } => {
+                        for tab in tabs {
+                            walk(&tab.fields, out);
+                        }
                     }
                     _ => {}
                 }
@@ -298,7 +463,9 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        check_fields(&self.fields, true, &self.fields)
+        let data = data_fields(&self.fields);
+        check_layout(&self.fields, &data)?;
+        check_fields(&data, true, &data)
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -357,8 +524,33 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
                 });
             }
         }
-        if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &f.kind {
-            unknown_in_fields(fields, raw.get("fields"))?;
+        match &f.kind {
+            FieldKind::Group { fields }
+            | FieldKind::Array { fields, .. }
+            | FieldKind::Row { fields }
+            | FieldKind::Collapsible { fields, .. } => {
+                unknown_in_fields(fields, raw.get("fields"))?
+            }
+            FieldKind::Tabs { tabs } => {
+                if let (Some(Value::Array(raw_tabs)), Some(Value::Array(known_tabs))) =
+                    (raw.get("tabs"), known.get("tabs"))
+                {
+                    for (i, ((tab, raw_tab), known_tab)) in
+                        tabs.iter().zip(raw_tabs).zip(known_tabs).enumerate()
+                    {
+                        if let (Value::Object(r), Value::Object(k)) = (raw_tab, known_tab)
+                            && let Some(option) = r.keys().find(|key| !k.contains_key(*key))
+                        {
+                            return Err(SchemaError::UnknownOption {
+                                field: f.name.clone(),
+                                option: format!("tabs.{i}.{option}"),
+                            });
+                        }
+                        unknown_in_fields(&tab.fields, raw_tab.get("fields"))?;
+                    }
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
@@ -513,19 +705,7 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             }
             _ => {}
         }
-        if let Some(condition) = &f.admin.condition
-            && find_field(root, &condition.field).is_none()
-        {
-            return Err(invalid(format!(
-                "admin.condition refers to `{}`, which isn't a field",
-                condition.field
-            )));
-        }
-        if let Some(width) = &f.admin.width
-            && !(width.ends_with('%') || width.ends_with("px"))
-        {
-            return Err(invalid("admin.width must look like 50% or 240px".into()));
-        }
+        check_admin(&f.admin, root).map_err(invalid)?;
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
             crate::validate::check_value(f, default, &f.name, &mut errors);
@@ -938,5 +1118,159 @@ mod tests {
                 message: "from must name a top-level text field, not `tags`".into()
             })
         );
+    }
+    fn layout_schema() -> Value {
+        json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "slug", "type": "slug", "from": "title"}
+            ]},
+            {"type": "tabs", "tabs": [
+                {"label": "Content", "fields": [{"name": "body", "type": "textarea"}]},
+                {"name": "meta", "label": "Meta", "fields": [
+                    {"type": "collapsible", "label": "SEO", "fields": [{"name": "title", "type": "text"}]}
+                ]}
+            ]}
+        ]})
+    }
+
+    #[test]
+    fn layout_dissolves_into_the_data_shape() {
+        let input = layout_schema();
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        let data: Vec<(String, &'static str)> = data_fields(&s.fields)
+            .iter()
+            .map(|f| (f.name.clone(), f.kind.name()))
+            .collect();
+        assert_eq!(
+            data,
+            [
+                ("title".into(), "text"),
+                ("slug".into(), "slug"),
+                ("body".into(), "textarea"),
+                ("meta".into(), "group")
+            ]
+        );
+        let meta = &data_fields(&s.fields)[3];
+        let FieldKind::Group { fields } = &meta.kind else {
+            panic!()
+        };
+        assert_eq!(
+            fields[0].name, "title",
+            "named tabs nest their fields; collapsibles inside them dissolve"
+        );
+    }
+
+    #[test]
+    fn layout_rules_are_checked() {
+        let cases = [
+            (
+                json!([{"type": "row", "name": "r", "fields": []}]),
+                "",
+                "row fields don't take a name",
+            ),
+            (
+                json!([{"type": "row", "required": true, "fields": []}]),
+                "",
+                "row fields can't be required, unique, filterable or have a default",
+            ),
+            (
+                json!([{"type": "tabs", "tabs": []}]),
+                "",
+                "tabs needs at least one tab",
+            ),
+            (
+                json!([{"type": "tabs", "tabs": [{"label": "", "fields": []}]}]),
+                "",
+                "every tab needs a label",
+            ),
+        ];
+        for (fields, field, message) in cases {
+            let s = schema(json!({"slug": "posts", "fields": fields}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: field.into(),
+                    message: message.into()
+                }),
+                "{message}"
+            );
+        }
+        let clash = schema(json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert_eq!(
+            clash.check(),
+            Err(SchemaError::DuplicateField("title".into()))
+        );
+        let same_name_in_named_tabs = schema(
+            json!({"slug": "posts", "fields": [{"type": "tabs", "tabs": [
+                {"name": "a", "label": "A", "fields": [{"name": "title", "type": "text"}]},
+                {"name": "b", "label": "B", "fields": [{"name": "title", "type": "text"}]}
+            ]}]}),
+        );
+        assert_eq!(same_name_in_named_tabs.check(), Ok(()));
+    }
+
+    #[test]
+    fn unknown_keys_inside_layout_are_rejected() {
+        let cases = [
+            (
+                json!({"type": "row", "fields": [{"name": "t", "type": "text", "maxLenght": 3}]}),
+                "t",
+                "maxLenght",
+            ),
+            (
+                json!({"type": "tabs", "tabs": [{"label": "A", "fields": [], "icon": "x"}]}),
+                "",
+                "tabs.0.icon",
+            ),
+            (
+                json!({"type": "tabs", "tabs": [{"label": "A", "fields": [{"name": "t", "type": "text", "bogus": 1}]}]}),
+                "t",
+                "bogus",
+            ),
+        ];
+        for (field, name, option) in cases {
+            let input = json!({"slug": "posts", "fields": [field]});
+            assert_eq!(
+                schema(input.clone()).reject_unknown_options(&input),
+                Err(SchemaError::UnknownOption {
+                    field: name.into(),
+                    option: option.into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn admin_options_on_layout_fields_are_checked() {
+        for (field, message) in [
+            (
+                json!({"type": "row", "admin": {"condition": {"field": "nope", "equals": 1}}, "fields": []}),
+                "admin.condition refers to `nope`, which isn't a field",
+            ),
+            (
+                json!({"type": "collapsible", "label": "C", "admin": {"width": "banana"}, "fields": []}),
+                "admin.width must look like 50% or 240px",
+            ),
+        ] {
+            let s = schema(json!({"slug": "posts", "fields": [field]}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: String::new(),
+                    message: message.into()
+                })
+            );
+        }
+        let ok = schema(json!({"slug": "posts", "fields": [
+            {"name": "kind", "type": "text"},
+            {"type": "row", "admin": {"condition": {"field": "kind", "equals": "video"}}, "fields": []}
+        ]}));
+        assert_eq!(ok.check(), Ok(()));
     }
 }

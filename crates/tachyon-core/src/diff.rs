@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, find_field};
+use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, data_fields, find_field};
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
 pub type Renames = BTreeMap<String, String>;
@@ -38,6 +38,8 @@ pub enum Change {
     OptionsChanged {
         path: String,
     },
+    /// Only the admin layout moved (rows, collapsibles, tabs); stored data is untouched.
+    LayoutChanged,
     /// A relationship now points at another collection; its existing links are cleared.
     Retargeted {
         path: String,
@@ -84,15 +86,21 @@ pub fn diff(
             "a collection can't become a global, or the other way round".into(),
         ));
     }
+    // Compare what's stored, not how the admin arranges it.
+    let old_data = data_fields(&old.fields);
+    let new_data = data_fields(&new.fields);
     for from in renames.keys() {
-        if find_field(&old.fields, from).is_none() {
+        if find_field(&old_data, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
         }
     }
     let mut changes = Vec::new();
-    compare(&old.fields, &new.fields, "", "", renames, &mut changes)?;
+    compare(&old_data, &new_data, "", "", renames, &mut changes)?;
+    if changes.is_empty() && old.fields != new.fields {
+        changes.push(Change::LayoutChanged);
+    }
     Ok(SchemaDiff { changes })
 }
 
@@ -256,6 +264,7 @@ pub fn migrate_document(
     renames: &Renames,
     doc: &Map<String, Value>,
 ) -> Map<String, Value> {
+    let new = &data_fields(new);
     let mut doc = doc.clone();
     // Renames are grouped by the object they happen in and applied deepest first, so a
     // renamed group's children are still found under its old name. Within one object every
@@ -616,5 +625,30 @@ mod tests {
         );
         let d = diff(&old, &new, &Renames::new()).unwrap();
         assert!(d.is_destructive(), "{:?}", d.changes);
+    }
+    #[test]
+    fn moving_fields_between_layout_containers_is_a_layout_change() {
+        let old = schema(
+            json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}, {"name": "body", "type": "textarea"}]}),
+        );
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]},
+            {"type": "collapsible", "label": "Body", "fields": [{"name": "body", "type": "textarea"}]}
+        ]}));
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert_eq!(d.changes, vec![Change::LayoutChanged]);
+        assert!(!d.is_destructive());
+
+        let named = schema(json!({"slug": "posts", "fields": [
+            {"type": "tabs", "tabs": [{"name": "content", "label": "Content", "fields": [
+                {"name": "title", "type": "text"}, {"name": "body", "type": "textarea"}
+            ]}]}
+        ]}));
+        let d = diff(&old, &named, &Renames::new()).unwrap();
+        assert!(
+            d.is_destructive(),
+            "a named tab nests data, so title/body move: {:?}",
+            d.changes
+        );
     }
 }

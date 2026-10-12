@@ -168,3 +168,15 @@ async fn reconcile_leaves_indexes_it_did_not_create_alone(pool: PgPool) {
     reconcile_indexes(&pool, c.id).await.unwrap();
     assert_eq!(index_state(&pool, "custom_ix").await, Some(true));
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unique_fields_inside_layout_are_indexed(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "pages", "fields": [
+        {"type": "row", "fields": [{"name": "title", "type": "text"}, {"name": "slug", "type": "slug", "from": "title"}]}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap();
+    reconcile_indexes(&pool, c.id).await.unwrap();
+    let name = index_name(c.id, "slug", IndexKind::Unique, ValueKind::Text);
+    assert_eq!(index_state(&pool, &name).await, Some(true));
+}

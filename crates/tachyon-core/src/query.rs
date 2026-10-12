@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, SelectOption};
+use crate::schema::{Field, FieldKind, SelectOption, data_fields};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -236,7 +236,12 @@ fn err(param: &str, message: impl Into<String>) -> FilterError {
 
 /// Parses the `where` subtree of a query into a filter checked against `fields`.
 pub fn parse_filter(fields: &[Field], input: &Value) -> Result<Filter, FilterError> {
-    Parser { fields, count: 0 }.group(input, "where", 0)
+    let fields = data_fields(fields);
+    Parser {
+        fields: &fields,
+        count: 0,
+    }
+    .group(input, "where", 0)
 }
 
 struct Parser<'a> {
@@ -487,7 +492,8 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         Some(rest) => (rest, true),
         None => (input, false),
     };
-    let (target, _) = resolve(fields, name).map_err(|m| err("sort", m))?;
+    let fields = data_fields(fields);
+    let (target, _) = resolve(&fields, name).map_err(|m| err("sort", m))?;
     if target.kind() == ValueKind::List {
         return Err(err(
             "sort",
@@ -931,6 +937,20 @@ mod tests {
         assert_eq!(
             filter("where[scores][contains]=x").unwrap_err(),
             "where[scores][contains]: expected a number"
+        );
+    }
+    #[test]
+    fn filters_and_sorts_use_data_paths_through_layout() {
+        let f: Vec<Field> = serde_json::from_value(json!([
+            {"type": "row", "fields": [{"name": "price", "type": "number"}]},
+            {"type": "tabs", "tabs": [{"name": "meta", "label": "Meta", "fields": [{"name": "rank", "type": "number"}]}]}
+        ]))
+        .unwrap();
+        let w = parse_query("where[price][gt]=1&where[meta.rank][lt]=5").unwrap();
+        assert!(parse_filter(&f, &w["where"]).is_ok());
+        assert_eq!(
+            parse_sort(&f, "-meta.rank").unwrap().target,
+            field("meta.rank", ValueKind::Number)
         );
     }
 }

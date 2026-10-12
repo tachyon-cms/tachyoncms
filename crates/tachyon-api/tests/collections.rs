@@ -134,3 +134,15 @@ async fn relationships_must_target_existing_collections(pool: PgPool) {
         422,
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn misspelt_keys_are_named_before_other_schema_errors(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let body = r#"{"slug": "posts", "fields": [{"nmae": "title", "type": "text"}]}"#;
+    let res = send(&app, "POST", "/api/admin/collections", Some(body)).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "field ``: unknown option `nmae`"
+    );
+}

@@ -28,9 +28,10 @@ fn schema_error(e: SchemaError) -> ApiError {
 fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
     let schema =
         CollectionSchema::deserialize(value).map_err(|e| ApiError::BadRequest(e.to_string()))?;
+    // Unknown keys first: a typo such as `nmae` should be named, not reported as a bad name.
     schema
-        .check()
-        .and_then(|()| schema.reject_unknown_options(value))
+        .reject_unknown_options(value)
+        .and_then(|()| schema.check())
         .map_err(schema_error)?;
     Ok(schema)
 }

@@ -13,7 +13,8 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::diff::{Change, Renames, SchemaDiff, clear_at, diff, migrate_document};
 use tachyon_core::{
-    CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
+    CollectionKind, CollectionSchema, FieldError, SchemaError, data_fields, relations,
+    validate_document,
 };
 use uuid::Uuid;
 
@@ -192,8 +193,8 @@ async fn run(
         needs_confirmation: false,
         cleared: 0,
     };
-    let unique: Vec<&str> = new
-        .fields
+    let data = data_fields(&new.fields);
+    let unique: Vec<&str> = data
         .iter()
         .filter(|f| f.is_unique())
         .map(|f| f.name.as_str())

@@ -54,3 +54,62 @@ async fn new_field_types_work_through_the_api(pool: PgPool) {
     .await;
     assert_eq!(found.json["docs"][0]["title"], "Soup");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn layout_fields_end_to_end(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let flat = json!({"slug": "pages", "fields": [{"name": "title", "type": "text"}, {"name": "rank", "type": "number"}]});
+    assert_eq!(
+        send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&flat.to_string())
+        )
+        .await
+        .status,
+        201
+    );
+    let doc = send(
+        &app,
+        "POST",
+        "/api/pages",
+        Some(r#"{"title": "Home", "rank": 1}"#),
+    )
+    .await;
+    let url = format!("/api/pages/{}", doc.json["id"].as_str().unwrap());
+
+    let arranged = json!({"schema": {"slug": "pages", "fields": [
+        {"type": "tabs", "tabs": [
+            {"label": "Content", "fields": [{"type": "row", "fields": [{"name": "title", "type": "text"}]}]},
+            {"label": "Settings", "fields": [{"type": "collapsible", "label": "Order", "fields": [{"name": "rank", "type": "number"}]}]}
+        ]}
+    ]}});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/pages",
+        Some(&arranged.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["preview"]["diff"]["changes"],
+        json!([{"type": "layoutChanged"}])
+    );
+    assert_eq!(res.json["collection"]["schemaVersion"], 2);
+
+    let got = send(&app, "GET", &url, None).await.json;
+    assert_eq!(
+        (got["title"].as_str(), got["rank"].as_i64()),
+        (Some("Home"), Some(1)),
+        "data is untouched"
+    );
+    let found = send(&app, "GET", "/api/pages?where[rank][equals]=1", None)
+        .await
+        .json;
+    assert_eq!(found["docs"][0]["title"], "Home");
+    let bad = send(&app, "PATCH", &url, Some(r#"{"rank": "first"}"#)).await;
+    assert_problem(&bad, 422);
+    assert_eq!(bad.json["errors"][0]["path"], "rank");
+}

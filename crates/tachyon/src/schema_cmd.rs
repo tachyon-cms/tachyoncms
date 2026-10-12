@@ -46,10 +46,10 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
             let schema: CollectionSchema = serde_json::from_value(item.clone())
                 .with_context(|| format!("{slug}: can't read this collection"))?;
-            schema.check().with_context(|| slug.to_owned())?;
             schema
                 .reject_unknown_options(item)
                 .with_context(|| slug.to_owned())?;
+            schema.check().with_context(|| slug.to_owned())?;
             Ok(schema)
         })
         .collect()
@@ -66,6 +66,7 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::Renamed { from, to } => format!("rename {from} to {to}"),
             Change::TypeChanged { path, from, to } => format!("change {path} from {from} to {to}"),
             Change::OptionsChanged { path } => format!("update options on {path}"),
+            Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::Retargeted { path, from, to } => {
                 format!("point {path} at {to} instead of {from}, clearing its links")
             }
