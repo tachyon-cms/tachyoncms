@@ -190,3 +190,22 @@ async fn polymorphic_links_store_populate_and_filter(pool: PgPool) {
     .json;
     assert_eq!(by_link["docs"][0]["label"], "Top");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_link_cannot_borrow_another_links_collection(pool: PgPool) {
+    let app = app(pool).await;
+    create(&app, "/api/admin/collections", json!({"slug": "menus", "fields": [
+        {"name": "target", "type": "relationship", "relationTo": ["posts", "authors"]},
+        {"name": "extras", "type": "relationship", "relationTo": ["posts", "authors"], "hasMany": true}
+    ]}))
+    .await;
+    let ann = create(&app, "/api/authors", json!({"name": "Ann"})).await;
+    // The first link is right; the second claims Ann is a post.
+    let body = json!({
+        "target": {"relationTo": "authors", "value": ann["id"]},
+        "extras": [{"relationTo": "posts", "value": ann["id"]}]
+    });
+    let res = send(&app, "POST", "/api/menus", Some(&body.to_string())).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "extras.0");
+}

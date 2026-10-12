@@ -42,7 +42,15 @@ pub enum Change {
     },
     /// Only the admin layout moved (rows, collapsibles, tabs); stored data is untouched.
     LayoutChanged,
-    /// A relationship now points at another collection; its existing links are cleared.
+    /// A relationship's targets widened without losing any (one collection to several that
+    /// include it); existing links are kept and reshaped.
+    Relinked {
+        path: String,
+        from: String,
+        to: String,
+    },
+    /// A relationship's targets changed so that some links can't be kept; those are cleared,
+    /// the rest are reshaped.
     Retargeted {
         path: String,
         from: String,
@@ -53,6 +61,18 @@ pub enum Change {
 #[derive(Debug, Clone, Default, PartialEq, Serialize)]
 pub struct SchemaDiff {
     pub changes: Vec<Change>,
+    /// How each relationship whose targets changed must be converted. Internal to applying
+    /// the change, so not serialised.
+    #[serde(skip)]
+    pub links: Vec<LinkChange>,
+}
+
+/// A relationship (at a path in the new schema) whose allowed targets changed.
+#[derive(Debug, Clone, PartialEq)]
+pub struct LinkChange {
+    pub path: String,
+    pub from: RelationTo,
+    pub to: RelationTo,
 }
 
 impl SchemaDiff {
@@ -99,11 +119,20 @@ pub fn diff(
         }
     }
     let mut changes = Vec::new();
-    compare(&old_data, &new_data, "", "", renames, &mut changes)?;
+    let mut links = Vec::new();
+    compare(
+        &old_data,
+        &new_data,
+        "",
+        "",
+        renames,
+        &mut changes,
+        &mut links,
+    )?;
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
     }
-    Ok(SchemaDiff { changes })
+    Ok(SchemaDiff { changes, links })
 }
 
 fn compare(
@@ -113,6 +142,7 @@ fn compare(
     new_prefix: &str,
     renames: &Renames,
     out: &mut Vec<Change>,
+    links: &mut Vec<LinkChange>,
 ) -> Result<(), SchemaError> {
     let new_name = |f: &Field| {
         renames
@@ -156,22 +186,47 @@ fn compare(
                         path: new_path.clone(),
                     });
                 }
-                compare(a, b, &old_path, &new_path, renames, out)?;
+                compare(a, b, &old_path, &new_path, renames, out, links)?;
             }
             (
                 FieldKind::Relationship {
-                    relation_to: RelationTo::One(from),
+                    relation_to: from,
                     has_many: h1,
                 },
                 FieldKind::Relationship {
-                    relation_to: RelationTo::One(to),
+                    relation_to: to,
                     has_many: h2,
                 },
-            ) if h1 == h2 && from != to => out.push(Change::Retargeted {
-                path: new_path,
-                from: from.clone(),
-                to: to.clone(),
-            }),
+            ) if h1 == h2 && from != to => {
+                let keeps_every_target = from.targets().iter().all(|t| to.allows(t));
+                match (from, to) {
+                    // Several → more: the stored shape and every link already fit.
+                    (RelationTo::Many(_), RelationTo::Many(_)) if keeps_every_target => {
+                        out.push(Change::OptionsChanged { path: new_path });
+                    }
+                    _ => {
+                        let (from_text, to_text) = (from.to_string(), to.to_string());
+                        out.push(if keeps_every_target {
+                            Change::Relinked {
+                                path: new_path.clone(),
+                                from: from_text,
+                                to: to_text,
+                            }
+                        } else {
+                            Change::Retargeted {
+                                path: new_path.clone(),
+                                from: from_text,
+                                to: to_text,
+                            }
+                        });
+                        links.push(LinkChange {
+                            path: new_path,
+                            from: from.clone(),
+                            to: to.clone(),
+                        });
+                    }
+                }
+            }
             _ if !same_type(&o.kind, &n.kind) => out.push(Change::TypeChanged {
                 path: new_path,
                 from: o.kind.name(),
@@ -338,24 +393,76 @@ fn rename_batch(obj: &mut Map<String, Value>, segments: &[&str], batch: &[(&str,
     }
 }
 
-/// Removes the value at a dotted path, in every array row along the way.
-/// Returns whether anything was removed.
-pub fn clear_at(doc: &mut Map<String, Value>, path: &str) -> bool {
-    fn walk(obj: &mut Map<String, Value>, segments: &[&str]) -> bool {
-        match segments {
-            [name] => obj.remove(*name).is_some(),
-            [head, rest @ ..] => match obj.get_mut(*head) {
-                Some(Value::Object(inner)) => walk(inner, rest),
-                Some(Value::Array(rows)) => rows.iter_mut().fold(false, |any, row| match row {
-                    Value::Object(inner) => walk(inner, rest) | any,
-                    _ => any,
-                }),
-                _ => false,
-            },
-            [] => false,
-        }
+/// Converts stored links for relationships whose targets changed: wraps plain IDs as
+/// `{relationTo, value}` when a field gains targets, unwraps links to the one remaining
+/// target, and drops links whose collection is no longer allowed. Paths are in the new
+/// schema, so call this after `migrate_document`. Returns whether any link was dropped.
+pub fn relink(doc: &mut Map<String, Value>, links: &[LinkChange]) -> bool {
+    let mut dropped = false;
+    for change in links {
+        let segments: Vec<&str> = change.path.split('.').collect();
+        dropped |= relink_at(doc, &segments, change);
     }
-    walk(doc, &path.split('.').collect::<Vec<_>>())
+    dropped
+}
+
+fn relink_at(obj: &mut Map<String, Value>, segments: &[&str], change: &LinkChange) -> bool {
+    match segments {
+        [name] => match obj.get_mut(*name) {
+            Some(Value::Array(items)) => {
+                let before = items.len();
+                let kept: Vec<Value> = items
+                    .iter()
+                    .filter_map(|v| convert_link(v, change))
+                    .collect();
+                let dropped = kept.len() < before;
+                *items = kept;
+                dropped
+            }
+            Some(value) => match convert_link(value, change) {
+                Some(converted) => {
+                    *value = converted;
+                    false
+                }
+                None => {
+                    obj.remove(*name);
+                    true
+                }
+            },
+            None => false,
+        },
+        [head, rest @ ..] => match obj.get_mut(*head) {
+            Some(Value::Object(inner)) => relink_at(inner, rest, change),
+            Some(Value::Array(rows)) => rows.iter_mut().fold(false, |any, row| match row {
+                Value::Object(inner) => relink_at(inner, rest, change) | any,
+                _ => any,
+            }),
+            _ => false,
+        },
+        [] => false,
+    }
+}
+
+/// One link in its new shape, or `None` when its collection is no longer allowed. Values
+/// in an unexpected shape are left for validation to report.
+fn convert_link(v: &Value, change: &LinkChange) -> Option<Value> {
+    match (&change.from, &change.to, v) {
+        (RelationTo::One(old), RelationTo::Many(allowed), Value::String(id)) => allowed
+            .contains(old)
+            .then(|| serde_json::json!({ "relationTo": old, "value": id })),
+        (RelationTo::Many(_), RelationTo::One(only), Value::Object(o)) => {
+            (o.get("relationTo").and_then(Value::as_str) == Some(only.as_str()))
+                .then(|| o.get("value").cloned())
+                .flatten()
+        }
+        (RelationTo::Many(_), RelationTo::Many(allowed), Value::Object(o)) => o
+            .get("relationTo")
+            .and_then(Value::as_str)
+            .is_some_and(|t| allowed.iter().any(|a| a == t))
+            .then(|| v.clone()),
+        (RelationTo::One(a), RelationTo::One(b), _) => (a == b).then(|| v.clone()),
+        _ => Some(v.clone()),
+    }
 }
 
 fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
@@ -590,17 +697,6 @@ mod tests {
     }
 
     #[test]
-    fn clear_at_removes_values_everywhere_on_a_path() {
-        let mut doc = json!({"who": "x", "rows": [{"who": "y"}, {}]})
-            .as_object()
-            .unwrap()
-            .clone();
-        assert!(clear_at(&mut doc, "who"));
-        assert!(clear_at(&mut doc, "rows.who"));
-        assert!(!clear_at(&mut doc, "missing"));
-        assert_eq!(Value::Object(doc), json!({"rows": [{}, {}]}));
-    }
-    #[test]
     fn same_shaped_types_change_options_not_type() {
         let old = schema(json!({"slug": "posts", "fields": [
             {"name": "body", "type": "text"},
@@ -659,23 +755,68 @@ mod tests {
         );
     }
     #[test]
-    fn relationship_target_shape_changes() {
-        let one = schema(
-            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": "posts"}]}),
-        );
-        let many = schema(
-            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": ["posts", "pages"]}]}),
-        );
-        let more = schema(
-            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": ["posts", "pages", "events"]}]}),
-        );
-        assert!(
-            diff(&one, &many, &Renames::new()).unwrap().is_destructive(),
-            "one → several changes the stored shape"
-        );
+    fn relationship_target_changes_carry_links_across() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let rel = |to: Value, many: bool| {
+            schema(
+                json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": to, "hasMany": many}]}),
+            )
+        };
+        let one = rel(json!("posts"), false);
+        let both = rel(json!(["posts", "pages"]), false);
+        let pages_only = rel(json!(["pages"]), false);
+
+        // One → several including the old target: every link survives, wrapped.
+        let d = diff(&one, &both, &Renames::new()).unwrap();
         assert_eq!(
-            diff(&many, &more, &Renames::new()).unwrap().changes,
-            vec![Change::OptionsChanged { path: "l".into() }]
+            d.changes,
+            vec![Change::Relinked {
+                path: "l".into(),
+                from: "posts".into(),
+                to: "posts, pages".into()
+            }]
         );
+        assert!(!d.is_destructive());
+        let mut doc = json!({"l": id}).as_object().unwrap().clone();
+        assert!(!relink(&mut doc, &d.links), "nothing is lost");
+        assert_eq!(doc["l"], json!({"relationTo": "posts", "value": id}));
+
+        // Several → one: links to the remaining target unwrap, others are cleared.
+        let d = diff(&both, &one, &Renames::new()).unwrap();
+        assert!(d.is_destructive());
+        let mut kept = json!({"l": {"relationTo": "posts", "value": id}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(!relink(&mut kept, &d.links));
+        assert_eq!(kept["l"], id);
+        let mut dropped = json!({"l": {"relationTo": "pages", "value": id}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(relink(&mut dropped, &d.links));
+        assert!(dropped.get("l").is_none());
+
+        // Several → fewer: only links to the removed collection go.
+        let d = diff(&both, &pages_only, &Renames::new()).unwrap();
+        assert!(d.is_destructive());
+        let mut doc = json!({"l": {"relationTo": "posts", "value": id}})
+            .as_object()
+            .unwrap()
+            .clone();
+        assert!(relink(&mut doc, &d.links));
+
+        // Several → more is an option change with nothing to convert.
+        let d = diff(&pages_only, &both, &Renames::new()).unwrap();
+        assert_eq!(d.changes, vec![Change::OptionsChanged { path: "l".into() }]);
+        assert!(d.links.is_empty());
+
+        // Lists convert element by element.
+        let many_one = rel(json!("posts"), true);
+        let many_both = rel(json!(["posts", "pages"]), true);
+        let d = diff(&many_both, &many_one, &Renames::new()).unwrap();
+        let mut doc = json!({"l": [{"relationTo": "posts", "value": id}, {"relationTo": "pages", "value": id}]}).as_object().unwrap().clone();
+        assert!(relink(&mut doc, &d.links));
+        assert_eq!(doc["l"], json!([id]));
     }
 }

@@ -11,7 +11,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
-use tachyon_core::diff::{Change, Renames, SchemaDiff, clear_at, diff, migrate_document};
+use tachyon_core::diff::{Renames, SchemaDiff, diff, migrate_document, relink};
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, data_fields, relations,
     validate_document,
@@ -38,7 +38,7 @@ pub struct Preview {
     /// Unique fields whose values aren't unique across live documents.
     pub duplicates: Vec<String>,
     pub needs_confirmation: bool,
-    /// Live documents whose links are cleared because their field now points elsewhere.
+    /// Live documents that lose a link because its collection is no longer allowed.
     pub cleared: i64,
 }
 
@@ -55,9 +55,9 @@ pub enum ChangeError {
     #[error("{0}")]
     Invalid(SchemaError),
     #[error("unique fields have duplicate values")]
-    Duplicates(Preview),
+    Duplicates(Box<Preview>),
     #[error("the change needs confirmation")]
-    NeedsConfirmation(Preview),
+    NeedsConfirmation(Box<Preview>),
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -199,16 +199,9 @@ async fn run(
         .filter(|f| f.is_unique())
         .map(|f| f.name.as_str())
         .collect();
-    // Links of a relationship that now points at another collection can't be kept.
-    let retargeted: Vec<String> = p
-        .diff
-        .changes
-        .iter()
-        .filter_map(|c| match c {
-            Change::Retargeted { path, .. } => Some(path.clone()),
-            _ => None,
-        })
-        .collect();
+    // Relationships whose targets changed: links are reshaped, and dropped where their
+    // collection is no longer allowed.
+    let links = p.diff.links.clone();
     let mut seen: HashMap<&str, HashSet<String>> = HashMap::new();
     let mut duplicates = BTreeSet::new();
     let mut after = None;
@@ -219,7 +212,7 @@ async fn run(
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
             let mut migrated = migrate_document(&new.fields, renames, &row.data);
-            if clear_links(&mut migrated, &retargeted) {
+            if relink(&mut migrated, &links) {
                 p.cleared += 1;
             }
             if let Err(errors) =
@@ -249,10 +242,10 @@ async fn run(
         return Ok((current, p));
     }
     if !p.duplicates.is_empty() {
-        return Err(ChangeError::Duplicates(p));
+        return Err(ChangeError::Duplicates(Box::new(p)));
     }
     if p.needs_confirmation && !confirm {
-        return Err(ChangeError::NeedsConfirmation(p));
+        return Err(ChangeError::NeedsConfirmation(Box::new(p)));
     }
 
     // Pass 2: rewrite every document, deleted ones included so Trash restores cleanly.
@@ -263,7 +256,7 @@ async fn run(
         after = Some(last.id);
         for row in rows {
             let mut migrated = migrate_document(&new.fields, renames, &row.data);
-            clear_links(&mut migrated, &retargeted);
+            relink(&mut migrated, &links);
             // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
             let stored =
                 validate_document(&new.fields, &Value::Object(Map::new()), Some(&migrated))
@@ -318,7 +311,7 @@ async fn run(
         {
             Err(DbError::Sqlx(sqlx::Error::Database(e))) if e.is_unique_violation() => {
                 p.duplicates = vec![w.field];
-                return Err(ChangeError::Duplicates(p));
+                return Err(ChangeError::Duplicates(Box::new(p)));
             }
             result => result?,
         }
@@ -340,12 +333,6 @@ async fn run(
         .await?;
     tx.commit().await?;
     Ok((updated, p))
-}
-
-fn clear_links(doc: &mut Map<String, Value>, paths: &[String]) -> bool {
-    paths
-        .iter()
-        .fold(false, |any, path| clear_at(doc, path) | any)
 }
 
 /// How a unique index sees a value: numbers by numeric value, so 1 and 1.0 collide.

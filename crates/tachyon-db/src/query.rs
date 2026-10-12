@@ -62,11 +62,21 @@ pub fn field_expr(path: &[String], kind: ValueKind) -> String {
 }
 
 /// One coordinate of a stored `[lng, lat]`, or NULL when the stored value isn't a number.
+/// Only a two-number array whose numbers are in range counts. The CASEs are nested
+/// because Postgres doesn't promise to evaluate AND left to right, and
+/// `jsonb_array_length` fails on anything that isn't an array.
 fn coordinate(path: &[String], index: usize) -> String {
     path.iter().for_each(|s| assert_identifier(s));
     let path = path.join(",");
+    let limit = if index == 0 { 180 } else { 90 };
     format!(
-        "(CASE WHEN jsonb_typeof(published #> '{{{path},{index}}}') = 'number' THEN (published #>> '{{{path},{index}}}')::float8 END)"
+        "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'array' THEN \
+           CASE WHEN jsonb_array_length(published #> '{{{path}}}') = 2 \
+                 AND jsonb_typeof(published #> '{{{path},{index}}}') = 'number' THEN \
+             CASE WHEN (published #>> '{{{path},{index}}}')::numeric BETWEEN -{limit} AND {limit} \
+               THEN (published #>> '{{{path},{index}}}')::float8 END \
+           END \
+         END)"
     )
 }
 

@@ -254,8 +254,8 @@ pub(crate) async fn sync_relations(
     }
     let ids: Vec<Uuid> = relations.iter().map(|r| r.id).collect();
     let collections: Vec<Uuid> = relations.iter().map(|r| r.collection_id).collect();
-    let found = sqlx::query_scalar!(
-        r#"SELECT d.id FROM documents d
+    let found: Vec<(Uuid, Uuid)> = sqlx::query!(
+        r#"SELECT d.id, d.collection_id FROM documents d
            JOIN unnest($1::uuid[], $2::uuid[]) AS t(id, collection_id)
              ON d.id = t.id AND d.collection_id = t.collection_id
            WHERE d.tenant_id = $3 AND d.deleted_at IS NULL
@@ -265,11 +265,16 @@ pub(crate) async fn sync_relations(
         DEFAULT_TENANT,
     )
     .fetch_all(&mut *conn)
-    .await?;
+    .await?
+    .into_iter()
+    .map(|row| (row.id, row.collection_id))
+    .collect();
+    // Check the pair, not just the ID: a correct link elsewhere in the document must not
+    // vouch for a link that names the wrong collection for the same ID.
     // NOTE: linear scan per link; fine for the few dozen links a document holds.
     let missing: Vec<FieldError> = relations
         .iter()
-        .filter(|r| !found.contains(&r.id))
+        .filter(|r| !found.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
             path: r.path.clone(),
             message: "doesn't match any document in the related collection".into(),

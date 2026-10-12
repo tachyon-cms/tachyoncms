@@ -528,8 +528,9 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .map(Scalar::Text)
             .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
         (_, Some(FieldKind::Relationship { relation_to, .. }))
-            if matches!(target, Target::Field { path, .. }
-                if path.last().map(String::as_str) == Some("relationTo")) =>
+            if relation_to.is_polymorphic()
+                && matches!(target, Target::Field { path, .. }
+                    if path.len() > 1 && path.last().map(String::as_str) == Some("relationTo")) =>
         {
             v.as_str()
                 .filter(|s| relation_to.allows(s))
@@ -1107,5 +1108,16 @@ mod tests {
             "near is only for points"
         );
         assert!(parse_sort(&fields(), "spot").is_err());
+    }
+
+    #[test]
+    fn a_field_named_relation_to_still_filters_by_id() {
+        let f: Vec<Field> = serde_json::from_value(json!([
+            {"name": "relationTo", "type": "relationship", "relationTo": "authors"}
+        ]))
+        .unwrap();
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let w = parse_query(&format!("where[relationTo][equals]={id}")).unwrap();
+        assert!(parse_filter(&f, &w["where"]).is_ok());
     }
 }

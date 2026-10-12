@@ -342,3 +342,49 @@ async fn near_finds_places_within_a_distance(pool: PgPool) {
         ["Greenwich", "Paris", "Trafalgar"]
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_ignores_values_that_are_not_points(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Real", json!([-0.1276, 51.5072])),
+        ("Three", json!([-0.1276, 51.5072, 7])),
+        ("Object", json!({"0": -0.1276, "1": 51.5072})),
+        ("OffMap", json!([0, 1000])),
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    // Too big for a float, written outside the API; must not make the query fail.
+    sqlx::query(
+        "INSERT INTO documents (id, tenant_id, collection_id, status, published)
+         VALUES ($1, $2, $3, 'published', '{\"title\": \"Huge\", \"at\": [0, 1e400]}'::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tachyon_db::DEFAULT_TENANT)
+    .bind(c)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    for qs in [
+        "where[at][near]=-0.1276,51.5072",
+        "where[at][near]=-0.1276,51.5072,1000",
+    ] {
+        let f = parse_filter(&s.fields, &parse_query(qs).unwrap()["where"]).unwrap();
+        assert_eq!(
+            titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+            ["Real"],
+            "{qs}"
+        );
+    }
+}
