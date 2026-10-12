@@ -18,7 +18,7 @@ use crate::documents::json_body;
 use crate::{ApiError, AppState};
 
 fn to_json(c: &Collection) -> Value {
-    json!({ "id": c.id, "schemaVersion": c.schema_version, "schema": &c.schema.0 })
+    json!({ "id": c.id, "schemaVersion": c.schema_version, "schema": c.schema.to_compact_json() })
 }
 
 fn schema_error(e: SchemaError) -> ApiError {

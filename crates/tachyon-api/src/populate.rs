@@ -51,7 +51,7 @@ pub(crate) fn prepare(
 ) -> Result<Prepared, ApiError> {
     let mut errors = Vec::new();
     let mut found = Vec::new();
-    for r in relations(&c.schema.fields, &data) {
+    for r in relations(c.schema.data(), &data) {
         match targets.get(&r.relation_to) {
             Some(&collection_id) => found.push(Relation {
                 path: r.path,
@@ -88,7 +88,7 @@ pub(crate) fn populate(
         }
         let mut ids: Vec<_> = docs
             .iter()
-            .filter_map(|(v, c)| v.as_object().map(|o| relations(&c.schema.fields, o)))
+            .filter_map(|(v, c)| v.as_object().map(|o| relations(c.schema.data(), o)))
             .flatten()
             .map(|r| r.id)
             .collect();
@@ -114,7 +114,7 @@ pub(crate) fn populate(
             .into_iter()
             .map(|(mut v, c)| {
                 if let Some(obj) = v.as_object_mut() {
-                    map_relations(&c.schema.fields, obj, &mut |id| by_id.get(id).cloned());
+                    map_relations(c.schema.data(), obj, &mut |id| by_id.get(id).cloned());
                 }
                 v
             })

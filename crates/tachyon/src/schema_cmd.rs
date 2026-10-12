@@ -14,7 +14,7 @@ use tachyon_db::{collections, indexes};
 /// Every collection's schema as a pretty JSON bundle.
 pub async fn export(pool: &PgPool) -> anyhow::Result<String> {
     let all = collections::list(pool).await?;
-    let schemas: Vec<&CollectionSchema> = all.iter().map(|c| &c.schema.0).collect();
+    let schemas: Vec<Value> = all.iter().map(|c| c.schema.to_compact_json()).collect();
     Ok(serde_json::to_string_pretty(&json!({ "collections": schemas }))? + "\n")
 }
 
@@ -250,6 +250,7 @@ mod tests {
             .await
             .unwrap();
         let file = export(&pool).await.unwrap();
+        assert!(!file.contains("false") && !file.contains("null"), "{file}");
         let out = run(&pool, &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap();

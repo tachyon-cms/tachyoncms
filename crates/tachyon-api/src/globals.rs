@@ -51,7 +51,7 @@ pub async fn get(
     let c = global(&state, path)?;
     match documents::get(&state.pool, c.id, c.id).await {
         Ok(doc) => respond(&state, c, &doc, depth).await,
-        Err(DbError::NotFound) => Ok(Json(Value::Object(defaults(&c.schema.fields)))),
+        Err(DbError::NotFound) => Ok(Json(Value::Object(defaults(c.schema.data())))),
         Err(e) => Err(e.into()),
     }
 }
@@ -67,7 +67,7 @@ pub async fn update(
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
         let updated = documents::update(&state.pool, c.id, c.schema_version, c.id, |current| {
-            let data = validate_document(&c.schema.fields, &patch, Some(current))
+            let data = validate_document(c.schema.data(), &patch, Some(current))
                 .map_err(ApiError::Validation)?;
             prepare(&targets, &c, data)
         })
@@ -78,7 +78,7 @@ pub async fn update(
             Err(e) => return Err(unique_error(&c, e)),
         }
         let data =
-            validate_document(&c.schema.fields, &patch, None).map_err(ApiError::Validation)?;
+            validate_document(c.schema.data(), &patch, None).map_err(ApiError::Validation)?;
         match documents::insert(
             &state.pool,
             c.id,

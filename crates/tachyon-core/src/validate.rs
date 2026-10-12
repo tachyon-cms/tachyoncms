@@ -28,7 +28,7 @@ pub fn validate_document(
     input: &Value,
     existing: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, Vec<FieldError>> {
-    let fields = &data_fields(fields);
+    let fields: &[Field] = &data_fields(fields);
     let Value::Object(input) = input else {
         return Err(vec![error(String::new(), "expected a JSON object")]);
     };
@@ -570,7 +570,7 @@ pub struct RelationRef {
 
 /// Every relationship ID in a validated document, in schema order.
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
-    let fields = &data_fields(fields);
+    let fields: &[Field] = &data_fields(fields);
     fn walk(fields: &[Field], obj: &Map<String, Value>, prefix: &str, out: &mut Vec<RelationRef>) {
         for f in fields {
             let Some(value) = obj.get(&f.name) else {

@@ -352,7 +352,7 @@ pub fn migrate_document(
     renames: &Renames,
     doc: &Map<String, Value>,
 ) -> Map<String, Value> {
-    let new = &data_fields(new);
+    let new: &[Field] = &data_fields(new);
     let mut doc = doc.clone();
     // Renames are grouped by the object they happen in and applied deepest first, so a
     // renamed group's children are still found under its old name. Within one object every

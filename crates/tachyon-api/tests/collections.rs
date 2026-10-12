@@ -167,3 +167,24 @@ async fn bad_options_name_the_field(pool: PgPool) {
         "field `kind`: each option must be text, or {\"label\": \"…\", \"value\": \"…\"}"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn schemas_come_back_without_default_options(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "posts", "fields": [
+        {"type": "row", "fields": [{"name": "title", "type": "text", "required": true}]}
+    ]});
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    assert_eq!(
+        res.json["schema"],
+        json!({"slug": "posts", "kind": "collection", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text", "required": true}]}
+        ]})
+    );
+}

@@ -159,8 +159,21 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
         FieldKind::Point => ValueKind::Point,
-        FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
-        _ => ValueKind::Text,
+        FieldKind::Text { .. }
+        | FieldKind::Textarea { .. }
+        | FieldKind::Email
+        | FieldKind::Url
+        | FieldKind::Select { .. }
+        | FieldKind::Radio { .. }
+        | FieldKind::Code { .. }
+        | FieldKind::Slug { .. }
+        | FieldKind::Relationship { .. } => ValueKind::Text,
+        FieldKind::Json
+        | FieldKind::Group { .. }
+        | FieldKind::Array { .. }
+        | FieldKind::Row { .. }
+        | FieldKind::Collapsible { .. }
+        | FieldKind::Tabs { .. } => return None,
     })
 }
 
@@ -1185,5 +1198,19 @@ mod tests {
         };
         assert_eq!(Cursor::decode(&cursor.encode()), Some(cursor));
         assert!(filter("where[price][equals]=1e400").is_err());
+    }
+
+    #[test]
+    fn layout_kinds_have_no_value_kind() {
+        let schema: crate::CollectionSchema =
+            serde_json::from_value(json!({"slug": "p", "fields": [
+                {"type": "row", "fields": []},
+                {"type": "collapsible", "label": "C", "fields": []},
+                {"type": "tabs", "tabs": [{"label": "A", "fields": []}]}
+            ]}))
+            .unwrap();
+        for f in &schema.fields {
+            assert_eq!(value_kind(&f.kind), None, "{}", f.kind.name());
+        }
     }
 }

@@ -1,4 +1,6 @@
+use std::borrow::Cow;
 use std::collections::HashSet;
+use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -11,12 +13,22 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "admin", "auth", "globals", "media", "search", "graphql", "plugins",
 ];
 
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
     pub slug: String,
     #[serde(default)]
     pub kind: CollectionKind,
     pub fields: Vec<Field>,
+    /// `data()`'s answer, worked out on first use. Schemas are built once and read many
+    /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
+    #[serde(skip)]
+    data: OnceLock<Vec<Field>>,
+}
+
+impl PartialEq for CollectionSchema {
+    fn eq(&self, other: &Self) -> bool {
+        (&self.slug, self.kind, &self.fields) == (&other.slug, other.kind, &other.fields)
+    }
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -289,14 +301,28 @@ pub struct Tab {
 }
 
 /// The fields as stored data sees them: rows, collapsibles and unnamed tabs dissolve into
-/// their parent, and named tabs become groups. Applies at every level.
-// NOTE: allocates on every call; fine for schemas of a few dozen fields.
-pub fn data_fields(fields: &[Field]) -> Vec<Field> {
+/// their parent, and named tabs become groups. Applies at every level. Borrows when there's
+/// no layout to dissolve, so calling it on fields that are already data costs nothing.
+pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
+    fn has_layout(fields: &[Field]) -> bool {
+        fields.iter().any(|f| match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => has_layout(fields),
+            kind => kind.is_layout(),
+        })
+    }
+    if has_layout(fields) {
+        Cow::Owned(flatten(fields))
+    } else {
+        Cow::Borrowed(fields)
+    }
+}
+
+fn flatten(fields: &[Field]) -> Vec<Field> {
     let mut out = Vec::new();
     for f in fields {
         match &f.kind {
             FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
-                out.extend(data_fields(fields))
+                out.extend(flatten(fields))
             }
             FieldKind::Tabs { tabs } => {
                 for tab in tabs {
@@ -310,16 +336,16 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             kind: FieldKind::Group {
-                                fields: data_fields(&tab.fields),
+                                fields: flatten(&tab.fields),
                             },
                         }),
-                        None => out.extend(data_fields(&tab.fields)),
+                        None => out.extend(flatten(&tab.fields)),
                     }
                 }
             }
             FieldKind::Group { fields } => out.push(Field {
                 kind: FieldKind::Group {
-                    fields: data_fields(fields),
+                    fields: flatten(fields),
                 },
                 ..f.clone()
             }),
@@ -329,7 +355,7 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
                 max_rows,
             } => out.push(Field {
                 kind: FieldKind::Array {
-                    fields: data_fields(fields),
+                    fields: flatten(fields),
                     min_rows: *min_rows,
                     max_rows: *max_rows,
                 },
@@ -339,6 +365,42 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
         }
     }
     out
+}
+
+/// Drops keys that hold their default from a serialized field list: `null`, `false`, an
+/// empty `name`, admin options left as they were. `default` values and options are data,
+/// so they're kept whole.
+fn compact_fields(fields: &mut Value) {
+    let Value::Array(fields) = fields else { return };
+    for field in fields {
+        let Value::Object(f) = field else { continue };
+        f.retain(|key, v| match key.as_str() {
+            "default" | "options" => !v.is_null(),
+            "name" => v.as_str().is_some_and(|n| !n.is_empty()),
+            _ => !v.is_null() && *v != Value::Bool(false),
+        });
+        if let Some(Value::Object(admin)) = f.get_mut("admin") {
+            admin.retain(|key, v| {
+                !v.is_null() && *v != Value::Bool(false) && !(key == "position" && v == "main")
+            });
+            if admin.is_empty() {
+                f.remove("admin");
+            }
+        }
+        if let Some(inner) = f.get_mut("fields") {
+            compact_fields(inner);
+        }
+        if let Some(Value::Array(tabs)) = f.get_mut("tabs") {
+            for tab in tabs {
+                if let Value::Object(t) = tab {
+                    t.retain(|_, v| !v.is_null());
+                    if let Some(inner) = t.get_mut("fields") {
+                        compact_fields(inner);
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// Admin options any field can carry, data or layout. `root` is the data shape; `inside`
@@ -618,6 +680,22 @@ impl Field {
 }
 
 impl CollectionSchema {
+    /// The data shape (see `data_fields`), worked out once per schema.
+    pub fn data(&self) -> &[Field] {
+        self.data
+            .get_or_init(|| data_fields(&self.fields).into_owned())
+    }
+
+    /// The schema as JSON without options left at their defaults: what people read and
+    /// keep in files. Parses back to an equal schema.
+    pub fn to_compact_json(&self) -> Value {
+        let mut v = serde_json::to_value(self).expect("schemas always serialize");
+        if let Some(fields) = v.get_mut("fields") {
+            compact_fields(fields);
+        }
+        v
+    }
+
     /// Every collection slug a relationship field points at, nested ones included.
     pub fn relation_targets(&self) -> Vec<&str> {
         fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
@@ -654,9 +732,9 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        let data = data_fields(&self.fields);
-        check_layout(&self.fields, &data, "fields", "")?;
-        check_fields(&data, true, &data, "")
+        let data = self.data();
+        check_layout(&self.fields, data, "fields", "")?;
+        check_fields(data, true, data, "")
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -1682,5 +1760,65 @@ mod tests {
             ])),
             "ok"
         );
+    }
+
+    #[test]
+    fn data_fields_borrow_when_nothing_dissolves() {
+        let plain = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert!(matches!(
+            data_fields(&plain.fields),
+            std::borrow::Cow::Borrowed(_)
+        ));
+        let nested_row = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [
+                {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+            ]}
+        ]}));
+        let flat = data_fields(&nested_row.fields);
+        assert!(matches!(flat, std::borrow::Cow::Owned(_)));
+        assert!(matches!(data_fields(&flat), std::borrow::Cow::Borrowed(_)));
+    }
+
+    #[test]
+    fn a_schemas_data_shape_is_worked_out_once() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert!(std::ptr::eq(s.data(), s.data()));
+        assert_eq!(s.data()[0].name, "title");
+        assert_eq!(s, s.clone(), "the cache doesn't affect equality");
+        let fresh = schema(json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [{"name": "title", "type": "text"}]}
+        ]}));
+        assert_eq!(s, fresh);
+    }
+
+    #[test]
+    fn compact_json_drops_defaults_and_round_trips() {
+        let input = json!({"slug": "posts", "fields": [
+            {"type": "row", "fields": [
+                {"name": "title", "type": "text", "required": true, "maxLength": 80},
+                {"name": "kind", "type": "select", "options": ["a", {"label": "B", "value": "b"}]}
+            ]},
+            {"name": "body", "type": "textarea", "admin": {"description": "Main text"}},
+            {"name": "meta", "type": "json", "default": {"x": null, "y": false}}
+        ]});
+        let s = schema(input);
+        let compact = s.to_compact_json();
+        assert_eq!(
+            compact,
+            json!({"slug": "posts", "kind": "collection", "fields": [
+                {"type": "row", "fields": [
+                    {"name": "title", "type": "text", "required": true, "maxLength": 80},
+                    {"name": "kind", "type": "select", "options": ["a", {"label": "B", "value": "b"}]}
+                ]},
+                {"name": "body", "type": "textarea", "admin": {"description": "Main text"}},
+                {"name": "meta", "type": "json", "default": {"x": null, "y": false}}
+            ]})
+        );
+        assert_eq!(schema(compact.clone()), s);
+        assert_eq!(s.reject_unknown_options(&compact), Ok(()));
     }
 }
