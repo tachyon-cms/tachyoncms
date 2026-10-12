@@ -55,7 +55,7 @@ pub fn field_expr(path: &[String], kind: ValueKind) -> String {
         ValueKind::Boolean => format!(
             "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'boolean' THEN (published #>> '{{{path}}}')::boolean END)"
         ),
-        ValueKind::List => format!("(published #> '{{{path}}}')"),
+        ValueKind::List | ValueKind::LinkList => format!("(published #> '{{{path}}}')"),
     }
 }
 
@@ -193,7 +193,12 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
         }
         (Op::Contains, Operand::One(Scalar::Text(s))) => {
             qb.push(&e).push(" @> ");
-            qb.push_bind(Json(json!([s])));
+            let element = if c.target.kind() == ValueKind::LinkList {
+                json!({ "value": s })
+            } else {
+                json!(s)
+            };
+            qb.push_bind(Json(json!([element])));
         }
         (Op::Contains, Operand::One(Scalar::Number(n))) => {
             // jsonb containment compares numbers by value, so 3 matches 3.0.

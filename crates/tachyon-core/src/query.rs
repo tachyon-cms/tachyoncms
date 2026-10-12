@@ -120,11 +120,17 @@ pub enum ValueKind {
     Boolean,
     Date,
     List,
+    /// A list of polymorphic links (`{"relationTo", "value"}` objects).
+    LinkList,
 }
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
 pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
     Some(match kind {
+        FieldKind::Relationship {
+            relation_to,
+            has_many: true,
+        } if relation_to.is_polymorphic() => ValueKind::LinkList,
         FieldKind::Select { multiple: true, .. }
         | FieldKind::Text { has_many: true, .. }
         | FieldKind::Number { has_many: true, .. }
@@ -196,7 +202,7 @@ impl Op {
             ValueKind::Text => matches!(self, Equals | NotEquals | In | NotIn | Like | Exists),
             ValueKind::Number | ValueKind::Date => !matches!(self, Like | Contains),
             ValueKind::Boolean => matches!(self, Equals | NotEquals | Exists),
-            ValueKind::List => matches!(self, Contains | Exists),
+            ValueKind::List | ValueKind::LinkList => matches!(self, Contains | Exists),
         }
     }
 }
@@ -384,6 +390,28 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
                 ));
             }
             FieldKind::Group { fields } if !last => current = fields,
+            // A polymorphic link is an object: filter its `value` (the default) or `relationTo`.
+            FieldKind::Relationship {
+                relation_to,
+                has_many: false,
+            } if relation_to.is_polymorphic() => {
+                let part = match segments.next() {
+                    None | Some("value") => "value",
+                    Some("relationTo") => "relationTo",
+                    Some(_) => return Err(format!("unknown field `{name}`")),
+                };
+                if segments.next().is_some() {
+                    return Err(format!("unknown field `{name}`"));
+                }
+                path.push(part.to_owned());
+                return Ok((
+                    Target::Field {
+                        path,
+                        kind: ValueKind::Text,
+                    },
+                    Some(f),
+                ));
+            }
             _ if !last => return Err(format!("unknown field `{name}`")),
             kind => {
                 let kind = value_kind(kind).ok_or_else(|| format!("`{name}` can't be filtered"))?;
@@ -453,6 +481,15 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .and_then(normalize_date_time)
             .map(Scalar::Text)
             .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
+        (_, Some(FieldKind::Relationship { relation_to, .. }))
+            if matches!(target, Target::Field { path, .. }
+                if path.last().map(String::as_str) == Some("relationTo")) =>
+        {
+            v.as_str()
+                .filter(|s| relation_to.allows(s))
+                .map(|s| Scalar::Text(s.to_owned()))
+                .ok_or_else(|| format!("expected one of: {relation_to}"))
+        }
         (_, None) | (_, Some(FieldKind::Relationship { .. })) => {
             let id = v
                 .as_str()
@@ -494,7 +531,7 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
     };
     let fields = data_fields(fields);
     let (target, _) = resolve(&fields, name).map_err(|m| err("sort", m))?;
-    if target.kind() == ValueKind::List {
+    if matches!(target.kind(), ValueKind::List | ValueKind::LinkList) {
         return Err(err(
             "sort",
             format!("`{name}` holds a list and can't be sorted"),
@@ -597,7 +634,9 @@ mod tests {
             {"name": "data", "type": "json"},
             {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}]},
             {"name": "snippet", "type": "code"},
-            {"name": "scores", "type": "number", "hasMany": true}
+            {"name": "scores", "type": "number", "hasMany": true},
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "linked", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true}
         ]))
         .unwrap()
     }
@@ -952,5 +991,40 @@ mod tests {
             parse_sort(&f, "-meta.rank").unwrap().target,
             field("meta.rank", ValueKind::Number)
         );
+    }
+    #[test]
+    fn polymorphic_links_filter_by_id_and_collection() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let by_id = cond(
+            field("link.value", ValueKind::Text),
+            Op::Equals,
+            Operand::One(text(id)),
+        );
+        assert_eq!(filter(&format!("where[link][equals]={id}")).unwrap(), by_id);
+        assert_eq!(
+            filter(&format!("where[link.value][equals]={id}")).unwrap(),
+            by_id
+        );
+        assert_eq!(
+            filter("where[link.relationTo][equals]=pages").unwrap(),
+            cond(
+                field("link.relationTo", ValueKind::Text),
+                Op::Equals,
+                Operand::One(text("pages"))
+            )
+        );
+        assert_eq!(
+            filter("where[link.relationTo][equals]=authors").unwrap_err(),
+            "where[link.relationTo][equals]: expected one of: posts, pages"
+        );
+        assert_eq!(
+            filter(&format!("where[linked][contains]={id}")).unwrap(),
+            cond(
+                field("linked", ValueKind::LinkList),
+                Op::Contains,
+                Operand::One(text(id))
+            )
+        );
+        assert!(parse_sort(&fields(), "linked").is_err());
     }
 }
