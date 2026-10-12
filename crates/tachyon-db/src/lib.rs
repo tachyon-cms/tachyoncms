@@ -29,6 +29,9 @@ pub enum DbError {
     /// Other live documents still link to this one.
     #[error("referenced by {0} documents")]
     Referenced(i64),
+    /// A list request that can't be answered as asked.
+    #[error("{0}")]
+    InvalidQuery(&'static str),
     /// The collection's schema changed after the caller validated against it.
     #[error("schema changed")]
     SchemaChanged,

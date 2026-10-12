@@ -296,3 +296,47 @@ async fn previews_never_wait_for_writers(pool: PgPool) {
     .unwrap();
     writer.rollback().await.unwrap();
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn one_target_to_several_wraps_existing_links(pool: PgPool) {
+    let s = seed(&pool).await;
+    let new = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": ["authors", "posts"]},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let (_, p) = apply(&pool, "posts", &new, &Renames::new(), false)
+        .await
+        .unwrap();
+    assert!(!p.needs_confirmation, "wrapping loses nothing");
+    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    assert_eq!(
+        doc.data.0["author"],
+        json!({"relationTo": "authors", "value": s.ann.to_string()})
+    );
+    assert_eq!(
+        documents::references(&pool, s.ann).await.unwrap()[0].path,
+        "author",
+        "the link stays protected"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn turning_a_link_into_a_list_keeps_it_protected(pool: PgPool) {
+    let s = seed(&pool).await;
+    let new = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "relationship", "relationTo": "authors", "hasMany": true},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    let (_, p) = apply(&pool, "posts", &new, &Renames::new(), false)
+        .await
+        .unwrap();
+    assert!(!p.needs_confirmation && p.invalid == 0, "{p:?}");
+    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    assert_eq!(doc.data.0["author"], json!([s.ann.to_string()]));
+    assert_eq!(
+        documents::references(&pool, s.ann).await.unwrap()[0].path,
+        "author.0"
+    );
+}

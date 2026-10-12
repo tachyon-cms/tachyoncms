@@ -6,7 +6,7 @@ use time::macros::format_description;
 
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, SelectOption, data_fields};
+use crate::schema::{Field, FieldKind, RelationTo, SelectOption, data_fields};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
@@ -99,14 +99,10 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                 FieldKind::Relationship {
                     has_many: false, ..
                 },
-                Value::String(s),
-            ) => canonical_id(s),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(ids)) => {
-                for id in ids {
-                    if let Value::String(s) = id {
-                        canonical_id(s);
-                    }
-                }
+                link,
+            ) => canonical_link(link),
+            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+                links.iter_mut().for_each(canonical_link);
             }
             (FieldKind::Group { fields }, Value::Object(inner)) => normalize(fields, inner),
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
@@ -244,6 +240,14 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             max_length,
         } => text_error(v, *min_length, *max_length),
         FieldKind::Code { .. } => text_error(v, None, None),
+        FieldKind::Point => {
+            let ok = v.as_array().is_some_and(|xy| {
+                matches!(xy.as_slice(), [x, y]
+                    if x.as_f64().is_some_and(|lng| (-180.0..=180.0).contains(&lng))
+                    && y.as_f64().is_some_and(|lat| (-90.0..=90.0).contains(&lat)))
+            });
+            (!ok).then(|| "expected [longitude, latitude], like [-0.1276, 51.5072]".into())
+        }
         FieldKind::Number {
             min, max, integer, ..
         } => {
@@ -303,13 +307,38 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             "expected lowercase letters, digits and single hyphens, like my-first-post".into()
         }),
         FieldKind::Relationship {
-            has_many: false, ..
+            relation_to: RelationTo::One(_),
+            has_many: false,
         } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
-        FieldKind::Relationship { has_many: true, .. } => {
+        FieldKind::Relationship {
+            relation_to: RelationTo::One(_),
+            has_many: true,
+        } => {
             let ok = v
                 .as_array()
                 .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
             (!ok).then(|| "expected a list of document IDs".into())
+        }
+        FieldKind::Relationship {
+            relation_to,
+            has_many: false,
+        } => (!is_link(v, relation_to)).then(|| {
+            format!(
+                "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
+            )
+        }),
+        FieldKind::Relationship {
+            relation_to,
+            has_many: true,
+        } => {
+            let ok = v
+                .as_array()
+                .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
+            (!ok).then(|| {
+                format!(
+                    "expected a list of links like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to: {relation_to}"
+                )
+            })
         }
         FieldKind::Json => None,
         // Never reached: validation only sees the data shape, where layout has dissolved.
@@ -450,11 +479,24 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 continue;
             };
             let path = join(prefix, &f.name);
-            let mut push = |path: String, relation_to: &str, id: &Value| {
-                if let Some(id) = id.as_str().and_then(|s| Uuid::try_parse(s).ok()) {
+            let mut push = |path: String, relation_to: &RelationTo, link: &Value| {
+                let (slug, id) = match (relation_to, link) {
+                    (RelationTo::One(slug), Value::String(id)) => (slug.as_str(), id.as_str()),
+                    (RelationTo::Many(_), Value::Object(o)) => {
+                        let (Some(slug), Some(id)) = (
+                            o.get("relationTo").and_then(Value::as_str),
+                            o.get("value").and_then(Value::as_str),
+                        ) else {
+                            return;
+                        };
+                        (slug, id)
+                    }
+                    _ => return,
+                };
+                if let Ok(id) = Uuid::try_parse(id) {
                     out.push(RelationRef {
                         path,
-                        relation_to: relation_to.to_owned(),
+                        relation_to: slug.to_owned(),
                         id,
                     });
                 }
@@ -521,10 +563,10 @@ fn map_inner(
                     has_many: false, ..
                 },
                 slot,
-            ) => replace_id(slot, f),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(ids)) => {
-                for slot in ids {
-                    replace_id(slot, f);
+            ) => replace_link(slot, f),
+            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+                for slot in links {
+                    replace_link(slot, f);
                 }
             }
             (FieldKind::Group { fields }, Value::Object(inner)) => map_inner(fields, inner, f),
@@ -537,6 +579,41 @@ fn map_inner(
             }
             _ => {}
         }
+    }
+}
+
+/// Polymorphic links keep their `relationTo`; only the `value` inside is replaced.
+fn replace_link(slot: &mut Value, f: &mut impl FnMut(&str) -> Option<Value>) {
+    match slot {
+        Value::Object(o) => {
+            if let Some(inner) = o.get_mut("value") {
+                replace_id(inner, f);
+            }
+        }
+        other => replace_id(other, f),
+    }
+}
+
+/// `{"relationTo": "<allowed slug>", "value": "<uuid>"}` and nothing else.
+fn is_link(v: &Value, relation_to: &RelationTo) -> bool {
+    v.as_object().is_some_and(|o| {
+        o.len() == 2
+            && o.get("relationTo")
+                .and_then(Value::as_str)
+                .is_some_and(|s| relation_to.allows(s))
+            && o.get("value").and_then(Value::as_str).is_some_and(is_uuid)
+    })
+}
+
+fn canonical_link(link: &mut Value) {
+    match link {
+        Value::String(s) => canonical_id(s),
+        Value::Object(o) => {
+            if let Some(Value::String(s)) = o.get_mut("value") {
+                canonical_id(s);
+            }
+        }
+        _ => {}
     }
 }
 
@@ -1012,5 +1089,77 @@ mod tests {
             errs(&f, json!({"title": "T", "row": {}})),
             vec![e("row", "unknown field")]
         );
+    }
+    #[test]
+    fn polymorphic_links_validate_and_are_found() {
+        let f = fields(json!([
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "more", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true}
+        ]));
+        let a = "0199D5C4-0000-7000-8000-00000000000A";
+        let doc = ok(
+            &f,
+            json!({
+                "link": {"relationTo": "pages", "value": a},
+                "more": [{"relationTo": "posts", "value": a}]
+            }),
+        );
+        assert_eq!(
+            doc["link"]["value"],
+            a.to_lowercase(),
+            "IDs inside links are canonical"
+        );
+        let found: Vec<(String, String)> = relations(&f, &doc)
+            .into_iter()
+            .map(|r| (r.path, r.relation_to))
+            .collect();
+        assert_eq!(
+            found,
+            [
+                ("link".to_owned(), "pages".to_owned()),
+                ("more.0".to_owned(), "posts".to_owned())
+            ]
+        );
+
+        let one = "expected a link like {\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"} to one of: posts, pages";
+        for bad in [
+            json!(a),
+            json!({"relationTo": "authors", "value": a}),
+            json!({"relationTo": "pages", "value": "x"}),
+            json!({"relationTo": "pages", "value": a, "extra": 1}),
+        ] {
+            assert_eq!(
+                errs(&f, json!({"link": bad})),
+                vec![e("link", one)],
+                "{bad}"
+            );
+        }
+
+        let mut doc = doc;
+        map_relations(&f, &mut doc, &mut |id| {
+            Some(json!({"id": id, "title": "T"}))
+        });
+        assert_eq!(doc["link"]["relationTo"], "pages");
+        assert_eq!(doc["link"]["value"]["title"], "T");
+        assert_eq!(doc["more"][0]["value"]["title"], "T");
+    }
+    #[test]
+    fn points_are_longitude_latitude_pairs() {
+        let f = fields(json!([{"name": "where", "type": "point"}]));
+        ok(&f, json!({"where": [-0.1276, 51.5072]}));
+        let message = "expected [longitude, latitude], like [-0.1276, 51.5072]";
+        for bad in [
+            json!([0]),
+            json!([181, 0]),
+            json!([0, 91]),
+            json!(["0", "0"]),
+            json!({"lng": 0, "lat": 0}),
+        ] {
+            assert_eq!(
+                errs(&f, json!({"where": bad})),
+                vec![e("where", message)],
+                "{bad}"
+            );
+        }
     }
 }

@@ -2,9 +2,9 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
-use tachyon_db::collections;
 use tachyon_db::documents::{self, Prepared};
 use tachyon_db::query::{self, ListQuery};
+use tachyon_db::{DbError, collections};
 use uuid::Uuid;
 
 fn schema() -> CollectionSchema {
@@ -300,4 +300,204 @@ async fn contains_works_on_text_and_number_lists(pool: PgPool) {
     assert_eq!(titles_for("where[labels][contains]=big").await, ["a"]);
     assert_eq!(titles_for("where[sizes][contains]=2.5").await, ["a"]);
     assert_eq!(titles_for("where[sizes][contains]=3").await, ["b"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_finds_places_within_a_distance(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Trafalgar", json!([-0.1281, 51.5080])), // ~90 m from the centre
+        ("Greenwich", json!([-0.0015, 51.4779])), // ~9 km
+        ("Paris", json!([2.3522, 48.8566])),      // ~340 km
+        ("Broken", json!("not a point")),         // left over from a retype
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let near = |qs: &str| parse_filter(&s.fields, &parse_query(qs).unwrap()["where"]).unwrap();
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    let centre = "-0.1276,51.5072";
+    let f = near(&format!("where[at][near]={centre},1000"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Trafalgar"]
+    );
+    let f = near(&format!("where[at][near]={centre},20000,1000"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich"]
+    );
+    let f = near(&format!("where[at][near]={centre}"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich", "Paris", "Trafalgar"]
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_ignores_values_that_are_not_points(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Real", json!([-0.1276, 51.5072])),
+        ("Three", json!([-0.1276, 51.5072, 7])),
+        ("Object", json!({"0": -0.1276, "1": 51.5072})),
+        ("OffMap", json!([0, 1000])),
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    // Too big for a float, written outside the API; must not make the query fail.
+    sqlx::query(
+        "INSERT INTO documents (id, tenant_id, collection_id, status, published)
+         VALUES ($1, $2, $3, 'published', '{\"title\": \"Huge\", \"at\": [0, 1e400]}'::jsonb)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(tachyon_db::DEFAULT_TENANT)
+    .bind(c)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    for qs in [
+        "where[at][near]=-0.1276,51.5072",
+        "where[at][near]=-0.1276,51.5072,1000",
+    ] {
+        let f = parse_filter(&s.fields, &parse_query(qs).unwrap()["where"]).unwrap();
+        assert_eq!(
+            titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+            ["Real"],
+            "{qs}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_without_a_sort_returns_nearest_first(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Paris", json!([2.3522, 48.8566])),
+        ("Trafalgar", json!([-0.1281, 51.5080])),
+        ("Greenwich", json!([-0.0015, 51.4779])),
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = parse_filter(
+        &s.fields,
+        &parse_query("where[at][near]=-0.1276,51.5072").unwrap()["where"],
+    )
+    .unwrap();
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), None)).await,
+        ["Trafalgar", "Greenwich", "Paris"]
+    );
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich", "Paris", "Trafalgar"],
+        "an explicit sort wins"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [("A", json!([0.0, 0.0])), ("B", json!([0.001, 0.0]))] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = parse_filter(
+        &s.fields,
+        &parse_query("where[at][near]=0,0").unwrap()["where"],
+    )
+    .unwrap();
+    let page = |offset| ListQuery {
+        filter: Some(&f),
+        sort: None,
+        limit: 1,
+        offset,
+        after: None,
+        count: false,
+    };
+    let first = query::list(&pool, c, &page(0)).await.unwrap();
+    assert!(first.has_more);
+    let last = query::list(&pool, c, &page(1)).await.unwrap();
+    assert!(!last.has_more);
+
+    let exact = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: None,
+            sort: None,
+            limit: 2,
+            offset: 0,
+            after: None,
+            count: false,
+        },
+    )
+    .await
+    .unwrap();
+    assert!(
+        !exact.has_more && exact.next.is_none(),
+        "a page that ends exactly at the last document says so"
+    );
+
+    let cursor = Cursor {
+        value: None,
+        id: Uuid::nil(),
+    };
+    let refused = query::list(
+        &pool,
+        c,
+        &ListQuery {
+            filter: Some(&f),
+            sort: None,
+            limit: 1,
+            offset: 0,
+            after: Some(&cursor),
+            count: false,
+        },
+    )
+    .await;
+    assert!(
+        matches!(refused, Err(DbError::InvalidQuery(_))),
+        "{refused:?}"
+    );
 }

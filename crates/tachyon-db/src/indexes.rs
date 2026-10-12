@@ -25,6 +25,8 @@ pub fn index_name(collection_id: Uuid, field: &str, kind: IndexKind, value: Valu
         ValueKind::Boolean => b'b',
         ValueKind::Date => b'd',
         ValueKind::List => b'l',
+        ValueKind::LinkList => b'k',
+        ValueKind::Point => b'p',
     };
     // FNV-1a: tiny, stable across releases, and good enough to avoid collisions here.
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;

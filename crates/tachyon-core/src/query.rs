@@ -80,6 +80,24 @@ pub enum Filter {
     Cond(Cond),
 }
 
+impl Filter {
+    /// The point of a `near` condition that every result must meet (top level or inside
+    /// `and`), which orders results by distance when no sort is given. A `near` inside `or`
+    /// doesn't qualify, since other branches can match rows that aren't near anything. With
+    /// several qualifying conditions the first one (in field-name order) sets the order.
+    pub fn near(&self) -> Option<(&[String], f64, f64)> {
+        match self {
+            Filter::Cond(Cond {
+                target: Target::Field { path, .. },
+                op: Op::Near,
+                value: Operand::Near { lng, lat, .. },
+            }) => Some((path, *lng, *lat)),
+            Filter::All(parts) => parts.iter().find_map(Filter::near),
+            _ => None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cond {
     pub target: Target,
@@ -120,11 +138,19 @@ pub enum ValueKind {
     Boolean,
     Date,
     List,
+    /// A list of polymorphic links (`{"relationTo", "value"}` objects).
+    LinkList,
+    /// A `[longitude, latitude]` location.
+    Point,
 }
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
 pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
     Some(match kind {
+        FieldKind::Relationship {
+            relation_to,
+            has_many: true,
+        } if relation_to.is_polymorphic() => ValueKind::LinkList,
         FieldKind::Select { multiple: true, .. }
         | FieldKind::Text { has_many: true, .. }
         | FieldKind::Number { has_many: true, .. }
@@ -132,6 +158,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Number { .. } => ValueKind::Number,
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
+        FieldKind::Point => ValueKind::Point,
         FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
         _ => ValueKind::Text,
     })
@@ -150,10 +177,11 @@ pub enum Op {
     Like,
     Contains,
     Exists,
+    Near,
 }
 
 impl Op {
-    const ALL: [Op; 11] = [
+    const ALL: [Op; 12] = [
         Op::Equals,
         Op::NotEquals,
         Op::In,
@@ -165,6 +193,7 @@ impl Op {
         Op::Like,
         Op::Contains,
         Op::Exists,
+        Op::Near,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -180,6 +209,7 @@ impl Op {
             Self::Like => "like",
             Self::Contains => "contains",
             Self::Exists => "exists",
+            Self::Near => "near",
         }
     }
 
@@ -194,9 +224,10 @@ impl Op {
         }
         match target.kind() {
             ValueKind::Text => matches!(self, Equals | NotEquals | In | NotIn | Like | Exists),
-            ValueKind::Number | ValueKind::Date => !matches!(self, Like | Contains),
+            ValueKind::Number | ValueKind::Date => !matches!(self, Like | Contains | Near),
+            ValueKind::Point => matches!(self, Near | Exists),
             ValueKind::Boolean => matches!(self, Equals | NotEquals | Exists),
-            ValueKind::List => matches!(self, Contains | Exists),
+            ValueKind::List | ValueKind::LinkList => matches!(self, Contains | Exists),
         }
     }
 }
@@ -212,6 +243,13 @@ pub enum Scalar {
 pub enum Operand {
     One(Scalar),
     Many(Vec<Scalar>),
+    /// Within `max` metres (and at least `min`) of a point.
+    Near {
+        lng: f64,
+        lat: f64,
+        max: Option<f64>,
+        min: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -320,7 +358,7 @@ impl Parser<'_> {
         let op = Op::parse(op).ok_or_else(|| {
             err(
                 param,
-                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains or exists",
+                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             )
         })?;
         let (target, field) = resolve(self.fields, name).map_err(|m| err(param, m))?;
@@ -331,6 +369,12 @@ impl Parser<'_> {
             ));
         }
         let value = match op {
+            Op::Near => parse_near(operand).map_err(|()| {
+                err(
+                    param,
+                    "expected longitude,latitude[,maxDistance[,minDistance]] in metres",
+                )
+            })?,
             Op::Exists => Operand::One(Scalar::Bool(
                 parse_bool(operand).ok_or_else(|| err(param, "expected true or false"))?,
             )),
@@ -384,6 +428,28 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
                 ));
             }
             FieldKind::Group { fields } if !last => current = fields,
+            // A polymorphic link is an object: filter its `value` (the default) or `relationTo`.
+            FieldKind::Relationship {
+                relation_to,
+                has_many: false,
+            } if relation_to.is_polymorphic() => {
+                let part = match segments.next() {
+                    None | Some("value") => "value",
+                    Some("relationTo") => "relationTo",
+                    Some(_) => return Err(format!("unknown field `{name}`")),
+                };
+                if segments.next().is_some() {
+                    return Err(format!("unknown field `{name}`"));
+                }
+                path.push(part.to_owned());
+                return Ok((
+                    Target::Field {
+                        path,
+                        kind: ValueKind::Text,
+                    },
+                    Some(f),
+                ));
+            }
             _ if !last => return Err(format!("unknown field `{name}`")),
             kind => {
                 let kind = value_kind(kind).ok_or_else(|| format!("`{name}` can't be filtered"))?;
@@ -392,6 +458,33 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
         }
     }
     Err(format!("unknown field `{name}`"))
+}
+
+/// `lng,lat[,maxDistance[,minDistance]]`, distances in metres.
+fn parse_near(v: &Value) -> Result<Operand, ()> {
+    let text = v.as_str().ok_or(())?;
+    let numbers: Vec<f64> = text
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| ())?;
+    if numbers.iter().any(|n| !n.is_finite()) {
+        return Err(());
+    }
+    let (lng, lat, max, min) = match numbers.as_slice() {
+        [lng, lat] => (*lng, *lat, None, None),
+        [lng, lat, max] => (*lng, *lat, Some(*max), None),
+        [lng, lat, max, min] => (*lng, *lat, Some(*max), Some(*min)),
+        _ => return Err(()),
+    };
+    let in_range = (-180.0..=180.0).contains(&lng) && (-90.0..=90.0).contains(&lat);
+    let distances_ok = [max, min].into_iter().flatten().all(|d| d >= 0.0)
+        && !matches!((min, max), (Some(min), Some(max)) if min > max);
+    if in_range && distances_ok {
+        Ok(Operand::Near { lng, lat, max, min })
+    } else {
+        Err(())
+    }
 }
 
 fn parse_bool(v: &Value) -> Option<bool> {
@@ -453,6 +546,27 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .and_then(normalize_date_time)
             .map(Scalar::Text)
             .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
+        // The `relationTo` part of a polymorphic link: the path is the field's own name
+        // followed by `relationTo` (a field merely named `relationTo` doesn't count).
+        (_, Some(f_kind @ FieldKind::Relationship { relation_to, .. }))
+            if relation_to.is_polymorphic()
+                && matches!(
+                    f_kind,
+                    FieldKind::Relationship {
+                        has_many: false,
+                        ..
+                    }
+                )
+                && matches!((target, field), (Target::Field { path, .. }, Some(f))
+                    if path.len() >= 2
+                        && path[path.len() - 1] == "relationTo"
+                        && path[path.len() - 2] == f.name) =>
+        {
+            v.as_str()
+                .filter(|s| relation_to.allows(s))
+                .map(|s| Scalar::Text(s.to_owned()))
+                .ok_or_else(|| format!("expected one of: {relation_to}"))
+        }
         (_, None) | (_, Some(FieldKind::Relationship { .. })) => {
             let id = v
                 .as_str()
@@ -494,10 +608,16 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
     };
     let fields = data_fields(fields);
     let (target, _) = resolve(&fields, name).map_err(|m| err("sort", m))?;
-    if target.kind() == ValueKind::List {
+    if matches!(target.kind(), ValueKind::List | ValueKind::LinkList) {
         return Err(err(
             "sort",
             format!("`{name}` holds a list and can't be sorted"),
+        ));
+    }
+    if target.kind() == ValueKind::Point {
+        return Err(err(
+            "sort",
+            format!("`{name}` holds a location and can't be sorted"),
         ));
     }
     Ok(Sort { target, descending })
@@ -597,7 +717,10 @@ mod tests {
             {"name": "data", "type": "json"},
             {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}]},
             {"name": "snippet", "type": "code"},
-            {"name": "scores", "type": "number", "hasMany": true}
+            {"name": "scores", "type": "number", "hasMany": true},
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "linked", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true},
+            {"name": "spot", "type": "point"}
         ]))
         .unwrap()
     }
@@ -796,7 +919,7 @@ mod tests {
             ),
             (
                 "where[title][shout]=x",
-                "where[title][shout]: unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains or exists",
+                "where[title][shout]: unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             ),
             (
                 "where[title]=x",
@@ -952,5 +1075,100 @@ mod tests {
             parse_sort(&f, "-meta.rank").unwrap().target,
             field("meta.rank", ValueKind::Number)
         );
+    }
+    #[test]
+    fn polymorphic_links_filter_by_id_and_collection() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let by_id = cond(
+            field("link.value", ValueKind::Text),
+            Op::Equals,
+            Operand::One(text(id)),
+        );
+        assert_eq!(filter(&format!("where[link][equals]={id}")).unwrap(), by_id);
+        assert_eq!(
+            filter(&format!("where[link.value][equals]={id}")).unwrap(),
+            by_id
+        );
+        assert_eq!(
+            filter("where[link.relationTo][equals]=pages").unwrap(),
+            cond(
+                field("link.relationTo", ValueKind::Text),
+                Op::Equals,
+                Operand::One(text("pages"))
+            )
+        );
+        assert_eq!(
+            filter("where[link.relationTo][equals]=authors").unwrap_err(),
+            "where[link.relationTo][equals]: expected one of: posts, pages"
+        );
+        assert_eq!(
+            filter(&format!("where[linked][contains]={id}")).unwrap(),
+            cond(
+                field("linked", ValueKind::LinkList),
+                Op::Contains,
+                Operand::One(text(id))
+            )
+        );
+        assert!(parse_sort(&fields(), "linked").is_err());
+    }
+    #[test]
+    fn near_takes_a_point_and_optional_distances() {
+        assert_eq!(
+            filter("where[spot][near]=-0.1276,51.5072,1000").unwrap(),
+            cond(
+                field("spot", ValueKind::Point),
+                Op::Near,
+                Operand::Near {
+                    lng: -0.1276,
+                    lat: 51.5072,
+                    max: Some(1000.0),
+                    min: None
+                }
+            )
+        );
+        for bad in [
+            "1",
+            "200,0",
+            "0,95",
+            "0,0,-5",
+            "0,0,NaN",
+            "a,b",
+            "0,0,10,20",
+        ] {
+            assert_eq!(
+                filter(&format!("where[spot][near]={bad}")).unwrap_err(),
+                "where[spot][near]: expected longitude,latitude[,maxDistance[,minDistance]] in metres",
+                "{bad}"
+            );
+        }
+        assert!(
+            filter("where[title][near]=0,0").is_err(),
+            "near is only for points"
+        );
+        assert!(parse_sort(&fields(), "spot").is_err());
+    }
+
+    #[test]
+    fn a_field_named_relation_to_still_filters_by_id() {
+        let f: Vec<Field> = serde_json::from_value(json!([
+            {"name": "relationTo", "type": "relationship", "relationTo": "authors"}
+        ]))
+        .unwrap();
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let w = parse_query(&format!("where[relationTo][equals]={id}")).unwrap();
+        assert!(parse_filter(&f, &w["where"]).is_ok());
+    }
+
+    #[test]
+    fn a_nested_link_list_named_relation_to_filters_by_id() {
+        let f: Vec<Field> = serde_json::from_value(json!([
+            {"name": "g", "type": "group", "fields": [
+                {"name": "relationTo", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true}
+            ]}
+        ]))
+        .unwrap();
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let w = parse_query(&format!("where[g.relationTo][contains]={id}")).unwrap();
+        assert!(parse_filter(&f, &w["where"]).is_ok());
     }
 }

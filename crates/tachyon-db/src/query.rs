@@ -30,6 +30,8 @@ pub struct Page {
     pub total: Option<i64>,
     /// Where the next page starts, when this one came back full.
     pub next: Option<Cursor>,
+    /// Whether at least one more document follows this page.
+    pub has_more: bool,
 }
 
 fn assert_identifier(segment: &str) {
@@ -55,8 +57,48 @@ pub fn field_expr(path: &[String], kind: ValueKind) -> String {
         ValueKind::Boolean => format!(
             "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'boolean' THEN (published #>> '{{{path}}}')::boolean END)"
         ),
-        ValueKind::List => format!("(published #> '{{{path}}}')"),
+        ValueKind::List | ValueKind::LinkList | ValueKind::Point => {
+            format!("(published #> '{{{path}}}')")
+        }
     }
+}
+
+/// One coordinate of a stored `[lng, lat]`, or NULL when the stored value isn't a number.
+/// Only a two-number array whose numbers are in range counts. The CASEs are nested
+/// because Postgres doesn't promise to evaluate AND left to right, and
+/// `jsonb_array_length` fails on anything that isn't an array.
+fn coordinate(path: &[String], index: usize) -> String {
+    path.iter().for_each(|s| assert_identifier(s));
+    let path = path.join(",");
+    let limit = if index == 0 { 180 } else { 90 };
+    format!(
+        "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'array' THEN \
+           CASE WHEN jsonb_array_length(published #> '{{{path}}}') = 2 \
+                 AND jsonb_typeof(published #> '{{{path},{index}}}') = 'number' THEN \
+             CASE WHEN (published #>> '{{{path},{index}}}')::numeric BETWEEN -{limit} AND {limit} \
+               THEN (published #>> '{{{path},{index}}}')::float8 END \
+           END \
+         END)"
+    )
+}
+
+/// Metres from a stored point to (`lng`, `lat`): haversine on a sphere of the mean earth
+/// radius, accurate to well under 1% for finding nearby places.
+fn push_distance(qb: &mut QueryBuilder<Postgres>, path: &[String], lng: f64, lat: f64) {
+    let (x, y) = (coordinate(path, 0), coordinate(path, 1));
+    qb.push("(6371008.8 * 2 * asin(least(1, sqrt(power(sin(radians((")
+        .push(&y)
+        .push(" - ");
+    qb.push_bind(lat);
+    qb.push(") / 2)), 2) + cos(radians(");
+    qb.push_bind(lat);
+    qb.push(")) * cos(radians(")
+        .push(&y)
+        .push(")) * power(sin(radians((")
+        .push(&x)
+        .push(" - ");
+    qb.push_bind(lng);
+    qb.push(") / 2)), 2)))))");
 }
 
 fn expr(target: &Target) -> String {
@@ -193,12 +235,40 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
         }
         (Op::Contains, Operand::One(Scalar::Text(s))) => {
             qb.push(&e).push(" @> ");
-            qb.push_bind(Json(json!([s])));
+            let element = if c.target.kind() == ValueKind::LinkList {
+                json!({ "value": s })
+            } else {
+                json!(s)
+            };
+            qb.push_bind(Json(json!([element])));
         }
         (Op::Contains, Operand::One(Scalar::Number(n))) => {
             // jsonb containment compares numbers by value, so 3 matches 3.0.
             qb.push(&e).push(" @> ");
             qb.push_bind(Json(json!([n])));
+        }
+        (Op::Near, Operand::Near { lng, lat, max, min }) => {
+            let Target::Field { path, .. } = &c.target else {
+                unreachable!("near only targets fields")
+            };
+            // Both coordinates must be real numbers: `least()` ignores NULLs, so a broken
+            // value would otherwise come out as a distance.
+            qb.push("(")
+                .push(coordinate(path, 0))
+                .push(" IS NOT NULL AND ")
+                .push(coordinate(path, 1))
+                .push(" IS NOT NULL");
+            if let Some(max) = max {
+                qb.push(" AND ");
+                push_distance(qb, path, *lng, *lat);
+                qb.push(" <= ").push_bind(*max);
+            }
+            if let Some(min) = min {
+                qb.push(" AND ");
+                push_distance(qb, path, *lng, *lat);
+                qb.push(" >= ").push_bind(*min);
+            }
+            qb.push(")");
         }
         (op, value) => unreachable!("the parser never builds {op:?} with {value:?}"),
     }
@@ -235,6 +305,19 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         None => ("id".to_owned(), true),
     };
 
+    // With `near` and no explicit sort, nearest first. Distance isn't a stored value a cursor
+    // can resume from, so those results page by number only.
+    let near = q
+        .sort
+        .is_none()
+        .then(|| q.filter.and_then(Filter::near))
+        .flatten();
+    if near.is_some() && q.after.is_some() {
+        return Err(DbError::InvalidQuery(
+            "results near a point are ordered by distance; page through them with page, not after",
+        ));
+    }
+
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, status, created_at, updated_at, published AS data FROM documents",
     );
@@ -243,9 +326,25 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         qb.push(" AND ");
         push_after(&mut qb, q.sort, &sort_expr, descending, cursor);
     }
-    qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
-    qb.push_bind(q.limit).push(" OFFSET ").push_bind(q.offset);
-    let docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
+    match near {
+        Some((path, lng, lat)) => {
+            qb.push(" ORDER BY ");
+            push_distance(&mut qb, path, lng, lat);
+            qb.push(" ASC NULLS LAST, id DESC LIMIT ");
+        }
+        None => {
+            qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
+        }
+    }
+    // One extra row says whether another page follows, without a separate count.
+    qb.push_bind(q.limit.saturating_add(1))
+        .push(" OFFSET ")
+        .push_bind(q.offset);
+    let mut docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
+    let has_more = usize::try_from(q.limit).is_ok_and(|limit| docs.len() > limit);
+    if has_more {
+        docs.truncate(usize::try_from(q.limit).unwrap_or(docs.len()));
+    }
 
     let total = if q.count {
         let mut qb = QueryBuilder::<Postgres>::new("SELECT count(*) FROM documents");
@@ -255,8 +354,7 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         None
     };
 
-    let full = q.limit > 0 && i64::try_from(docs.len()).is_ok_and(|n| n == q.limit);
-    let next = if full {
+    let next = if has_more && near.is_none() {
         docs.last().map(|last| Cursor {
             value: sort_value(q.sort, last),
             id: last.id,
@@ -264,7 +362,12 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
     } else {
         None
     };
-    Ok(Page { docs, total, next })
+    Ok(Page {
+        docs,
+        total,
+        next,
+        has_more,
+    })
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.

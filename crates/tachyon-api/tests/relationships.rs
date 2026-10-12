@@ -132,3 +132,80 @@ async fn linked_documents_are_protected_and_listed(pool: PgPool) {
     assert_eq!(send(&app, "DELETE", &post_url, None).await.status, 204);
     assert_eq!(send(&app, "DELETE", &ann_url, None).await.status, 204);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn polymorphic_links_store_populate_and_filter(pool: PgPool) {
+    let app = app(pool).await;
+    create(&app, "/api/admin/collections", json!({"slug": "menus", "fields": [
+        {"name": "label", "type": "text"},
+        {"name": "target", "type": "relationship", "relationTo": ["posts", "authors"]},
+        {"name": "extras", "type": "relationship", "relationTo": ["posts", "authors"], "hasMany": true}
+    ]}))
+    .await;
+    let ann = create(&app, "/api/authors", json!({"name": "Ann"})).await;
+    let post = create(&app, "/api/posts", json!({"title": "Hi"})).await;
+    let menu = create(
+        &app,
+        "/api/menus",
+        json!({
+            "label": "Top",
+            "target": {"relationTo": "authors", "value": ann["id"]},
+            "extras": [{"relationTo": "posts", "value": post["id"]}]
+        }),
+    )
+    .await;
+    assert_eq!(menu["target"]["relationTo"], "authors");
+    assert_eq!(menu["target"]["value"]["name"], "Ann", "populated in place");
+    assert_eq!(menu["extras"][0]["value"]["title"], "Hi");
+
+    let wrong = send(
+        &app,
+        "POST",
+        "/api/menus",
+        Some(&json!({"target": {"relationTo": "posts", "value": ann["id"]}}).to_string()),
+    )
+    .await;
+    assert_problem(&wrong, 422);
+    assert_eq!(wrong.json["errors"][0]["path"], "target");
+
+    let by_collection = send(
+        &app,
+        "GET",
+        "/api/menus?where[target.relationTo][equals]=authors&depth=0",
+        None,
+    )
+    .await
+    .json;
+    assert_eq!(by_collection["docs"][0]["target"]["value"], ann["id"]);
+    let by_link = send(
+        &app,
+        "GET",
+        &format!(
+            "/api/menus?where[extras][contains]={}",
+            post["id"].as_str().unwrap()
+        ),
+        None,
+    )
+    .await
+    .json;
+    assert_eq!(by_link["docs"][0]["label"], "Top");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_link_cannot_borrow_another_links_collection(pool: PgPool) {
+    let app = app(pool).await;
+    create(&app, "/api/admin/collections", json!({"slug": "menus", "fields": [
+        {"name": "target", "type": "relationship", "relationTo": ["posts", "authors"]},
+        {"name": "extras", "type": "relationship", "relationTo": ["posts", "authors"], "hasMany": true}
+    ]}))
+    .await;
+    let ann = create(&app, "/api/authors", json!({"name": "Ann"})).await;
+    // The first link is right; the second claims Ann is a post.
+    let body = json!({
+        "target": {"relationTo": "authors", "value": ann["id"]},
+        "extras": [{"relationTo": "posts", "value": ann["id"]}]
+    });
+    let res = send(&app, "POST", "/api/menus", Some(&body.to_string())).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "extras.0");
+}
