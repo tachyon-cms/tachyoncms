@@ -178,3 +178,54 @@ async fn unsupported_or_malformed_changes_are_rejected(pool: PgPool) {
         400,
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_failed_index_build_still_reloads_the_schema_and_startup_heals_it(pool: PgPool) {
+    let (app, _) = app(pool.clone()).await;
+    let posts = tachyon_db::collections::get_by_slug(&pool, "posts")
+        .await
+        .unwrap();
+    let name = tachyon_db::indexes::index_name(
+        posts.id,
+        "rank",
+        tachyon_db::indexes::IndexKind::Filter,
+        tachyon_core::query::ValueKind::Number,
+    );
+    // Something already holds the index's name, so building it fails.
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE TABLE \"{name}\" ()")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let fields = json!([
+        {"name": "title", "type": "text"}, {"name": "summary", "type": "textarea"},
+        {"name": "rank", "type": "number", "filterable": true}
+    ]);
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(&change(fields, json!({}))),
+    )
+    .await;
+    assert_problem(&res, 500);
+    let got = send(&app, "GET", "/api/admin/collections/posts", None).await;
+    assert_eq!(
+        got.json["schema"]["fields"][2]["name"], "rank",
+        "the saved schema is served even though its index failed"
+    );
+    let res = send(&app, "POST", "/api/posts", Some(r#"{"rank": 3}"#)).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+
+    sqlx::query(sqlx::AssertSqlSafe(format!("DROP TABLE \"{name}\"")))
+        .execute(&pool)
+        .await
+        .unwrap();
+    let _restarted = tachyon_api::router(pool.clone()).await.unwrap();
+    let built: bool =
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)")
+            .bind(&name)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!(built, "startup builds indexes a failed change left missing");
+}

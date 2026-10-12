@@ -69,8 +69,10 @@ pub async fn create(
         }
     }
     let created = collections::create(&state.pool, &schema).await?;
-    reconcile_indexes(&state.pool, created.id).await?;
+    // The schema is saved either way, so serve it even if its indexes failed to build.
+    let indexed = reconcile_indexes(&state.pool, created.id).await;
     state.schemas.reload(&state.pool).await?;
+    indexed?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
 }
 
@@ -143,7 +145,8 @@ pub async fn update(
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;
-    reconcile_indexes(&state.pool, c.id).await?;
+    let indexed = reconcile_indexes(&state.pool, c.id).await;
     state.schemas.reload(&state.pool).await?;
+    indexed?;
     Ok(Json(json!({ "collection": to_json(&c), "preview": p })))
 }
