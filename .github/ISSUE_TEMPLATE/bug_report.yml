@@ -11,7 +11,7 @@ body:
     attributes:
       label: What happened?
       description: What you did, what you expected, and what you got instead.
-      placeholder: I sent a PATCH with `{"title": null}` and expected a 422, but got a 500.
+      placeholder: 'I sent a PATCH with `{"title": null}` and expected a 422, but got a 500.'
     validations:
       required: true
   - type: textarea
