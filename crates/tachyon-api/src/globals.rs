@@ -73,7 +73,7 @@ pub async fn update(
     let patch = json_body(body)?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
-        let updated = documents::update(&state.pool, c.id, c.id, |current| {
+        let updated = documents::update(&state.pool, c.id, c.schema_version, c.id, |current| {
             let data = validate_document(&c.schema.fields, &patch, Some(current))
                 .map_err(ApiError::Validation)?;
             Ok(prepare(&state, &c, data))
@@ -86,7 +86,15 @@ pub async fn update(
         }
         let data =
             validate_document(&c.schema.fields, &patch, None).map_err(ApiError::Validation)?;
-        match documents::insert(&state.pool, c.id, Some(c.id), &prepare(&state, &c, data)).await {
+        match documents::insert(
+            &state.pool,
+            c.id,
+            c.schema_version,
+            Some(c.id),
+            &prepare(&state, &c, data),
+        )
+        .await
+        {
             Ok(doc) => return respond(&state, c.clone(), &doc, 1).await,
             Err(DbError::UniqueViolation(ref name)) if name == "documents_pkey" => continue,
             Err(e) => return Err(unique_error(&c, e.into())),

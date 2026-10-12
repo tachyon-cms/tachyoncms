@@ -1,0 +1,40 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT c.relname AS \"name!\", i.indisvalid AS \"valid!\"\n           FROM pg_index i\n           JOIN pg_class c ON c.oid = i.indexrelid\n           WHERE i.indrelid = 'documents'::regclass\n             AND left(c.relname, 13) IN ('documents_uq_', 'documents_ix_')\n             AND pg_get_expr(i.indpred, i.indrelid) LIKE '%' || $1 || '%'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "name!",
+        "type_info": "Name",
+        "origin": {
+          "Table": {
+            "table": "pg_class",
+            "name": "relname"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "valid!",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "pg_index",
+            "name": "indisvalid"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "d4ff207a76ebd504f72b16fe615440e0051f3e23ffc4e1937e671e9c445c1444"
+}

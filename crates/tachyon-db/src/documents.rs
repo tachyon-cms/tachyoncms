@@ -59,10 +59,12 @@ pub struct Reference {
 pub async fn insert(
     pool: &PgPool,
     collection_id: Uuid,
+    schema_version: i32,
     id: Option<Uuid>,
     doc: &Prepared,
 ) -> Result<Document, DbError> {
     let mut tx = pool.begin().await?;
+    check_schema(&mut tx, collection_id, schema_version).await?;
     let created = sqlx::query_as!(
         Document,
         r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at)
@@ -79,6 +81,27 @@ pub async fn insert(
     sync_relations(&mut tx, created.id, &doc.relations).await?;
     tx.commit().await?;
     Ok(created)
+}
+
+/// Locks the collection row for the rest of the transaction (shared with other writers,
+/// exclusive with schema changes) and confirms nobody changed its fields meanwhile.
+async fn check_schema(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+) -> Result<(), DbError> {
+    let current = sqlx::query_scalar!(
+        "SELECT schema_version FROM collections WHERE id = $1 FOR KEY SHARE",
+        collection_id,
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    if current == schema_version {
+        Ok(())
+    } else {
+        Err(DbError::SchemaChanged)
+    }
 }
 
 pub async fn get(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<Document, DbError> {
@@ -127,10 +150,12 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document
 pub async fn update<E: From<DbError>>(
     pool: &PgPool,
     collection_id: Uuid,
+    schema_version: i32,
     id: Uuid,
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
     let mut tx = pool.begin().await.map_err(DbError::from)?;
+    check_schema(&mut tx, collection_id, schema_version).await?;
     let current = sqlx::query_scalar!(
         r#"SELECT published AS "data!: Json<Map<String, Value>>"
            FROM documents
@@ -216,7 +241,7 @@ pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbErr
 /// the document's rows in `relations`. Targets are key-share locked: that blocks a
 /// concurrent delete (which takes FOR UPDATE) but not an ordinary save (FOR NO KEY UPDATE),
 /// so two documents linking to each other can be saved at the same time without deadlock.
-async fn sync_relations(
+pub(crate) async fn sync_relations(
     conn: &mut PgConnection,
     from_doc: Uuid,
     relations: &[Relation],

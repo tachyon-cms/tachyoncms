@@ -1,0 +1,28 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT schema AS \"schema: Json<CollectionSchema>\" FROM collections WHERE id = $1",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "schema: Json<CollectionSchema>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "collections",
+            "name": "schema"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "e48ea7e83ba9cbf05065d6d73810c71fec9c8f15811e5aca280e5eff1e658fb2"
+}

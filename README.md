@@ -58,6 +58,27 @@ curl -X POST localhost:3000/api/posts \
 curl localhost:3000/api/posts
 ```
 
+## Changing your content types
+
+Fields change. Maybe "title" should have been "headline", or that "summary" field never earned its keep. Change the schema and TachyonCMS carries your documents across:
+
+```bash
+curl -X PUT localhost:3000/api/admin/collections/posts \
+  -H 'content-type: application/json' \
+  -d '{"schema": {"slug": "posts", "fields": [{"name": "headline", "type": "text"}]},
+       "renames": {"title": "headline"}}'
+```
+
+Renamed fields keep their data. Anything that would delete or retype data comes back first as a preview (what changes, how many documents it touches, which ones won't validate) and only goes through when you send it again with `"confirm": true`. `POST .../posts/preview` shows the same report without changing anything.
+
+Prefer files under version control? Export every content type, edit the JSON, and apply it:
+
+```bash
+cargo run -p tachyon -- schema export -o schema.json
+cargo run -p tachyon -- schema diff schema.json --rename posts:title=headline
+cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
+```
+
 ## Roadmap
 
 | Milestone | What it adds |

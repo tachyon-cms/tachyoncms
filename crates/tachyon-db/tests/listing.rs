@@ -28,7 +28,7 @@ async fn seed(pool: &PgPool) -> Uuid {
         json!({"title": "date_fruit", "live": true}),
     ] {
         let data: Map<String, Value> = item.as_object().unwrap().clone();
-        documents::insert(pool, c, None, &Prepared::plain(data))
+        documents::insert(pool, c, 1, None, &Prepared::plain(data))
             .await
             .unwrap();
     }
@@ -205,7 +205,7 @@ async fn numbers_compare_exactly(pool: PgPool) {
             .as_object()
             .unwrap()
             .clone();
-        documents::insert(&pool, c, None, &Prepared::plain(data))
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
             .await
             .unwrap();
     }
@@ -243,4 +243,28 @@ async fn numbers_compare_exactly(pool: PgPool) {
         }
     }
     assert_eq!(seen, ["small", "tricky", "big"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn mistyped_stored_values_never_break_filters(pool: PgPool) {
+    // Values left behind by a confirmed retype: a string in a number field, a string in a boolean.
+    let c = collections::create(&pool, &schema()).await.unwrap().id;
+    for item in [
+        json!({"title": "ok", "price": 5, "live": false}),
+        json!({"title": "bad", "price": "abc", "live": "yes"}),
+    ] {
+        let data = item.as_object().unwrap().clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = filter("where[price][gt]=1");
+    assert_eq!(titles(&pool, c, q(Some(&f), None)).await, ["ok"]);
+    let f = filter("where[live][equals]=false");
+    assert_eq!(titles(&pool, c, q(Some(&f), None)).await, ["ok"]);
+    let by_price = sort("price");
+    assert_eq!(
+        titles(&pool, c, q(None, Some(&by_price))).await,
+        ["ok", "bad"]
+    );
 }
