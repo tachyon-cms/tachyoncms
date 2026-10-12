@@ -330,14 +330,32 @@ fn unknown_in_fields(fields: &[Field], input: Option<&Value>) -> Result<(), Sche
     for (f, raw) in fields.iter().zip(raw) {
         let known = serde_json::to_value(f).expect("fields always serialize");
         unknown_key(raw, &known, &f.name)?;
-        if let (Some(Value::Object(raw_admin)), Some(Value::Object(known_admin))) =
-            (raw.get("admin"), known.get("admin"))
-            && let Some(option) = raw_admin.keys().find(|k| !known_admin.contains_key(*k))
+        // Nested objects that parsing could also drop keys from: admin, its condition
+        // (which holds exactly one test), and labelled options.
+        let mut nested = vec![
+            ("admin".to_owned(), raw.get("admin"), known.get("admin")),
+            (
+                "admin.condition".to_owned(),
+                raw.pointer("/admin/condition"),
+                known.pointer("/admin/condition"),
+            ),
+        ];
+        if let (Some(Value::Array(raw_options)), Some(Value::Array(known_options))) =
+            (raw.get("options"), known.get("options"))
         {
-            return Err(SchemaError::UnknownOption {
-                field: f.name.clone(),
-                option: format!("admin.{option}"),
-            });
+            for (i, (r, k)) in raw_options.iter().zip(known_options).enumerate() {
+                nested.push((format!("options.{i}"), Some(r), Some(k)));
+            }
+        }
+        for (prefix, raw_part, known_part) in nested {
+            if let (Some(Value::Object(r)), Some(Value::Object(k))) = (raw_part, known_part)
+                && let Some(option) = r.keys().find(|key| !k.contains_key(*key))
+            {
+                return Err(SchemaError::UnknownOption {
+                    field: f.name.clone(),
+                    option: format!("{prefix}.{option}"),
+                });
+            }
         }
         if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &f.kind {
             unknown_in_fields(fields, raw.get("fields"))?;
@@ -418,6 +436,26 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             } if a > b => {
                 return Err(invalid("min is greater than max".into()));
             }
+            FieldKind::Text {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            }
+            | FieldKind::Number {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            } if (min_rows.is_some() || max_rows.is_some())
+                && (!has_many || min_rows > max_rows && max_rows.is_some()) =>
+            {
+                return Err(invalid(if *has_many {
+                    "minRows is greater than maxRows".into()
+                } else {
+                    "minRows and maxRows only apply with hasMany".into()
+                }));
+            }
             FieldKind::Select { options, .. } | FieldKind::Radio { options } => {
                 if options.is_empty() {
                     return Err(invalid(format!(
@@ -450,9 +488,16 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
                 return Err(invalid("minRows is greater than maxRows".into()));
             }
             FieldKind::Slug { from: Some(source) }
-                if !fields
-                    .iter()
-                    .any(|s| &s.name == source && matches!(s.kind, FieldKind::Text { .. })) =>
+                if !fields.iter().any(|s| {
+                    &s.name == source
+                        && matches!(
+                            s.kind,
+                            FieldKind::Text {
+                                has_many: false,
+                                ..
+                            }
+                        )
+                }) =>
             {
                 return Err(invalid(format!(
                     "from must name a top-level text field, not `{source}`"
@@ -828,6 +873,69 @@ mod tests {
             Err(SchemaError::InvalidField {
                 field: "tags".into(),
                 message: "text fields with multiple values can't be unique or filterable".into()
+            })
+        );
+    }
+
+    #[test]
+    fn stray_keys_in_conditions_and_options_are_rejected() {
+        let cases = [
+            (
+                json!({"name": "t", "type": "text", "admin": {"condition": {"field": "t", "equals": "a", "bogus": 1}}}),
+                "admin.condition.bogus",
+            ),
+            (
+                json!({"name": "t", "type": "text", "admin": {"condition": {"field": "t", "equals": "a", "in": ["b"]}}}),
+                "admin.condition.in",
+            ),
+            (
+                json!({"name": "c", "type": "select", "options": [{"label": "A", "value": "a", "color": "red"}]}),
+                "options.0.color",
+            ),
+        ];
+        for (field, option) in cases {
+            let name = field["name"].as_str().unwrap().to_owned();
+            let input = json!({"slug": "posts", "fields": [field]});
+            assert_eq!(
+                schema(input.clone()).reject_unknown_options(&input),
+                Err(SchemaError::UnknownOption {
+                    field: name,
+                    option: option.into()
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn row_limits_need_has_many_and_must_be_ordered() {
+        for (field, message) in [
+            (
+                json!({"name": "t", "type": "text", "hasMany": true, "minRows": 3, "maxRows": 1}),
+                "minRows is greater than maxRows",
+            ),
+            (
+                json!({"name": "t", "type": "number", "minRows": 2}),
+                "minRows and maxRows only apply with hasMany",
+            ),
+        ] {
+            let s = schema(json!({"slug": "posts", "fields": [field]}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: "t".into(),
+                    message: message.into()
+                })
+            );
+        }
+        let slug_from_list = schema(json!({"slug": "posts", "fields": [
+            {"name": "tags", "type": "text", "hasMany": true},
+            {"name": "slug", "type": "slug", "from": "tags"}
+        ]}));
+        assert_eq!(
+            slug_from_list.check(),
+            Err(SchemaError::InvalidField {
+                field: "slug".into(),
+                message: "from must name a top-level text field, not `tags`".into()
             })
         );
     }
