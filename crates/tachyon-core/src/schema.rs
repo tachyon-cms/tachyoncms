@@ -133,6 +133,8 @@ pub enum SchemaError {
     DuplicateField(String),
     #[error("field `{field}`: {message}")]
     InvalidField { field: String, message: String },
+    #[error("{0}")]
+    InvalidChange(String),
     #[error("field `{field}`: unknown option `{option}`")]
     UnknownOption { field: String, option: String },
 }
