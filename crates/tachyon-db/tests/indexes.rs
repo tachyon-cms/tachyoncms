@@ -239,3 +239,42 @@ async fn unique_filterable_fields_get_sort_indexes_too(pool: PgPool) {
         assert_eq!(index_state(&pool, &name).await, Some(true), "{kind:?}");
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_cancelled_reconcile_releases_its_lock(pool: PgPool) {
+    let c = collections::create(&pool, &filterable_price())
+        .await
+        .unwrap();
+    // An open writer makes CREATE INDEX CONCURRENTLY wait, so the reconcile is mid-build
+    // (holding its advisory lock) when the caller gives up on it.
+    let mut writer = pool.begin().await.unwrap();
+    documents::insert(&pool, c.id, 1, None, &doc("x"))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE documents SET updated_at = now()")
+        .execute(&mut *writer)
+        .await
+        .unwrap();
+    let cancelled = tokio::time::timeout(
+        std::time::Duration::from_millis(300),
+        reconcile_indexes(&pool, c.id),
+    )
+    .await;
+    assert!(cancelled.is_err(), "the build should still be waiting");
+    writer.commit().await.unwrap();
+
+    let key = i64::from_le_bytes(c.id.as_bytes()[..8].try_into().unwrap());
+    let mut free = false;
+    for _ in 0..100 {
+        free = sqlx::query_scalar("SELECT pg_try_advisory_lock($1)")
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        if free {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    assert!(free, "the lock outlived the cancelled reconcile");
+}

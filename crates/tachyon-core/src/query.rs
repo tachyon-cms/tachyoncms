@@ -1198,6 +1198,15 @@ mod tests {
         };
         assert_eq!(Cursor::decode(&cursor.encode()), Some(cursor));
         assert!(filter("where[price][equals]=1e400").is_err());
+        // Numbers are read as JSON writes them, so these spellings aren't numbers.
+        // (`%2B` is a plus sign; a bare `+` in a query string means a space.)
+        for odd in ["%2B5", ".5", "5.", "0x10", "NaN", "inf"] {
+            assert!(
+                filter(&format!("where[price][equals]={odd}")).is_err(),
+                "{odd}"
+            );
+        }
+        assert!(filter("where[price][equals]=-0.5e3").is_ok());
     }
 
     #[test]

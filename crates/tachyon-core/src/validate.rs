@@ -80,15 +80,20 @@ fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Val
                 let mut value = value.clone();
                 if let Some(f) = field {
                     strip_nulls(f, &mut value);
-                    // Rows replace the stored list whole, so they're new and get their defaults.
-                    if let (FieldKind::Array { fields, .. }, Value::Array(rows)) =
-                        (&f.kind, &mut value)
-                    {
-                        for row in rows {
-                            if let Value::Object(row) = row {
-                                apply_defaults(fields, row);
+                    // What replaces the stored value whole (rows, or a group the document
+                    // didn't have) is new, so it gets its defaults.
+                    match (&f.kind, &mut value) {
+                        (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                            for row in rows {
+                                if let Value::Object(row) = row {
+                                    apply_defaults(fields, row);
+                                }
                             }
                         }
+                        (FieldKind::Group { fields }, Value::Object(group)) => {
+                            apply_defaults(fields, group)
+                        }
+                        _ => {}
                     }
                 }
                 doc.insert(key.clone(), value);
@@ -123,9 +128,16 @@ fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
 
 /// Fills missing values that have a default, inside groups and array rows too. A missing
 /// group is created when something inside it has a default.
-fn apply_defaults(fields: &[Field], obj: &mut Map<String, Value>) {
+pub(crate) fn apply_defaults(fields: &[Field], obj: &mut Map<String, Value>) {
     for f in fields {
         match (&f.kind, obj.get_mut(&f.name)) {
+            (FieldKind::Group { fields }, None) if f.default.is_some() => {
+                let mut group = f.default.clone().unwrap_or_default();
+                if let Value::Object(inner) = &mut group {
+                    apply_defaults(fields, inner);
+                }
+                obj.insert(f.name.clone(), group);
+            }
             (_, None) if f.default.is_some() => {
                 obj.insert(f.name.clone(), f.default.clone().unwrap_or_default());
             }
@@ -1392,6 +1404,30 @@ mod tests {
         assert_eq!(
             normalize_date_time("2026-10-12T11:30:00.123999+02:00").as_deref(),
             Some(stored.as_str())
+        );
+    }
+
+    #[test]
+    fn groups_new_to_a_document_get_their_defaults() {
+        let f = fields(json!([
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "index", "type": "boolean", "default": true},
+                {"name": "title", "type": "text"}
+            ]},
+            {"name": "card", "type": "group", "default": {"a": "x"}, "fields": [
+                {"name": "a", "type": "text"},
+                {"name": "b", "type": "text", "default": "bd"}
+            ]}
+        ]));
+        assert_eq!(
+            update(&f, json!({}), json!({"seo": {"title": "new"}})),
+            json!({"seo": {"title": "new", "index": true}}),
+            "a group the update creates is as new as a row"
+        );
+        assert_eq!(
+            Value::Object(ok(&f, json!({}))),
+            json!({"seo": {"index": true}, "card": {"a": "x", "b": "bd"}}),
+            "a group's own default still gets its children's defaults"
         );
     }
 }

@@ -345,7 +345,7 @@ fn join(prefix: &str, key: &str) -> String {
 }
 
 /// Reshapes a stored document for a new schema: applies renames, drops values the new
-/// schema has no field for, and fills in new fields' defaults. Values whose type changed
+/// schema has no field for, and fills in new fields' defaults at every depth. Values whose type changed
 /// are left alone; validation reports them.
 pub fn migrate_document(
     new: &[Field],
@@ -376,13 +376,7 @@ pub fn migrate_document(
         rename_batch(&mut doc, &segments, &batch);
     }
     prune(new, &mut doc);
-    for f in new {
-        if let Some(default) = &f.default
-            && !doc.contains_key(&f.name)
-        {
-            doc.insert(f.name.clone(), default.clone());
-        }
-    }
+    crate::validate::apply_defaults(new, &mut doc);
     doc
 }
 
@@ -672,6 +666,25 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
     }
+    #[test]
+    fn schema_changes_fill_nested_defaults() {
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "index", "type": "boolean", "default": true}
+            ]}
+        ]}));
+        let doc = json!({"seo": {"title": "T"}});
+        assert_eq!(
+            Value::Object(migrate_document(
+                &new.fields,
+                &Renames::new(),
+                doc.as_object().unwrap()
+            )),
+            json!({"seo": {"title": "T", "index": true}})
+        );
+    }
+
     #[test]
     fn renaming_onto_a_removed_fields_name() {
         let old = schema(json!({"slug": "posts", "fields": [

@@ -372,11 +372,7 @@ async fn previews_list_index_changes(pool: PgPool) {
         .unwrap();
     assert_eq!(
         p.indexes.create,
-        [
-            "title (unique)",
-            "title (filter)",
-            "title (filter, highest first)"
-        ]
+        ["title (unique)", "title (filter)", "title (filter desc)"]
     );
     assert!(p.indexes.drop.is_empty());
 

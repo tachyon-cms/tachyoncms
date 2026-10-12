@@ -39,6 +39,13 @@ fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
     Ok(schema)
 }
 
+/// Logged here so the cause survives even if the reload after it fails too.
+fn log_index_failure(indexed: &Result<(), tachyon_db::DbError>, slug: &str) {
+    if let Err(error) = indexed {
+        tracing::warn!(%error, collection = slug, "couldn't build indexes; startup will retry");
+    }
+}
+
 pub async fn list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let docs: Vec<Value> = collections::list(&state.pool)
         .await?
@@ -69,6 +76,7 @@ pub async fn create(
     let created = collections::create(&state.pool, &schema).await?;
     // The schema is saved either way, so serve it even if its indexes failed to build.
     let indexed = reconcile_indexes(&state.pool, created.id).await;
+    log_index_failure(&indexed, &schema.slug);
     state.schemas.reload(&state.pool).await?;
     indexed?;
     Ok((StatusCode::CREATED, Json(to_json(&created))))
@@ -144,6 +152,7 @@ pub async fn update(
         .await
         .map_err(change_error)?;
     let indexed = reconcile_indexes(&state.pool, c.id).await;
+    log_index_failure(&indexed, &slug);
     state.schemas.reload(&state.pool).await?;
     indexed?;
     Ok(Json(json!({ "collection": to_json(&c), "preview": p })))

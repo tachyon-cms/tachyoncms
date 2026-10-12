@@ -113,7 +113,7 @@ impl Wanted {
         let kind = match self.kind {
             IndexKind::Unique => "unique",
             IndexKind::Filter => "filter",
-            IndexKind::FilterDesc => "filter, highest first",
+            IndexKind::FilterDesc => "filter desc",
         };
         format!("{} ({kind})", self.field)
     }

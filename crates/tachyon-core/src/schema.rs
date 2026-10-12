@@ -418,6 +418,28 @@ fn check_admin(
                 "admin.condition refers to `{target}`, which isn't a field"
             ));
         };
+        // A field inside a list exists once per row, so only fields in that same row can
+        // depend on it.
+        let mut reach = String::new();
+        let mut current = root;
+        for segment in target.split('.') {
+            reach = join(&reach, segment);
+            let Some(step) = current.iter().find(|f| f.name == segment) else {
+                break;
+            };
+            current = match &step.kind {
+                FieldKind::Array { fields, .. } if reach != *target => {
+                    if !inside.iter().any(|p| p.starts_with(&format!("{reach}."))) {
+                        return Err(format!(
+                            "admin.condition can't reach into the list `{reach}` from outside it"
+                        ));
+                    }
+                    fields
+                }
+                FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+                _ => &[],
+            };
+        }
         if inside
             .iter()
             .any(|p| target == p || target.starts_with(&format!("{p}.")))
@@ -460,9 +482,10 @@ fn is_size(width: &str) -> bool {
     } else {
         return false;
     };
-    number
-        .parse::<f64>()
-        .is_ok_and(|v| v.is_finite() && v > 0.0 && v <= max)
+    // Digits with an optional fraction, like CSS writes them: no signs, exponents or bare dots.
+    let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
+    let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
+    digits(whole) && digits(fraction) && number.parse::<f64>().is_ok_and(|v| v > 0.0 && v <= max)
 }
 
 /// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
@@ -1711,6 +1734,11 @@ mod tests {
             ("%", false),
             ("NaNpx", false),
             ("infpx", false),
+            ("50.px", false),
+            ("1e2px", false),
+            ("+50%", false),
+            (".5%", false),
+            ("12.5px", true),
         ] {
             let result =
                 check_err(json!([{"name": "t", "type": "text", "admin": {"width": width}}]));
@@ -1745,6 +1773,11 @@ mod tests {
                         "fields": [{"name": "a", "type": "text"}]}]),
                 "field `fields.0`: admin.condition can't depend on a field inside it",
             ),
+            (
+                json!([{"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
+                       {"name": "t", "type": "text", "admin": {"condition": {"field": "links.url", "exists": true}}}]),
+                "field `t`: admin.condition can't reach into the list `links` from outside it",
+            ),
         ];
         for (fields, message) in cases {
             assert_eq!(check_err(fields), message);
@@ -1756,6 +1789,10 @@ mod tests {
                 {"name": "seo", "type": "group", "fields": [
                     {"name": "on", "type": "boolean"},
                     {"name": "title", "type": "text", "admin": {"condition": {"field": "seo.on", "equals": true}}}
+                ]},
+                {"name": "rows", "type": "array", "fields": [
+                    {"name": "kind", "type": "text"},
+                    {"name": "extra", "type": "text", "admin": {"condition": {"field": "rows.kind", "equals": "x"}}}
                 ]}
             ])),
             "ok"

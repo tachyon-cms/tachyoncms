@@ -34,13 +34,17 @@ pub(crate) struct AppState {
 
 pub async fn router(pool: PgPool) -> Result<Router, DbError> {
     let schemas = Arc::new(Schemas::load(&pool).await?);
-    // Builds any index a failed change left missing. Already-matching collections cost one
-    // catalog query each.
-    for c in tachyon_db::collections::list(&pool).await? {
-        if let Err(error) = tachyon_db::indexes::reconcile_indexes(&pool, c.id).await {
-            tracing::warn!(%error, collection = %c.schema.slug, "couldn't build indexes");
+    // Builds any index a failed change left missing, in the background: a big build, or one
+    // waiting on another server's, mustn't keep this one from answering.
+    let collections = tachyon_db::collections::list(&pool).await?;
+    let heal = pool.clone();
+    tokio::spawn(async move {
+        for c in collections {
+            if let Err(error) = tachyon_db::indexes::reconcile_indexes(&heal, c.id).await {
+                tracing::warn!(%error, collection = %c.schema.slug, "couldn't build indexes");
+            }
         }
-    }
+    });
     schemas::spawn_listener(pool.clone(), schemas.clone());
     let routes = Router::new()
         .route(

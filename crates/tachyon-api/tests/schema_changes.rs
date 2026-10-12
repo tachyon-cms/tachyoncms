@@ -221,11 +221,44 @@ async fn a_failed_index_build_still_reloads_the_schema_and_startup_heals_it(pool
         .await
         .unwrap();
     let _restarted = tachyon_api::router(pool.clone()).await.unwrap();
-    let built: bool =
-        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)")
+    let mut built = false;
+    for _ in 0..100 {
+        built = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_indexes WHERE indexname = $1)")
             .bind(&name)
             .fetch_one(&pool)
             .await
             .unwrap();
+        if built {
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
     assert!(built, "startup builds indexes a failed change left missing");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn startup_doesnt_wait_for_another_servers_index_build(pool: PgPool) {
+    let (_app, _) = app(pool.clone()).await;
+    let posts = tachyon_db::collections::get_by_slug(&pool, "posts")
+        .await
+        .unwrap();
+    // Another server is mid-reconcile for this collection.
+    let mut other = pool.acquire().await.unwrap();
+    let key = i64::from_le_bytes(posts.id.as_bytes()[..8].try_into().unwrap());
+    sqlx::query("SELECT pg_advisory_lock($1)")
+        .bind(key)
+        .execute(&mut *other)
+        .await
+        .unwrap();
+    let started = tokio::time::timeout(
+        std::time::Duration::from_secs(2),
+        tachyon_api::router(pool.clone()),
+    )
+    .await;
+    assert!(started.is_ok(), "startup waited on the lock");
+    sqlx::query("SELECT pg_advisory_unlock($1)")
+        .bind(key)
+        .execute(&mut *other)
+        .await
+        .unwrap();
 }
