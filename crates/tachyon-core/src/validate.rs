@@ -4,6 +4,8 @@ use time::format_description::BorrowedFormatItem;
 use time::format_description::well_known::Rfc3339;
 use time::macros::format_description;
 
+use uuid::Uuid;
+
 use crate::schema::{Field, FieldKind};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
@@ -44,6 +46,17 @@ pub fn validate_document(
                 doc.insert(f.name.clone(), default.clone());
             }
         }
+        for f in fields {
+            if let FieldKind::Slug { from: Some(source) } = &f.kind
+                && !doc.contains_key(&f.name)
+                && let Some(Value::String(text)) = doc.get(source)
+            {
+                let slug = slugify(text);
+                if !slug.is_empty() {
+                    doc.insert(f.name.clone(), Value::String(slug));
+                }
+            }
+        }
     }
     let mut errors = Vec::new();
     check_object(fields, &doc, "", &mut errors);
@@ -56,7 +69,7 @@ pub fn validate_document(
     if !errors.is_empty() {
         return Err(errors);
     }
-    normalize_dates(fields, &mut doc);
+    normalize(fields, &mut doc);
     Ok(doc)
 }
 
@@ -69,25 +82,36 @@ fn contains_nul(v: &Value) -> bool {
     }
 }
 
-/// Date-times are stored in UTC, whatever offset the client sent.
-fn normalize_dates(fields: &[Field], obj: &mut Map<String, Value>) {
+/// Stores date-times in UTC and relationship IDs in canonical form, whatever the client sent.
+fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
     for f in fields {
         let Some(value) = obj.get_mut(&f.name) else {
             continue;
         };
         match (&f.kind, value) {
             (FieldKind::Date { date_only: false }, Value::String(s)) => {
-                if let Ok(t) = time::OffsetDateTime::parse(s, &Rfc3339)
-                    && let Ok(utc) = t.to_offset(time::UtcOffset::UTC).format(&Rfc3339)
-                {
+                if let Some(utc) = normalize_date_time(s) {
                     *s = utc;
                 }
             }
-            (FieldKind::Group { fields }, Value::Object(inner)) => normalize_dates(fields, inner),
+            (
+                FieldKind::Relationship {
+                    has_many: false, ..
+                },
+                Value::String(s),
+            ) => canonical_id(s),
+            (FieldKind::Relationship { has_many: true, .. }, Value::Array(ids)) => {
+                for id in ids {
+                    if let Value::String(s) = id {
+                        canonical_id(s);
+                    }
+                }
+            }
+            (FieldKind::Group { fields }, Value::Object(inner)) => normalize(fields, inner),
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                 for row in rows {
                     if let Value::Object(inner) = row {
-                        normalize_dates(fields, inner);
+                        normalize(fields, inner);
                     }
                 }
             }
@@ -193,9 +217,7 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         }
         FieldKind::Boolean => (!v.is_boolean()).then(|| "expected true or false".into()),
         FieldKind::Date { date_only: true } => {
-            let ok = v
-                .as_str()
-                .is_some_and(|s| time::Date::parse(s, DATE).is_ok());
+            let ok = v.as_str().is_some_and(is_date);
             (!ok).then(|| "expected a date like 2026-10-12".into())
         }
         FieldKind::Date { date_only: false } => {
@@ -220,7 +242,18 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
                 (!allowed(v)).then(|| format!("expected one of: {list}"))
             }
         }
-        FieldKind::Slug { .. } | FieldKind::Relationship { .. } => None,
+        FieldKind::Slug { .. } => (!v.as_str().is_some_and(is_slug)).then(|| {
+            "expected lowercase letters, digits and single hyphens, like my-first-post".into()
+        }),
+        FieldKind::Relationship {
+            has_many: false, ..
+        } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
+        FieldKind::Relationship { has_many: true, .. } => {
+            let ok = v
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
+            (!ok).then(|| "expected a list of document IDs".into())
+        }
         FieldKind::Json => None,
         FieldKind::Group { .. } => Some("expected an object".into()),
         FieldKind::Array { .. } => Some("expected a list".into()),
@@ -259,6 +292,53 @@ fn is_email(s: &str) -> bool {
         && !domain.ends_with('.')
 }
 
+const DATE_TIME_UTC: &[BorrowedFormatItem<'_>] =
+    format_description!("[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]Z");
+
+/// Parses an RFC 3339 date-time and returns it in UTC with exactly three fractional digits,
+/// so stored values sort correctly as text.
+pub fn normalize_date_time(s: &str) -> Option<String> {
+    time::OffsetDateTime::parse(s, &Rfc3339)
+        .ok()?
+        .to_offset(time::UtcOffset::UTC)
+        .format(DATE_TIME_UTC)
+        .ok()
+}
+
+pub(crate) fn is_date(s: &str) -> bool {
+    time::Date::parse(s, DATE).is_ok()
+}
+
+/// Turns "Hello, World! Café" into "hello-world-café".
+pub fn slugify(s: &str) -> String {
+    let mut out = String::new();
+    for c in s.chars().flat_map(char::to_lowercase) {
+        if c.is_alphanumeric() {
+            out.push(c);
+        } else if !out.is_empty() && !out.ends_with('-') {
+            out.push('-');
+        }
+    }
+    while out.ends_with('-') {
+        out.pop();
+    }
+    out
+}
+
+fn is_slug(s: &str) -> bool {
+    !s.is_empty() && s.len() <= 200 && slugify(s) == s
+}
+
+fn is_uuid(s: &str) -> bool {
+    Uuid::try_parse(s).is_ok()
+}
+
+fn canonical_id(s: &mut String) {
+    if let Ok(id) = Uuid::try_parse(s) {
+        *s = id.to_string();
+    }
+}
+
 fn is_web_url(s: &str) -> bool {
     url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
 }
@@ -279,6 +359,111 @@ fn error(path: String, message: &str) -> FieldError {
     FieldError {
         path,
         message: message.into(),
+    }
+}
+
+/// A link from a document to another document.
+#[derive(Debug, Clone, PartialEq)]
+pub struct RelationRef {
+    /// Where the ID sits in the document: `author`, `related.1`, `links.0.author`.
+    pub path: String,
+    pub relation_to: String,
+    pub id: Uuid,
+}
+
+/// Every relationship ID in a validated document, in schema order.
+pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
+    fn walk(fields: &[Field], obj: &Map<String, Value>, prefix: &str, out: &mut Vec<RelationRef>) {
+        for f in fields {
+            let Some(value) = obj.get(&f.name) else {
+                continue;
+            };
+            let path = join(prefix, &f.name);
+            let mut push = |path: String, relation_to: &str, id: &Value| {
+                if let Some(id) = id.as_str().and_then(|s| Uuid::try_parse(s).ok()) {
+                    out.push(RelationRef {
+                        path,
+                        relation_to: relation_to.to_owned(),
+                        id,
+                    });
+                }
+            };
+            match (&f.kind, value) {
+                (
+                    FieldKind::Relationship {
+                        relation_to,
+                        has_many: false,
+                    },
+                    id,
+                ) => push(path, relation_to, id),
+                (
+                    FieldKind::Relationship {
+                        relation_to,
+                        has_many: true,
+                    },
+                    Value::Array(ids),
+                ) => {
+                    for (i, id) in ids.iter().enumerate() {
+                        push(format!("{path}.{i}"), relation_to, id);
+                    }
+                }
+                (FieldKind::Group { fields }, Value::Object(inner)) => {
+                    walk(fields, inner, &path, out)
+                }
+                (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                    for (i, row) in rows.iter().enumerate() {
+                        if let Value::Object(inner) = row {
+                            walk(fields, inner, &format!("{path}.{i}"), out);
+                        }
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    walk(fields, doc, "", &mut out);
+    out
+}
+
+/// Replaces each relationship ID with `f(id)` wherever `f` returns a value. Used to populate.
+pub fn map_relations(
+    fields: &[Field],
+    doc: &mut Map<String, Value>,
+    f: &mut impl FnMut(&str) -> Option<Value>,
+) {
+    for field in fields {
+        let Some(value) = doc.get_mut(&field.name) else {
+            continue;
+        };
+        match (&field.kind, value) {
+            (
+                FieldKind::Relationship {
+                    has_many: false, ..
+                },
+                slot,
+            ) => replace_id(slot, f),
+            (FieldKind::Relationship { has_many: true, .. }, Value::Array(ids)) => {
+                for slot in ids {
+                    replace_id(slot, f);
+                }
+            }
+            (FieldKind::Group { fields }, Value::Object(inner)) => map_relations(fields, inner, f),
+            (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                for row in rows {
+                    if let Value::Object(inner) = row {
+                        map_relations(fields, inner, f);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn replace_id(slot: &mut Value, f: &mut impl FnMut(&str) -> Option<Value>) {
+    if let Some(found) = slot.as_str().and_then(f) {
+        *slot = found;
     }
 }
 
@@ -524,7 +709,7 @@ mod tests {
         );
         assert_eq!(
             Value::Object(doc),
-            json!({"at": "2026-10-12T07:30:00Z", "times": [{"at": "2026-10-12T01:15:00Z"}]})
+            json!({"at": "2026-10-12T07:30:00.000Z", "times": [{"at": "2026-10-12T01:15:00.000Z"}]})
         );
     }
 
@@ -555,5 +740,106 @@ mod tests {
                 message: "is required".into()
             }]
         );
+    }
+
+    #[test]
+    fn slugs_are_generated_and_validated() {
+        let f = fields(json!([
+            {"name": "title", "type": "text"},
+            {"name": "slug", "type": "slug", "from": "title"}
+        ]));
+        assert_eq!(
+            ok(&f, json!({"title": "Hello, World! Café"}))["slug"],
+            "hello-world-café"
+        );
+        assert_eq!(
+            ok(&f, json!({"title": "x", "slug": "my-own"}))["slug"],
+            "my-own"
+        );
+        for bad in ["Has-Caps", "two--dashes", "-lead", "trail-", "sp ace", ""] {
+            assert_eq!(
+                errs(&f, json!({"slug": bad})),
+                vec![e(
+                    "slug",
+                    "expected lowercase letters, digits and single hyphens, like my-first-post"
+                )],
+                "{bad}"
+            );
+        }
+    }
+
+    #[test]
+    fn relationships_hold_document_ids() {
+        let f = fields(json!([
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "related", "type": "relationship", "relationTo": "posts", "hasMany": true}
+        ]));
+        let id = "0199D5C4-0000-7000-8000-000000000001";
+        let doc = ok(&f, json!({"author": id, "related": [id]}));
+        assert_eq!(
+            doc["author"],
+            id.to_lowercase(),
+            "IDs are stored in canonical form"
+        );
+        assert_eq!(
+            errs(&f, json!({"author": "nope"})),
+            vec![e("author", "expected a document ID")]
+        );
+        assert_eq!(
+            errs(&f, json!({"related": id})),
+            vec![e("related", "expected a list of document IDs")]
+        );
+    }
+
+    #[test]
+    fn relations_are_found_everywhere() {
+        let f = fields(json!([
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "related", "type": "relationship", "relationTo": "posts", "hasMany": true},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "author", "type": "relationship", "relationTo": "authors"}
+            ]}
+        ]));
+        let a = "0199d5c4-0000-7000-8000-00000000000a";
+        let b = "0199d5c4-0000-7000-8000-00000000000b";
+        let doc = ok(
+            &f,
+            json!({"author": a, "related": [a, b], "links": [{}, {"author": b}]}),
+        );
+        let found: Vec<(String, String, String)> = relations(&f, &doc)
+            .into_iter()
+            .map(|r| (r.path, r.relation_to, r.id.to_string()))
+            .collect();
+        let expected: Vec<(String, String, String)> = [
+            ("author", "authors", a),
+            ("related.0", "posts", a),
+            ("related.1", "posts", b),
+            ("links.1.author", "authors", b),
+        ]
+        .into_iter()
+        .map(|(p, r, i)| (p.into(), r.into(), i.into()))
+        .collect();
+        assert_eq!(found, expected);
+
+        let mut doc = doc;
+        map_relations(&f, &mut doc, &mut |id| {
+            (id == b).then(|| json!({"id": b, "name": "Bee"}))
+        });
+        assert_eq!(doc["author"], a, "unmatched IDs stay as they are");
+        assert_eq!(doc["related"][1]["name"], "Bee");
+        assert_eq!(doc["links"][1]["author"]["name"], "Bee");
+    }
+
+    #[test]
+    fn normalize_date_time_pads_to_milliseconds() {
+        assert_eq!(
+            normalize_date_time("2026-10-12T09:30:00+02:00").as_deref(),
+            Some("2026-10-12T07:30:00.000Z")
+        );
+        assert_eq!(
+            normalize_date_time("2026-10-12T07:30:00.123456Z").as_deref(),
+            Some("2026-10-12T07:30:00.123Z")
+        );
+        assert_eq!(normalize_date_time("yesterday"), None);
     }
 }
