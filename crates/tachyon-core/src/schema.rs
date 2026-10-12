@@ -284,13 +284,32 @@ pub fn data_fields(fields: &[Field]) -> Vec<Field> {
 }
 
 /// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
-fn check_layout(fields: &[Field]) -> Result<(), SchemaError> {
+/// Admin options any field can carry, data or layout. `root` is the data shape.
+fn check_admin(admin: &Admin, root: &[Field]) -> Result<(), String> {
+    if let Some(condition) = &admin.condition
+        && find_field(root, &condition.field).is_none()
+    {
+        return Err(format!(
+            "admin.condition refers to `{}`, which isn't a field",
+            condition.field
+        ));
+    }
+    if let Some(width) = &admin.width
+        && !(width.ends_with('%') || width.ends_with("px"))
+    {
+        return Err("admin.width must look like 50% or 240px".into());
+    }
+    Ok(())
+}
+
+fn check_layout(fields: &[Field], root: &[Field]) -> Result<(), SchemaError> {
     for f in fields {
         if f.kind.is_layout() {
             let invalid = |message: String| SchemaError::InvalidField {
                 field: String::new(),
                 message,
             };
+            check_admin(&f.admin, root).map_err(invalid)?;
             let kind = f.kind.name();
             if !f.name.is_empty() {
                 return Err(invalid(format!("{kind} fields don't take a name")));
@@ -318,10 +337,10 @@ fn check_layout(fields: &[Field]) -> Result<(), SchemaError> {
             FieldKind::Row { fields }
             | FieldKind::Collapsible { fields, .. }
             | FieldKind::Group { fields }
-            | FieldKind::Array { fields, .. } => check_layout(fields)?,
+            | FieldKind::Array { fields, .. } => check_layout(fields, root)?,
             FieldKind::Tabs { tabs } => {
                 for tab in tabs {
-                    check_layout(&tab.fields)?;
+                    check_layout(&tab.fields, root)?;
                 }
             }
             _ => {}
@@ -444,8 +463,8 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
-        check_layout(&self.fields)?;
         let data = data_fields(&self.fields);
+        check_layout(&self.fields, &data)?;
         check_fields(&data, true, &data)
     }
 
@@ -686,19 +705,7 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             }
             _ => {}
         }
-        if let Some(condition) = &f.admin.condition
-            && find_field(root, &condition.field).is_none()
-        {
-            return Err(invalid(format!(
-                "admin.condition refers to `{}`, which isn't a field",
-                condition.field
-            )));
-        }
-        if let Some(width) = &f.admin.width
-            && !(width.ends_with('%') || width.ends_with("px"))
-        {
-            return Err(invalid("admin.width must look like 50% or 240px".into()));
-        }
+        check_admin(&f.admin, root).map_err(invalid)?;
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
             crate::validate::check_value(f, default, &f.name, &mut errors);
@@ -1237,5 +1244,33 @@ mod tests {
                 })
             );
         }
+    }
+
+    #[test]
+    fn admin_options_on_layout_fields_are_checked() {
+        for (field, message) in [
+            (
+                json!({"type": "row", "admin": {"condition": {"field": "nope", "equals": 1}}, "fields": []}),
+                "admin.condition refers to `nope`, which isn't a field",
+            ),
+            (
+                json!({"type": "collapsible", "label": "C", "admin": {"width": "banana"}, "fields": []}),
+                "admin.width must look like 50% or 240px",
+            ),
+        ] {
+            let s = schema(json!({"slug": "posts", "fields": [field]}));
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::InvalidField {
+                    field: String::new(),
+                    message: message.into()
+                })
+            );
+        }
+        let ok = schema(json!({"slug": "posts", "fields": [
+            {"name": "kind", "type": "text"},
+            {"type": "row", "admin": {"condition": {"field": "kind", "equals": "video"}}, "fields": []}
+        ]}));
+        assert_eq!(ok.check(), Ok(()));
     }
 }

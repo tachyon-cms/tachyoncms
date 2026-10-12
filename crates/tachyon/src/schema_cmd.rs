@@ -46,10 +46,10 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
             let schema: CollectionSchema = serde_json::from_value(item.clone())
                 .with_context(|| format!("{slug}: can't read this collection"))?;
-            schema.check().with_context(|| slug.to_owned())?;
             schema
                 .reject_unknown_options(item)
                 .with_context(|| slug.to_owned())?;
+            schema.check().with_context(|| slug.to_owned())?;
             Ok(schema)
         })
         .collect()
