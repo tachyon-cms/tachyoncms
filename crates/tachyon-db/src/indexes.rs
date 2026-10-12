@@ -13,7 +13,10 @@ use crate::query::field_expr;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum IndexKind {
     Unique,
+    /// Filters, and sorts lowest first.
     Filter,
+    /// Sorts highest first. One B-tree can't keep missing values last in both directions.
+    FilterDesc,
 }
 
 /// A stable name under Postgres's 63-byte limit. The comparison kind is part of the hash,
@@ -29,19 +32,26 @@ pub fn index_name(collection_id: Uuid, field: &str, kind: IndexKind, value: Valu
         ValueKind::Point => b'p',
     };
     // FNV-1a: tiny, stable across releases, and good enough to avoid collisions here.
+    // Ascending names predate the descending ones, so only descending adds a byte.
+    let direction: &[u8] = if kind == IndexKind::FilterDesc {
+        b"-"
+    } else {
+        b""
+    };
     let mut hash: u64 = 0xcbf2_9ce4_8422_2325;
     for byte in collection_id
         .as_bytes()
         .iter()
         .chain(field.as_bytes())
         .chain([tag].iter())
+        .chain(direction)
     {
         hash ^= u64::from(*byte);
         hash = hash.wrapping_mul(0x0100_0000_01b3);
     }
     let prefix = match kind {
         IndexKind::Unique => "uq",
-        IndexKind::Filter => "ix",
+        IndexKind::Filter | IndexKind::FilterDesc => "ix",
     };
     format!("documents_{prefix}_{hash:016x}")
 }
@@ -60,31 +70,39 @@ pub(crate) struct Wanted {
 
 pub(crate) fn wanted_indexes(collection_id: Uuid, schema: &CollectionSchema) -> Vec<Wanted> {
     let scope = format!("WHERE collection_id = '{collection_id}' AND deleted_at IS NULL");
-    data_fields(&schema.fields)
-        .iter()
-        .filter_map(|f| {
-            let kind = value_kind(&f.kind)?;
-            let expr = field_expr(std::slice::from_ref(&f.name), kind);
-            let (unique, definition) = if f.is_unique() {
-                (true, format!("ON documents (({expr})) {scope}"))
-            } else if f.filterable {
-                (false, format!("ON documents (({expr}), id DESC) {scope}"))
-            } else {
-                return None;
-            };
-            let index_kind = if unique {
-                IndexKind::Unique
-            } else {
-                IndexKind::Filter
-            };
-            Some(Wanted {
-                name: index_name(collection_id, &f.name, index_kind, kind),
+    let mut out = Vec::new();
+    for f in data_fields(&schema.fields) {
+        let Some(value) = value_kind(&f.kind) else {
+            continue;
+        };
+        let expr = field_expr(std::slice::from_ref(&f.name), value);
+        let mut want = |kind: IndexKind, definition: String| {
+            out.push(Wanted {
+                name: index_name(collection_id, &f.name, kind, value),
                 field: f.name.clone(),
-                unique,
+                unique: kind == IndexKind::Unique,
                 definition,
-            })
-        })
-        .collect()
+            });
+        };
+        if f.is_unique() {
+            want(
+                IndexKind::Unique,
+                format!("ON documents (({expr})) {scope}"),
+            );
+        }
+        // Both match `query::order_by`: missing values last, ties newest first.
+        if f.filterable {
+            want(
+                IndexKind::Filter,
+                format!("ON documents (({expr}), id DESC) {scope}"),
+            );
+            want(
+                IndexKind::FilterDesc,
+                format!("ON documents (({expr}) DESC NULLS LAST, id DESC) {scope}"),
+            );
+        }
+    }
+    out
 }
 
 /// Makes a collection's indexes match its schema: creates missing ones, drops ones no field
