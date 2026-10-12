@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
-use sqlx::postgres::PgListener;
+use sqlx::postgres::{PgListener, PgPoolOptions};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use uuid::Uuid;
@@ -68,11 +68,15 @@ impl Schemas {
     }
 }
 
-/// Keeps `schemas` current until the pool closes. Reconnects after errors.
+/// Keeps `schemas` current until the pool closes. Reconnects after errors. Listens on a
+/// connection of its own, so requests keep every pooled connection.
 pub fn spawn_listener(pool: PgPool, schemas: Arc<Schemas>) {
     tokio::spawn(async move {
+        let own = PgPoolOptions::new()
+            .max_connections(1)
+            .connect_lazy_with((*pool.connect_options()).clone());
         while !pool.is_closed() {
-            if let Err(error) = listen(&pool, &schemas).await {
+            if let Err(error) = listen(&pool, &own, &schemas).await {
                 if pool.is_closed() {
                     break;
                 }
@@ -80,19 +84,25 @@ pub fn spawn_listener(pool: PgPool, schemas: Arc<Schemas>) {
                 tokio::time::sleep(Duration::from_secs(1)).await;
             }
         }
+        own.close().await;
     });
 }
 
-async fn listen(pool: &PgPool, schemas: &Schemas) -> Result<(), DbError> {
-    let mut listener = PgListener::connect_with(pool).await?;
+async fn listen(pool: &PgPool, own: &PgPool, schemas: &Schemas) -> Result<(), DbError> {
+    let mut listener = PgListener::connect_with(own).await?;
     listener.listen(CHANNEL).await?;
     // Catch anything that changed while we were (re)connecting.
     schemas.reload(pool).await?;
     loop {
         // `None` means the connection dropped. Start over with a fresh listener, which
         // re-subscribes and reloads, so nothing announced while we were away is missed.
-        if listener.try_recv().await?.is_none() {
-            return Ok(());
+        tokio::select! {
+            received = listener.try_recv() => {
+                if received?.is_none() {
+                    return Ok(());
+                }
+            }
+            () = pool.close_event() => return Ok(()),
         }
         schemas.reload(pool).await?;
     }
@@ -152,5 +162,36 @@ mod tests {
         let schemas = Schemas::load(&pool).await.unwrap();
         assert_eq!(schemas.get_by_id(created.id).unwrap().schema.slug, "posts");
         assert!(schemas.get_by_id(Uuid::now_v7()).is_none());
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn the_listener_leaves_the_pool_alone(pool: PgPool) {
+        let small = sqlx::postgres::PgPoolOptions::new()
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(1))
+            .connect_with((*pool.connect_options()).clone())
+            .await
+            .unwrap();
+        let schemas = Arc::new(Schemas::load(&small).await.unwrap());
+        spawn_listener(small.clone(), schemas.clone());
+        tokio::time::sleep(Duration::from_millis(300)).await;
+
+        let (a, b) = tokio::join!(small.acquire(), small.acquire());
+        assert!(
+            a.is_ok() && b.is_ok(),
+            "the listener took a pooled connection"
+        );
+        drop((a, b));
+
+        // It still hears changes.
+        posts(&small).await;
+        for _ in 0..50 {
+            if schemas.get("posts").is_some() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        assert!(schemas.get("posts").is_some());
+        small.close().await;
     }
 }
