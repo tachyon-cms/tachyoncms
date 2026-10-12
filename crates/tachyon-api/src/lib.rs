@@ -3,6 +3,7 @@
 mod collections;
 mod documents;
 mod error;
+mod params;
 mod request_id;
 mod schemas;
 

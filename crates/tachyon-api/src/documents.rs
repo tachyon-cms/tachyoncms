@@ -1,10 +1,9 @@
 //! `/api/{collection}` and `/api/{collection}/{id}`.
 
 use axum::Json;
-use axum::extract::rejection::{JsonRejection, PathRejection, QueryRejection};
-use axum::extract::{Path, Query, State};
+use axum::extract::rejection::{JsonRejection, PathRejection};
+use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
@@ -15,18 +14,8 @@ use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
+use crate::params::{depth_param, list_params};
 use crate::{ApiError, AppState};
-
-const DEFAULT_LIMIT: i64 = 10;
-const MAX_LIMIT: i64 = 100;
-
-#[derive(Deserialize)]
-pub struct ListParams {
-    limit: Option<i64>,
-    page: Option<i64>,
-    #[serde(default)]
-    count: bool,
-}
 
 /// A collection (not a global) by slug, from the in-memory cache.
 pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>, ApiError> {
@@ -58,7 +47,7 @@ fn parse_id(id: &str) -> Result<Uuid, ApiError> {
     id.parse().map_err(|_| ApiError::NotFound)
 }
 
-fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
+pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
     body.map(|Json(v)| v)
         .map_err(|e| ApiError::BadRequest(e.body_text()))
 }
@@ -66,34 +55,32 @@ fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError
 pub async fn list(
     State(state): State<AppState>,
     path: Result<Path<String>, PathRejection>,
-    params: Result<Query<ListParams>, QueryRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    let Query(params) = params.map_err(|e| ApiError::BadRequest(e.body_text()))?;
-    let limit = params.limit.unwrap_or(DEFAULT_LIMIT);
-    let page = params.page.unwrap_or(1);
-    if limit < 1 {
-        return Err(ApiError::BadRequest("limit must be at least 1".into()));
-    }
-    if page < 1 {
-        return Err(ApiError::BadRequest("page must be at least 1".into()));
-    }
-    let limit = limit.min(MAX_LIMIT);
-    let offset = (page - 1)
-        .checked_mul(limit)
-        .ok_or_else(|| ApiError::BadRequest("page is too large".into()))?;
-
     let c = collection(&state, &slug)?;
+    let p = list_params(raw.as_deref(), &c)?;
+    let _depth = p.depth; // populated in the relationships task
+    let page = p.page.unwrap_or(1);
+    let offset = (page - 1)
+        .checked_mul(p.limit)
+        .ok_or_else(|| ApiError::BadRequest("page is too large".into()))?;
     let q = ListQuery {
-        filter: None,
-        sort: None,
-        limit,
-        offset,
-        after: None,
-        count: params.count,
+        filter: p.filter.as_ref(),
+        sort: p.sort.as_ref(),
+        limit: p.limit,
+        offset: if p.after.is_some() { 0 } else { offset },
+        after: p.after.as_ref(),
+        count: p.count,
     };
     let found = query::list(&state.pool, c.id, &q).await?;
-    let mut body = json!({ "docs": found.docs, "page": page, "limit": limit });
+    let mut body = json!({ "docs": found.docs, "limit": p.limit });
+    if p.after.is_none() {
+        body["page"] = page.into();
+    }
+    if let Some(next) = found.next {
+        body["nextCursor"] = next.encode().into();
+    }
     if let Some(total) = found.total {
         body["totalDocs"] = total.into();
     }
@@ -122,8 +109,10 @@ pub async fn create(
 pub async fn get(
     State(state): State<AppState>,
     path: Result<Path<(String, String)>, PathRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Document>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    let _depth = depth_param(raw.as_deref())?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     Ok(Json(documents::get(&state.pool, c.id, id).await?))
