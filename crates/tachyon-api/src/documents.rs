@@ -16,7 +16,7 @@ use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
 use crate::params::{depth_param, list_params};
-use crate::populate::{populate, prepare, to_value};
+use crate::populate::{link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -120,12 +120,13 @@ pub async fn create(
     let c = collection(&state, &slug)?;
     let data = validate_document(&c.schema.fields, &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
+    let targets = link_targets(&state, &c).await?;
     let doc = documents::insert(
         &state.pool,
         c.id,
         c.schema_version,
         None,
-        &prepare(&state, &c, data),
+        &prepare(&targets, &c, data)?,
     )
     .await
     .map_err(|e| unique_error(&c, e.into()))?;
@@ -154,10 +155,11 @@ pub async fn update(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let patch = json_body(body)?;
+    let targets = link_targets(&state, &c).await?;
     let doc = documents::update(&state.pool, c.id, c.schema_version, id, |current| {
-        validate_document(&c.schema.fields, &patch, Some(current))
-            .map(|data| prepare(&state, &c, data))
-            .map_err(ApiError::Validation)
+        let data = validate_document(&c.schema.fields, &patch, Some(current))
+            .map_err(ApiError::Validation)?;
+        prepare(&targets, &c, data)
     })
     .await
     .map_err(|e| unique_error(&c, e))?;

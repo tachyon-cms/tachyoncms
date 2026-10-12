@@ -14,7 +14,7 @@ use tachyon_db::documents::{self, Document};
 
 use crate::documents::{json_body, unique_error};
 use crate::params::depth_param;
-use crate::populate::{populate, prepare, to_value};
+use crate::populate::{link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -63,12 +63,13 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
     let patch = json_body(body)?;
+    let targets = link_targets(&state, &c).await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
         let updated = documents::update(&state.pool, c.id, c.schema_version, c.id, |current| {
             let data = validate_document(&c.schema.fields, &patch, Some(current))
                 .map_err(ApiError::Validation)?;
-            Ok(prepare(&state, &c, data))
+            prepare(&targets, &c, data)
         })
         .await;
         match updated {
@@ -83,7 +84,7 @@ pub async fn update(
             c.id,
             c.schema_version,
             Some(c.id),
-            &prepare(&state, &c, data),
+            &prepare(&targets, &c, data)?,
         )
         .await
         {
