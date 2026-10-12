@@ -8,9 +8,10 @@ use serde::Deserialize;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
-use tachyon_core::{CollectionKind, validate_document};
+use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document, Prepared};
+use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
@@ -34,6 +35,22 @@ pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>
         .get(slug)
         .filter(|c| c.schema.kind == CollectionKind::Collection)
         .ok_or(ApiError::NotFound)
+}
+
+/// Turns a unique-index rejection into a field error, when the index belongs to one of `c`'s fields.
+pub(crate) fn unique_error(c: &Collection, e: ApiError) -> ApiError {
+    if let ApiError::Unique(constraint) = &e
+        && let Some(f) =
+            c.schema.fields.iter().find(|f| {
+                f.is_unique() && index_name(c.id, &f.name, IndexKind::Unique) == *constraint
+            })
+    {
+        return ApiError::Validation(vec![FieldError {
+            path: f.name.clone(),
+            message: "must be unique; another document already uses this value".into(),
+        }]);
+    }
+    e
 }
 
 /// A malformed ID can't match any document, so it's a 404 rather than a 400.
@@ -94,7 +111,11 @@ pub async fn create(
         .map_err(ApiError::Validation)?;
     Ok((
         StatusCode::CREATED,
-        Json(documents::insert(&state.pool, c.id, None, &Prepared::plain(data)).await?),
+        Json(
+            documents::insert(&state.pool, c.id, None, &Prepared::plain(data))
+                .await
+                .map_err(|e| unique_error(&c, e.into()))?,
+        ),
     ))
 }
 
@@ -122,7 +143,8 @@ pub async fn update(
             .map(Prepared::plain)
             .map_err(ApiError::Validation)
     })
-    .await?;
+    .await
+    .map_err(|e| unique_error(&c, e))?;
     Ok(Json(doc))
 }
 

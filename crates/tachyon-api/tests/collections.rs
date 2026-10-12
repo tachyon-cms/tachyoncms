@@ -101,3 +101,36 @@ async fn request_ids_are_echoed_or_generated(pool: PgPool) {
     assert_ne!(id, "a b\tc");
     assert_eq!(id.len(), 36, "expected a generated UUID, got {id}");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn relationships_must_target_existing_collections(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let to_nowhere = r#"{"slug": "posts", "fields": [{"name": "a", "type": "relationship", "relationTo": "authors"}]}"#;
+    let res = send(&app, "POST", "/api/admin/collections", Some(to_nowhere)).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "relationTo `authors` doesn't match an existing collection"
+    );
+
+    let to_self = r#"{"slug": "pages", "fields": [{"name": "parent", "type": "relationship", "relationTo": "pages"}]}"#;
+    assert_eq!(
+        send(&app, "POST", "/api/admin/collections", Some(to_self))
+            .await
+            .status,
+        201
+    );
+
+    let global = r#"{"slug": "settings", "kind": "global", "fields": []}"#;
+    assert_eq!(
+        send(&app, "POST", "/api/admin/collections", Some(global))
+            .await
+            .status,
+        201
+    );
+    let to_global = r#"{"slug": "notes", "fields": [{"name": "s", "type": "relationship", "relationTo": "settings"}]}"#;
+    assert_problem(
+        &send(&app, "POST", "/api/admin/collections", Some(to_global)).await,
+        422,
+    );
+}
