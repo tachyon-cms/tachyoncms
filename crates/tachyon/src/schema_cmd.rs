@@ -40,6 +40,15 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
         .get("collections")
         .and_then(Value::as_array)
         .context("the schema file needs a \"collections\" list")?;
+    let mut seen = std::collections::HashSet::new();
+    for slug in items
+        .iter()
+        .filter_map(|i| i.get("slug").and_then(Value::as_str))
+    {
+        if !seen.insert(slug) {
+            bail!("`{slug}` appears more than once in the file");
+        }
+    }
     items
         .iter()
         .map(|item| {
@@ -113,6 +122,9 @@ pub async fn run(
     for slug in renames.keys() {
         if !wanted.iter().any(|s| &s.slug == slug) {
             bail!("--rename {slug}: that collection isn't in the file");
+        }
+        if is_new(slug) {
+            bail!("--rename {slug}: the file creates {slug}, so it has no fields to rename yet");
         }
     }
     for s in &wanted {
@@ -341,6 +353,33 @@ mod tests {
         assert!(
             plan.contains("\n  indexes: create title (unique)"),
             "{plan}"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn duplicate_slugs_and_renames_on_new_collections_are_refused(pool: PgPool) {
+        let twice = json!({"collections": [
+            {"slug": "posts", "fields": []}, {"slug": "posts", "fields": []}
+        ]})
+        .to_string();
+        let err = run(&pool, &twice, &BTreeMap::new(), None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(err, "`posts` appears more than once in the file");
+
+        let new = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "headline", "type": "text"}
+        ]}]})
+        .to_string();
+        let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
+        let err = run(&pool, &new, &renames, None)
+            .await
+            .unwrap_err()
+            .to_string();
+        assert_eq!(
+            err,
+            "--rename posts: the file creates posts, so it has no fields to rename yet"
         );
     }
 }
