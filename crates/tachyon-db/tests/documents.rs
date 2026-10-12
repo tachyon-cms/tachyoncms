@@ -376,3 +376,45 @@ async fn writes_against_an_old_schema_version_are_refused(pool: PgPool) {
         .await
         .unwrap();
 }
+
+#[sqlx::test]
+async fn rows_cant_point_across_tenants(pool: PgPool) {
+    let c = collection(&pool, "posts").await;
+    let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data("Hello")))
+        .await
+        .unwrap();
+    let other = Uuid::now_v7();
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, 'other')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let is_fk_violation = |r: Result<sqlx::postgres::PgQueryResult, sqlx::Error>| {
+        matches!(r, Err(sqlx::Error::Database(ref e)) if e.is_foreign_key_violation())
+    };
+
+    let doc_in_other_tenant = sqlx::query(
+        "INSERT INTO documents (id, tenant_id, collection_id, published) VALUES ($1, $2, $3, '{}')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(other)
+    .bind(c)
+    .execute(&pool)
+    .await;
+    assert!(
+        is_fk_violation(doc_in_other_tenant),
+        "a document can't sit in another tenant's collection"
+    );
+
+    let link_in_other_tenant = sqlx::query(
+        "INSERT INTO relations (tenant_id, from_doc, field_path, to_doc) VALUES ($1, $2, 'x', $2)",
+    )
+    .bind(other)
+    .bind(doc.id)
+    .execute(&pool)
+    .await;
+    assert!(
+        is_fk_violation(link_in_other_tenant),
+        "a link can't join documents from another tenant"
+    );
+}
