@@ -119,6 +119,8 @@ pub enum FieldKind {
     },
     Textarea {
         #[serde(default)]
+        min_length: Option<usize>,
+        #[serde(default)]
         max_length: Option<usize>,
     },
     Number {
@@ -129,6 +131,7 @@ pub enum FieldKind {
         #[serde(default)]
         integer: bool,
     },
+    #[serde(alias = "checkbox")]
     Boolean,
     Date {
         #[serde(default)]
@@ -137,9 +140,17 @@ pub enum FieldKind {
     Email,
     Url,
     Select {
-        options: Vec<String>,
+        options: Vec<SelectOption>,
         #[serde(default)]
         multiple: bool,
+    },
+    Radio {
+        options: Vec<SelectOption>,
+    },
+    Code {
+        /// For the admin's editor highlighting, such as `rust` or `html`.
+        #[serde(default)]
+        language: Option<String>,
     },
     Slug {
         /// A text field to generate the slug from when none is given.
@@ -162,6 +173,22 @@ pub enum FieldKind {
         #[serde(default)]
         max_rows: Option<usize>,
     },
+}
+
+/// A choice in a `select` or `radio`: a bare value, or a label shown to editors plus the stored value.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum SelectOption {
+    Value(String),
+    Labeled { label: String, value: String },
+}
+
+impl SelectOption {
+    pub fn value(&self) -> &str {
+        match self {
+            Self::Value(v) | Self::Labeled { value: v, .. } => v,
+        }
+    }
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -199,6 +226,8 @@ impl FieldKind {
             Self::Email => "email",
             Self::Url => "url",
             Self::Select { .. } => "select",
+            Self::Radio { .. } => "radio",
+            Self::Code { .. } => "code",
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
             Self::Json => "json",
@@ -370,8 +399,29 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             } if a > b => {
                 return Err(invalid("min is greater than max".into()));
             }
-            FieldKind::Select { options, .. } if options.is_empty() => {
-                return Err(invalid("select needs at least one option".into()));
+            FieldKind::Select { options, .. } | FieldKind::Radio { options } => {
+                if options.is_empty() {
+                    return Err(invalid(format!(
+                        "{} needs at least one option",
+                        f.kind.name()
+                    )));
+                }
+                let mut values = HashSet::new();
+                if let Some(dup) = options
+                    .iter()
+                    .map(SelectOption::value)
+                    .find(|v| !values.insert(*v))
+                {
+                    return Err(invalid(format!(
+                        "option values must be unique; `{dup}` appears twice"
+                    )));
+                }
+            }
+            FieldKind::Textarea {
+                min_length: Some(a),
+                max_length: Some(b),
+            } if a > b => {
+                return Err(invalid("minLength is greater than maxLength".into()));
             }
             FieldKind::Array {
                 min_rows: Some(a),
@@ -702,6 +752,47 @@ mod tests {
             Err(SchemaError::InvalidField {
                 field: "t".into(),
                 message: "admin.width must look like 50% or 240px".into()
+            })
+        );
+    }
+    #[test]
+    fn labelled_options_radio_checkbox_and_code_parse() {
+        let input = json!({"slug": "posts", "fields": [
+            {"name": "stage", "type": "select", "options": ["draft", {"label": "Ready to go", "value": "ready"}]},
+            {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}, {"label": "Large", "value": "l"}]},
+            {"name": "featured", "type": "checkbox"},
+            {"name": "snippet", "type": "code", "language": "rust"},
+            {"name": "intro", "type": "textarea", "minLength": 10}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(
+            s.fields[2].kind,
+            FieldKind::Boolean,
+            "checkbox is stored as boolean"
+        );
+        assert_eq!(
+            s.fields[3].kind,
+            FieldKind::Code {
+                language: Some("rust".into())
+            }
+        );
+        let FieldKind::Select { options, .. } = &s.fields[0].kind else {
+            panic!()
+        };
+        assert_eq!(
+            options.iter().map(SelectOption::value).collect::<Vec<_>>(),
+            ["draft", "ready"]
+        );
+
+        let dup = schema(
+            json!({"slug": "posts", "fields": [{"name": "r", "type": "radio", "options": ["a", {"label": "A", "value": "a"}]}]}),
+        );
+        assert_eq!(
+            dup.check(),
+            Err(SchemaError::InvalidField {
+                field: "r".into(),
+                message: "option values must be unique; `a` appears twice".into()
             })
         );
     }

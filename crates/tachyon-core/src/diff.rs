@@ -196,7 +196,23 @@ fn options(f: &Field) -> Field {
 }
 
 fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
+    use FieldKind::{Code, Radio, Select, Text, Textarea};
     match (a, b) {
+        // Same stored shape, so a change between them is an option change.
+        (
+            Text { .. } | Textarea { .. } | Code { .. },
+            Text { .. } | Textarea { .. } | Code { .. },
+        ) => true,
+        (
+            Radio { .. }
+            | Select {
+                multiple: false, ..
+            },
+            Radio { .. }
+            | Select {
+                multiple: false, ..
+            },
+        ) => true,
         (FieldKind::Select { multiple: x, .. }, FieldKind::Select { multiple: y, .. }) => x == y,
         (FieldKind::Date { date_only: x }, FieldKind::Date { date_only: y }) => x == y,
         (
@@ -556,5 +572,29 @@ mod tests {
         assert!(clear_at(&mut doc, "rows.who"));
         assert!(!clear_at(&mut doc, "missing"));
         assert_eq!(Value::Object(doc), json!({"rows": [{}, {}]}));
+    }
+    #[test]
+    fn same_shaped_types_change_options_not_type() {
+        let old = schema(json!({"slug": "posts", "fields": [
+            {"name": "body", "type": "text"},
+            {"name": "size", "type": "select", "options": ["s", "l"]}
+        ]}));
+        let new = schema(json!({"slug": "posts", "fields": [
+            {"name": "body", "type": "code"},
+            {"name": "size", "type": "radio", "options": ["s", "l"]}
+        ]}));
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::OptionsChanged {
+                    path: "body".into()
+                },
+                Change::OptionsChanged {
+                    path: "size".into()
+                },
+            ]
+        );
+        assert!(!d.is_destructive());
     }
 }

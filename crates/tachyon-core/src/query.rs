@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind};
+use crate::schema::{Field, FieldKind, SelectOption};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -443,11 +443,14 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
                 .ok_or("expected a document ID")?;
             Ok(Scalar::Text(id.to_string()))
         }
-        (_, Some(FieldKind::Select { options, .. })) => v
+        (_, Some(FieldKind::Select { options, .. } | FieldKind::Radio { options })) => v
             .as_str()
-            .filter(|s| options.iter().any(|o| o == s))
+            .filter(|s| options.iter().any(|o| o.value() == *s))
             .map(|s| Scalar::Text(s.to_owned()))
-            .ok_or_else(|| format!("expected one of: {}", options.join(", "))),
+            .ok_or_else(|| {
+                let values: Vec<&str> = options.iter().map(SelectOption::value).collect();
+                format!("expected one of: {}", values.join(", "))
+            }),
         _ => v
             .as_str()
             .map(|s| Scalar::Text(s.to_owned()))
@@ -573,7 +576,9 @@ mod tests {
             {"name": "author", "type": "relationship", "relationTo": "authors"},
             {"name": "seo", "type": "group", "fields": [{"name": "title", "type": "text"}]},
             {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
-            {"name": "data", "type": "json"}
+            {"name": "data", "type": "json"},
+            {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}]},
+            {"name": "snippet", "type": "code"}
         ]))
         .unwrap()
     }
@@ -876,5 +881,28 @@ mod tests {
     fn nul_characters_are_rejected() {
         assert!(parse_query("where[title][equals]=a%00b").is_err());
         assert!(parse_query("a%00=1").is_err());
+    }
+    #[test]
+    fn radio_and_code_filter_like_text() {
+        assert_eq!(
+            filter("where[size][equals]=s").unwrap(),
+            cond(
+                field("size", ValueKind::Text),
+                Op::Equals,
+                Operand::One(text("s"))
+            )
+        );
+        assert_eq!(
+            filter("where[size][equals]=Small").unwrap_err(),
+            "where[size][equals]: expected one of: s"
+        );
+        assert_eq!(
+            filter("where[snippet][like]=fn").unwrap(),
+            cond(
+                field("snippet", ValueKind::Text),
+                Op::Like,
+                Operand::One(text("fn"))
+            )
+        );
     }
 }

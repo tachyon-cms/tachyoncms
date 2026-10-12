@@ -6,7 +6,7 @@ use time::macros::format_description;
 
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind};
+use crate::schema::{Field, FieldKind, SelectOption};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
@@ -195,7 +195,11 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             min_length,
             max_length,
         } => text_error(v, *min_length, *max_length),
-        FieldKind::Textarea { max_length } => text_error(v, None, *max_length),
+        FieldKind::Textarea {
+            min_length,
+            max_length,
+        } => text_error(v, *min_length, *max_length),
+        FieldKind::Code { .. } => text_error(v, None, None),
         FieldKind::Number { min, max, integer } => {
             let Some(n) = v.as_f64() else {
                 return Some("expected a number".into());
@@ -230,9 +234,18 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         FieldKind::Url => {
             (!v.as_str().is_some_and(is_web_url)).then(|| "expected an http or https URL".into())
         }
+        FieldKind::Radio { options } => {
+            let ok = v
+                .as_str()
+                .is_some_and(|s| options.iter().any(|o| o.value() == s));
+            (!ok).then(|| format!("expected one of: {}", values_list(options)))
+        }
         FieldKind::Select { options, multiple } => {
-            let allowed = |x: &Value| x.as_str().is_some_and(|s| options.iter().any(|o| o == s));
-            let list = options.join(", ");
+            let allowed = |x: &Value| {
+                x.as_str()
+                    .is_some_and(|s| options.iter().any(|o| o.value() == s))
+            };
+            let list = values_list(options);
             if *multiple {
                 let ok = v.as_array().is_some_and(|xs| xs.iter().all(allowed));
                 (!ok).then(|| format!("expected a list of: {list}"))
@@ -256,6 +269,14 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         FieldKind::Group { .. } => Some("expected an object".into()),
         FieldKind::Array { .. } => Some("expected a list".into()),
     }
+}
+
+fn values_list(options: &[SelectOption]) -> String {
+    options
+        .iter()
+        .map(SelectOption::value)
+        .collect::<Vec<_>>()
+        .join(", ")
 }
 
 fn text_error(v: &Value, min: Option<usize>, max: Option<usize>) -> Option<String> {
@@ -852,6 +873,35 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"at": "9999-12-31T23:00:00-02:00"})),
             vec![e("at", "expected a date-time like 2026-10-12T09:30:00Z")]
+        );
+    }
+    #[test]
+    fn labelled_options_validate_by_value() {
+        let f = fields(json!([
+            {"name": "status", "type": "select", "options": [{"label": "Ready to go", "value": "ready"}]},
+            {"name": "size", "type": "radio", "options": ["s", "l"]},
+            {"name": "snippet", "type": "code"},
+            {"name": "intro", "type": "textarea", "minLength": 3}
+        ]));
+        ok(
+            &f,
+            json!({"status": "ready", "size": "l", "snippet": "fn main() {}", "intro": "abc"}),
+        );
+        assert_eq!(
+            errs(&f, json!({"status": "Ready to go"})),
+            vec![e("status", "expected one of: ready")]
+        );
+        assert_eq!(
+            errs(&f, json!({"size": "m"})),
+            vec![e("size", "expected one of: s, l")]
+        );
+        assert_eq!(
+            errs(&f, json!({"snippet": 1})),
+            vec![e("snippet", "expected text")]
+        );
+        assert_eq!(
+            errs(&f, json!({"intro": "ab"})),
+            vec![e("intro", "must be at least 3 characters")]
         );
     }
 }
