@@ -122,6 +122,8 @@ pub enum ValueKind {
     List,
     /// A list of polymorphic links (`{"relationTo", "value"}` objects).
     LinkList,
+    /// A `[longitude, latitude]` location.
+    Point,
 }
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
@@ -138,6 +140,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Number { .. } => ValueKind::Number,
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
+        FieldKind::Point => ValueKind::Point,
         FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
         _ => ValueKind::Text,
     })
@@ -156,10 +159,11 @@ pub enum Op {
     Like,
     Contains,
     Exists,
+    Near,
 }
 
 impl Op {
-    const ALL: [Op; 11] = [
+    const ALL: [Op; 12] = [
         Op::Equals,
         Op::NotEquals,
         Op::In,
@@ -171,6 +175,7 @@ impl Op {
         Op::Like,
         Op::Contains,
         Op::Exists,
+        Op::Near,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -186,6 +191,7 @@ impl Op {
             Self::Like => "like",
             Self::Contains => "contains",
             Self::Exists => "exists",
+            Self::Near => "near",
         }
     }
 
@@ -200,7 +206,8 @@ impl Op {
         }
         match target.kind() {
             ValueKind::Text => matches!(self, Equals | NotEquals | In | NotIn | Like | Exists),
-            ValueKind::Number | ValueKind::Date => !matches!(self, Like | Contains),
+            ValueKind::Number | ValueKind::Date => !matches!(self, Like | Contains | Near),
+            ValueKind::Point => matches!(self, Near | Exists),
             ValueKind::Boolean => matches!(self, Equals | NotEquals | Exists),
             ValueKind::List | ValueKind::LinkList => matches!(self, Contains | Exists),
         }
@@ -218,6 +225,13 @@ pub enum Scalar {
 pub enum Operand {
     One(Scalar),
     Many(Vec<Scalar>),
+    /// Within `max` metres (and at least `min`) of a point.
+    Near {
+        lng: f64,
+        lat: f64,
+        max: Option<f64>,
+        min: Option<f64>,
+    },
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -326,7 +340,7 @@ impl Parser<'_> {
         let op = Op::parse(op).ok_or_else(|| {
             err(
                 param,
-                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains or exists",
+                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             )
         })?;
         let (target, field) = resolve(self.fields, name).map_err(|m| err(param, m))?;
@@ -337,6 +351,12 @@ impl Parser<'_> {
             ));
         }
         let value = match op {
+            Op::Near => parse_near(operand).map_err(|()| {
+                err(
+                    param,
+                    "expected longitude,latitude[,maxDistance[,minDistance]] in metres",
+                )
+            })?,
             Op::Exists => Operand::One(Scalar::Bool(
                 parse_bool(operand).ok_or_else(|| err(param, "expected true or false"))?,
             )),
@@ -420,6 +440,32 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
         }
     }
     Err(format!("unknown field `{name}`"))
+}
+
+/// `lng,lat[,maxDistance[,minDistance]]`, distances in metres.
+fn parse_near(v: &Value) -> Result<Operand, ()> {
+    let text = v.as_str().ok_or(())?;
+    let numbers: Vec<f64> = text
+        .split(',')
+        .map(|p| p.trim().parse::<f64>())
+        .collect::<Result<_, _>>()
+        .map_err(|_| ())?;
+    if numbers.iter().any(|n| !n.is_finite()) {
+        return Err(());
+    }
+    let (lng, lat, max, min) = match numbers.as_slice() {
+        [lng, lat] => (*lng, *lat, None, None),
+        [lng, lat, max] => (*lng, *lat, Some(*max), None),
+        [lng, lat, max, min] => (*lng, *lat, Some(*max), Some(*min)),
+        _ => return Err(()),
+    };
+    let in_range = (-180.0..=180.0).contains(&lng) && (-90.0..=90.0).contains(&lat);
+    let distances_ok = [max, min].into_iter().flatten().all(|d| d >= 0.0);
+    if in_range && distances_ok {
+        Ok(Operand::Near { lng, lat, max, min })
+    } else {
+        Err(())
+    }
 }
 
 fn parse_bool(v: &Value) -> Option<bool> {
@@ -537,6 +583,12 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
             format!("`{name}` holds a list and can't be sorted"),
         ));
     }
+    if target.kind() == ValueKind::Point {
+        return Err(err(
+            "sort",
+            format!("`{name}` holds a location and can't be sorted"),
+        ));
+    }
     Ok(Sort { target, descending })
 }
 
@@ -636,7 +688,8 @@ mod tests {
             {"name": "snippet", "type": "code"},
             {"name": "scores", "type": "number", "hasMany": true},
             {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
-            {"name": "linked", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true}
+            {"name": "linked", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true},
+            {"name": "spot", "type": "point"}
         ]))
         .unwrap()
     }
@@ -835,7 +888,7 @@ mod tests {
             ),
             (
                 "where[title][shout]=x",
-                "where[title][shout]: unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains or exists",
+                "where[title][shout]: unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             ),
             (
                 "where[title]=x",
@@ -1026,5 +1079,33 @@ mod tests {
             )
         );
         assert!(parse_sort(&fields(), "linked").is_err());
+    }
+    #[test]
+    fn near_takes_a_point_and_optional_distances() {
+        assert_eq!(
+            filter("where[spot][near]=-0.1276,51.5072,1000").unwrap(),
+            cond(
+                field("spot", ValueKind::Point),
+                Op::Near,
+                Operand::Near {
+                    lng: -0.1276,
+                    lat: 51.5072,
+                    max: Some(1000.0),
+                    min: None
+                }
+            )
+        );
+        for bad in ["1", "200,0", "0,95", "0,0,-5", "0,0,NaN", "a,b"] {
+            assert_eq!(
+                filter(&format!("where[spot][near]={bad}")).unwrap_err(),
+                "where[spot][near]: expected longitude,latitude[,maxDistance[,minDistance]] in metres",
+                "{bad}"
+            );
+        }
+        assert!(
+            filter("where[title][near]=0,0").is_err(),
+            "near is only for points"
+        );
+        assert!(parse_sort(&fields(), "spot").is_err());
     }
 }

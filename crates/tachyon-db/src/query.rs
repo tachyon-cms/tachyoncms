@@ -55,8 +55,19 @@ pub fn field_expr(path: &[String], kind: ValueKind) -> String {
         ValueKind::Boolean => format!(
             "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'boolean' THEN (published #>> '{{{path}}}')::boolean END)"
         ),
-        ValueKind::List | ValueKind::LinkList => format!("(published #> '{{{path}}}')"),
+        ValueKind::List | ValueKind::LinkList | ValueKind::Point => {
+            format!("(published #> '{{{path}}}')")
+        }
     }
+}
+
+/// One coordinate of a stored `[lng, lat]`, or NULL when the stored value isn't a number.
+fn coordinate(path: &[String], index: usize) -> String {
+    path.iter().for_each(|s| assert_identifier(s));
+    let path = path.join(",");
+    format!(
+        "(CASE WHEN jsonb_typeof(published #> '{{{path},{index}}}') = 'number' THEN (published #>> '{{{path},{index}}}')::float8 END)"
+    )
 }
 
 fn expr(target: &Target) -> String {
@@ -204,6 +215,47 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
             // jsonb containment compares numbers by value, so 3 matches 3.0.
             qb.push(&e).push(" @> ");
             qb.push_bind(Json(json!([n])));
+        }
+        (Op::Near, Operand::Near { lng, lat, max, min }) => {
+            let Target::Field { path, .. } = &c.target else {
+                unreachable!("near only targets fields")
+            };
+            let (x, y) = (coordinate(path, 0), coordinate(path, 1));
+            // NOTE: haversine on a sphere of the mean earth radius; good to well under 1% for
+            // finding nearby places. Results aren't ordered by distance yet.
+            let distance = |qb: &mut QueryBuilder<Postgres>| {
+                qb.push("(6371008.8 * 2 * asin(least(1, sqrt(power(sin(radians((")
+                    .push(&y)
+                    .push(" - ");
+                qb.push_bind(*lat);
+                qb.push(") / 2)), 2) + cos(radians(");
+                qb.push_bind(*lat);
+                qb.push(")) * cos(radians(")
+                    .push(&y)
+                    .push(")) * power(sin(radians((")
+                    .push(&x)
+                    .push(" - ");
+                qb.push_bind(*lng);
+                qb.push(") / 2)), 2)))))");
+            };
+            // Both coordinates must be real numbers: `least()` ignores NULLs, so a broken
+            // value would otherwise come out as a distance.
+            qb.push("(")
+                .push(&x)
+                .push(" IS NOT NULL AND ")
+                .push(&y)
+                .push(" IS NOT NULL");
+            if let Some(max) = max {
+                qb.push(" AND ");
+                distance(qb);
+                qb.push(" <= ").push_bind(*max);
+            }
+            if let Some(min) = min {
+                qb.push(" AND ");
+                distance(qb);
+                qb.push(" >= ").push_bind(*min);
+            }
+            qb.push(")");
         }
         (op, value) => unreachable!("the parser never builds {op:?} with {value:?}"),
     }

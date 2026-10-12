@@ -167,6 +167,8 @@ pub enum FieldKind {
         #[serde(default)]
         language: Option<String>,
     },
+    /// A location, stored as `[longitude, latitude]`.
+    Point,
     Slug {
         /// A text field to generate the slug from when none is given.
         #[serde(default)]
@@ -418,6 +420,7 @@ impl FieldKind {
             Self::Select { .. } => "select",
             Self::Radio { .. } => "radio",
             Self::Code { .. } => "code",
+            Self::Point => "point",
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
             Self::Json => "json",
@@ -450,7 +453,8 @@ impl FieldKind {
             | Self::Array { .. }
             | Self::Row { .. }
             | Self::Collapsible { .. }
-            | Self::Tabs { .. } => false,
+            | Self::Tabs { .. }
+            | Self::Point => false,
             _ => true,
         }
     }

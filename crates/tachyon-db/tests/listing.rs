@@ -301,3 +301,44 @@ async fn contains_works_on_text_and_number_lists(pool: PgPool) {
     assert_eq!(titles_for("where[sizes][contains]=2.5").await, ["a"]);
     assert_eq!(titles_for("where[sizes][contains]=3").await, ["b"]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn near_finds_places_within_a_distance(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "places", "fields": [
+        {"name": "title", "type": "text"}, {"name": "at", "type": "point"}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for (title, at) in [
+        ("Trafalgar", json!([-0.1281, 51.5080])), // ~90 m from the centre
+        ("Greenwich", json!([-0.0015, 51.4779])), // ~9 km
+        ("Paris", json!([2.3522, 48.8566])),      // ~340 km
+        ("Broken", json!("not a point")),         // left over from a retype
+    ] {
+        let data = json!({"title": title, "at": at})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let near = |qs: &str| parse_filter(&s.fields, &parse_query(qs).unwrap()["where"]).unwrap();
+    let by_title = parse_sort(&s.fields, "title").unwrap();
+    let centre = "-0.1276,51.5072";
+    let f = near(&format!("where[at][near]={centre},1000"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Trafalgar"]
+    );
+    let f = near(&format!("where[at][near]={centre},20000,1000"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich"]
+    );
+    let f = near(&format!("where[at][near]={centre}"));
+    assert_eq!(
+        titles(&pool, c, q(Some(&f), Some(&by_title))).await,
+        ["Greenwich", "Paris", "Trafalgar"]
+    );
+}

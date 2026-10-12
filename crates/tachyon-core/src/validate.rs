@@ -240,6 +240,14 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             max_length,
         } => text_error(v, *min_length, *max_length),
         FieldKind::Code { .. } => text_error(v, None, None),
+        FieldKind::Point => {
+            let ok = v.as_array().is_some_and(|xy| {
+                matches!(xy.as_slice(), [x, y]
+                    if x.as_f64().is_some_and(|lng| (-180.0..=180.0).contains(&lng))
+                    && y.as_f64().is_some_and(|lat| (-90.0..=90.0).contains(&lat)))
+            });
+            (!ok).then(|| "expected [longitude, latitude], like [-0.1276, 51.5072]".into())
+        }
         FieldKind::Number {
             min, max, integer, ..
         } => {
@@ -1134,5 +1142,24 @@ mod tests {
         assert_eq!(doc["link"]["relationTo"], "pages");
         assert_eq!(doc["link"]["value"]["title"], "T");
         assert_eq!(doc["more"][0]["value"]["title"], "T");
+    }
+    #[test]
+    fn points_are_longitude_latitude_pairs() {
+        let f = fields(json!([{"name": "where", "type": "point"}]));
+        ok(&f, json!({"where": [-0.1276, 51.5072]}));
+        let message = "expected [longitude, latitude], like [-0.1276, 51.5072]";
+        for bad in [
+            json!([0]),
+            json!([181, 0]),
+            json!([0, 91]),
+            json!(["0", "0"]),
+            json!({"lng": 0, "lat": 0}),
+        ] {
+            assert_eq!(
+                errs(&f, json!({"where": bad})),
+                vec![e("where", message)],
+                "{bad}"
+            );
+        }
     }
 }
