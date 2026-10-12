@@ -31,6 +31,9 @@ impl From<DbError> for ApiError {
             DbError::Referenced(n) => Self::Conflict(format!(
                 "{n} other documents link to this one; remove those links first"
             )),
+            DbError::SchemaChanged => Self::Conflict(
+                "This collection's fields just changed. Reload and try again.".into(),
+            ),
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
     }

@@ -28,6 +28,9 @@ pub enum DbError {
     /// Other live documents still link to this one.
     #[error("referenced by {0} documents")]
     Referenced(i64),
+    /// The collection's schema changed after the caller validated against it.
+    #[error("schema changed")]
+    SchemaChanged,
     #[error(transparent)]
     Sqlx(#[from] sqlx::Error),
 }

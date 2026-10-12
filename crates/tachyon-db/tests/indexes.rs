@@ -30,10 +30,10 @@ async fn unique_fields_reject_duplicates_among_live_documents(pool: PgPool) {
         .await
         .unwrap();
 
-    let first = documents::insert(&pool, c.id, None, &doc("hello"))
+    let first = documents::insert(&pool, c.id, 1, None, &doc("hello"))
         .await
         .unwrap();
-    let err = documents::insert(&pool, c.id, None, &doc("hello"))
+    let err = documents::insert(&pool, c.id, 1, None, &doc("hello"))
         .await
         .unwrap_err();
     assert!(
@@ -43,7 +43,7 @@ async fn unique_fields_reject_duplicates_among_live_documents(pool: PgPool) {
 
     // Deleted documents release their values.
     documents::delete(&pool, c.id, first.id).await.unwrap();
-    documents::insert(&pool, c.id, None, &doc("hello"))
+    documents::insert(&pool, c.id, 1, None, &doc("hello"))
         .await
         .unwrap();
 }

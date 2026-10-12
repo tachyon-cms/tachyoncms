@@ -28,7 +28,7 @@ async fn seed(pool: &PgPool) -> Uuid {
         json!({"title": "date_fruit", "live": true}),
     ] {
         let data: Map<String, Value> = item.as_object().unwrap().clone();
-        documents::insert(pool, c, None, &Prepared::plain(data))
+        documents::insert(pool, c, 1, None, &Prepared::plain(data))
             .await
             .unwrap();
     }
@@ -205,7 +205,7 @@ async fn numbers_compare_exactly(pool: PgPool) {
             .as_object()
             .unwrap()
             .clone();
-        documents::insert(&pool, c, None, &Prepared::plain(data))
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data))
             .await
             .unwrap();
     }

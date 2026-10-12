@@ -116,9 +116,15 @@ pub async fn create(
     let c = collection(&state, &slug)?;
     let data = validate_document(&c.schema.fields, &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
-    let doc = documents::insert(&state.pool, c.id, None, &prepare(&state, &c, data))
-        .await
-        .map_err(|e| unique_error(&c, e.into()))?;
+    let doc = documents::insert(
+        &state.pool,
+        c.id,
+        c.schema_version,
+        None,
+        &prepare(&state, &c, data),
+    )
+    .await
+    .map_err(|e| unique_error(&c, e.into()))?;
     Ok((StatusCode::CREATED, respond(&state, c, &doc, 1).await?))
 }
 
@@ -144,7 +150,7 @@ pub async fn update(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let patch = json_body(body)?;
-    let doc = documents::update(&state.pool, c.id, id, |current| {
+    let doc = documents::update(&state.pool, c.id, c.schema_version, id, |current| {
         validate_document(&c.schema.fields, &patch, Some(current))
             .map(|data| prepare(&state, &c, data))
             .map_err(ApiError::Validation)

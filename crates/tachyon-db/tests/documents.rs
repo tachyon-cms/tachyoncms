@@ -21,7 +21,7 @@ fn data(title: &str) -> Map<String, Value> {
 #[sqlx::test]
 async fn insert_then_get(pool: PgPool) {
     let c = collection(&pool, "posts").await;
-    let doc = documents::insert(&pool, c, None, &Prepared::plain(data("Hello")))
+    let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data("Hello")))
         .await
         .unwrap();
     assert_eq!(doc.status, "published");
@@ -38,7 +38,7 @@ async fn insert_then_get(pool: PgPool) {
 async fn documents_are_scoped_to_their_collection(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
     let pages = collection(&pool, "pages").await;
-    let doc = documents::insert(&pool, posts, None, &Prepared::plain(data("Hello")))
+    let doc = documents::insert(&pool, posts, 1, None, &Prepared::plain(data("Hello")))
         .await
         .unwrap();
     assert!(matches!(
@@ -51,7 +51,7 @@ async fn documents_are_scoped_to_their_collection(pool: PgPool) {
 async fn list_pages_newest_first(pool: PgPool) {
     let c = collection(&pool, "posts").await;
     for title in ["one", "two", "three"] {
-        documents::insert(&pool, c, None, &Prepared::plain(data(title)))
+        documents::insert(&pool, c, 1, None, &Prepared::plain(data(title)))
             .await
             .unwrap();
     }
@@ -98,10 +98,10 @@ async fn list_pages_newest_first(pool: PgPool) {
 #[sqlx::test]
 async fn update_applies_the_closure(pool: PgPool) {
     let c = collection(&pool, "posts").await;
-    let doc = documents::insert(&pool, c, None, &Prepared::plain(data("Old")))
+    let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data("Old")))
         .await
         .unwrap();
-    let updated = documents::update(&pool, c, doc.id, |current| {
+    let updated = documents::update(&pool, c, 1, doc.id, |current| {
         assert_eq!(current["title"], "Old");
         Ok::<_, DbError>(Prepared::plain(data("New")))
     })
@@ -114,7 +114,7 @@ async fn update_applies_the_closure(pool: PgPool) {
 #[sqlx::test]
 async fn update_missing_is_not_found(pool: PgPool) {
     let c = collection(&pool, "posts").await;
-    let res = documents::update(&pool, c, Uuid::now_v7(), |_| {
+    let res = documents::update(&pool, c, 1, Uuid::now_v7(), |_| {
         Ok::<_, DbError>(Prepared::plain(data("x")))
     })
     .await;
@@ -124,7 +124,7 @@ async fn update_missing_is_not_found(pool: PgPool) {
 #[sqlx::test]
 async fn delete_hides_the_document(pool: PgPool) {
     let c = collection(&pool, "posts").await;
-    let doc = documents::insert(&pool, c, None, &Prepared::plain(data("Bye")))
+    let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data("Bye")))
         .await
         .unwrap();
     documents::delete(&pool, c, doc.id).await.unwrap();
@@ -174,6 +174,7 @@ async fn link(
     documents::insert(
         pool,
         c,
+        1,
         None,
         &Prepared {
             data: data(title),
@@ -187,7 +188,7 @@ async fn link(
 async fn relations_must_point_at_live_documents_in_the_right_collection(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
     let authors = collection(&pool, "authors").await;
-    let ann = documents::insert(&pool, authors, None, &Prepared::plain(data("Ann")))
+    let ann = documents::insert(&pool, authors, 1, None, &Prepared::plain(data("Ann")))
         .await
         .unwrap();
 
@@ -208,7 +209,7 @@ async fn relations_must_point_at_live_documents_in_the_right_collection(pool: Pg
         assert_eq!(errors[0].path, "refs.0");
     }
 
-    let gone = documents::insert(&pool, authors, None, &Prepared::plain(data("Gone")))
+    let gone = documents::insert(&pool, authors, 1, None, &Prepared::plain(data("Gone")))
         .await
         .unwrap();
     documents::delete(&pool, authors, gone.id).await.unwrap();
@@ -222,7 +223,7 @@ async fn relations_must_point_at_live_documents_in_the_right_collection(pool: Pg
 async fn linked_documents_cannot_be_deleted_until_unlinked(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
     let authors = collection(&pool, "authors").await;
-    let ann = documents::insert(&pool, authors, None, &Prepared::plain(data("Ann")))
+    let ann = documents::insert(&pool, authors, 1, None, &Prepared::plain(data("Ann")))
         .await
         .unwrap();
     let post = link(&pool, posts, "p", &[(authors, ann.id)]).await.unwrap();
@@ -244,7 +245,7 @@ async fn linked_documents_cannot_be_deleted_until_unlinked(pool: PgPool) {
     );
 
     // Dropping the link through an update frees the target.
-    documents::update(&pool, posts, post.id, |_| {
+    documents::update(&pool, posts, 1, post.id, |_| {
         Ok::<_, DbError>(Prepared::plain(data("p")))
     })
     .await
@@ -255,7 +256,7 @@ async fn linked_documents_cannot_be_deleted_until_unlinked(pool: PgPool) {
 #[sqlx::test]
 async fn deleting_the_linker_frees_the_target_and_self_links_never_block(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
-    let a = documents::insert(&pool, posts, None, &Prepared::plain(data("a")))
+    let a = documents::insert(&pool, posts, 1, None, &Prepared::plain(data("a")))
         .await
         .unwrap();
     let b = link(&pool, posts, "b", &[(posts, a.id)]).await.unwrap();
@@ -271,6 +272,7 @@ async fn deleting_the_linker_frees_the_target_and_self_links_never_block(pool: P
     documents::insert(
         &pool,
         posts,
+        1,
         Some(me),
         &Prepared {
             data: data("me"),
@@ -285,10 +287,10 @@ async fn deleting_the_linker_frees_the_target_and_self_links_never_block(pool: P
 #[sqlx::test]
 async fn get_many_returns_live_documents_with_their_collection(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
-    let a = documents::insert(&pool, posts, None, &Prepared::plain(data("a")))
+    let a = documents::insert(&pool, posts, 1, None, &Prepared::plain(data("a")))
         .await
         .unwrap();
-    let b = documents::insert(&pool, posts, None, &Prepared::plain(data("b")))
+    let b = documents::insert(&pool, posts, 1, None, &Prepared::plain(data("b")))
         .await
         .unwrap();
     documents::delete(&pool, posts, b.id).await.unwrap();
@@ -303,11 +305,11 @@ async fn get_many_returns_live_documents_with_their_collection(pool: PgPool) {
 async fn insert_with_a_chosen_id_conflicts_on_reuse(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
     let id = Uuid::now_v7();
-    let first = documents::insert(&pool, posts, Some(id), &Prepared::plain(data("a")))
+    let first = documents::insert(&pool, posts, 1, Some(id), &Prepared::plain(data("a")))
         .await
         .unwrap();
     assert_eq!(first.id, id);
-    let err = documents::insert(&pool, posts, Some(id), &Prepared::plain(data("b")))
+    let err = documents::insert(&pool, posts, 1, Some(id), &Prepared::plain(data("b")))
         .await
         .unwrap_err();
     assert!(
@@ -319,7 +321,7 @@ async fn insert_with_a_chosen_id_conflicts_on_reuse(pool: PgPool) {
 #[sqlx::test]
 async fn saving_documents_that_link_to_each_other_at_once_never_deadlocks(pool: PgPool) {
     let posts = collection(&pool, "posts").await;
-    let a = documents::insert(&pool, posts, None, &Prepared::plain(data("a")))
+    let a = documents::insert(&pool, posts, 1, None, &Prepared::plain(data("a")))
         .await
         .unwrap();
     let b = link(&pool, posts, "b", &[(posts, a.id)]).await.unwrap();
@@ -333,10 +335,44 @@ async fn saving_documents_that_link_to_each_other_at_once_never_deadlocks(pool: 
     };
     for _ in 0..10 {
         let (ra, rb) = tokio::join!(
-            documents::update(&pool, posts, a.id, |_| Ok::<_, DbError>(linking("a", b.id))),
-            documents::update(&pool, posts, b.id, |_| Ok::<_, DbError>(linking("b", a.id))),
+            documents::update(&pool, posts, 1, a.id, |_| Ok::<_, DbError>(linking(
+                "a", b.id
+            ))),
+            documents::update(&pool, posts, 1, b.id, |_| Ok::<_, DbError>(linking(
+                "b", a.id
+            ))),
         );
         ra.unwrap();
         rb.unwrap();
     }
+}
+
+#[sqlx::test]
+async fn writes_against_an_old_schema_version_are_refused(pool: PgPool) {
+    let c = collection(&pool, "posts").await;
+    let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data("a")))
+        .await
+        .unwrap();
+    sqlx::query("UPDATE collections SET schema_version = 2 WHERE id = $1")
+        .bind(c)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    let stale_insert = documents::insert(&pool, c, 1, None, &Prepared::plain(data("b"))).await;
+    assert!(
+        matches!(stale_insert, Err(DbError::SchemaChanged)),
+        "{stale_insert:?}"
+    );
+    let stale_update = documents::update(&pool, c, 1, doc.id, |_| {
+        Ok::<_, DbError>(Prepared::plain(data("c")))
+    })
+    .await;
+    assert!(
+        matches!(stale_update, Err(DbError::SchemaChanged)),
+        "{stale_update:?}"
+    );
+    documents::insert(&pool, c, 2, None, &Prepared::plain(data("d")))
+        .await
+        .unwrap();
 }
