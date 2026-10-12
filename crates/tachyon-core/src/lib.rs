@@ -7,7 +7,7 @@ pub mod validate;
 
 pub use schema::{
     Admin, CollectionKind, CollectionSchema, Condition, ConditionTest, Field, FieldKind, Position,
-    SchemaError, SelectOption, Tab, data_fields,
+    RelationTo, SchemaError, SelectOption, Tab, data_fields,
 };
 pub use validate::{
     FieldError, RelationRef, map_relations, normalize_date_time, relations, slugify,

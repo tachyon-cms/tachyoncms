@@ -173,7 +173,7 @@ pub enum FieldKind {
         from: Option<String>,
     },
     Relationship {
-        relation_to: String,
+        relation_to: RelationTo,
         #[serde(default)]
         has_many: bool,
     },
@@ -218,6 +218,38 @@ impl SelectOption {
         match self {
             Self::Value(v) | Self::Labeled { value: v, .. } => v,
         }
+    }
+}
+
+/// Which collections a relationship may link to.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum RelationTo {
+    One(String),
+    Many(Vec<String>),
+}
+
+impl RelationTo {
+    pub fn targets(&self) -> Vec<&str> {
+        match self {
+            Self::One(s) => vec![s.as_str()],
+            Self::Many(list) => list.iter().map(String::as_str).collect(),
+        }
+    }
+
+    /// Several possible targets, so each stored link names its collection.
+    pub fn is_polymorphic(&self) -> bool {
+        matches!(self, Self::Many(_))
+    }
+
+    pub fn allows(&self, slug: &str) -> bool {
+        self.targets().contains(&slug)
+    }
+}
+
+impl std::fmt::Display for RelationTo {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.targets().join(", "))
     }
 }
 
@@ -408,9 +440,11 @@ impl FieldKind {
     pub fn is_indexable(&self) -> bool {
         match self {
             Self::Select { multiple, .. } => !multiple,
-            Self::Relationship { has_many, .. }
-            | Self::Text { has_many, .. }
-            | Self::Number { has_many, .. } => !has_many,
+            Self::Relationship {
+                relation_to,
+                has_many,
+            } => !has_many && !relation_to.is_polymorphic(),
+            Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
             | Self::Group { .. }
             | Self::Array { .. }
@@ -434,7 +468,9 @@ impl CollectionSchema {
         fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
             for f in fields {
                 match &f.kind {
-                    FieldKind::Relationship { relation_to, .. } => out.push(relation_to),
+                    FieldKind::Relationship { relation_to, .. } => {
+                        out.extend(relation_to.targets())
+                    }
                     FieldKind::Group { fields }
                     | FieldKind::Array { fields, .. }
                     | FieldKind::Row { fields }
@@ -602,7 +638,10 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             ));
         }
         if (f.unique || f.filterable) && !f.kind.is_indexable() {
-            let what = match f.kind {
+            let what = match &f.kind {
+                FieldKind::Relationship { relation_to, .. } if relation_to.is_polymorphic() => {
+                    "relationship fields with several targets".to_owned()
+                }
                 FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
                 FieldKind::Relationship { .. }
                 | FieldKind::Text { .. }
@@ -695,10 +734,22 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
                     "from must name a top-level text field, not `{source}`"
                 )));
             }
-            FieldKind::Relationship { relation_to, .. } if !is_identifier(relation_to, false) => {
-                return Err(invalid(format!(
-                    "relationTo `{relation_to}` isn't a valid collection slug"
-                )));
+            FieldKind::Relationship { relation_to, .. } => {
+                let targets = relation_to.targets();
+                if targets.is_empty() {
+                    return Err(invalid("relationTo needs at least one collection".into()));
+                }
+                let mut seen = HashSet::new();
+                for t in targets {
+                    if !is_identifier(t, false) {
+                        return Err(invalid(format!(
+                            "relationTo `{t}` isn't a valid collection slug"
+                        )));
+                    }
+                    if !seen.insert(t) {
+                        return Err(invalid(format!("relationTo lists `{t}` twice")));
+                    }
+                }
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                 check_fields(fields, false, root)?
@@ -882,7 +933,7 @@ mod tests {
         assert_eq!(
             s.fields[2].kind,
             FieldKind::Relationship {
-                relation_to: "authors".into(),
+                relation_to: RelationTo::One("authors".into()),
                 has_many: false
             }
         );
@@ -1272,5 +1323,49 @@ mod tests {
             {"type": "row", "admin": {"condition": {"field": "kind", "equals": "video"}}, "fields": []}
         ]}));
         assert_eq!(ok.check(), Ok(()));
+    }
+    #[test]
+    fn polymorphic_relationships_parse_and_are_checked() {
+        let s = schema(json!({"slug": "menus", "fields": [
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "author", "type": "relationship", "relationTo": "authors"}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.relation_targets(), ["authors", "pages", "posts"]);
+        let FieldKind::Relationship { relation_to, .. } = &s.fields[0].kind else {
+            panic!()
+        };
+        assert!(
+            relation_to.is_polymorphic()
+                && relation_to.allows("pages")
+                && !relation_to.allows("authors")
+        );
+
+        for (rel, message) in [
+            (json!([]), "relationTo needs at least one collection"),
+            (json!(["posts", "posts"]), "relationTo lists `posts` twice"),
+        ] {
+            let bad = schema(
+                json!({"slug": "menus", "fields": [{"name": "link", "type": "relationship", "relationTo": rel}]}),
+            );
+            assert_eq!(
+                bad.check(),
+                Err(SchemaError::InvalidField {
+                    field: "link".into(),
+                    message: message.into()
+                })
+            );
+        }
+        let indexed = schema(json!({"slug": "menus", "fields": [
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"], "filterable": true}
+        ]}));
+        assert_eq!(
+            indexed.check(),
+            Err(SchemaError::InvalidField {
+                field: "link".into(),
+                message: "relationship fields with several targets can't be unique or filterable"
+                    .into()
+            })
+        );
     }
 }

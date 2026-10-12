@@ -6,7 +6,9 @@ use std::collections::BTreeMap;
 use serde::Serialize;
 use serde_json::{Map, Value};
 
-use crate::schema::{CollectionSchema, Field, FieldKind, SchemaError, data_fields, find_field};
+use crate::schema::{
+    CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields, find_field,
+};
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
 pub type Renames = BTreeMap<String, String>;
@@ -158,11 +160,11 @@ fn compare(
             }
             (
                 FieldKind::Relationship {
-                    relation_to: from,
+                    relation_to: RelationTo::One(from),
                     has_many: h1,
                 },
                 FieldKind::Relationship {
-                    relation_to: to,
+                    relation_to: RelationTo::One(to),
                     has_many: h2,
                 },
             ) if h1 == h2 && from != to => out.push(Change::Retargeted {
@@ -243,7 +245,12 @@ fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
                 relation_to: r2,
                 has_many: h2,
             },
-        ) => r1 == r2 && h1 == h2,
+        ) => {
+            // Several targets ↔ several targets keeps the stored shape, so it's an option change.
+            h1 == h2
+                && r1.is_polymorphic() == r2.is_polymorphic()
+                && (r1.is_polymorphic() || r1 == r2)
+        }
         _ => a.name() == b.name(),
     }
 }
@@ -649,6 +656,26 @@ mod tests {
             d.is_destructive(),
             "a named tab nests data, so title/body move: {:?}",
             d.changes
+        );
+    }
+    #[test]
+    fn relationship_target_shape_changes() {
+        let one = schema(
+            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": "posts"}]}),
+        );
+        let many = schema(
+            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": ["posts", "pages"]}]}),
+        );
+        let more = schema(
+            json!({"slug": "m", "fields": [{"name": "l", "type": "relationship", "relationTo": ["posts", "pages", "events"]}]}),
+        );
+        assert!(
+            diff(&one, &many, &Renames::new()).unwrap().is_destructive(),
+            "one → several changes the stored shape"
+        );
+        assert_eq!(
+            diff(&many, &more, &Renames::new()).unwrap().changes,
+            vec![Change::OptionsChanged { path: "l".into() }]
         );
     }
 }
