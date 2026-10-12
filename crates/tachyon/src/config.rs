@@ -27,11 +27,29 @@ impl Config {
     }
 }
 
+/// Until sign-in ships, anyone who can reach the server can change content, so say so when
+/// it listens anywhere but this machine.
+pub fn exposure_warning(addr: SocketAddr) -> Option<&'static str> {
+    (!addr.ip().is_loopback()).then_some(
+        "listening beyond this machine without authentication: anyone who can reach this address can change content. Bind to 127.0.0.1 until sign-in ships.",
+    )
+}
+
 #[cfg(test)]
 #[allow(clippy::result_large_err)] // figment::Jail closures return figment::Error
 mod tests {
     use super::Config;
     use figment::Jail;
+
+    #[test]
+    fn warns_only_off_loopback() {
+        let warn = |a: &str| super::exposure_warning(a.parse().unwrap());
+        assert!(warn("127.0.0.1:3000").is_none());
+        assert!(warn("[::1]:3000").is_none());
+        assert!(warn("0.0.0.0:3000").is_some());
+        assert!(warn("192.168.1.5:3000").is_some());
+        assert!(warn("[::]:3000").is_some());
+    }
 
     #[test]
     fn env_overrides_file() {
