@@ -10,7 +10,7 @@ pub enum ApiError {
     NotFound,
     MethodNotAllowed,
     BadRequest(String),
-    PayloadTooLarge,
+    BodyTooLarge,
     /// The request ran past its time limit.
     Timeout,
     Conflict(String),
@@ -66,9 +66,9 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
-            Self::PayloadTooLarge => (
+            Self::BodyTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
-                "Payload too large",
+                "Content too large",
                 Some("the request body is over 10 MB".to_owned()),
                 None,
             ),

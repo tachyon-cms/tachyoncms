@@ -54,7 +54,7 @@ fn parse_id(id: &str) -> Result<Uuid, ApiError> {
 pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
     body.map(|Json(v)| v).map_err(|e| {
         if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::PayloadTooLarge
+            ApiError::BodyTooLarge
         } else {
             ApiError::BadRequest(e.body_text())
         }
