@@ -98,7 +98,7 @@ pub(crate) fn list_params(raw: Option<&str>, c: &Collection) -> Result<ListParam
             return Err(bad("use either page or after, not both"));
         }
         let fits = match &sort {
-            Some(s) => cursor.fits(s.target.kind()),
+            Some(s) => cursor.fits(&s.target),
             None => cursor.value.is_none(),
         };
         if !fits {

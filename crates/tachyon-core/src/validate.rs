@@ -221,9 +221,7 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             (!ok).then(|| "expected a date like 2026-10-12".into())
         }
         FieldKind::Date { date_only: false } => {
-            let ok = v
-                .as_str()
-                .is_some_and(|s| time::OffsetDateTime::parse(s, &Rfc3339).is_ok());
+            let ok = v.as_str().is_some_and(|s| normalize_date_time(s).is_some());
             (!ok).then(|| "expected a date-time like 2026-10-12T09:30:00Z".into())
         }
         FieldKind::Email => {
@@ -297,12 +295,15 @@ const DATE_TIME_UTC: &[BorrowedFormatItem<'_>] =
 
 /// Parses an RFC 3339 date-time and returns it in UTC with exactly three fractional digits,
 /// so stored values sort correctly as text.
+/// Years outside 0–9999 are rejected: they'd break fixed-width text ordering.
 pub fn normalize_date_time(s: &str) -> Option<String> {
-    time::OffsetDateTime::parse(s, &Rfc3339)
+    let utc = time::OffsetDateTime::parse(s, &Rfc3339)
         .ok()?
-        .to_offset(time::UtcOffset::UTC)
-        .format(DATE_TIME_UTC)
-        .ok()
+        .checked_to_offset(time::UtcOffset::UTC)?;
+    if !(0..=9999).contains(&utc.year()) {
+        return None;
+    }
+    utc.format(DATE_TIME_UTC).ok()
 }
 
 pub(crate) fn is_date(s: &str) -> bool {
@@ -841,5 +842,16 @@ mod tests {
             Some("2026-10-12T07:30:00.123Z")
         );
         assert_eq!(normalize_date_time("yesterday"), None);
+    }
+
+    #[test]
+    fn date_times_outside_years_0_to_9999_are_rejected_not_panics() {
+        assert_eq!(normalize_date_time("9999-12-31T23:00:00-02:00"), None);
+        assert_eq!(normalize_date_time("0000-01-01T00:00:00+01:00"), None);
+        let f = fields(json!([{"name": "at", "type": "date"}]));
+        assert_eq!(
+            errs(&f, json!({"at": "9999-12-31T23:00:00-02:00"})),
+            vec![e("at", "expected a date-time like 2026-10-12T09:30:00Z")]
+        );
     }
 }

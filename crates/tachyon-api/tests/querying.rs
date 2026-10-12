@@ -132,3 +132,43 @@ async fn bad_parameters_are_400(pool: PgPool) {
         400,
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hostile_cursors_dates_and_nuls_are_400s(pool: PgPool) {
+    use tachyon_core::query::{Cursor, Scalar};
+    let app = app(pool).await;
+    let garbage = Cursor {
+        value: Some(Scalar::Text("garbage".into())),
+        id: uuid::Uuid::nil(),
+    }
+    .encode();
+    for qs in [
+        format!("sort=id&after={garbage}"),
+        format!("sort=createdAt&after={garbage}"),
+        "where[createdAt][gt]=9999-12-31T23:00:00-02:00".to_owned(),
+        "where[title][equals]=a%00".to_owned(),
+        "where[title][like]=a%00".to_owned(),
+    ] {
+        assert_problem(
+            &send(&app, "GET", &format!("/api/items?{qs}"), None).await,
+            400,
+        );
+    }
+
+    let schema = r#"{"slug": "events", "fields": [{"name": "at", "type": "date"}]}"#;
+    assert_eq!(
+        send(&app, "POST", "/api/admin/collections", Some(schema))
+            .await
+            .status,
+        201
+    );
+    let res = send(
+        &app,
+        "POST",
+        "/api/events",
+        Some(r#"{"at": "9999-12-31T23:00:00-02:00"}"#),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "at");
+}

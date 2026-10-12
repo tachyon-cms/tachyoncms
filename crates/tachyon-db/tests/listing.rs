@@ -192,3 +192,55 @@ fn field_expr_refuses_unsafe_names() {
         tachyon_core::query::ValueKind::Text,
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn numbers_compare_exactly(pool: PgPool) {
+    let c = collections::create(&pool, &schema()).await.unwrap().id;
+    for (title, price) in [
+        ("small", json!(0.3)),
+        ("tricky", json!(0.30000000000000004)),
+        ("big", json!(1234567890123456_i64)),
+    ] {
+        let data = json!({"title": title, "price": price})
+            .as_object()
+            .unwrap()
+            .clone();
+        documents::insert(&pool, c, None, &Prepared::plain(data))
+            .await
+            .unwrap();
+    }
+    let f = filter("where[price][equals]=1234567890123456");
+    assert_eq!(titles(&pool, c, q(Some(&f), None)).await, ["big"]);
+    let f = filter("where[price][in]=0.30000000000000004");
+    assert_eq!(titles(&pool, c, q(Some(&f), None)).await, ["tricky"]);
+
+    let by_price = sort("price");
+    let mut seen = Vec::new();
+    let mut after: Option<Cursor> = None;
+    while seen.len() < 10 {
+        let page = query::list(
+            &pool,
+            c,
+            &ListQuery {
+                filter: None,
+                sort: Some(&by_price),
+                limit: 1,
+                offset: 0,
+                after: after.as_ref(),
+                count: false,
+            },
+        )
+        .await
+        .unwrap();
+        seen.extend(
+            page.docs
+                .iter()
+                .map(|d| d.data.0["title"].as_str().unwrap().to_owned()),
+        );
+        match page.next {
+            Some(next) => after = Some(next),
+            None => break,
+        }
+    }
+    assert_eq!(seen, ["small", "tricky", "big"]);
+}

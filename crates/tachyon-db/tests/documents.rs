@@ -315,3 +315,28 @@ async fn insert_with_a_chosen_id_conflicts_on_reuse(pool: PgPool) {
         "{err:?}"
     );
 }
+
+#[sqlx::test]
+async fn saving_documents_that_link_to_each_other_at_once_never_deadlocks(pool: PgPool) {
+    let posts = collection(&pool, "posts").await;
+    let a = documents::insert(&pool, posts, None, &Prepared::plain(data("a")))
+        .await
+        .unwrap();
+    let b = link(&pool, posts, "b", &[(posts, a.id)]).await.unwrap();
+    let linking = |title: &str, to: Uuid| Prepared {
+        data: data(title),
+        relations: vec![Relation {
+            path: "refs.0".into(),
+            collection_id: posts,
+            id: to,
+        }],
+    };
+    for _ in 0..10 {
+        let (ra, rb) = tokio::join!(
+            documents::update(&pool, posts, a.id, |_| Ok::<_, DbError>(linking("a", b.id))),
+            documents::update(&pool, posts, b.id, |_| Ok::<_, DbError>(linking("b", a.id))),
+        );
+        ra.unwrap();
+        rb.unwrap();
+    }
+}

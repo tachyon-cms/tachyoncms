@@ -68,7 +68,11 @@ async fn listen(pool: &PgPool, schemas: &Schemas) -> Result<(), DbError> {
     // Catch anything that changed while we were (re)connecting.
     schemas.reload(pool).await?;
     loop {
-        listener.recv().await?;
+        // `None` means the connection dropped. Start over with a fresh listener, which
+        // re-subscribes and reloads, so nothing announced while we were away is missed.
+        if listener.try_recv().await?.is_none() {
+            return Ok(());
+        }
         schemas.reload(pool).await?;
     }
 }

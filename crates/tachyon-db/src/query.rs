@@ -71,8 +71,9 @@ fn bind(qb: &mut QueryBuilder<Postgres>, target: &Target, value: &Scalar) {
         (Target::CreatedAt | Target::UpdatedAt, Scalar::Text(s)) => {
             qb.push_bind(OffsetDateTime::parse(s, &Rfc3339).expect("parser normalized the date"));
         }
+        // Bound as text: Rust prints the shortest exact form, where float8→numeric keeps 15 digits.
         (_, Scalar::Number(n)) => {
-            qb.push_bind(*n).push("::numeric");
+            qb.push_bind(n.to_string()).push("::numeric");
         }
         (_, Scalar::Bool(b)) => {
             qb.push_bind(*b);
@@ -108,10 +109,10 @@ fn bind_list(qb: &mut QueryBuilder<Postgres>, target: &Target, values: &[Scalar]
             kind: ValueKind::Number,
             ..
         } => {
-            let numbers: Vec<f64> = values
+            let numbers: Vec<String> = values
                 .iter()
                 .filter_map(|v| match v {
-                    Scalar::Number(n) => Some(*n),
+                    Scalar::Number(n) => Some(n.to_string()),
                     _ => None,
                 })
                 .collect();
@@ -193,6 +194,19 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
     }
 }
 
+/// Built-in columns are NOT NULL, so they skip NULLS LAST and can use the plain indexes.
+fn order_by(sort: Option<&Sort>) -> String {
+    let Some(s) = sort else {
+        return "id DESC".into();
+    };
+    let direction = if s.descending { "DESC" } else { "ASC" };
+    match &s.target {
+        Target::Id => format!("id {direction}"),
+        Target::Field { .. } => format!("{} {direction} NULLS LAST, id DESC", expr(&s.target)),
+        _ => format!("{} {direction}, id DESC", expr(&s.target)),
+    }
+}
+
 fn push_where(qb: &mut QueryBuilder<Postgres>, collection_id: Uuid, filter: Option<&Filter>) {
     qb.push(" WHERE tenant_id = ").push_bind(DEFAULT_TENANT);
     // A literal (not a bind) so the planner can match per-collection partial indexes.
@@ -210,7 +224,6 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         Some(s) => (expr(&s.target), s.descending),
         None => ("id".to_owned(), true),
     };
-    let direction = if descending { "DESC" } else { "ASC" };
 
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT id, status, created_at, updated_at, published AS data FROM documents",
@@ -220,9 +233,7 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         qb.push(" AND ");
         push_after(&mut qb, q.sort, &sort_expr, descending, cursor);
     }
-    qb.push(format!(
-        " ORDER BY {sort_expr} {direction} NULLS LAST, id DESC LIMIT "
-    ));
+    qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
     qb.push_bind(q.limit).push(" OFFSET ").push_bind(q.offset);
     let docs: Vec<Document> = qb.build_query_as().fetch_all(pool).await?;
 
@@ -296,5 +307,32 @@ fn sort_value(sort: Option<&Sort>, doc: &Document) -> Option<Scalar> {
                 _ => None,
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn built_in_sorts_match_their_indexes() {
+        // NOT NULL columns get no NULLS LAST, so Postgres can walk the (…, id DESC) index.
+        assert_eq!(order_by(None), "id DESC");
+        let created = Sort {
+            target: Target::CreatedAt,
+            descending: false,
+        };
+        assert_eq!(order_by(Some(&created)), "created_at ASC, id DESC");
+        let price = Sort {
+            target: Target::Field {
+                path: vec!["price".into()],
+                kind: ValueKind::Number,
+            },
+            descending: true,
+        };
+        assert_eq!(
+            order_by(Some(&price)),
+            "((published #>> '{price}'))::numeric DESC NULLS LAST, id DESC"
+        );
     }
 }

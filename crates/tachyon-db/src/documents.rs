@@ -135,7 +135,7 @@ pub async fn update<E: From<DbError>>(
         r#"SELECT published AS "data!: Json<Map<String, Value>>"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
-           FOR UPDATE"#,
+           FOR NO KEY UPDATE"#,
         DEFAULT_TENANT,
         collection_id,
         id,
@@ -213,8 +213,9 @@ pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbErr
 }
 
 /// Checks every link points at a live document in the expected collection, then replaces
-/// the document's rows in `relations`. Targets are share-locked so they can't be deleted
-/// before this transaction commits.
+/// the document's rows in `relations`. Targets are key-share locked: that blocks a
+/// concurrent delete (which takes FOR UPDATE) but not an ordinary save (FOR NO KEY UPDATE),
+/// so two documents linking to each other can be saved at the same time without deadlock.
 async fn sync_relations(
     conn: &mut PgConnection,
     from_doc: Uuid,
@@ -233,7 +234,7 @@ async fn sync_relations(
            JOIN unnest($1::uuid[], $2::uuid[]) AS t(id, collection_id)
              ON d.id = t.id AND d.collection_id = t.collection_id
            WHERE d.tenant_id = $3 AND d.deleted_at IS NULL
-           FOR SHARE OF d"#,
+           FOR KEY SHARE OF d"#,
         &ids,
         &collections,
         DEFAULT_TENANT,

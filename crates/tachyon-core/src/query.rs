@@ -22,6 +22,10 @@ pub fn parse_query(raw: &str) -> Result<Map<String, Value>, String> {
         if i >= MAX_PARAMS {
             return Err(format!("too many query parameters (max {MAX_PARAMS})"));
         }
+        // Postgres can't store or compare U+0000, so stop it here rather than as a 500.
+        if key.contains('\0') || value.contains('\0') {
+            return Err("query parameters can't contain NUL characters".into());
+        }
         let path = split_key(&key).ok_or_else(|| format!("malformed parameter `{key}`"))?;
         if path.len() > MAX_KEY_DEPTH {
             return Err(format!("parameter `{key}` is nested too deeply"));
@@ -516,6 +520,7 @@ impl Cursor {
         };
         let value = match value {
             Value::Null => None,
+            Value::String(s) if s.contains('\0') => return None,
             Value::String(s) => Some(Scalar::Text(s.clone())),
             Value::Number(n) => Some(Scalar::Number(n.as_f64()?)),
             Value::Bool(b) => Some(Scalar::Bool(*b)),
@@ -527,10 +532,21 @@ impl Cursor {
         })
     }
 
-    /// Whether this cursor's value can be compared with a sort of `kind`.
-    pub fn fits(&self, kind: ValueKind) -> bool {
+    /// Whether this cursor's value can be compared and bound for a sort on `target`.
+    pub fn fits(&self, target: &Target) -> bool {
+        match (&self.value, target) {
+            (Some(Scalar::Text(s)), Target::Id) => return Uuid::try_parse(s).is_ok(),
+            (Some(Scalar::Text(s)), Target::CreatedAt | Target::UpdatedAt) => {
+                return time::OffsetDateTime::parse(
+                    s,
+                    &time::format_description::well_known::Rfc3339,
+                )
+                .is_ok();
+            }
+            _ => {}
+        }
         matches!(
-            (&self.value, kind),
+            (&self.value, target.kind()),
             (None, _)
                 | (Some(Scalar::Text(_)), ValueKind::Text | ValueKind::Date)
                 | (Some(Scalar::Number(_)), ValueKind::Number)
@@ -817,14 +833,31 @@ mod tests {
             id: Uuid::nil(),
         };
         assert_eq!(Cursor::decode(&c.encode()), Some(c.clone()));
-        assert!(c.fits(ValueKind::Number) && !c.fits(ValueKind::Text));
+        assert!(
+            c.fits(&field("price", ValueKind::Number)) && !c.fits(&field("title", ValueKind::Text))
+        );
         assert!(
             Cursor {
                 value: None,
                 id: Uuid::nil()
             }
-            .fits(ValueKind::Text)
+            .fits(&field("title", ValueKind::Text))
         );
+        let garbage = Cursor {
+            value: Some(text("garbage")),
+            id: Uuid::nil(),
+        };
+        assert!(garbage.fits(&field("title", ValueKind::Text)));
+        assert!(!garbage.fits(&Target::Id), "an id cursor must hold an ID");
+        assert!(
+            !garbage.fits(&Target::CreatedAt),
+            "a createdAt cursor must hold a date-time"
+        );
+        let nul = Cursor {
+            value: Some(text("a\u{0}b")),
+            id: Uuid::nil(),
+        };
+        assert_eq!(Cursor::decode(&nul.encode()), None);
         let encoded = [hex("[1]"), hex("[1, \"nope\"]")];
         for bad in ["zz", "", "00"]
             .into_iter()
@@ -837,5 +870,11 @@ mod tests {
 
     fn hex(s: &str) -> String {
         s.bytes().map(|b| format!("{b:02x}")).collect()
+    }
+
+    #[test]
+    fn nul_characters_are_rejected() {
+        assert!(parse_query("where[title][equals]=a%00b").is_err());
+        assert!(parse_query("a%00=1").is_err());
     }
 }
