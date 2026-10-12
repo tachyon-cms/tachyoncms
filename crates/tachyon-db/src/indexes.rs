@@ -63,6 +63,7 @@ pub fn index_name(collection_id: Uuid, field: &str, kind: IndexKind, value: Valu
 pub(crate) struct Wanted {
     pub name: String,
     pub field: String,
+    pub kind: IndexKind,
     pub unique: bool,
     /// Everything after `CREATE [UNIQUE] INDEX [CONCURRENTLY] <name> `.
     pub definition: String,
@@ -80,6 +81,7 @@ pub(crate) fn wanted_indexes(collection_id: Uuid, schema: &CollectionSchema) -> 
             out.push(Wanted {
                 name: index_name(collection_id, &f.name, kind, value),
                 field: f.name.clone(),
+                kind,
                 unique: kind == IndexKind::Unique,
                 definition,
             });
@@ -103,6 +105,18 @@ pub(crate) fn wanted_indexes(collection_id: Uuid, schema: &CollectionSchema) -> 
         }
     }
     out
+}
+
+impl Wanted {
+    /// How a person reads it in a preview: `title (unique)`.
+    pub fn label(&self) -> String {
+        let kind = match self.kind {
+            IndexKind::Unique => "unique",
+            IndexKind::Filter => "filter",
+            IndexKind::FilterDesc => "filter, highest first",
+        };
+        format!("{} ({kind})", self.field)
+    }
 }
 
 /// Makes a collection's indexes match its schema: creates missing ones, drops ones no field

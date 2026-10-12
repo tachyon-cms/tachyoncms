@@ -158,12 +158,24 @@ fn compare(
         let name = new_name(o);
         let new_path = join(new_prefix, &name);
         let renamed = name != o.name;
-        if renamed && old.iter().any(|s| s.name == name && new_name(s) == name) {
+        if renamed
+            && let Some(other) = old
+                .iter()
+                .find(|s| s.name != o.name && s.name != name && new_name(s) == name)
+        {
+            let mut both = [old_path.clone(), join(old_prefix, &other.name)];
+            both.sort();
             return Err(invalid(format!(
-                "can't rename `{old_path}` to `{name}`: a field with that name already exists"
+                "can't rename both `{}` and `{}` to `{name}`",
+                both[0], both[1]
             )));
         }
-        let Some(n) = new.iter().find(|n| n.name == name) else {
+        // Another field is renamed onto this one's name, so this one is removed.
+        let displaced = !renamed
+            && old
+                .iter()
+                .any(|s| s.name != o.name && new_name(s) == o.name);
+        let Some(n) = new.iter().find(|n| n.name == name && !displaced) else {
             if renamed {
                 return Err(invalid(format!(
                     "can't rename `{old_path}` to `{name}`: there's no `{new_path}` in the new fields"
@@ -389,6 +401,10 @@ fn rename_batch(obj: &mut Map<String, Value>, segments: &[&str], batch: &[(&str,
                 .iter()
                 .filter_map(|(from, to)| obj.remove(*from).map(|value| (*to, value)))
                 .collect();
+            // A target's old value belonged to a field this change removes.
+            for (_, to) in batch {
+                obj.remove(*to);
+            }
             for (to, value) in taken {
                 obj.insert(to.to_owned(), value);
             }
@@ -646,9 +662,9 @@ mod tests {
                 "can't rename `title` to `heading`: there's no `heading` in the new fields",
             ),
             (
-                json!({"slug": "posts", "fields": [{"name": "name", "type": "text"}]}),
-                vec![("title", "name")],
-                "can't rename `title` to `name`: a field with that name already exists",
+                json!({"slug": "posts", "fields": [{"name": "label", "type": "text"}]}),
+                vec![("title", "label"), ("name", "label")],
+                "can't rename both `name` and `title` to `label`",
             ),
         ];
         for (new, pairs, message) in cases {
@@ -656,6 +672,41 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
     }
+    #[test]
+    fn renaming_onto_a_removed_fields_name() {
+        let old = schema(json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"}, {"name": "name", "type": "text"}
+        ]}));
+        let new = schema(json!({"slug": "posts", "fields": [{"name": "name", "type": "text"}]}));
+        let r = renames(&[("title", "name")]);
+        let d = diff(&old, &new, &r).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Renamed {
+                    from: "title".into(),
+                    to: "name".into()
+                },
+                Change::Removed {
+                    path: "name".into(),
+                    kind: "text"
+                },
+            ]
+        );
+        assert!(d.is_destructive());
+        let doc = json!({"title": "T", "name": "N"});
+        assert_eq!(
+            Value::Object(migrate_document(&new.fields, &r, doc.as_object().unwrap())),
+            json!({"name": "T"})
+        );
+        let doc = json!({"name": "N"});
+        assert_eq!(
+            Value::Object(migrate_document(&new.fields, &r, doc.as_object().unwrap())),
+            json!({}),
+            "the removed field's value goes even when there's nothing to move in"
+        );
+    }
+
     #[test]
     fn migrate_document_renames_prunes_and_fills_defaults() {
         let new = schema(json!({"slug": "posts", "fields": [

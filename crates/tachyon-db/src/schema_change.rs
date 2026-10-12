@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 use crate::collections::Collection;
 use crate::documents::{Relation, sync_relations};
-use crate::indexes::{ddl, existing_indexes, wanted_indexes};
+use crate::indexes::{Wanted, ddl, existing_indexes, wanted_indexes};
 use crate::{DEFAULT_TENANT, DbError};
 
 const BATCH: i64 = 500;
@@ -40,6 +40,14 @@ pub struct Preview {
     pub needs_confirmation: bool,
     /// Live documents that lose a link because its collection is no longer allowed.
     pub cleared: i64,
+    pub indexes: IndexChanges,
+}
+
+/// Indexes the change builds and drops, labelled like `title (unique)`.
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct IndexChanges {
+    pub create: Vec<String>,
+    pub drop: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -88,6 +96,23 @@ pub async fn apply(
     confirm: bool,
 ) -> Result<(Collection, Preview), ChangeError> {
     run(pool, slug, new, renames, &[], Some(confirm)).await
+}
+
+fn index_changes(id: Uuid, old: &CollectionSchema, new: &CollectionSchema) -> IndexChanges {
+    let (before, after) = (wanted_indexes(id, old), wanted_indexes(id, new));
+    let missing_from = |list: &[Wanted], w: &Wanted| !list.iter().any(|o| o.name == w.name);
+    IndexChanges {
+        create: after
+            .iter()
+            .filter(|w| missing_from(&before, w))
+            .map(Wanted::label)
+            .collect(),
+        drop: before
+            .iter()
+            .filter(|w| missing_from(&after, w))
+            .map(Wanted::label)
+            .collect(),
+    }
 }
 
 struct Row {
@@ -192,6 +217,7 @@ async fn run(
         duplicates: Vec::new(),
         needs_confirmation: false,
         cleared: 0,
+        indexes: index_changes(current.id, &current.schema.0, new),
     };
     let data = data_fields(&new.fields);
     let unique: Vec<&str> = data

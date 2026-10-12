@@ -85,6 +85,16 @@ fn describe(slug: &str, p: &Preview) -> String {
     if !p.duplicates.is_empty() {
         line += &format!("\n  duplicate values in: {}", p.duplicates.join(", "));
     }
+    let mut indexes = Vec::new();
+    if !p.indexes.create.is_empty() {
+        indexes.push(format!("create {}", p.indexes.create.join(", ")));
+    }
+    if !p.indexes.drop.is_empty() {
+        indexes.push(format!("drop {}", p.indexes.drop.join(", ")));
+    }
+    if !indexes.is_empty() {
+        line += &format!("\n  indexes: {}", indexes.join("; "));
+    }
     line
 }
 
@@ -315,6 +325,22 @@ mod tests {
                 .fields
                 .len(),
             1
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn diffs_say_which_indexes_change(pool: PgPool) {
+        collections::create(&pool, &posts(json!([{"name": "title", "type": "text"}])))
+            .await
+            .unwrap();
+        let file = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "title", "type": "text", "unique": true}
+        ]}]})
+        .to_string();
+        let plan = run(&pool, &file, &BTreeMap::new(), None).await.unwrap();
+        assert!(
+            plan.contains("\n  indexes: create title (unique)"),
+            "{plan}"
         );
     }
 }
