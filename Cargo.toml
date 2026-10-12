@@ -1,0 +1,35 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+repository = "https://github.com/tachyon-cms/tachyoncms"
+
+[workspace.dependencies]
+tachyon-core = { path = "crates/tachyon-core" }
+tachyon-db = { path = "crates/tachyon-db" }
+tachyon-api = { path = "crates/tachyon-api" }
+
+anyhow = "1.0.104"
+axum = "0.8.9"
+clap = { version = "4.6.7", features = ["derive"] }
+figment = { version = "0.10.19", features = ["toml", "env"] }
+http-body-util = "0.1.5"
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+sqlx = { version = "0.9.0", default-features = false, features = ["runtime-tokio", "tls-rustls-ring-webpki", "postgres", "macros", "migrate", "uuid", "time", "json"] }
+thiserror = "2.0.21"
+time = { version = "0.3.55", features = ["serde-well-known", "parsing", "macros"] }
+tokio = { version = "1.53.2", features = ["rt-multi-thread", "macros", "net", "signal"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["timeout"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
+url = "2.5.8"
+uuid = { version = "1.28.0", features = ["v7", "serde"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
