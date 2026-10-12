@@ -116,6 +116,13 @@ pub enum FieldKind {
         min_length: Option<usize>,
         #[serde(default)]
         max_length: Option<usize>,
+        /// Store a list of values instead of one.
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
     },
     Textarea {
         #[serde(default)]
@@ -130,6 +137,13 @@ pub enum FieldKind {
         max: Option<f64>,
         #[serde(default)]
         integer: bool,
+        /// Store a list of values instead of one.
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
     },
     #[serde(alias = "checkbox")]
     Boolean,
@@ -240,7 +254,9 @@ impl FieldKind {
     pub fn is_indexable(&self) -> bool {
         match self {
             Self::Select { multiple, .. } => !multiple,
-            Self::Relationship { has_many, .. } => !has_many,
+            Self::Relationship { has_many, .. }
+            | Self::Text { has_many, .. }
+            | Self::Number { has_many, .. } => !has_many,
             Self::Json | Self::Group { .. } | Self::Array { .. } => false,
             _ => true,
         }
@@ -378,8 +394,10 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
         if (f.unique || f.filterable) && !f.kind.is_indexable() {
             let what = match f.kind {
                 FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
-                FieldKind::Relationship { .. } => {
-                    "relationship fields with multiple values".to_owned()
+                FieldKind::Relationship { .. }
+                | FieldKind::Text { .. }
+                | FieldKind::Number { .. } => {
+                    format!("{} fields with multiple values", f.kind.name())
                 }
                 _ => format!("{} fields", f.kind.name()),
             };
@@ -389,6 +407,7 @@ fn check_fields(fields: &[Field], top_level: bool, root: &[Field]) -> Result<(),
             FieldKind::Text {
                 min_length: Some(a),
                 max_length: Some(b),
+                ..
             } if a > b => {
                 return Err(invalid("minLength is greater than maxLength".into()));
             }
@@ -494,7 +513,10 @@ mod tests {
             s.fields[0].kind,
             FieldKind::Text {
                 min_length: None,
-                max_length: Some(120)
+                max_length: Some(120),
+                has_many: false,
+                min_rows: None,
+                max_rows: None,
             }
         );
         assert!(s.fields[0].required);
@@ -793,6 +815,19 @@ mod tests {
             Err(SchemaError::InvalidField {
                 field: "r".into(),
                 message: "option values must be unique; `a` appears twice".into()
+            })
+        );
+    }
+    #[test]
+    fn has_many_fields_cant_be_indexed() {
+        let s = schema(
+            json!({"slug": "posts", "fields": [{"name": "tags", "type": "text", "hasMany": true, "filterable": true}]}),
+        );
+        assert_eq!(
+            s.check(),
+            Err(SchemaError::InvalidField {
+                field: "tags".into(),
+                message: "text fields with multiple values can't be unique or filterable".into()
             })
         );
     }

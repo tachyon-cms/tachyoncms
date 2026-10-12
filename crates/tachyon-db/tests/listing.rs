@@ -268,3 +268,36 @@ async fn mistyped_stored_values_never_break_filters(pool: PgPool) {
         ["ok", "bad"]
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn contains_works_on_text_and_number_lists(pool: PgPool) {
+    let s: CollectionSchema = serde_json::from_value(json!({"slug": "things", "fields": [
+        {"name": "title", "type": "text"},
+        {"name": "labels", "type": "text", "hasMany": true},
+        {"name": "sizes", "type": "number", "hasMany": true}
+    ]}))
+    .unwrap();
+    let c = collections::create(&pool, &s).await.unwrap().id;
+    for item in [
+        json!({"title": "a", "labels": ["red", "big"], "sizes": [1, 2.5]}),
+        json!({"title": "b", "labels": ["blue"], "sizes": [3]}),
+    ] {
+        documents::insert(
+            &pool,
+            c,
+            1,
+            None,
+            &Prepared::plain(item.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap();
+    }
+    let titles_for = |qs: &str| {
+        let f = parse_filter(&s.fields, &parse_query(qs).unwrap()["where"]).unwrap();
+        let pool = pool.clone();
+        async move { titles(&pool, c, q(Some(&f), None)).await }
+    };
+    assert_eq!(titles_for("where[labels][contains]=big").await, ["a"]);
+    assert_eq!(titles_for("where[sizes][contains]=2.5").await, ["a"]);
+    assert_eq!(titles_for("where[sizes][contains]=3").await, ["b"]);
+}

@@ -146,6 +146,48 @@ fn check_object(
 
 pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<FieldError>) {
     match (&f.kind, v) {
+        (
+            FieldKind::Text {
+                has_many: true,
+                min_rows,
+                max_rows,
+                ..
+            }
+            | FieldKind::Number {
+                has_many: true,
+                min_rows,
+                max_rows,
+                ..
+            },
+            value,
+        ) => {
+            let Value::Array(items) = value else {
+                errors.push(error(path.into(), "expected a list"));
+                return;
+            };
+            if let Some(min) = *min_rows
+                && items.len() < min
+            {
+                errors.push(error(
+                    path.into(),
+                    &format!("must have at least {}", row_count(min)),
+                ));
+            }
+            if let Some(max) = *max_rows
+                && items.len() > max
+            {
+                errors.push(error(
+                    path.into(),
+                    &format!("must have at most {}", row_count(max)),
+                ));
+            }
+            // `scalar_error` ignores `has_many`, so it checks one element.
+            for (i, item) in items.iter().enumerate() {
+                if let Some(message) = scalar_error(&f.kind, item) {
+                    errors.push(error(format!("{path}.{i}"), &message));
+                }
+            }
+        }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
             check_object(fields, obj, path, errors)
         }
@@ -194,13 +236,16 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         FieldKind::Text {
             min_length,
             max_length,
+            ..
         } => text_error(v, *min_length, *max_length),
         FieldKind::Textarea {
             min_length,
             max_length,
         } => text_error(v, *min_length, *max_length),
         FieldKind::Code { .. } => text_error(v, None, None),
-        FieldKind::Number { min, max, integer } => {
+        FieldKind::Number {
+            min, max, integer, ..
+        } => {
             let Some(n) = v.as_f64() else {
                 return Some("expected a number".into());
             };
@@ -902,6 +947,34 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"intro": "ab"})),
             vec![e("intro", "must be at least 3 characters")]
+        );
+    }
+    #[test]
+    fn has_many_text_and_numbers_validate_each_value() {
+        let f = fields(json!([
+            {"name": "tags", "type": "text", "hasMany": true, "maxLength": 5, "maxRows": 2},
+            {"name": "scores", "type": "number", "hasMany": true, "integer": true, "minRows": 1}
+        ]));
+        ok(&f, json!({"tags": ["a", "b"], "scores": [1, 2, 3]}));
+        assert_eq!(
+            errs(&f, json!({"tags": "a"})),
+            vec![e("tags", "expected a list")]
+        );
+        assert_eq!(
+            errs(&f, json!({"tags": ["ok", "toolong"]})),
+            vec![e("tags.1", "must be at most 5 characters")]
+        );
+        assert_eq!(
+            errs(&f, json!({"tags": ["a", "b", "c"]})),
+            vec![e("tags", "must have at most 2 rows")]
+        );
+        assert_eq!(
+            errs(&f, json!({"scores": []})),
+            vec![e("scores", "must have at least 1 row")]
+        );
+        assert_eq!(
+            errs(&f, json!({"scores": [1.5]})),
+            vec![e("scores.0", "expected a whole number")]
         );
     }
 }

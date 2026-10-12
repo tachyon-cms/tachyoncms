@@ -196,12 +196,23 @@ fn options(f: &Field) -> Field {
 }
 
 fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
-    use FieldKind::{Code, Radio, Select, Text, Textarea};
+    use FieldKind::{Code, Number, Radio, Select, Text, Textarea};
     match (a, b) {
+        // Turning `hasMany` on or off changes the stored shape.
+        (Text { has_many: x, .. }, Text { has_many: y, .. }) => x == y,
+        (Number { has_many: x, .. }, Number { has_many: y, .. }) => x == y,
         // Same stored shape, so a change between them is an option change.
         (
-            Text { .. } | Textarea { .. } | Code { .. },
-            Text { .. } | Textarea { .. } | Code { .. },
+            Text {
+                has_many: false, ..
+            }
+            | Textarea { .. }
+            | Code { .. },
+            Text {
+                has_many: false, ..
+            }
+            | Textarea { .. }
+            | Code { .. },
         ) => true,
         (
             Radio { .. }
@@ -596,5 +607,14 @@ mod tests {
             ]
         );
         assert!(!d.is_destructive());
+    }
+    #[test]
+    fn toggling_has_many_is_a_type_change() {
+        let old = schema(json!({"slug": "posts", "fields": [{"name": "tags", "type": "text"}]}));
+        let new = schema(
+            json!({"slug": "posts", "fields": [{"name": "tags", "type": "text", "hasMany": true}]}),
+        );
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert!(d.is_destructive(), "{:?}", d.changes);
     }
 }

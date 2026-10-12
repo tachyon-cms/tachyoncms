@@ -195,6 +195,11 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
             qb.push(&e).push(" @> ");
             qb.push_bind(Json(json!([s])));
         }
+        (Op::Contains, Operand::One(Scalar::Number(n))) => {
+            // jsonb containment compares numbers by value, so 3 matches 3.0.
+            qb.push(&e).push(" @> ");
+            qb.push_bind(Json(json!([n])));
+        }
         (op, value) => unreachable!("the parser never builds {op:?} with {value:?}"),
     }
 }

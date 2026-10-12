@@ -125,11 +125,13 @@ pub enum ValueKind {
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
 pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
     Some(match kind {
+        FieldKind::Select { multiple: true, .. }
+        | FieldKind::Text { has_many: true, .. }
+        | FieldKind::Number { has_many: true, .. }
+        | FieldKind::Relationship { has_many: true, .. } => ValueKind::List,
         FieldKind::Number { .. } => ValueKind::Number,
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
-        FieldKind::Select { multiple: true, .. }
-        | FieldKind::Relationship { has_many: true, .. } => ValueKind::List,
         FieldKind::Json | FieldKind::Group { .. } | FieldKind::Array { .. } => return None,
         _ => ValueKind::Text,
     })
@@ -413,6 +415,16 @@ fn list(v: &Value) -> Option<Vec<Value>> {
 fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, String> {
     let kind = field.map(|f| &f.kind);
     match (target.kind(), kind) {
+        (ValueKind::List, Some(FieldKind::Number { .. })) => {
+            let n = match v {
+                Value::Number(n) => n.as_f64(),
+                Value::String(s) => s.parse::<f64>().ok(),
+                _ => None,
+            };
+            n.filter(|n| n.is_finite())
+                .map(Scalar::Number)
+                .ok_or_else(|| "expected a number".into())
+        }
         (ValueKind::Number, _) => {
             let n = match v {
                 Value::Number(n) => n.as_f64(),
@@ -578,7 +590,8 @@ mod tests {
             {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
             {"name": "data", "type": "json"},
             {"name": "size", "type": "radio", "options": [{"label": "Small", "value": "s"}]},
-            {"name": "snippet", "type": "code"}
+            {"name": "snippet", "type": "code"},
+            {"name": "scores", "type": "number", "hasMany": true}
         ]))
         .unwrap()
     }
@@ -903,6 +916,21 @@ mod tests {
                 Op::Like,
                 Operand::One(text("fn"))
             )
+        );
+    }
+    #[test]
+    fn number_lists_take_numbers() {
+        assert_eq!(
+            filter("where[scores][contains]=3").unwrap(),
+            cond(
+                field("scores", ValueKind::List),
+                Op::Contains,
+                Operand::One(Scalar::Number(3.0))
+            )
+        );
+        assert_eq!(
+            filter("where[scores][contains]=x").unwrap_err(),
+            "where[scores][contains]: expected a number"
         );
     }
 }
