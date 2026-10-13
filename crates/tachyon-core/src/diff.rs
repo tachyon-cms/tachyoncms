@@ -42,6 +42,12 @@ pub enum Change {
     },
     /// Only the admin layout moved (rows, collapsibles, tabs); stored data is untouched.
     LayoutChanged,
+    /// A collection-wide option such as `defaultPopulate` changed; stored data is untouched.
+    CollectionOptionsChanged,
+    /// A virtual field went. It stored nothing, so nothing is lost.
+    VirtualRemoved {
+        path: String,
+    },
     /// A relationship's targets widened without losing any (one collection to several that
     /// include it); existing links are kept and reshaped.
     Relinked {
@@ -135,6 +141,9 @@ pub fn diff(
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
     }
+    if old.default_populate != new.default_populate {
+        changes.push(Change::CollectionOptionsChanged);
+    }
     Ok(SchemaDiff { changes, links })
 }
 
@@ -181,9 +190,13 @@ fn compare(
                     "can't rename `{old_path}` to `{name}`: there's no `{new_path}` in the new fields"
                 )));
             }
-            out.push(Change::Removed {
-                path: old_path,
-                kind: o.kind.name(),
+            out.push(if o.virtual_path.is_some() {
+                Change::VirtualRemoved { path: old_path }
+            } else {
+                Change::Removed {
+                    path: old_path,
+                    kind: o.kind.name(),
+                }
             });
             continue;
         };
@@ -192,6 +205,15 @@ fn compare(
                 from: old_path.clone(),
                 to: new_path.clone(),
             });
+        }
+        // A stored field turned virtual: what it stored goes.
+        if o.virtual_path.is_none() && n.virtual_path.is_some() {
+            out.push(Change::TypeChanged {
+                path: new_path,
+                from: o.kind.name(),
+                to: "virtual",
+            });
+            continue;
         }
         match (&o.kind, &n.kind) {
             (FieldKind::Group { fields: a }, FieldKind::Group { fields: b })
@@ -207,10 +229,12 @@ fn compare(
                 FieldKind::Relationship {
                     relation_to: from,
                     has_many: h1,
+                    ..
                 },
                 FieldKind::Relationship {
                     relation_to: to,
                     has_many: h2,
+                    ..
                 },
             ) if from != to || h1 != h2 => {
                 let keeps_every_target = from.targets().iter().all(|t| to.allows(t));
@@ -293,6 +317,7 @@ fn options_ignoring_targets(f: &Field) -> Field {
     if let FieldKind::Relationship {
         relation_to,
         has_many,
+        ..
     } = &mut f.kind
     {
         *relation_to = RelationTo::One(String::new());
@@ -301,7 +326,7 @@ fn options_ignoring_targets(f: &Field) -> Field {
     f
 }
 
-fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
+pub(crate) fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
     use FieldKind::{Code, Number, Radio, Select, Text, Textarea};
     match (a, b) {
         // Turning `hasMany` on or off changes the stored shape.
@@ -512,7 +537,12 @@ fn convert_link(v: &Value, change: &LinkChange) -> Option<Value> {
 }
 
 fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
-    obj.retain(|key, _| fields.iter().any(|f| &f.name == key));
+    // Virtual values are read on the way out, never stored.
+    obj.retain(|key, _| {
+        fields
+            .iter()
+            .any(|f| &f.name == key && f.virtual_path.is_none())
+    });
     for f in fields {
         match (&f.kind, obj.get_mut(&f.name)) {
             (FieldKind::Group { fields }, Some(Value::Object(inner))) => prune(fields, inner),
@@ -666,6 +696,16 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
     }
+    #[test]
+    fn changing_default_populate_is_a_change() {
+        let old = schema(json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}));
+        let new = schema(json!({"slug": "authors", "defaultPopulate": {"name": true},
+                                "fields": [{"name": "name", "type": "text"}]}));
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert_eq!(d.changes, vec![Change::CollectionOptionsChanged]);
+        assert!(!d.is_destructive());
+    }
+
     #[test]
     fn schema_changes_fill_nested_defaults() {
         let new = schema(json!({"slug": "posts", "fields": [

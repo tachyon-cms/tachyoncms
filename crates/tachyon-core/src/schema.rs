@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Keys the API adds to every document, so top-level fields can't use them.
 pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "status"];
@@ -19,6 +19,9 @@ pub struct CollectionSchema {
     #[serde(default)]
     pub kind: CollectionKind,
     pub fields: Vec<Field>,
+    /// What other collections get when they populate a link to this one, as a `select`.
+    #[serde(default, rename = "defaultPopulate")]
+    pub default_populate: Option<Map<String, Value>>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -27,7 +30,13 @@ pub struct CollectionSchema {
 
 impl PartialEq for CollectionSchema {
     fn eq(&self, other: &Self) -> bool {
-        (&self.slug, self.kind, &self.fields) == (&other.slug, other.kind, &other.fields)
+        (&self.slug, self.kind, &self.fields, &self.default_populate)
+            == (
+                &other.slug,
+                other.kind,
+                &other.fields,
+                &other.default_populate,
+            )
     }
 }
 
@@ -66,6 +75,9 @@ pub struct Field {
     pub filterable: bool,
     #[serde(default, deserialize_with = "null_as_default")]
     pub admin: Admin,
+    /// Read through a relationship instead of stored, such as `author.name`.
+    #[serde(default, rename = "virtual")]
+    pub virtual_path: Option<String>,
     #[serde(flatten)]
     pub kind: FieldKind,
 }
@@ -197,6 +209,9 @@ pub enum FieldKind {
         relation_to: RelationTo,
         #[serde(default)]
         has_many: bool,
+        /// Populate through this field at most this deep, whatever `depth` asks for.
+        #[serde(default)]
+        max_depth: Option<u8>,
     },
     Json,
     Group {
@@ -335,6 +350,7 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                             unique: false,
                             filterable: false,
                             admin: Admin::default(),
+                            virtual_path: None,
                             kind: FieldKind::Group {
                                 fields: flatten(&tab.fields),
                             },
@@ -486,6 +502,92 @@ fn is_size(width: &str) -> bool {
     let (whole, fraction) = number.split_once('.').unwrap_or((number, "0"));
     let digits = |s: &str| !s.is_empty() && s.bytes().all(|b| b.is_ascii_digit());
     digits(whole) && digits(fraction) && number.parse::<f64>().is_ok_and(|v| v > 0.0 && v <= max)
+}
+
+/// A virtual field's own rules. Whether its targets have the field is `check_virtual_targets`.
+fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result<(), String> {
+    if in_list {
+        return Err("virtual fields can't be inside a list yet".into());
+    }
+    if matches!(f.kind, FieldKind::Slug { .. }) {
+        return Err("slug fields can't be virtual; a slug is stored so it can stay unique".into());
+    }
+    if matches!(
+        f.kind,
+        FieldKind::Group { .. } | FieldKind::Array { .. } | FieldKind::Relationship { .. }
+    ) || f.kind.is_layout()
+    {
+        return Err(format!(
+            "{} fields can't be virtual; a virtual field holds one value",
+            f.kind.name()
+        ));
+    }
+    if f.required || f.unique || f.filterable || f.default.is_some() {
+        return Err(
+            "virtual fields can't be required, unique, filterable or have a default".into(),
+        );
+    }
+    if split_virtual(root, path).is_none() {
+        return Err("virtual must name a relationship field, then a field in the linked document, like author.name".into());
+    }
+    Ok(())
+}
+
+/// Splits `meta.editor.name` into the relationship field (`meta.editor`, through groups) and
+/// the path inside the linked document (`name`).
+fn split_virtual<'a>(root: &'a [Field], path: &str) -> Option<(&'a Field, String, String)> {
+    let segments: Vec<&str> = path.split('.').collect();
+    let mut current = root;
+    for (i, segment) in segments.iter().enumerate() {
+        let f = current.iter().find(|f| f.name == *segment)?;
+        match &f.kind {
+            FieldKind::Group { fields } => current = fields,
+            FieldKind::Relationship { .. } if i + 1 < segments.len() => {
+                return Some((f, segments[..=i].join("."), segments[i + 1..].join(".")));
+            }
+            _ => return None,
+        }
+    }
+    None
+}
+
+enum ReadError {
+    Missing,
+    InList,
+}
+
+/// The field a virtual reads, through groups only: a value inside a list has no one place.
+fn read_field<'a>(fields: &'a [Field], path: &str) -> Result<&'a Field, ReadError> {
+    let mut current = fields;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let f = current
+            .iter()
+            .find(|f| f.name == segment)
+            .ok_or(ReadError::Missing)?;
+        if segments.peek().is_none() {
+            return Ok(f);
+        }
+        current = match &f.kind {
+            FieldKind::Group { fields } => fields,
+            FieldKind::Array { .. } => return Err(ReadError::InList),
+            _ => return Err(ReadError::Missing),
+        };
+    }
+    Err(ReadError::Missing)
+}
+
+/// A field whose value is read through a relationship.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VirtualField {
+    /// Where the value goes, such as `authorName` or `meta.editorNames`.
+    pub path: String,
+    /// The relationship field it reads through, such as `author`.
+    pub link: String,
+    /// The field in the linked document, such as `name` or `profile.city`.
+    pub read: String,
+    /// The link holds a list, so the value is a list too.
+    pub many: bool,
 }
 
 /// Rules for layout fields themselves, on the raw tree. Data rules run on `data_fields`.
@@ -641,6 +743,8 @@ pub enum SchemaError {
     InvalidChange(String),
     #[error("field `{field}`: unknown option `{option}`")]
     UnknownOption { field: String, option: String },
+    #[error("{0}")]
+    InvalidOption(String),
 }
 
 impl FieldKind {
@@ -682,6 +786,7 @@ impl FieldKind {
             Self::Relationship {
                 relation_to,
                 has_many,
+                ..
             } => !has_many && !relation_to.is_polymorphic(),
             Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
@@ -709,12 +814,108 @@ impl CollectionSchema {
             .get_or_init(|| data_fields(&self.fields).into_owned())
     }
 
+    /// Every virtual field, with where it reads from.
+    pub fn virtual_fields(&self) -> Vec<VirtualField> {
+        fn walk(fields: &[Field], root: &[Field], prefix: &str, out: &mut Vec<VirtualField>) {
+            for f in fields {
+                let path = join(prefix, &f.name);
+                if let Some(v) = &f.virtual_path
+                    && let Some((link, link_path, read)) = split_virtual(root, v)
+                {
+                    out.push(VirtualField {
+                        path,
+                        link: link_path,
+                        read,
+                        many: matches!(link.kind, FieldKind::Relationship { has_many: true, .. }),
+                    });
+                } else if let FieldKind::Group { fields } = &f.kind {
+                    walk(fields, root, &path, out);
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.data(), self.data(), "", &mut out);
+        out
+    }
+
+    /// Checks every collection a virtual field can read from has the field it names, of the
+    /// same type. `lookup` finds other collections; this one is found by itself.
+    pub fn check_virtual_targets<S: std::borrow::Borrow<CollectionSchema>>(
+        &self,
+        lookup: impl Fn(&str) -> Option<S>,
+    ) -> Result<(), SchemaError> {
+        for v in self.virtual_fields() {
+            let field = find_field(self.data(), &v.path).expect("virtual_fields found it");
+            let invalid = |message: String| SchemaError::InvalidField {
+                field: field.name.clone(),
+                message,
+            };
+            let Some(FieldKind::Relationship { relation_to, .. }) =
+                find_field(self.data(), &v.link).map(|f| &f.kind)
+            else {
+                continue;
+            };
+            for slug in relation_to.targets() {
+                let found = if slug == self.slug {
+                    None
+                } else {
+                    lookup(slug)
+                };
+                let target: &CollectionSchema = match &found {
+                    Some(s) => s.borrow(),
+                    None if slug == self.slug => self,
+                    None => continue,
+                };
+                let read = read_field(target.data(), &v.read).map_err(|e| {
+                    invalid(match e {
+                        ReadError::Missing => format!("{slug} has no field `{}` to read", v.read),
+                        ReadError::InList => {
+                            format!("{slug}.{} is inside a list, so it can't be read", v.read)
+                        }
+                    })
+                })?;
+                if read.virtual_path.is_some() {
+                    return Err(invalid(format!(
+                        "{slug}.{} is itself virtual; read the field it reads",
+                        v.read
+                    )));
+                }
+                if !crate::diff::same_type(&read.kind, &field.kind) {
+                    let list_of = match &read.kind {
+                        FieldKind::Text { has_many: true, .. } => Some("text"),
+                        FieldKind::Number { has_many: true, .. } => Some("numbers"),
+                        FieldKind::Select { multiple: true, .. } => Some("select values"),
+                        _ => None,
+                    };
+                    return Err(invalid(match list_of {
+                        Some(what) => format!(
+                            "{slug}.{} is a list of {what}, which a {} field can't hold",
+                            v.read,
+                            field.kind.name()
+                        ),
+                        None => format!(
+                            "{slug}.{} is a {} field, but {} is a {} field",
+                            v.read,
+                            read.kind.name(),
+                            field.name,
+                            field.kind.name()
+                        ),
+                    }));
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// The schema as JSON without options left at their defaults: what people read and
     /// keep in files. Parses back to an equal schema.
     pub fn to_compact_json(&self) -> Value {
         let mut v = serde_json::to_value(self).expect("schemas always serialize");
         if let Some(fields) = v.get_mut("fields") {
             compact_fields(fields);
+        }
+        if let Value::Object(top) = &mut v {
+            top.retain(|_, value| !value.is_null());
         }
         v
     }
@@ -757,7 +958,17 @@ impl CollectionSchema {
         }
         let data = self.data();
         check_layout(&self.fields, data, "fields", "")?;
-        check_fields(data, true, data, "")
+        check_fields(data, true, data, "", false)?;
+        if self.default_populate.is_some() && self.kind == CollectionKind::Global {
+            return Err(SchemaError::InvalidOption(
+                "defaultPopulate: globals are never populated, so they can't have one".into(),
+            ));
+        }
+        if let Some(dp) = &self.default_populate {
+            crate::select::parse_select(data, &Value::Object(dp.clone()), "defaultPopulate")
+                .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -891,6 +1102,7 @@ fn check_fields(
     top_level: bool,
     root: &[Field],
     prefix: &str,
+    in_list: bool,
 ) -> Result<(), SchemaError> {
     let mut seen = HashSet::new();
     for f in fields {
@@ -1010,6 +1222,11 @@ fn check_fields(
                     "from must name a top-level text field, not `{source}`"
                 )));
             }
+            FieldKind::Relationship {
+                max_depth: Some(d), ..
+            } if *d > 5 => {
+                return Err(invalid("maxDepth can be at most 5".into()));
+            }
             FieldKind::Relationship { relation_to, .. } => {
                 let targets = relation_to.targets();
                 if targets.is_empty() {
@@ -1027,10 +1244,16 @@ fn check_fields(
                     }
                 }
             }
-            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                check_fields(fields, false, root, &join(prefix, &f.name))?
+            FieldKind::Group { fields } => {
+                check_fields(fields, false, root, &join(prefix, &f.name), in_list)?
+            }
+            FieldKind::Array { fields, .. } => {
+                check_fields(fields, false, root, &join(prefix, &f.name), true)?
             }
             _ => {}
+        }
+        if let Some(path) = &f.virtual_path {
+            check_virtual(f, path, root, in_list).map_err(invalid)?;
         }
         check_admin(&f.admin, root, &[join(prefix, &f.name)], false).map_err(invalid)?;
         if let Some(default) = &f.default {
@@ -1210,7 +1433,8 @@ mod tests {
             s.fields[2].kind,
             FieldKind::Relationship {
                 relation_to: RelationTo::One("authors".into()),
-                has_many: false
+                has_many: false,
+                max_depth: None,
             }
         );
         assert_eq!(s.relation_targets(), ["authors", "posts"]);
@@ -1857,5 +2081,45 @@ mod tests {
         );
         assert_eq!(schema(compact.clone()), s);
         assert_eq!(s.reject_unknown_options(&compact), Ok(()));
+    }
+
+    #[test]
+    fn default_populate_is_checked_and_round_trips() {
+        let input = json!({"slug": "authors", "defaultPopulate": {"name": true, "id": true},
+                           "fields": [{"name": "name", "type": "text"}, {"name": "bio", "type": "textarea"}]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        assert_eq!(
+            s.to_compact_json()["defaultPopulate"],
+            json!({"name": true, "id": true})
+        );
+        let bad = schema(json!({"slug": "authors", "defaultPopulate": {"nope": true},
+                                "fields": [{"name": "name", "type": "text"}]}));
+        assert_eq!(
+            bad.check().unwrap_err().to_string(),
+            "defaultPopulate[nope]: unknown field"
+        );
+        let plain = schema(json!({"slug": "authors", "fields": []}));
+        assert!(plain.to_compact_json().get("defaultPopulate").is_none());
+    }
+
+    #[test]
+    fn max_depth_is_checked_and_parsed() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors", "maxDepth": 1}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let FieldKind::Relationship { max_depth, .. } = &s.fields[0].kind else {
+            panic!()
+        };
+        assert_eq!(*max_depth, Some(1));
+        let deep = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors", "maxDepth": 6}
+        ]}));
+        assert_eq!(
+            deep.check().unwrap_err().to_string(),
+            "field `author`: maxDepth can be at most 5"
+        );
     }
 }

@@ -12,9 +12,9 @@ use tachyon_db::DbError;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 
-use crate::documents::{json_body, unique_error};
-use crate::params::depth_param;
-use crate::populate::{link_targets, populate, prepare, to_value};
+use crate::documents::{json_body, shaped, unique_error};
+use crate::params::read_params;
+use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -35,8 +35,10 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    let mut items = vec![(to_value(doc)?, c)];
+    fill_virtuals(state, &mut items, None).await?;
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth)
+        populate(state, items, depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -47,13 +49,22 @@ pub async fn get(
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
-    let depth = depth_param(raw.as_deref())?;
     let c = global(&state, path)?;
-    match documents::get(&state.pool, c.id, c.id).await {
-        Ok(doc) => respond(&state, c, &doc, depth).await,
-        Err(DbError::NotFound) => Ok(Json(Value::Object(defaults(c.schema.data())))),
-        Err(e) => Err(e.into()),
-    }
+    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
+    let value = match documents::get(&state.pool, c.id, c.id).await {
+        Ok(doc) => to_value(&doc)?,
+        Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
+        Err(e) => return Err(e.into()),
+    };
+    let mut items = vec![(value, c)];
+    fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    let (value, c) = items.remove(0);
+    let value = shaped(value, p.select.as_ref());
+    Ok(Json(
+        populate(&state, vec![(value, c)], p.depth, &p.populate)
+            .await?
+            .remove(0),
+    ))
 }
 
 pub async fn update(

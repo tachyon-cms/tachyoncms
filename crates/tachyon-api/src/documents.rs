@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use tachyon_core::query::value_kind;
+use tachyon_core::select::{Select, project};
 use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
@@ -15,8 +16,8 @@ use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
-use crate::params::{depth_param, list_params};
-use crate::populate::{link_targets, populate, prepare, to_value};
+use crate::params::{list_params, read_params};
+use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -68,7 +69,7 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    let p = list_params(raw.as_deref(), &c)?;
+    let p = list_params(raw.as_deref(), &c, &state.schemas)?;
     let page = p.page.unwrap_or(1);
     let offset = (page - 1)
         .checked_mul(p.limit)
@@ -82,12 +83,17 @@ pub async fn list(
         count: p.count,
     };
     let found = query::list(&state.pool, c.id, &q).await?;
-    let docs = found
+    let mut docs = found
         .docs
         .iter()
         .map(|d| Ok((to_value(d)?, c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let docs = populate(&state, docs, p.depth).await?;
+    fill_virtuals(&state, &mut docs, p.select.as_ref()).await?;
+    let docs = docs
+        .into_iter()
+        .map(|(v, c)| (shaped(v, p.select.as_ref()), c))
+        .collect();
+    let docs = populate(&state, docs, p.depth, &p.populate).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
     if p.after.is_none() {
         body["page"] = page.into();
@@ -102,6 +108,14 @@ pub async fn list(
     Ok(Json(body))
 }
 
+/// `value` cut down to what `select` asks for.
+pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
+    if let (Some(select), Value::Object(doc)) = (select, &mut value) {
+        project(select, doc);
+    }
+    value
+}
+
 /// The document as JSON, with its relationships populated to `depth`.
 async fn respond(
     state: &AppState,
@@ -109,8 +123,10 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    let mut items = vec![(to_value(doc)?, c)];
+    fill_virtuals(state, &mut items, None).await?;
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth)
+        populate(state, items, depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -144,11 +160,19 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
-    let depth = depth_param(raw.as_deref())?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
     let doc = documents::get(&state.pool, c.id, id).await?;
-    respond(&state, c, &doc, depth).await
+    let mut items = vec![(to_value(&doc)?, c)];
+    fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    let (value, c) = items.remove(0);
+    let value = shaped(value, p.select.as_ref());
+    Ok(Json(
+        populate(&state, vec![(value, c)], p.depth, &p.populate)
+            .await?
+            .remove(0),
+    ))
 }
 
 pub async fn update(

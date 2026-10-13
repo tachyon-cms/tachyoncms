@@ -77,6 +77,8 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::TypeChanged { path, from, to } => format!("change {path} from {from} to {to}"),
             Change::OptionsChanged { path } => format!("update options on {path}"),
             Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
+            Change::CollectionOptionsChanged => "update collection options".to_owned(),
+            Change::VirtualRemoved { path } => format!("remove virtual field {path}"),
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")
             }
@@ -138,6 +140,18 @@ pub async fn run(
                 );
             }
         }
+    }
+
+    for s in &wanted {
+        s.check_virtual_targets(|slug| {
+            wanted.iter().find(|o| o.slug == slug).or_else(|| {
+                existing
+                    .iter()
+                    .map(|c| &c.schema.0)
+                    .find(|o| o.slug == slug)
+            })
+        })
+        .with_context(|| s.slug.clone())?;
     }
 
     let none = Renames::new();
@@ -383,5 +397,29 @@ mod tests {
             err,
             "--rename posts: the file creates posts, so it has no fields to rename yet"
         );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn virtual_fields_must_read_a_real_field(pool: PgPool) {
+        let file = |read: &str| {
+            json!({"collections": [
+                {"slug": "authors", "fields": [{"name": "name", "type": "text"}]},
+                {"slug": "posts", "fields": [
+                    {"name": "author", "type": "relationship", "relationTo": "authors"},
+                    {"name": "authorName", "type": "text", "virtual": read}
+                ]}
+            ]})
+            .to_string()
+        };
+        let err = run(&pool, &file("author.nope"), &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "posts: field `authorName`: authors has no field `nope` to read"
+        );
+        run(&pool, &file("author.name"), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
     }
 }

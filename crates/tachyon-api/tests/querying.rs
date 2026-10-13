@@ -223,3 +223,115 @@ async fn lists_say_whether_another_page_follows(pool: PgPool) {
         "no cursor to an empty page"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn select_shapes_lists_and_single_reads(pool: PgPool) {
+    let app = app(pool).await;
+    let res = send(
+        &app,
+        "GET",
+        "/api/items?select[title]=true&sort=title",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let first = &res.json["docs"][0];
+    assert_eq!(first["title"], "a");
+    let keys: Vec<&String> = first.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["id", "title"]);
+
+    let id = first["id"].as_str().unwrap();
+    let one = send(
+        &app,
+        "GET",
+        &format!("/api/items/{id}?select[price]=false"),
+        None,
+    )
+    .await;
+    assert_eq!(one.status, 200, "{}", one.json);
+    assert!(one.json.get("price").is_none());
+    assert_eq!(one.json["title"], "a");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn select_skips_unselected_relationships(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    for schema in [
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"}
+        ]}),
+    ] {
+        send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+    }
+    let ann = send(&app, "POST", "/api/authors", Some(r#"{"name": "Ann"}"#)).await;
+    let body = json!({"title": "Hi", "author": ann.json["id"]}).to_string();
+    send(&app, "POST", "/api/posts", Some(&body)).await;
+
+    let res = send(&app, "GET", "/api/posts?select[title]=true&depth=2", None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert!(res.json["docs"][0].get("author").is_none());
+    let res = send(&app, "GET", "/api/posts?select[author]=true", None).await;
+    assert_eq!(
+        res.json["docs"][0]["author"]["name"], "Ann",
+        "a selected link still populates"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn select_on_globals(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let schema = json!({"slug": "settings", "kind": "global", "fields": [
+        {"name": "siteName", "type": "text"}, {"name": "tagline", "type": "text"}
+    ]});
+    send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    send(
+        &app,
+        "PATCH",
+        "/api/globals/settings",
+        Some(r#"{"siteName": "T", "tagline": "x"}"#),
+    )
+    .await;
+    let res = send(
+        &app,
+        "GET",
+        "/api/globals/settings?select[tagline]=true",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["tagline"], "x");
+    assert!(res.json.get("siteName").is_none());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_select_is_a_400_naming_the_parameter(pool: PgPool) {
+    let app = app(pool).await;
+    for (uri, detail) in [
+        (
+            "/api/items?select[nope]=true",
+            "select[nope]: unknown field",
+        ),
+        (
+            "/api/items?select[title]=true&select[price]=false",
+            "select: use either true or false throughout, not both",
+        ),
+    ] {
+        let res = send(&app, "GET", uri, None).await;
+        assert_problem(&res, 400);
+        assert_eq!(res.json["detail"], detail);
+    }
+}

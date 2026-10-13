@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use tachyon_core::select::{Select, parse_select, project};
+use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
@@ -77,44 +79,180 @@ pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
     serde_json::to_value(doc).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-pub(crate) fn populate(
+/// Fills each document's virtual fields (those `select` keeps) with one query for all of them.
+pub(crate) async fn fill_virtuals(
     state: &AppState,
+    items: &mut [(Value, Arc<Collection>)],
+    select: Option<&Select>,
+) -> Result<(), ApiError> {
+    let selects = vec![select; items.len()];
+    fill_virtuals_each(state, items, &selects).await
+}
+
+/// `fill_virtuals` where each document has its own `select`, still in one query.
+async fn fill_virtuals_each(
+    state: &AppState,
+    items: &mut [(Value, Arc<Collection>)],
+    selects: &[Option<&Select>],
+) -> Result<(), ApiError> {
+    let wanted: Vec<Vec<VirtualField>> = items
+        .iter()
+        .zip(selects)
+        .map(|((_, c), select)| {
+            c.schema
+                .virtual_fields()
+                .into_iter()
+                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)))
+                .collect()
+        })
+        .collect();
+    let mut ids: Vec<Uuid> = items
+        .iter()
+        .zip(&wanted)
+        .filter_map(|((v, _), wanted)| Some((v.as_object()?, wanted)))
+        .flat_map(|(doc, wanted)| wanted.iter().flat_map(|v| virtuals::linked_ids(v, doc)))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let linked: HashMap<Uuid, Value> = documents::get_many(&state.pool, &ids)
+        .await?
+        .into_iter()
+        .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
+        .collect();
+    for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
+        if let Some(doc) = value.as_object_mut() {
+            for v in wanted {
+                virtuals::fill(v, doc, |id| linked.get(&id).cloned());
+            }
+        }
+    }
+    Ok(())
+}
+
+/// `populate[collection]` choices: how documents of each collection look when populated.
+pub(crate) type Shapes = HashMap<String, Select>;
+
+/// How a populated document of `c` is cut down: `populate[its collection]`, or else its
+/// collection's `defaultPopulate`, or not at all.
+// ponytail: defaultPopulate is parsed per populated document; cache the parsed Select on the
+// collection if it shows up in a profile.
+fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
+    if let Some(select) = shapes.get(&c.schema.slug) {
+        return Some(select.clone());
+    }
+    let dp = c.schema.default_populate.as_ref()?;
+    // Checked when the schema was saved, so this only fails on a hand-edited row.
+    parse_select(
+        c.schema.data(),
+        &Value::Object(dp.clone()),
+        "defaultPopulate",
+    )
+    .ok()
+}
+
+pub(crate) fn populate<'a>(
+    state: &'a AppState,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
-) -> Populated<'_> {
+    shapes: &'a Shapes,
+) -> Populated<'a> {
+    let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
+    populate_each(state, items, shapes)
+}
+
+/// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
+/// short. One query per level for every distinct link, whatever the depths.
+fn populate_each<'a>(
+    state: &'a AppState,
+    items: Vec<(Value, Arc<Collection>, u8)>,
+    shapes: &'a Shapes,
+) -> Populated<'a> {
     Box::pin(async move {
-        if depth == 0 {
-            return Ok(docs.into_iter().map(|(v, _)| v).collect());
-        }
-        let mut ids: Vec<_> = docs
+        // For each document: the link at each path, and how deep to populate it.
+        let wanted: Vec<HashMap<String, (Uuid, u8)>> = items
             .iter()
-            .filter_map(|(v, c)| v.as_object().map(|o| relations(c.schema.data(), o)))
-            .flatten()
-            .map(|r| r.id)
+            .map(|(v, c, depth)| {
+                let Some(obj) = v.as_object().filter(|_| *depth > 0) else {
+                    return HashMap::new();
+                };
+                relations(c.schema.data(), obj)
+                    .into_iter()
+                    .filter_map(|r| {
+                        let reach = r.max_depth.map_or(*depth, |cap| cap.min(*depth));
+                        (reach > 0).then(|| (r.path, (r.id, reach - 1)))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut ids: Vec<Uuid> = wanted
+            .iter()
+            .flat_map(|w| w.values().map(|(id, _)| *id))
             .collect();
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
-            return Ok(docs.into_iter().map(|(v, _)| v).collect());
+            return Ok(items.into_iter().map(|(v, _, _)| v).collect());
         }
 
-        let mut children = Vec::new();
-        for (collection_id, doc) in documents::get_many(&state.pool, &ids).await? {
-            if let Some(c) = state.schemas.get_by_id(collection_id) {
-                children.push((to_value(&doc)?, c));
+        let found: HashMap<Uuid, (Uuid, Document)> = documents::get_many(&state.pool, &ids)
+            .await?
+            .into_iter()
+            .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
+            .collect();
+        // The same document wanted at two depths is populated once for each.
+        let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
+        keys.sort_unstable();
+        keys.dedup();
+        let mut fetched = Vec::new();
+        let mut child_keys = Vec::new();
+        for key @ (id, remaining) in keys {
+            let Some((collection_id, doc)) = found.get(&id) else {
+                continue;
+            };
+            if let Some(c) = state.schemas.get_by_id(*collection_id) {
+                fetched.push((to_value(doc)?, c, remaining));
+                child_keys.push(key);
             }
         }
-        let children = populate(state, children, depth - 1).await?;
-        let by_id: HashMap<String, Value> = children
-            .into_iter()
-            .filter_map(|v| Some((v.get("id")?.as_str()?.to_owned(), v)))
+        // Populated documents show their virtual fields too (those their shape keeps),
+        // then take that shape.
+        let shapes_of: Vec<Option<Select>> = fetched
+            .iter()
+            .map(|(_, c, _)| child_shape(c, shapes))
             .collect();
-
-        Ok(docs
+        let mut pairs = Vec::with_capacity(fetched.len());
+        let mut depths = Vec::with_capacity(fetched.len());
+        for (value, c, remaining) in fetched {
+            pairs.push((value, c));
+            depths.push(remaining);
+        }
+        let refs: Vec<Option<&Select>> = shapes_of.iter().map(Option::as_ref).collect();
+        fill_virtuals_each(state, &mut pairs, &refs).await?;
+        let children: Vec<(Value, Arc<Collection>, u8)> = pairs
             .into_iter()
-            .map(|(mut v, c)| {
+            .zip(shapes_of)
+            .zip(depths)
+            .map(|(((mut value, c), shape), remaining)| {
+                if let (Some(select), Value::Object(doc)) = (&shape, &mut value) {
+                    project(select, doc);
+                }
+                (value, c, remaining)
+            })
+            .collect();
+        let children = populate_each(state, children, shapes).await?;
+        let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
+
+        Ok(items
+            .into_iter()
+            .zip(wanted)
+            .map(|((mut v, c, _), wanted)| {
                 if let Some(obj) = v.as_object_mut() {
-                    map_relations(c.schema.data(), obj, &mut |id| by_id.get(id).cloned());
+                    map_relations(c.schema.data(), obj, &mut |path, _| {
+                        wanted.get(path).and_then(|key| by_key.get(key)).cloned()
+                    });
                 }
                 v
             })

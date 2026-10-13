@@ -73,6 +73,7 @@ pub async fn create(
             ))));
         }
     }
+    check_virtuals(&state, &schema)?;
     let created = collections::create(&state.pool, &schema).await?;
     // The schema is saved either way, so serve it even if its indexes failed to build.
     let indexed = reconcile_indexes(&state.pool, created.id).await;
@@ -99,6 +100,13 @@ struct ChangeRequest {
     renames: Renames,
     #[serde(default)]
     confirm: bool,
+}
+
+/// Every virtual field must read a field its targets have.
+fn check_virtuals(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+    schema
+        .check_virtual_targets(|slug| state.schemas.get(slug).map(|c| c.schema.0.clone()))
+        .map_err(schema_error)
 }
 
 fn change_request(
@@ -136,6 +144,7 @@ pub async fn preview(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let (slug, req, schema) = change_request(path, body)?;
+    check_virtuals(&state, &schema)?;
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
         .await
         .map_err(change_error)?;
@@ -148,6 +157,7 @@ pub async fn update(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let (slug, req, schema) = change_request(path, body)?;
+    check_virtuals(&state, &schema)?;
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;

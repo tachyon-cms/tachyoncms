@@ -393,3 +393,15 @@ async fn previews_list_index_changes(pool: PgPool) {
     assert!(p.indexes.create.is_empty());
     assert_eq!(p.indexes.drop, ["title (unique)"]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn changing_default_populate_is_applied(pool: PgPool) {
+    seed(&pool).await;
+    let mut authors = schema(json!({"slug": "authors", "defaultPopulate": {"name": true},
+                                     "fields": [{"name": "name", "type": "text"}]}));
+    let (c, p) = apply(&pool, "authors", &authors, &Renames::new(), false)
+        .await
+        .unwrap();
+    assert!(!p.diff.is_empty());
+    assert_eq!(c.schema.0.default_populate, authors.default_populate.take());
+}

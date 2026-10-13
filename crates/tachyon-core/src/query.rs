@@ -150,6 +150,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Relationship {
             relation_to,
             has_many: true,
+            ..
         } if relation_to.is_polymorphic() => ValueKind::LinkList,
         FieldKind::Select { multiple: true, .. }
         | FieldKind::Text { has_many: true, .. }
@@ -376,6 +377,12 @@ impl Parser<'_> {
             )
         })?;
         let (target, field) = resolve(self.fields, name).map_err(|m| err(param, m))?;
+        if field.is_some_and(|f| f.virtual_path.is_some()) {
+            return Err(err(
+                param,
+                format!("`{name}` is read through a relationship and can't be filtered yet"),
+            ));
+        }
         if !op.allowed(&target) {
             return Err(err(
                 param,
@@ -446,6 +453,7 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
             FieldKind::Relationship {
                 relation_to,
                 has_many: false,
+                ..
             } if relation_to.is_polymorphic() => {
                 let part = match segments.next() {
                     None | Some("value") => "value",
@@ -616,7 +624,13 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         None => (input, false),
     };
     let fields = data_fields(fields);
-    let (target, _) = resolve(&fields, name).map_err(|m| err("sort", m))?;
+    let (target, field) = resolve(&fields, name).map_err(|m| err("sort", m))?;
+    if field.is_some_and(|f| f.virtual_path.is_some()) {
+        return Err(err(
+            "sort",
+            format!("`{name}` is read through a relationship and can't be sorted yet"),
+        ));
+    }
     if matches!(target.kind(), ValueKind::List | ValueKind::LinkList) {
         return Err(err(
             "sort",
