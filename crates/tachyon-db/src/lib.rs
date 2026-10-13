@@ -1,5 +1,6 @@
 //! PostgreSQL storage for TachyonCMS.
 
+pub mod auth;
 pub mod collections;
 pub mod documents;
 pub mod indexes;
@@ -32,6 +33,12 @@ pub enum DbError {
     /// A list request that can't be answered as asked.
     #[error("{0}")]
     InvalidQuery(&'static str),
+    /// The caller may only change documents they created, and this isn't one.
+    #[error("not the owner")]
+    NotOwner,
+    /// A change the rules don't allow, explained in a sentence for the person making it.
+    #[error("{0}")]
+    Refused(String),
     /// The collection's schema changed after the caller validated against it.
     #[error("schema changed")]
     SchemaChanged,

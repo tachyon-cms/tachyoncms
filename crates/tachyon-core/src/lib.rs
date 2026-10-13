@@ -1,5 +1,6 @@
 //! Content model and validation for TachyonCMS. This crate does no I/O.
 
+pub mod auth;
 pub mod diff;
 pub mod joins;
 pub mod query;
@@ -13,6 +14,6 @@ pub use schema::{
     RelationTo, SchemaError, SelectOption, Tab, data_fields, explain_parse_error,
 };
 pub use validate::{
-    FieldError, RelationRef, defaults, map_relations, normalize_date_time, relations, slugify,
-    validate_document,
+    FieldError, RelationRef, defaults, is_email, map_relations, normalize_date_time, relations,
+    slugify, validate_document,
 };

@@ -1,16 +1,16 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           FOR UPDATE",
+  "query": "SELECT created_by FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           FOR UPDATE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
-        "name": "id",
+        "name": "created_by",
         "type_info": "Uuid",
         "origin": {
           "Table": {
             "table": "documents",
-            "name": "id"
+            "name": "created_by"
           }
         }
       }
@@ -23,8 +23,8 @@
       ]
     },
     "nullable": [
-      false
+      true
     ]
   },
-  "hash": "fc44fee51511c83c8a2980a433c3205d3f70b7081fdc73a9b3b27b9e2ca55a2a"
+  "hash": "4280b3d288f6814e50d693f07b2c27c12c739bc5a7cf49be33ba69ff46c28d3e"
 }

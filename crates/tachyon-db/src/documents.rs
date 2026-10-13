@@ -63,17 +63,37 @@ pub async fn insert(
     id: Option<Uuid>,
     doc: &Prepared,
 ) -> Result<Document, DbError> {
+    insert_as(pool, collection_id, schema_version, id, doc, None).await
+}
+
+/// Who is writing, and whether they may only touch documents they created.
+#[derive(Debug, Clone, Copy)]
+pub struct Actor {
+    pub id: Uuid,
+    pub own_only: bool,
+}
+
+/// `insert`, recording `actor` as the document's creator and last editor.
+pub async fn insert_as(
+    pool: &PgPool,
+    collection_id: Uuid,
+    schema_version: i32,
+    id: Option<Uuid>,
+    doc: &Prepared,
+    actor: Option<Uuid>,
+) -> Result<Document, DbError> {
     let mut tx = pool.begin().await?;
     check_schema(&mut tx, collection_id, schema_version).await?;
     let created = sqlx::query_as!(
         Document,
-        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at)
-           VALUES ($1, $2, $3, 'published', $4, now())
+        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by, updated_by)
+           VALUES ($1, $2, $3, 'published', $4, now(), $5, $5)
            RETURNING id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>""#,
         id.unwrap_or_else(Uuid::now_v7),
         DEFAULT_TENANT,
         collection_id,
         Json(&doc.data) as _,
+        actor,
     )
     .fetch_one(&mut *tx)
     .await
@@ -154,10 +174,23 @@ pub async fn update<E: From<DbError>>(
     id: Uuid,
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
+    update_as(pool, collection_id, schema_version, id, None, apply).await
+}
+
+/// `update`, as `actor`: recorded as the last editor, and refused with `NotOwner` when they
+/// may only change their own documents and this isn't one.
+pub async fn update_as<E: From<DbError>>(
+    pool: &PgPool,
+    collection_id: Uuid,
+    schema_version: i32,
+    id: Uuid,
+    actor: Option<Actor>,
+    apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
+) -> Result<Document, E> {
     let mut tx = pool.begin().await.map_err(DbError::from)?;
     check_schema(&mut tx, collection_id, schema_version).await?;
-    let current = sqlx::query_scalar!(
-        r#"SELECT published AS "data!: Json<Map<String, Value>>"
+    let current = sqlx::query!(
+        r#"SELECT published AS "data!: Json<Map<String, Value>>", created_by
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
            FOR NO KEY UPDATE"#,
@@ -169,16 +202,23 @@ pub async fn update<E: From<DbError>>(
     .await
     .map_err(DbError::from)?
     .ok_or(DbError::NotFound)?;
-    let next = apply(&current.0)?;
+    if let Some(a) = actor
+        && a.own_only
+        && current.created_by != Some(a.id)
+    {
+        return Err(DbError::NotOwner.into());
+    }
+    let next = apply(&current.data.0)?;
     let doc = sqlx::query_as!(
         Document,
-        r#"UPDATE documents SET published = $4, updated_at = now()
+        r#"UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
            RETURNING id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         collection_id,
         id,
         Json(&next.data) as _,
+        actor.map(|a| a.id),
     )
     .fetch_one(&mut *tx)
     .await
@@ -190,10 +230,21 @@ pub async fn update<E: From<DbError>>(
 
 /// Soft delete. Refused while other live documents link here. Restoring from Trash arrives in M4.
 pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), DbError> {
+    delete_as(pool, collection_id, id, None).await
+}
+
+/// `delete`, as `actor` (see `update_as`). Deleting a user also ends their sessions and keys,
+/// and is refused when they're the last Admin, all in the same transaction.
+pub async fn delete_as(
+    pool: &PgPool,
+    collection_id: Uuid,
+    id: Uuid,
+    actor: Option<Actor>,
+) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
     // Lock first, so a concurrent write can't add a link between the check and the delete.
-    sqlx::query_scalar!(
-        r#"SELECT id FROM documents
+    let created_by = sqlx::query_scalar!(
+        r#"SELECT created_by FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
            FOR UPDATE"#,
         DEFAULT_TENANT,
@@ -203,6 +254,12 @@ pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), 
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(DbError::NotFound)?;
+    if let Some(a) = actor
+        && a.own_only
+        && created_by != Some(a.id)
+    {
+        return Err(DbError::NotOwner);
+    }
     let linked = sqlx::query_scalar!(
         r#"SELECT count(*) AS "n!" FROM relations r
            JOIN documents d ON d.id = r.from_doc
@@ -214,9 +271,14 @@ pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), 
     if linked > 0 {
         return Err(DbError::Referenced(linked));
     }
-    sqlx::query!("UPDATE documents SET deleted_at = now() WHERE id = $1", id)
-        .execute(&mut *tx)
-        .await?;
+    crate::auth::before_removing(&mut tx, id).await?;
+    sqlx::query!(
+        "UPDATE documents SET deleted_at = now(), updated_by = COALESCE($2, updated_by) WHERE id = $1",
+        id,
+        actor.map(|a| a.id),
+    )
+    .execute(&mut *tx)
+    .await?;
     tx.commit().await?;
     Ok(())
 }

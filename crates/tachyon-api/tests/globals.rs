@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn globals_hold_one_document(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "settings", "kind": "global", "fields": [
         {"name": "siteName", "type": "text", "required": true},
         {"name": "tagline", "type": "text", "default": "Just launched"}
@@ -60,7 +60,7 @@ async fn globals_hold_one_document(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn globals_and_collections_dont_mix(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let global = r#"{"slug": "settings", "kind": "global", "fields": []}"#;
     send(&app, "POST", "/api/admin/collections", Some(global)).await;
     send(
@@ -77,7 +77,7 @@ async fn globals_and_collections_dont_mix(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn globals_show_nested_defaults_before_first_save(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "settings", "kind": "global", "fields": [
         {"name": "seo", "type": "group", "fields": [
             {"name": "index", "type": "boolean", "default": true}

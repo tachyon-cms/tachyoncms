@@ -1,0 +1,89 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT k.id, k.secret_hash, k.scopes, k.user_id, a.role, r.abilities\n           FROM api_keys k\n           JOIN accounts a ON a.user_id = k.user_id\n           JOIN roles r ON r.tenant_id = a.tenant_id AND r.slug = a.role\n           JOIN documents d ON d.id = k.user_id AND d.deleted_at IS NULL\n           WHERE k.prefix = $1 AND k.tenant_id = $2 AND k.revoked_at IS NULL\n             AND (k.expires_at IS NULL OR k.expires_at > now())",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "secret_hash",
+        "type_info": "Bytea",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "secret_hash"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "scopes",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "scopes"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "user_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "user_id"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "role",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "accounts",
+            "name": "role"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "abilities",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "abilities"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "25fa1bf72d94e57f13ab218582f8c87747a8eac039a0c4ec59c5f143f91ba334"
+}

@@ -6,7 +6,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 
 async fn app(pool: PgPool) -> (Router, String) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "posts", "fields": [
         {"name": "title", "type": "text"}, {"name": "summary", "type": "textarea"}
     ]});

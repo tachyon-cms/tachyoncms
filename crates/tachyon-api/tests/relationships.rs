@@ -12,7 +12,7 @@ async fn create(app: &Router, url: &str, body: Value) -> Value {
 }
 
 async fn app(pool: PgPool) -> Router {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     create(
         &app,
         "/api/admin/collections",
@@ -211,7 +211,7 @@ async fn a_link_cannot_borrow_another_links_collection(pool: PgPool) {
 }
 
 async fn blog(pool: PgPool, default_populate: Option<serde_json::Value>) -> (Router, String) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let mut authors = json!({"slug": "authors", "fields": [
         {"name": "name", "type": "text"}, {"name": "bio", "type": "textarea"}
     ]});
@@ -311,7 +311,7 @@ async fn bad_populate_is_a_400(pool: PgPool) {
 }
 
 async fn capped(pool: PgPool) -> (Router, String) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for schema in [
         json!({"slug": "people", "fields": [
             {"name": "name", "type": "text"},
@@ -375,7 +375,7 @@ async fn the_same_document_through_two_fields_gets_each_fields_depth(pool: PgPoo
 }
 
 async fn with_virtuals(pool: PgPool) -> (Router, Value) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for schema in [
         json!({"slug": "authors", "fields": [
             {"name": "name", "type": "text"},
@@ -515,7 +515,7 @@ async fn select_picks_virtual_fields(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn virtual_targets_must_have_the_field(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let authors = json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]});
     send(
         &app,
@@ -564,7 +564,7 @@ async fn virtual_targets_must_have_the_field(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn virtuals_skip_deleted_documents_and_fill_inside_groups(pool: PgPool) {
-    let app = tachyon_api::router(pool.clone()).await.unwrap();
+    let app = common::admin_app(pool.clone()).await;
     for schema in [
         json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
         json!({"slug": "posts", "fields": [

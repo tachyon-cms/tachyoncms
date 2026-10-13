@@ -229,7 +229,7 @@ mod tests {
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn one_join_query_for_a_whole_page(pool: PgPool) {
-        let app = crate::router(pool).await.unwrap();
+        let app = crate::auth::admin_router(pool).await;
         call(
             &app,
             "POST",

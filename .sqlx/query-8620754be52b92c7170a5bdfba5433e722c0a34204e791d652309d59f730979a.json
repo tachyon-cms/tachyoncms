@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET password_hash = $2, password_changed_at = now() WHERE user_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8620754be52b92c7170a5bdfba5433e722c0a34204e791d652309d59f730979a"
+}

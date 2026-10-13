@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET\n             failed_logins = CASE WHEN first_failure_at > now() - make_interval(secs => $2)\n                                  THEN failed_logins + 1 ELSE 1 END,\n             first_failure_at = CASE WHEN first_failure_at > now() - make_interval(secs => $2)\n                                     THEN first_failure_at ELSE now() END,\n             locked_until = CASE WHEN (CASE WHEN first_failure_at > now() - make_interval(secs => $2)\n                                            THEN failed_logins + 1 ELSE 1 END) >= $3\n                                 THEN now() + make_interval(secs => $4) ELSE locked_until END\n           WHERE user_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Float8",
+        "Int4",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "df60a240005476095567c3faec1ea1b6c2804ce3664c0df68ec6b4494b0b9a4a"
+}

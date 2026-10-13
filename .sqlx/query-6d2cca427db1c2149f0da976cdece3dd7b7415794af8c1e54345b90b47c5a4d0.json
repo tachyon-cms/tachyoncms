@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO roles (tenant_id, slug, name, abilities) VALUES ($1, $2, $3, $4)\n           ON CONFLICT (tenant_id, slug) DO UPDATE SET name = $3, abilities = $4\n           WHERE NOT roles.builtin",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "6d2cca427db1c2149f0da976cdece3dd7b7415794af8c1e54345b90b47c5a4d0"
+}

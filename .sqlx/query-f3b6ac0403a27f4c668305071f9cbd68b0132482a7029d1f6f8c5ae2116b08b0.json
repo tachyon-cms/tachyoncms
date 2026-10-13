@@ -1,0 +1,100 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT id, name, prefix, scopes, expires_at, last_used_at, created_at\n           FROM api_keys WHERE user_id = $1 AND revoked_at IS NULL ORDER BY created_at DESC",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "prefix",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "prefix"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "scopes",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "scopes"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "expires_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "expires_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "last_used_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "last_used_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "api_keys",
+            "name": "created_at"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false
+    ]
+  },
+  "hash": "f3b6ac0403a27f4c668305071f9cbd68b0132482a7029d1f6f8c5ae2116b08b0"
+}

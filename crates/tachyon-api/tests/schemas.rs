@@ -7,7 +7,7 @@ use sqlx::PgPool;
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn a_second_server_sees_new_collections_without_a_restart(pool: PgPool) {
-    let a = tachyon_api::router(pool.clone()).await.unwrap();
+    let a = common::admin_app(pool.clone()).await;
     let b = tachyon_api::router(pool).await.unwrap();
     let body = r#"{"slug": "posts", "fields": [{"name": "title", "type": "text"}]}"#;
     assert_eq!(
@@ -30,7 +30,7 @@ async fn a_second_server_sees_new_collections_without_a_restart(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn the_listener_reloads_after_reconnecting(pool: PgPool) {
-    let app = tachyon_api::router(pool.clone()).await.unwrap();
+    let app = common::admin_app(pool.clone()).await;
 
     // A change the listener never hears about: written without NOTIFY.
     let schema = serde_json::json!({"slug": "posts", "fields": []});

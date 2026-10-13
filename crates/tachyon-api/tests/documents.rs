@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 async fn app_with_posts(pool: PgPool) -> Router {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "posts", "fields": [
         {"name": "title", "type": "text", "required": true, "maxLength": 100},
         {"name": "summary", "type": "textarea"}
@@ -198,7 +198,7 @@ async fn patch_null_removes_optional_but_not_required(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn unique_values_are_field_errors(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = r#"{"slug": "pages", "fields": [{"name": "title", "type": "text"}, {"name": "slug", "type": "slug", "from": "title"}]}"#;
     assert_eq!(
         send(&app, "POST", "/api/admin/collections", Some(schema))
@@ -248,7 +248,7 @@ async fn saves_against_a_changed_schema_are_409(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn patching_part_of_a_group_keeps_the_rest(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "pages", "fields": [
         {"name": "seo", "type": "group", "fields": [
             {"name": "title", "type": "text"},

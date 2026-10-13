@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT published AS \"data!: Json<Map<String, Value>>\", created_by\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           FOR NO KEY UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "data!: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "created_by",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "created_by"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "5bdc7e5e919cb061eab4310ce0eaa2aaf0e67efef28e050e71fd47387672c081"
+}

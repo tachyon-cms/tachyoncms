@@ -1,5 +1,6 @@
 //! HTTP API for TachyonCMS.
 
+pub mod auth;
 mod collections;
 mod documents;
 mod error;
@@ -31,9 +32,35 @@ use schemas::Schemas;
 pub(crate) struct AppState {
     pub pool: PgPool,
     pub schemas: Arc<Schemas>,
+    pub auth: Arc<auth::AuthState>,
 }
 
-pub async fn router(pool: PgPool) -> Result<Router, DbError> {
+/// How the router is set up. `Default` suits development and tests.
+#[derive(Debug, Clone, Default)]
+pub struct Options {
+    pub auth: auth::AuthConfig,
+}
+
+/// Why the API couldn't start.
+#[derive(Debug, thiserror::Error)]
+pub enum StartError {
+    #[error(transparent)]
+    Db(#[from] DbError),
+    #[error("{0}")]
+    Config(String),
+}
+
+/// The API with default options; see `router_with`. The defaults suit development and tests:
+/// the public URL is `http://localhost:3000` and the password breach check is off. A server
+/// facing people should pass real settings to `router_with`.
+pub async fn router(pool: PgPool) -> Result<Router, StartError> {
+    router_with(pool, Options::default()).await
+}
+
+pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
+    let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
+    // Users are a collection like any other, so make sure it's there before serving.
+    tachyon_db::auth::ensure_users_collection(&pool).await?;
     let schemas = Arc::new(Schemas::load(&pool).await?);
     // Builds any index a failed change left missing, in the background: a big build, or one
     // waiting on another server's, mustn't keep this one from answering.
@@ -78,8 +105,18 @@ pub async fn router(pool: PgPool) -> Result<Router, DbError> {
             "/api/{collection}/{id}/references",
             get(documents::references),
         )
+        .merge(auth::routes())
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed });
-    Ok(layers(routes, Duration::from_secs(30)).with_state(AppState { pool, schemas }))
+    let state = AppState {
+        pool,
+        schemas,
+        auth,
+    };
+    let routes = routes.layer(axum::middleware::from_fn_with_state(
+        state.clone(),
+        auth::principal::resolve,
+    ));
+    Ok(layers(routes, Duration::from_secs(30)).with_state(state))
 }
 
 /// What every route sits behind: a body limit, a time limit and a panic guard, all answering

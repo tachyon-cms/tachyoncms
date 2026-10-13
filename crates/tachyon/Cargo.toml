@@ -19,6 +19,7 @@ tachyon-core.workspace = true
 tachyon-db.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+url.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]

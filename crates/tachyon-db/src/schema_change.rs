@@ -159,6 +159,7 @@ async fn run(
     write: Option<bool>,
 ) -> Result<(Collection, Preview), ChangeError> {
     new.check().map_err(ChangeError::Invalid)?;
+    crate::auth::check_users_schema(new).map_err(ChangeError::Invalid)?;
     let mut tx = pool.begin().await?;
     // Only a real change locks the collection; a preview reads without blocking saves.
     let current = if write.is_some() {

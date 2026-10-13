@@ -6,7 +6,7 @@ use serde_json::json;
 use sqlx::PgPool;
 
 async fn app(pool: PgPool) -> Router {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "items", "fields": [
         {"name": "title", "type": "text"},
         {"name": "price", "type": "number", "filterable": true},
@@ -175,7 +175,7 @@ async fn hostile_cursors_dates_and_nuls_are_400s(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn near_pages_by_number_not_cursor(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "places", "fields": [{"name": "at", "type": "point"}]});
     assert_eq!(
         send(
@@ -255,7 +255,7 @@ async fn select_shapes_lists_and_single_reads(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn select_skips_unselected_relationships(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for schema in [
         json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
         json!({"slug": "posts", "fields": [
@@ -287,7 +287,7 @@ async fn select_skips_unselected_relationships(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn select_on_globals(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "settings", "kind": "global", "fields": [
         {"name": "siteName", "type": "text"}, {"name": "tagline", "type": "text"}
     ]});
@@ -337,7 +337,7 @@ async fn bad_select_is_a_400_naming_the_parameter(pool: PgPool) {
 }
 
 async fn linked(pool: PgPool) -> Router {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for schema in [
         json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
         json!({"slug": "posts", "fields": [

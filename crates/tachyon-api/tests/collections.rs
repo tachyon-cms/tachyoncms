@@ -10,7 +10,7 @@ const POSTS: &str =
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn create_and_list_collections(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let res = send(&app, "POST", "/api/admin/collections", Some(POSTS)).await;
     assert_eq!(res.status, 201, "{}", res.json);
     assert_eq!(res.json["schema"]["slug"], "posts");
@@ -23,7 +23,7 @@ async fn create_and_list_collections(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn duplicate_collection_is_409(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     send(&app, "POST", "/api/admin/collections", Some(POSTS)).await;
     let res = send(&app, "POST", "/api/admin/collections", Some(POSTS)).await;
     assert_problem(&res, 409);
@@ -32,7 +32,7 @@ async fn duplicate_collection_is_409(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn invalid_schemas_are_422(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for body in [
         r#"{"slug": "Posts", "fields": []}"#,
         r#"{"slug": "admin", "fields": []}"#,
@@ -45,7 +45,7 @@ async fn invalid_schemas_are_422(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn unknown_field_options_are_422(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let body =
         r#"{"slug": "posts", "fields": [{"name": "t", "type": "text", "searchable": true}]}"#;
     let res = send(&app, "POST", "/api/admin/collections", Some(body)).await;
@@ -58,7 +58,7 @@ async fn unknown_field_options_are_422(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn malformed_bodies_are_400(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     for body in [
         r#"{"slug": "#,
         r#"{"slug": "posts"}"#,
@@ -71,13 +71,13 @@ async fn malformed_bodies_are_400(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn unknown_routes_are_problem_404(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     assert_problem(&send(&app, "GET", "/nope", None).await, 404);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn request_ids_are_echoed_or_generated(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let ok = send_with(
         &app,
         Request::builder()
@@ -105,7 +105,7 @@ async fn request_ids_are_echoed_or_generated(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn relationships_must_target_existing_collections(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let to_nowhere = r#"{"slug": "posts", "fields": [{"name": "a", "type": "relationship", "relationTo": "authors"}]}"#;
     let res = send(&app, "POST", "/api/admin/collections", Some(to_nowhere)).await;
     assert_problem(&res, 422);
@@ -138,7 +138,7 @@ async fn relationships_must_target_existing_collections(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn misspelt_keys_are_named_before_other_schema_errors(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let body = r#"{"slug": "posts", "fields": [{"nmae": "title", "type": "text"}]}"#;
     let res = send(&app, "POST", "/api/admin/collections", Some(body)).await;
     assert_problem(&res, 422);
@@ -150,7 +150,7 @@ async fn misspelt_keys_are_named_before_other_schema_errors(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn bad_options_name_the_field(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "posts", "fields": [
         {"name": "kind", "type": "select", "options": [1, 2]}
     ]});
@@ -170,7 +170,7 @@ async fn bad_options_name_the_field(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn schemas_come_back_without_default_options(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "posts", "fields": [
         {"type": "row", "fields": [{"name": "title", "type": "text", "required": true}]}
     ]});

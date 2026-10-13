@@ -501,7 +501,8 @@ fn text_error(v: &Value, min: Option<usize>, max: Option<usize>) -> Option<Strin
     None
 }
 
-fn is_email(s: &str) -> bool {
+/// A plausible email address: one `@`, a dotted domain, no spaces, at most 254 characters.
+pub fn is_email(s: &str) -> bool {
     let Some((local, domain)) = s.rsplit_once('@') else {
         return false;
     };

@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE accounts SET failed_logins = 0, first_failure_at = NULL, locked_until = NULL WHERE user_id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "db889d782327e979a98e9a47d97ccc41f1ccdbf9f12a8d13d8cf3ffb706bbe4d"
+}

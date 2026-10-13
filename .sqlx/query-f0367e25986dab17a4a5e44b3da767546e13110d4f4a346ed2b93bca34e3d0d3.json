@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT abilities FROM roles WHERE tenant_id = $1 AND slug = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "abilities",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "abilities"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "f0367e25986dab17a4a5e44b3da767546e13110d4f4a346ed2b93bca34e3d0d3"
+}
