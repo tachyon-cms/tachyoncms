@@ -145,6 +145,27 @@ pub async fn create_account(
     new: &NewAccount<'_>,
     setup: bool,
 ) -> Result<Uuid, DbError> {
+    // The profile holds a name when the users collection has that field.
+    let profile = if users.schema.data().iter().any(|f| f.name == "name") {
+        json!({ "name": new.name })
+    } else {
+        json!({})
+    };
+    let profile =
+        crate::documents::Prepared::plain(profile.as_object().cloned().unwrap_or_default());
+    create_account_with(pool, users, new, &profile, setup, None).await
+}
+
+/// `create_account` with a validated profile document (and the links it holds), recording
+/// `actor` as its creator (or the new user themselves).
+pub async fn create_account_with(
+    pool: &PgPool,
+    users: &Collection,
+    new: &NewAccount<'_>,
+    profile: &crate::documents::Prepared,
+    setup: bool,
+    actor: Option<Uuid>,
+) -> Result<Uuid, DbError> {
     let mut tx = pool.begin().await?;
     if setup {
         // An arbitrary constant: the one lock every setup attempt shares.
@@ -162,22 +183,19 @@ pub async fn create_account(
         }
     }
     let id = Uuid::now_v7();
-    // The profile holds a name when the users collection has that field.
-    let profile = if users.schema.data().iter().any(|f| f.name == "name") {
-        json!({ "name": new.name })
-    } else {
-        json!({})
-    };
+    let creator = actor.unwrap_or(id);
     sqlx::query!(
-        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by)
-           VALUES ($1, $2, $3, 'published', $4, now(), $1)"#,
+        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by, updated_by)
+           VALUES ($1, $2, $3, 'published', $4, now(), $5, $5)"#,
         id,
         DEFAULT_TENANT,
         users.id,
-        profile,
+        sqlx::types::Json(&profile.data) as _,
+        creator,
     )
     .execute(&mut *tx)
     .await?;
+    crate::documents::sync_relations(&mut tx, id, &profile.relations).await?;
     sqlx::query!(
         "INSERT INTO accounts (user_id, tenant_id, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)",
         id,
@@ -226,6 +244,23 @@ pub async fn account(pool: &PgPool, user_id: Uuid) -> Result<Option<Account>, Db
     )
     .fetch_optional(pool)
     .await?)
+}
+
+/// The email and role of each of `ids` that has an account, for showing users in a list.
+pub async fn emails_and_roles(
+    pool: &PgPool,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, String, String)>, DbError> {
+    Ok(sqlx::query!(
+        "SELECT user_id, email, role FROM accounts WHERE tenant_id = $1 AND user_id = ANY($2)",
+        DEFAULT_TENANT,
+        ids,
+    )
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .map(|r| (r.user_id, r.email, r.role))
+    .collect())
 }
 
 /// Counts a failed login; enough of them within the window lock the account.
@@ -419,7 +454,9 @@ pub(crate) async fn guard_last_admin(
     .await?;
     let leaving = admins.contains(&user_id) && new_role != Some("admin");
     if leaving && admins.len() <= 1 {
-        return Err(DbError::Conflict("the last Admin".into()));
+        return Err(DbError::Refused(
+            "This is the last Admin. Make someone else an Admin first.".into(),
+        ));
     }
     Ok(())
 }
@@ -520,7 +557,9 @@ pub async fn role_upsert(
     .execute(pool)
     .await?;
     if done.rows_affected() == 0 {
-        return Err(DbError::Conflict(format!("the built-in role `{slug}`")));
+        return Err(DbError::Refused(format!(
+            "`{slug}` is a built-in role and can't be changed or removed."
+        )));
     }
     Ok(())
 }
@@ -537,7 +576,9 @@ pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     .await?
     .ok_or(DbError::NotFound)?;
     if builtin {
-        return Err(DbError::Conflict(format!("the built-in role `{slug}`")));
+        return Err(DbError::Refused(format!(
+            "`{slug}` is a built-in role and can't be changed or removed."
+        )));
     }
     let used = sqlx::query_scalar!(
         r#"SELECT EXISTS (SELECT 1 FROM accounts WHERE tenant_id = $1 AND role = $2) AS "used!""#,
@@ -547,7 +588,9 @@ pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     .fetch_one(&mut *tx)
     .await?;
     if used {
-        return Err(DbError::Conflict(format!("users with the role `{slug}`")));
+        return Err(DbError::Refused(format!(
+            "Some users have the role `{slug}`. Give them another role first."
+        )));
     }
     sqlx::query!(
         "DELETE FROM roles WHERE tenant_id = $1 AND slug = $2",

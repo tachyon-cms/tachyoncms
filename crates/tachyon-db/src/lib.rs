@@ -36,6 +36,9 @@ pub enum DbError {
     /// The caller may only change documents they created, and this isn't one.
     #[error("not the owner")]
     NotOwner,
+    /// A change the rules don't allow, explained in a sentence for the person making it.
+    #[error("{0}")]
+    Refused(String),
     /// The collection's schema changed after the caller validated against it.
     #[error("schema changed")]
     SchemaChanged,

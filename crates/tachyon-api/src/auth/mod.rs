@@ -2,7 +2,11 @@
 
 pub(crate) mod password;
 pub(crate) mod principal;
+mod roles;
 mod routes;
+mod users;
+
+pub(crate) use users::ACCOUNT_KEYS;
 
 use std::time::Duration;
 

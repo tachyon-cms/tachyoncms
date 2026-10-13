@@ -35,6 +35,24 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/auth/sessions", get(sessions))
         .route("/api/auth/sessions/{id}", delete(end_session))
         .route("/api/auth/password", post(change_password))
+        .route(
+            "/api/users",
+            get(super::users::list).post(super::users::create),
+        )
+        .route(
+            "/api/users/{id}",
+            get(super::users::get)
+                .patch(super::users::update)
+                .delete(super::users::delete),
+        )
+        .route(
+            "/api/admin/roles",
+            get(super::roles::list).post(super::roles::create),
+        )
+        .route(
+            "/api/admin/roles/{slug}",
+            axum::routing::put(super::roles::update).delete(super::roles::delete),
+        )
 }
 
 fn parse<T: for<'de> Deserialize<'de>>(
@@ -51,7 +69,11 @@ fn field(path: &str, message: &str) -> FieldError {
 }
 
 /// A new password must be long enough and not known from a breach.
-async fn check_new_password(state: &AppState, path: &str, password: &str) -> Result<(), ApiError> {
+pub(crate) async fn check_new_password(
+    state: &AppState,
+    path: &str,
+    password: &str,
+) -> Result<(), ApiError> {
     check_password(password).map_err(|m| ApiError::Validation(vec![field(path, m)]))?;
     if let Some(breach) = &state.auth.breach
         && breach.check(password).await == Breach::Found

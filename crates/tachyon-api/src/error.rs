@@ -41,6 +41,7 @@ impl From<DbError> for ApiError {
                 "{n} other documents link to this one; remove those links first"
             )),
             DbError::InvalidQuery(message) => Self::BadRequest(message.to_owned()),
+            DbError::Refused(why) => Self::Conflict(why),
             DbError::NotOwner => {
                 Self::Forbidden("You can only change documents you created.".into())
             }

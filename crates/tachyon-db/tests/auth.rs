@@ -220,18 +220,18 @@ async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
     let first = account(&pool, "a@b.co", "admin").await;
     assert!(matches!(
         auth::set_role(&pool, first, "editor").await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
     assert!(matches!(
         auth::guard_removal(&pool, first).await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
     let second = account(&pool, "c@d.co", "admin").await;
     auth::set_role(&pool, first, "editor").await.unwrap();
     assert_eq!(auth::count_admins(&pool).await.unwrap(), 1);
     assert!(matches!(
         auth::set_role(&pool, second, "viewer").await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
 }
 
@@ -254,16 +254,16 @@ async fn roles_in_use_and_builtin_roles_cant_be_deleted(pool: PgPool) {
     );
     assert!(matches!(
         auth::role_upsert(&pool, "admin", "Boss", &abilities).await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
     assert!(matches!(
         auth::role_delete(&pool, "editor").await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
     let id = account(&pool, "a@b.co", "reviewer").await;
     assert!(matches!(
         auth::role_delete(&pool, "reviewer").await,
-        Err(DbError::Conflict(_))
+        Err(DbError::Refused(_))
     ));
     auth::set_role(&pool, id, "viewer").await.unwrap();
     auth::role_delete(&pool, "reviewer").await.unwrap();
