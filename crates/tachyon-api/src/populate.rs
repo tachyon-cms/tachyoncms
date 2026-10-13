@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
@@ -77,11 +78,33 @@ pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
     serde_json::to_value(doc).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
-pub(crate) fn populate(
-    state: &AppState,
+/// `populate[collection]` choices: how documents of each collection look when populated.
+pub(crate) type Shapes = HashMap<String, Select>;
+
+/// Cuts a populated document down by `populate[its collection]`, or else by its
+/// collection's `defaultPopulate`.
+fn shape_child(c: &Collection, shapes: &Shapes, value: &mut Value) {
+    let Value::Object(doc) = value else { return };
+    if let Some(select) = shapes.get(&c.schema.slug) {
+        project(select, doc);
+    } else if let Some(dp) = &c.schema.default_populate {
+        // Checked when the schema was saved, so this only fails on a hand-edited row.
+        if let Ok(select) = parse_select(
+            c.schema.data(),
+            &Value::Object(dp.clone()),
+            "defaultPopulate",
+        ) {
+            project(&select, doc);
+        }
+    }
+}
+
+pub(crate) fn populate<'a>(
+    state: &'a AppState,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
-) -> Populated<'_> {
+    shapes: &'a Shapes,
+) -> Populated<'a> {
     Box::pin(async move {
         if depth == 0 {
             return Ok(docs.into_iter().map(|(v, _)| v).collect());
@@ -101,10 +124,12 @@ pub(crate) fn populate(
         let mut children = Vec::new();
         for (collection_id, doc) in documents::get_many(&state.pool, &ids).await? {
             if let Some(c) = state.schemas.get_by_id(collection_id) {
-                children.push((to_value(&doc)?, c));
+                let mut value = to_value(&doc)?;
+                shape_child(&c, shapes, &mut value);
+                children.push((value, c));
             }
         }
-        let children = populate(state, children, depth - 1).await?;
+        let children = populate(state, children, depth - 1, shapes).await?;
         let by_id: HashMap<String, Value> = children
             .into_iter()
             .filter_map(|v| Some((v.get("id")?.as_str()?.to_owned(), v)))

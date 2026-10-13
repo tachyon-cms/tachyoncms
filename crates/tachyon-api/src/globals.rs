@@ -14,7 +14,7 @@ use tachyon_db::documents::{self, Document};
 
 use crate::documents::{json_body, shaped, unique_error};
 use crate::params::read_params;
-use crate::populate::{link_targets, populate, prepare, to_value};
+use crate::populate::{Shapes, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -36,7 +36,7 @@ async fn respond(
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth)
+        populate(state, vec![(to_value(doc)?, c)], depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -48,7 +48,7 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
-    let p = read_params(raw.as_deref(), c.schema.data())?;
+    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
     let value = match documents::get(&state.pool, c.id, c.id).await {
         Ok(doc) => to_value(&doc)?,
         Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
@@ -56,7 +56,9 @@ pub async fn get(
     };
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
-        populate(&state, vec![(value, c)], p.depth).await?.remove(0),
+        populate(&state, vec![(value, c)], p.depth, &p.populate)
+            .await?
+            .remove(0),
     ))
 }
 

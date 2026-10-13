@@ -42,6 +42,8 @@ pub enum Change {
     },
     /// Only the admin layout moved (rows, collapsibles, tabs); stored data is untouched.
     LayoutChanged,
+    /// A collection-wide option such as `defaultPopulate` changed; stored data is untouched.
+    CollectionOptionsChanged,
     /// A relationship's targets widened without losing any (one collection to several that
     /// include it); existing links are kept and reshaped.
     Relinked {
@@ -134,6 +136,9 @@ pub fn diff(
     )?;
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
+    }
+    if old.default_populate != new.default_populate {
+        changes.push(Change::CollectionOptionsChanged);
     }
     Ok(SchemaDiff { changes, links })
 }
@@ -666,6 +671,16 @@ mod tests {
             assert_eq!(err.to_string(), message);
         }
     }
+    #[test]
+    fn changing_default_populate_is_a_change() {
+        let old = schema(json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}));
+        let new = schema(json!({"slug": "authors", "defaultPopulate": {"name": true},
+                                "fields": [{"name": "name", "type": "text"}]}));
+        let d = diff(&old, &new, &Renames::new()).unwrap();
+        assert_eq!(d.changes, vec![Change::CollectionOptionsChanged]);
+        assert!(!d.is_destructive());
+    }
+
     #[test]
     fn schema_changes_fill_nested_defaults() {
         let new = schema(json!({"slug": "posts", "fields": [

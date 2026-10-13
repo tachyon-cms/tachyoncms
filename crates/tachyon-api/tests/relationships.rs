@@ -209,3 +209,103 @@ async fn a_link_cannot_borrow_another_links_collection(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(res.json["errors"][0]["path"], "extras.0");
 }
+
+async fn blog(pool: PgPool, default_populate: Option<serde_json::Value>) -> (Router, String) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let mut authors = json!({"slug": "authors", "fields": [
+        {"name": "name", "type": "text"}, {"name": "bio", "type": "textarea"}
+    ]});
+    if let Some(dp) = default_populate {
+        authors["defaultPopulate"] = dp;
+    }
+    for schema in [
+        authors,
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let ann = send(
+        &app,
+        "POST",
+        "/api/authors",
+        Some(r#"{"name": "Ann", "bio": "Writes"}"#),
+    )
+    .await;
+    let body = json!({"title": "Hi", "author": ann.json["id"]}).to_string();
+    let post = send(&app, "POST", "/api/posts", Some(&body)).await;
+    (app, post.json["id"].as_str().unwrap().to_owned())
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn populate_shapes_linked_documents_per_collection(pool: PgPool) {
+    let (app, post) = blog(pool, None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/posts/{post}?populate[authors][name]=true"),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let author = res.json["author"].as_object().unwrap();
+    let keys: Vec<&String> = author.keys().collect();
+    assert_eq!(keys, ["id", "name"]);
+    let list = send(&app, "GET", "/api/posts?populate[authors][bio]=false", None).await;
+    assert!(list.json["docs"][0]["author"].get("bio").is_none());
+    assert_eq!(list.json["docs"][0]["author"]["name"], "Ann");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn default_populate_applies_when_no_populate_is_given(pool: PgPool) {
+    let (app, post) = blog(pool, Some(json!({"name": true}))).await;
+    let res = send(&app, "GET", &format!("/api/posts/{post}"), None).await;
+    let keys: Vec<&String> = res.json["author"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["id", "name"]);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/posts/{post}?populate[authors][bio]=true"),
+        None,
+    )
+    .await;
+    let keys: Vec<&String> = res.json["author"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["bio", "id"], "populate wins over defaultPopulate");
+    let direct = send(&app, "GET", "/api/authors", None).await;
+    assert_eq!(
+        direct.json["docs"][0]["bio"], "Writes",
+        "defaultPopulate only shapes populated copies"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_populate_is_a_400(pool: PgPool) {
+    let (app, post) = blog(pool, None).await;
+    for (q, detail) in [
+        (
+            "populate[nope][name]=true",
+            "populate[nope]: no such collection",
+        ),
+        (
+            "populate[authors][nope]=true",
+            "populate[authors][nope]: unknown field",
+        ),
+        (
+            "populate=authors",
+            "populate: expected populate[collection][field]=true",
+        ),
+    ] {
+        let res = send(&app, "GET", &format!("/api/posts/{post}?{q}"), None).await;
+        assert_problem(&res, 400);
+        assert_eq!(res.json["detail"], detail, "{q}");
+    }
+}

@@ -65,6 +65,11 @@ fn parse_tree(
             return Err(err("unknown field".into()));
         }
         let child = match value {
+            // Text from a query string, or a boolean from a schema's `defaultPopulate`.
+            Value::Bool(b) => {
+                modes.push(*b);
+                None
+            }
             Value::String(s) => {
                 modes.push(match s.as_str() {
                     "true" => true,

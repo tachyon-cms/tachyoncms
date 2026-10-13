@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
-use serde_json::Value;
+use serde_json::{Map, Value};
 
 /// Keys the API adds to every document, so top-level fields can't use them.
 pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "status"];
@@ -19,6 +19,13 @@ pub struct CollectionSchema {
     #[serde(default)]
     pub kind: CollectionKind,
     pub fields: Vec<Field>,
+    /// What other collections get when they populate a link to this one, as a `select`.
+    #[serde(
+        default,
+        rename = "defaultPopulate",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub default_populate: Option<Map<String, Value>>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -27,7 +34,13 @@ pub struct CollectionSchema {
 
 impl PartialEq for CollectionSchema {
     fn eq(&self, other: &Self) -> bool {
-        (&self.slug, self.kind, &self.fields) == (&other.slug, other.kind, &other.fields)
+        (&self.slug, self.kind, &self.fields, &self.default_populate)
+            == (
+                &other.slug,
+                other.kind,
+                &other.fields,
+                &other.default_populate,
+            )
     }
 }
 
@@ -641,6 +654,8 @@ pub enum SchemaError {
     InvalidChange(String),
     #[error("field `{field}`: unknown option `{option}`")]
     UnknownOption { field: String, option: String },
+    #[error("{0}")]
+    InvalidOption(String),
 }
 
 impl FieldKind {
@@ -757,7 +772,12 @@ impl CollectionSchema {
         }
         let data = self.data();
         check_layout(&self.fields, data, "fields", "")?;
-        check_fields(data, true, data, "")
+        check_fields(data, true, data, "")?;
+        if let Some(dp) = &self.default_populate {
+            crate::select::parse_select(data, &Value::Object(dp.clone()), "defaultPopulate")
+                .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;
+        }
+        Ok(())
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -1857,5 +1877,26 @@ mod tests {
         );
         assert_eq!(schema(compact.clone()), s);
         assert_eq!(s.reject_unknown_options(&compact), Ok(()));
+    }
+
+    #[test]
+    fn default_populate_is_checked_and_round_trips() {
+        let input = json!({"slug": "authors", "defaultPopulate": {"name": true, "id": true},
+                           "fields": [{"name": "name", "type": "text"}, {"name": "bio", "type": "textarea"}]});
+        let s = schema(input.clone());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        assert_eq!(
+            s.to_compact_json()["defaultPopulate"],
+            json!({"name": true, "id": true})
+        );
+        let bad = schema(json!({"slug": "authors", "defaultPopulate": {"nope": true},
+                                "fields": [{"name": "name", "type": "text"}]}));
+        assert_eq!(
+            bad.check().unwrap_err().to_string(),
+            "defaultPopulate[nope]: unknown field"
+        );
+        let plain = schema(json!({"slug": "authors", "fields": []}));
+        assert!(plain.to_compact_json().get("defaultPopulate").is_none());
     }
 }

@@ -17,7 +17,7 @@ use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
 use crate::params::{list_params, read_params};
-use crate::populate::{link_targets, populate, prepare, to_value};
+use crate::populate::{Shapes, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -69,7 +69,7 @@ pub async fn list(
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    let p = list_params(raw.as_deref(), &c)?;
+    let p = list_params(raw.as_deref(), &c, &state.schemas)?;
     let page = p.page.unwrap_or(1);
     let offset = (page - 1)
         .checked_mul(p.limit)
@@ -88,7 +88,7 @@ pub async fn list(
         .iter()
         .map(|d| Ok((shaped(to_value(d)?, p.select.as_ref()), c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    let docs = populate(&state, docs, p.depth).await?;
+    let docs = populate(&state, docs, p.depth, &p.populate).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
     if p.after.is_none() {
         body["page"] = page.into();
@@ -119,7 +119,7 @@ async fn respond(
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth)
+        populate(state, vec![(to_value(doc)?, c)], depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -155,11 +155,13 @@ pub async fn get(
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let p = read_params(raw.as_deref(), c.schema.data())?;
+    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
     let doc = documents::get(&state.pool, c.id, id).await?;
     let value = shaped(to_value(&doc)?, p.select.as_ref());
     Ok(Json(
-        populate(&state, vec![(value, c)], p.depth).await?.remove(0),
+        populate(&state, vec![(value, c)], p.depth, &p.populate)
+            .await?
+            .remove(0),
     ))
 }
 
