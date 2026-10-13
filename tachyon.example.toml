@@ -1,0 +1,18 @@
+# Copy to tachyon.toml. Every setting can also come from the environment:
+# TACHYON_LISTEN, TACHYON_PUBLIC_URL, TACHYON_AUTH__SESSION_IDLE and so on.
+
+database_url = "postgres://tachyon:tachyon@127.0.0.1:54329/tachyon"
+listen = "127.0.0.1:3000"
+
+# Where browsers reach the admin and API. Required when listening beyond this machine.
+# public_url = "https://cms.example.com"
+
+[auth]
+session_idle = "7d"         # signed out after this long without use
+session_absolute = "30d"    # and after this long whatever happens
+lockout_attempts = 5        # wrong passwords within the window...
+lockout_window = "15m"
+lockout_duration = "15m"    # ...lock the account for this long
+argon2_memory_kib = 19456   # password hashing memory (OWASP baseline)
+breach_check = true         # refuse passwords known from data breaches
+allowed_origins = []        # other sites allowed to send cookie-signed changes

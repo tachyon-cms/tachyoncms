@@ -78,12 +78,19 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve => {
+            config.check_serve().map_err(anyhow::Error::msg)?;
+            let options = tachyon_api::Options {
+                auth: config.auth_config().map_err(anyhow::Error::msg)?,
+            };
+            let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
             tracing::info!(addr = %config.listen, "listening");
-            if let Some(warning) = config::exposure_warning(config.listen) {
+            if let Some(warning) =
+                config::setup_warning(tachyon_db::auth::has_accounts(&pool).await?)
+            {
                 tracing::warn!("{warning}");
             }
-            axum::serve(listener, tachyon_api::router(pool).await?)
+            axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
         }
