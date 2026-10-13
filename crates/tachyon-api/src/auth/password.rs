@@ -59,8 +59,10 @@ impl Hasher {
 
     /// Spends the time a real check takes, for logins with an unknown email.
     pub(crate) async fn dummy_verify(&self) {
+        // A fresh random guess each time, so there's no fixed input to reason about.
+        let guess = hex::encode(rand::random::<[u8; 16]>());
         let dummy = self.dummy.as_str().to_owned();
-        self.verify("not the password", &dummy).await;
+        self.verify(&guess, &dummy).await;
     }
 }
 
