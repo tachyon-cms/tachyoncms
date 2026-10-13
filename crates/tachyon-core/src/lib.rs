@@ -3,6 +3,7 @@
 pub mod diff;
 pub mod query;
 pub mod schema;
+pub mod select;
 pub mod validate;
 
 pub use schema::{
