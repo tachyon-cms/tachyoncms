@@ -8,6 +8,7 @@ use serde_json::{Value, json};
 use std::sync::Arc;
 
 use tachyon_core::query::value_kind;
+use tachyon_core::select::{Select, project};
 use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
@@ -15,7 +16,7 @@ use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
-use crate::params::{depth_param, list_params};
+use crate::params::{list_params, read_params};
 use crate::populate::{link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
@@ -85,7 +86,7 @@ pub async fn list(
     let docs = found
         .docs
         .iter()
-        .map(|d| Ok((to_value(d)?, c.clone())))
+        .map(|d| Ok((shaped(to_value(d)?, p.select.as_ref()), c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
     let docs = populate(&state, docs, p.depth).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
@@ -100,6 +101,14 @@ pub async fn list(
         body["totalDocs"] = total.into();
     }
     Ok(Json(body))
+}
+
+/// `value` cut down to what `select` asks for.
+pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
+    if let (Some(select), Value::Object(doc)) = (select, &mut value) {
+        project(select, doc);
+    }
+    value
 }
 
 /// The document as JSON, with its relationships populated to `depth`.
@@ -144,11 +153,14 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
-    let depth = depth_param(raw.as_deref())?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    let p = read_params(raw.as_deref(), c.schema.data())?;
     let doc = documents::get(&state.pool, c.id, id).await?;
-    respond(&state, c, &doc, depth).await
+    let value = shaped(to_value(&doc)?, p.select.as_ref());
+    Ok(Json(
+        populate(&state, vec![(value, c)], p.depth).await?.remove(0),
+    ))
 }
 
 pub async fn update(

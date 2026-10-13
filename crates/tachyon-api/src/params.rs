@@ -1,7 +1,9 @@
 //! Query parameters for listing and reading documents.
 
 use serde_json::{Map, Value};
+use tachyon_core::Field;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
+use tachyon_core::select::{Select, parse_select};
 use tachyon_db::collections::Collection;
 
 use crate::ApiError;
@@ -19,6 +21,13 @@ pub(crate) struct ListParams {
     pub depth: u8,
     pub filter: Option<Filter>,
     pub sort: Option<Sort>,
+    pub select: Option<Select>,
+}
+
+/// How a single read is shaped.
+pub(crate) struct ReadParams {
+    pub depth: u8,
+    pub select: Option<Select>,
 }
 
 fn bad(message: impl Into<String>) -> ApiError {
@@ -50,6 +59,14 @@ fn number(params: &Map<String, Value>, name: &str) -> Result<Option<i64>, ApiErr
         .transpose()
 }
 
+fn select(params: &Map<String, Value>, fields: &[Field]) -> Result<Option<Select>, ApiError> {
+    params
+        .get("select")
+        .map(|s| parse_select(fields, s, "select"))
+        .transpose()
+        .map_err(|e| bad(e.to_string()))
+}
+
 fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     match single(params, "depth")? {
         None => Ok(DEFAULT_DEPTH),
@@ -64,7 +81,9 @@ fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
 pub(crate) fn list_params(raw: Option<&str>, c: &Collection) -> Result<ListParams, ApiError> {
     let params = params(
         raw,
-        &["limit", "page", "after", "count", "depth", "where", "sort"],
+        &[
+            "limit", "page", "after", "count", "depth", "where", "sort", "select",
+        ],
     )?;
     let fields = c.schema.data();
 
@@ -111,11 +130,16 @@ pub(crate) fn list_params(raw: Option<&str>, c: &Collection) -> Result<ListParam
         after,
         count,
         depth: depth(&params)?,
+        select: select(&params, fields)?,
         filter,
         sort,
     })
 }
 
-pub(crate) fn depth_param(raw: Option<&str>) -> Result<u8, ApiError> {
-    depth(&params(raw, &["depth"])?)
+pub(crate) fn read_params(raw: Option<&str>, fields: &[Field]) -> Result<ReadParams, ApiError> {
+    let params = params(raw, &["depth", "select"])?;
+    Ok(ReadParams {
+        depth: depth(&params)?,
+        select: select(&params, fields)?,
+    })
 }
