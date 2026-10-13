@@ -48,19 +48,25 @@ fn assert_identifier(segment: &str) {
 
 /// The SQL expression for a field. Index DDL uses this too, so indexes always match queries.
 pub fn field_expr(path: &[String], kind: ValueKind) -> String {
+    field_expr_on("published", path, kind)
+}
+
+/// `field_expr` read from another JSON expression: a linked document's `t1.published`, or a
+/// list row's `r1.v`.
+fn field_expr_on(base: &str, path: &[String], kind: ValueKind) -> String {
     path.iter().for_each(|s| assert_identifier(s));
     let path = path.join(",");
     match kind {
-        ValueKind::Text | ValueKind::Date => format!("(published #>> '{{{path}}}')"),
+        ValueKind::Text | ValueKind::Date => format!("({base} #>> '{{{path}}}')"),
         // Guarded casts: values left behind by a retype read as NULL instead of failing the query.
         ValueKind::Number => format!(
-            "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'number' THEN (published #>> '{{{path}}}')::numeric END)"
+            "(CASE WHEN jsonb_typeof({base} #> '{{{path}}}') = 'number' THEN ({base} #>> '{{{path}}}')::numeric END)"
         ),
         ValueKind::Boolean => format!(
-            "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'boolean' THEN (published #>> '{{{path}}}')::boolean END)"
+            "(CASE WHEN jsonb_typeof({base} #> '{{{path}}}') = 'boolean' THEN ({base} #>> '{{{path}}}')::boolean END)"
         ),
         ValueKind::List | ValueKind::LinkList | ValueKind::Point => {
-            format!("(published #> '{{{path}}}')")
+            format!("({base} #> '{{{path}}}')")
         }
     }
 }
@@ -103,12 +109,39 @@ fn push_distance(qb: &mut QueryBuilder<Postgres>, path: &[String], lng: f64, lat
     qb.push(") / 2)), 2)))))");
 }
 
+/// What a condition reads from: the document's own JSON and columns at the top, a linked
+/// document's (`t1.published`, `t1.id`) or a list row's (`r1.v`) further in. `depth` keeps
+/// each nested alias distinct.
+struct Base {
+    json: String,
+    columns: String,
+    depth: u8,
+}
+
+impl Base {
+    fn top() -> Self {
+        Self {
+            json: "published".into(),
+            columns: String::new(),
+            depth: 0,
+        }
+    }
+}
+
 fn expr(target: &Target) -> String {
+    expr_in(target, &Base::top())
+}
+
+fn expr_in(target: &Target, base: &Base) -> String {
+    let columns = &base.columns;
     match target {
-        Target::Id => "id".into(),
-        Target::CreatedAt => "created_at".into(),
-        Target::UpdatedAt => "updated_at".into(),
-        Target::Field { path, kind } => field_expr(path, *kind),
+        Target::Id => format!("{columns}id"),
+        Target::CreatedAt => format!("{columns}created_at"),
+        Target::UpdatedAt => format!("{columns}updated_at"),
+        Target::Field { path, kind } => field_expr_on(&base.json, path, *kind),
+        Target::Via { .. } | Target::Row { .. } => {
+            unreachable!("nested targets compile to EXISTS, never to an expression")
+        }
     }
 }
 
@@ -170,6 +203,9 @@ fn bind_list(qb: &mut QueryBuilder<Postgres>, target: &Target, values: &[Scalar]
         Target::Field { .. } => {
             qb.push_bind(texts().collect::<Vec<_>>());
         }
+        Target::Via { .. } | Target::Row { .. } => {
+            unreachable!("values bind against the innermost target")
+        }
     }
 }
 
@@ -180,6 +216,10 @@ fn escape_like(s: &str) -> String {
 }
 
 fn push_filter(qb: &mut QueryBuilder<Postgres>, f: &Filter) {
+    push_filter_in(qb, f, &Base::top());
+}
+
+fn push_filter_in(qb: &mut QueryBuilder<Postgres>, f: &Filter, base: &Base) {
     match f {
         Filter::All(parts) | Filter::Any(parts) => {
             let all = matches!(f, Filter::All(_));
@@ -192,16 +232,148 @@ fn push_filter(qb: &mut QueryBuilder<Postgres>, f: &Filter) {
                 if i > 0 {
                     qb.push(if all { " AND " } else { " OR " });
                 }
-                push_filter(qb, part);
+                push_filter_in(qb, part, base);
             }
             qb.push(")");
         }
-        Filter::Cond(c) => push_cond(qb, c),
+        Filter::Cond(c) if c.target.is_nested() => push_nested(qb, c, base),
+        Filter::Cond(c) => push_cond(qb, c, base),
     }
 }
 
-fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond) {
-    let e = expr(&c.target);
+/// A condition through a relationship or into a list: `EXISTS` some linked document or
+/// row matching it. The negative operators mean "none matches", so they become `NOT EXISTS`
+/// of the positive form, the way a missing value already satisfies them on plain fields.
+fn push_nested(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
+    let (negate, op, value) = match (c.op, &c.value) {
+        (Op::NotEquals, v) => (true, Op::Equals, v.clone()),
+        (Op::NotIn, v) => (true, Op::In, v.clone()),
+        (Op::Exists, Operand::One(Scalar::Bool(false))) => {
+            (true, Op::Exists, Operand::One(Scalar::Bool(true)))
+        }
+        (op, v) => (false, op, v.clone()),
+    };
+    if negate {
+        qb.push("NOT ");
+    }
+    push_exists(qb, &c.target, op, &value, base);
+}
+
+/// A stored link's text, as a `uuid` only when it looks like one, so bad data never errors.
+fn guarded_uuid(text: &str) -> String {
+    format!(
+        "(CASE WHEN {text} ~* '^[0-9a-f]{{8}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{4}}-[0-9a-f]{{12}}$' THEN ({text})::uuid END)"
+    )
+}
+
+/// `jsonb` at `path` when it's an array, else an empty one, so `jsonb_array_elements` never fails.
+fn array_at(base: &str, path: &[String]) -> String {
+    path.iter().for_each(|s| assert_identifier(s));
+    let at = format!("({base} #> '{{{}}}')", path.join(","));
+    format!("(CASE WHEN jsonb_typeof({at}) = 'array' THEN {at} ELSE '[]'::jsonb END)")
+}
+
+// ponytail: the EXISTS runs per candidate document (a primary-key probe each), so a very
+// selective filter through a link on a huge collection still visits every row. If that shows
+// up, drive top-level links from `relations` (matching linked documents first, then
+// `relations_to_doc_from_doc`) and keep this form for links inside list rows.
+fn push_exists(
+    qb: &mut QueryBuilder<Postgres>,
+    target: &Target,
+    op: Op,
+    value: &Operand,
+    base: &Base,
+) {
+    let depth = base.depth + 1;
+    // Inside the subquery a bare `published` would mean the linked document's, so the
+    // outer document's JSON is named by its table.
+    let outer = if base.depth == 0 {
+        "documents.published".to_owned()
+    } else {
+        base.json.clone()
+    };
+    let inner = match target {
+        Target::Row { list, inner } => {
+            let alias = format!("r{depth}");
+            qb.push(format!(
+                "EXISTS (SELECT 1 FROM jsonb_array_elements({}) AS {alias}(v) \
+                 WHERE jsonb_typeof({alias}.v) = 'object' AND ",
+                array_at(&outer, list)
+            ));
+            let row = Base {
+                json: format!("{alias}.v"),
+                columns: String::new(),
+                depth,
+            };
+            (inner, row)
+        }
+        Target::Via {
+            link,
+            many,
+            polymorphic,
+            collections,
+            inner,
+        } => {
+            let alias = format!("t{depth}");
+            link.iter().for_each(|s| assert_identifier(s));
+            let path = link.join(",");
+            let ids = match (many, polymorphic) {
+                (false, false) => format!(
+                    "ARRAY[{}]",
+                    guarded_uuid(&format!("({outer} #>> '{{{path}}}')"))
+                ),
+                (false, true) => format!(
+                    "ARRAY[{}]",
+                    guarded_uuid(&format!("({outer} #>> '{{{path},value}}')"))
+                ),
+                (true, false) => format!(
+                    "ARRAY(SELECT {} FROM jsonb_array_elements({}) AS x WHERE jsonb_typeof(x) = 'string')",
+                    guarded_uuid("(x #>> '{}')"),
+                    array_at(&outer, link)
+                ),
+                (true, true) => format!(
+                    "ARRAY(SELECT {} FROM jsonb_array_elements({}) AS x WHERE jsonb_typeof(x) = 'object')",
+                    guarded_uuid("(x ->> 'value')"),
+                    array_at(&outer, link)
+                ),
+            };
+            qb.push(format!(
+                "EXISTS (SELECT 1 FROM documents {alias} WHERE {alias}.tenant_id = "
+            ))
+            .push_bind(DEFAULT_TENANT)
+            .push(format!(
+                " AND {alias}.deleted_at IS NULL AND {alias}.id = ANY({ids}) \
+                     AND {alias}.collection_id IN (SELECT id FROM collections WHERE tenant_id = "
+            ))
+            .push_bind(DEFAULT_TENANT)
+            .push(" AND slug = ANY(")
+            .push_bind(collections.clone())
+            .push(")) AND ");
+            let linked = Base {
+                json: format!("{alias}.published"),
+                columns: format!("{alias}."),
+                depth,
+            };
+            (inner, linked)
+        }
+        _ => unreachable!("push_exists is only called on nested targets"),
+    };
+    let (inner, next) = inner;
+    if inner.is_nested() {
+        push_exists(qb, inner, op, value, &next);
+    } else {
+        let leaf = Cond {
+            target: (**inner).clone(),
+            op,
+            value: value.clone(),
+        };
+        push_cond(qb, &leaf, &next);
+    }
+    qb.push(")");
+}
+
+fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
+    let e = expr_in(&c.target, base);
     let compare = |qb: &mut QueryBuilder<Postgres>, sql_op: &str, v: &Scalar| {
         qb.push(&e).push(sql_op);
         bind(qb, &c.target, v);
@@ -510,6 +682,7 @@ fn push_after(
 
 fn sort_value(sort: Option<&Sort>, doc: &Document) -> Option<Scalar> {
     match &sort?.target {
+        Target::Via { .. } | Target::Row { .. } => None,
         Target::Id => Some(Scalar::Text(doc.id.to_string())),
         Target::CreatedAt => doc.created_at.format(&Rfc3339).ok().map(Scalar::Text),
         Target::UpdatedAt => doc.updated_at.format(&Rfc3339).ok().map(Scalar::Text),

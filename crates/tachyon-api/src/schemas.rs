@@ -63,6 +63,16 @@ impl Schemas {
         self.current.load().by_slug.get(slug).cloned()
     }
 
+    /// A collection's schema by slug, for filters that reach through relationships. Globals
+    /// aren't linkable, so they're left out.
+    // ponytail: clones the schema per relationship a filter crosses; borrow from the
+    // snapshot if that shows up in a profile.
+    pub fn lookup(&self, slug: &str) -> Option<tachyon_core::CollectionSchema> {
+        self.get(slug)
+            .filter(|c| c.schema.kind == tachyon_core::CollectionKind::Collection)
+            .map(|c| c.schema.0.clone())
+    }
+
     /// Every collection and global, in no particular order.
     pub fn all(&self) -> Vec<Arc<Collection>> {
         self.current.load().by_id.values().cloned().collect()

@@ -762,3 +762,220 @@ mod joins {
         assert!(!pages[&news].has_more);
     }
 }
+
+mod cross {
+    use super::*;
+    use tachyon_core::query::parse_filter_with;
+
+    struct World {
+        posts: Uuid,
+        schemas: Vec<CollectionSchema>,
+        ann: Uuid,
+    }
+
+    fn s(v: Value) -> CollectionSchema {
+        serde_json::from_value(v).unwrap()
+    }
+
+    async fn insert(pool: &PgPool, c: Uuid, v: Value) -> Uuid {
+        documents::insert(
+            pool,
+            c,
+            1,
+            None,
+            &Prepared::plain(v.as_object().unwrap().clone()),
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    async fn world(pool: &PgPool) -> World {
+        let companies =
+            s(json!({"slug": "companies", "fields": [{"name": "name", "type": "text"}]}));
+        let authors = s(json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "company", "type": "relationship", "relationTo": "companies"}
+        ]}));
+        let posts = s(json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "tags", "type": "relationship", "relationTo": "authors", "hasMany": true},
+            {"name": "related", "type": "relationship", "relationTo": ["authors", "companies"], "hasMany": true},
+            {"name": "one", "type": "relationship", "relationTo": ["authors", "companies"]},
+            {"name": "sections", "type": "array", "fields": [
+                {"name": "parts", "type": "array", "fields": [{"name": "n", "type": "number"}]}
+            ]},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "url", "type": "url"},
+                {"name": "label", "type": "text"},
+                {"name": "by", "type": "relationship", "relationTo": "authors"}
+            ]}
+        ]}));
+        let company_id = collections::create(pool, &companies).await.unwrap().id;
+        let author_id = collections::create(pool, &authors).await.unwrap().id;
+        let post_id = collections::create(pool, &posts).await.unwrap().id;
+        let acme = insert(pool, company_id, json!({"name": "Acme"})).await;
+        let ann = insert(pool, author_id, json!({"name": "Ann", "company": acme})).await;
+        let bo = insert(pool, author_id, json!({"name": "Bo"})).await;
+        let gone = insert(pool, author_id, json!({"name": "Gone"})).await;
+        // A company named Ann, to prove polymorphic links compare only the right collection.
+        let ann_co = insert(pool, company_id, json!({"name": "Ann"})).await;
+        for post in [
+            json!({"title": "by-ann", "author": ann, "tags": [bo, ann],
+                   "links": [{"url": "https://a.test", "label": "x", "by": ann}, {"url": "https://b.test", "label": "y"}]}),
+            json!({"title": "by-bo", "author": bo, "tags": [bo],
+                   "one": {"relationTo": "companies", "value": acme},
+                   "sections": [{"parts": [{"n": 1}, {"n": 7}]}],
+                   "related": [{"relationTo": "companies", "value": ann_co}],
+                   "links": [{"url": "https://a.test", "label": "y"}]}),
+            json!({"title": "alone", "links": []}),
+            json!({"title": "broken", "author": "not-a-uuid", "tags": "nope", "links": [5, {"url": 3}]}),
+            json!({"title": "by-gone", "author": gone}),
+        ] {
+            insert(pool, post_id, post).await;
+        }
+        sqlx::query("UPDATE documents SET deleted_at = now() WHERE id = $1")
+            .bind(gone)
+            .execute(pool)
+            .await
+            .unwrap();
+        World {
+            posts: post_id,
+            schemas: vec![companies, authors, posts],
+            ann,
+        }
+    }
+
+    async fn titles_where(pool: &PgPool, w: &World, qs: &str) -> Vec<String> {
+        let lookup = |slug: &str| w.schemas.iter().find(|s| s.slug == slug).cloned();
+        let posts = w.schemas.iter().find(|s| s.slug == "posts").unwrap();
+        let f =
+            parse_filter_with(&posts.fields, &parse_query(qs).unwrap()["where"], &lookup).unwrap();
+        let by_title = sort("title");
+        let mut found = titles(pool, w.posts, q(Some(&f), Some(&by_title))).await;
+        found.sort();
+        found
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn filters_through_a_relationship(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][equals]=Ann").await,
+            ["by-ann"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[tags.name][equals]=Bo").await,
+            ["by-ann", "by-bo"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.company.name][equals]=Acme").await,
+            ["by-ann"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][like]=o").await,
+            ["by-bo"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][in]=Ann,Bo").await,
+            ["by-ann", "by-bo"]
+        );
+        let id = w.ann.to_string();
+        assert_eq!(
+            titles_where(&pool, &w, &format!("where[author.id][equals]={id}")).await,
+            ["by-ann"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn filters_into_list_rows_and_links_inside_them(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[links.url][equals]=https://a.test").await,
+            ["by-ann", "by-bo"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[links.by.name][equals]=Ann").await,
+            ["by-ann"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[links.label][exists]=true").await,
+            ["by-ann", "by-bo"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn negatives_match_documents_with_no_match(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][not_equals]=Ann").await,
+            ["alone", "broken", "by-bo", "by-gone"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[links.url][not_in]=https://a.test").await,
+            ["alone", "broken", "by-gone"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][exists]=false").await,
+            ["alone", "broken", "by-gone"],
+            "no live author with a name"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn each_condition_checks_its_own_row(pool: PgPool) {
+        let w = world(&pool).await;
+        // by-ann has a.test (label x) and b.test (label y): different rows satisfy each.
+        assert_eq!(
+            titles_where(
+                &pool,
+                &w,
+                "where[and][0][links.url][equals]=https://b.test&where[and][1][links.label][equals]=x"
+            )
+            .await,
+            ["by-ann"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn deleted_and_malformed_links_never_match(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][equals]=Gone").await,
+            Vec::<String>::new()
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][like]=").await,
+            ["by-ann", "by-bo"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn polymorphic_links_only_compare_the_right_collection(pool: PgPool) {
+        let w = world(&pool).await;
+        // by-bo links a *company* named Ann; the author named Ann isn't linked there.
+        assert_eq!(
+            titles_where(&pool, &w, "where[related.name][equals]=Ann").await,
+            ["by-bo"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn single_polymorphic_links_nested_lists_and_exists_through_links(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[one.name][equals]=Acme").await,
+            ["by-bo"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[sections.parts.n][gt]=5").await,
+            ["by-bo"]
+        );
+        // Bo has no company: a live author exists, but the field doesn't.
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.company][exists]=true").await,
+            ["by-ann"]
+        );
+    }
+}

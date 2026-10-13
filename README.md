@@ -24,9 +24,9 @@ We think you can have both. Here's what we're building toward:
 - Paginated lists, newest first.
 - Errors in the standard [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) format, each with a request ID you can find in the logs.
 - Soft delete, UUIDv7 IDs, and date-times stored in UTC.
-- Filter (`where[price][gt]=10`), sort (`sort=-price`) and page through results with cursors; link documents with relationship fields and get them back populated (`depth=2`); edit singleton globals such as site settings.
+- Filter (`where[price][gt]=10`), including through relationships (`where[author.name][equals]=Ann`) and into list rows (`where[links.url][like]=docs`), sort (`sort=-price`) and page through results with cursors; link documents with relationship fields and get them back populated (`depth=2`); edit singleton globals such as site settings.
 - Ask for only what you need. `select[title]=true` returns just the title (and `id`), `populate[authors][name]=true` trims the documents your links fill in, and a collection's `defaultPopulate` sets that trim once. A relationship's `maxDepth` stops population going deeper than you want, whatever `depth` a request asks for.
-- Virtual fields show a value from a linked document without storing it: a field with `"virtual": "author.name"` reads the author's name on every read.
+- Virtual fields show a value from a linked document without storing it: a field with `"virtual": "author.name"` reads the author's name on every read, and you can filter on it like any other field.
 - Join fields list the documents that link to this one. Give a category `{"type": "join", "collection": "posts", "on": "category"}` and every read shows its posts, newest first. Page, sort, filter and count them per request with `joins[posts][limit]=5&joins[posts][sort]=-title`, or switch them off with `joins=false`. A join inside a group goes by its path, `joins[meta.recent]` or `joins[meta][recent]`.
 
 ## Try it

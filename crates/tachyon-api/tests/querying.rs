@@ -335,3 +335,85 @@ async fn bad_select_is_a_400_naming_the_parameter(pool: PgPool) {
         assert_eq!(res.json["detail"], detail);
     }
 }
+
+async fn linked(pool: PgPool) -> Router {
+    let app = tachyon_api::router(pool).await.unwrap();
+    for schema in [
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "authorName", "type": "text", "virtual": "author.name"},
+            {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let ann = send(&app, "POST", "/api/authors", Some(r#"{"name": "Ann"}"#)).await;
+    let bo = send(&app, "POST", "/api/authors", Some(r#"{"name": "Bo"}"#)).await;
+    for (title, author, url) in [("a", &ann, "https://a.test"), ("b", &bo, "https://b.test")] {
+        let body = json!({"title": title, "author": author.json["id"], "links": [{"url": url}]});
+        send(&app, "POST", "/api/posts", Some(&body.to_string())).await;
+    }
+    app
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn where_reaches_through_relationships_and_into_lists(pool: PgPool) {
+    let app = linked(pool).await;
+    let res = send(
+        &app,
+        "GET",
+        "/api/posts?where[author.name][equals]=Ann",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(titles(&res.json), ["a"]);
+    let res = send(
+        &app,
+        "GET",
+        "/api/posts?where[links.url][like]=b.test",
+        None,
+    )
+    .await;
+    assert_eq!(titles(&res.json), ["b"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtual_fields_can_be_filtered(pool: PgPool) {
+    let app = linked(pool).await;
+    let res = send(&app, "GET", "/api/posts?where[authorName][equals]=Bo", None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(titles(&res.json), ["b"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_cross_paths_are_400s(pool: PgPool) {
+    let app = linked(pool).await;
+    for (uri, detail) in [
+        (
+            "/api/posts?where[author.nope][equals]=x",
+            "where[author.nope][equals]: `author.nope`: authors has no field `nope`",
+        ),
+        (
+            "/api/posts?sort=author.name",
+            "sort: `author.name` goes through a relationship and can't be sorted yet",
+        ),
+        (
+            "/api/posts?where[author.id][like]=a",
+            "where[author.id][like]: like can't be used on this field",
+        ),
+    ] {
+        let res = send(&app, "GET", uri, None).await;
+        assert_problem(&res, 400);
+        assert_eq!(res.json["detail"], detail);
+    }
+}
