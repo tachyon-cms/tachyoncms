@@ -190,14 +190,16 @@ fn compare(
                     "can't rename `{old_path}` to `{name}`: there's no `{new_path}` in the new fields"
                 )));
             }
-            out.push(if o.virtual_path.is_some() {
-                Change::VirtualRemoved { path: old_path }
-            } else {
-                Change::Removed {
-                    path: old_path,
-                    kind: o.kind.name(),
-                }
-            });
+            out.push(
+                if o.virtual_path.is_some() || matches!(o.kind, FieldKind::Join { .. }) {
+                    Change::VirtualRemoved { path: old_path }
+                } else {
+                    Change::Removed {
+                        path: old_path,
+                        kind: o.kind.name(),
+                    }
+                },
+            );
             continue;
         };
         if renamed {
@@ -539,9 +541,9 @@ fn convert_link(v: &Value, change: &LinkChange) -> Option<Value> {
 fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
     // Virtual values are read on the way out, never stored.
     obj.retain(|key, _| {
-        fields
-            .iter()
-            .any(|f| &f.name == key && f.virtual_path.is_none())
+        fields.iter().any(|f| {
+            &f.name == key && f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. })
+        })
     });
     for f in fields {
         match (&f.kind, obj.get_mut(&f.name)) {

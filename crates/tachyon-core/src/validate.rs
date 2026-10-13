@@ -225,6 +225,15 @@ fn check_object(
     }
     for f in fields {
         let path = join(prefix, &f.name);
+        if let FieldKind::Join { collection, on, .. } = &f.kind {
+            if obj.contains_key(&f.name) {
+                errors.push(error(
+                    path,
+                    &format!("is filled from {collection}.{on}; it can't be set"),
+                ));
+            }
+            continue;
+        }
         if let Some(source) = &f.virtual_path {
             if obj.contains_key(&f.name) {
                 errors.push(error(
@@ -456,6 +465,8 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             })
         }
         FieldKind::Json => None,
+        // Never reached: `check_object` refuses a join value before this.
+        FieldKind::Join { .. } => None,
         // Never reached: validation only sees the data shape, where layout has dissolved.
         FieldKind::Row { .. } | FieldKind::Collapsible { .. } | FieldKind::Tabs { .. } => None,
         FieldKind::Group { .. } => Some("expected an object".into()),
