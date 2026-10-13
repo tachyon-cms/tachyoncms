@@ -273,6 +273,10 @@ fn array_at(base: &str, path: &[String]) -> String {
     format!("(CASE WHEN jsonb_typeof({at}) = 'array' THEN {at} ELSE '[]'::jsonb END)")
 }
 
+// ponytail: the EXISTS runs per candidate document (a primary-key probe each), so a very
+// selective filter through a link on a huge collection still visits every row. If that shows
+// up, drive top-level links from `relations` (matching linked documents first, then
+// `relations_to_doc_from_doc`) and keep this form for links inside list rows.
 fn push_exists(
     qb: &mut QueryBuilder<Postgres>,
     target: &Target,

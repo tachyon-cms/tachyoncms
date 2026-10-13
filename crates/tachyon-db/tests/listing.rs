@@ -771,7 +771,6 @@ mod cross {
         posts: Uuid,
         schemas: Vec<CollectionSchema>,
         ann: Uuid,
-        gone: Uuid,
     }
 
     fn s(v: Value) -> CollectionSchema {
@@ -803,6 +802,10 @@ mod cross {
             {"name": "author", "type": "relationship", "relationTo": "authors"},
             {"name": "tags", "type": "relationship", "relationTo": "authors", "hasMany": true},
             {"name": "related", "type": "relationship", "relationTo": ["authors", "companies"], "hasMany": true},
+            {"name": "one", "type": "relationship", "relationTo": ["authors", "companies"]},
+            {"name": "sections", "type": "array", "fields": [
+                {"name": "parts", "type": "array", "fields": [{"name": "n", "type": "number"}]}
+            ]},
             {"name": "links", "type": "array", "fields": [
                 {"name": "url", "type": "url"},
                 {"name": "label", "type": "text"},
@@ -822,6 +825,8 @@ mod cross {
             json!({"title": "by-ann", "author": ann, "tags": [bo, ann],
                    "links": [{"url": "https://a.test", "label": "x", "by": ann}, {"url": "https://b.test", "label": "y"}]}),
             json!({"title": "by-bo", "author": bo, "tags": [bo],
+                   "one": {"relationTo": "companies", "value": acme},
+                   "sections": [{"parts": [{"n": 1}, {"n": 7}]}],
                    "related": [{"relationTo": "companies", "value": ann_co}],
                    "links": [{"url": "https://a.test", "label": "y"}]}),
             json!({"title": "alone", "links": []}),
@@ -839,7 +844,6 @@ mod cross {
             posts: post_id,
             schemas: vec![companies, authors, posts],
             ann,
-            gone,
         }
     }
 
@@ -941,12 +945,10 @@ mod cross {
             titles_where(&pool, &w, "where[author.name][equals]=Gone").await,
             Vec::<String>::new()
         );
-        assert!(
-            titles_where(&pool, &w, "where[author.name][like]=")
-                .await
-                .contains(&"by-ann".to_owned())
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.name][like]=").await,
+            ["by-ann", "by-bo"]
         );
-        let _ = w.gone;
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -956,6 +958,24 @@ mod cross {
         assert_eq!(
             titles_where(&pool, &w, "where[related.name][equals]=Ann").await,
             ["by-bo"]
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn single_polymorphic_links_nested_lists_and_exists_through_links(pool: PgPool) {
+        let w = world(&pool).await;
+        assert_eq!(
+            titles_where(&pool, &w, "where[one.name][equals]=Acme").await,
+            ["by-bo"]
+        );
+        assert_eq!(
+            titles_where(&pool, &w, "where[sections.parts.n][gt]=5").await,
+            ["by-bo"]
+        );
+        // Bo has no company: a live author exists, but the field doesn't.
+        assert_eq!(
+            titles_where(&pool, &w, "where[author.company][exists]=true").await,
+            ["by-ann"]
         );
     }
 }

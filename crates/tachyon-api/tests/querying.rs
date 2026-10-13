@@ -407,6 +407,10 @@ async fn bad_cross_paths_are_400s(pool: PgPool) {
             "/api/posts?sort=author.name",
             "sort: `author.name` goes through a relationship and can't be sorted yet",
         ),
+        (
+            "/api/posts?where[author.id][like]=a",
+            "where[author.id][like]: like can't be used on this field",
+        ),
     ] {
         let res = send(&app, "GET", uri, None).await;
         assert_problem(&res, 400);

@@ -154,8 +154,12 @@ impl Target {
         matches!(self, Self::Via { .. } | Self::Row { .. })
     }
 
+    /// A built-in column (`id`, timestamps), here or at the end of a relationship.
     fn is_builtin(&self) -> bool {
-        matches!(self, Self::Id | Self::CreatedAt | Self::UpdatedAt)
+        matches!(
+            self.innermost(),
+            Self::Id | Self::CreatedAt | Self::UpdatedAt
+        )
     }
 }
 
@@ -530,6 +534,9 @@ fn resolve(
             _ => {}
         }
     }
+    if name.split('.').any(str::is_empty) {
+        return Err(format!("unknown field `{full}`"));
+    }
     let unknown = |segment: &str| match scope.collection {
         Some(slug) => format!("`{full}`: {slug} has no field `{segment}`"),
         None => format!("unknown field `{full}`"),
@@ -613,6 +620,12 @@ fn resolve(
                 has_many,
                 ..
             } if !last => {
+                if *has_many && (rest == "relationTo" || rest == "value") {
+                    let at = path.join(".");
+                    return Err(format!(
+                        "`{at}` holds several links; use where[{at}][contains] to match one"
+                    ));
+                }
                 let Some(lookup) = lookup else {
                     return Err(if verb == "sorted" {
                         format!("`{full}` goes through a relationship and can't be sorted yet")
@@ -648,8 +661,13 @@ fn resolve(
                         in_row: false,
                     };
                     let (inner, field) = resolve(&linked, &rest, full, verb, Some(lookup), hops)?;
-                    if let Some((first, seen, _)) = &found
-                        && *seen != inner
+                    let same_field = |a: &Option<Field>, b: &Option<Field>| match (a, b) {
+                        (Some(a), Some(b)) => crate::diff::same_type(&a.kind, &b.kind),
+                        (None, None) => true,
+                        _ => false,
+                    };
+                    if let Some((first, seen, seen_field)) = &found
+                        && (*seen != inner || !same_field(seen_field, &field))
                     {
                         return Err(format!(
                             "`{full}` means different things in {first} and {slug}"
@@ -1697,6 +1715,42 @@ mod tests {
             assert_eq!(
                 parse_sort(&posts(), "links.url").unwrap_err().to_string(),
                 "sort: `links.url` is inside a list and can't be sorted"
+            );
+        }
+
+        #[test]
+        fn trailing_dots_and_odd_sub_paths_are_named() {
+            assert_eq!(
+                filter("where[author.][equals]=x").unwrap_err(),
+                "where[author.][equals]: unknown field `author.`"
+            );
+            assert_eq!(
+                filter("where[tags.relationTo][equals]=authors").unwrap_err(),
+                "where[tags.relationTo][equals]: `tags` holds several links; use where[tags][contains] to match one"
+            );
+        }
+
+        #[test]
+        fn polymorphic_paths_need_the_same_field_type_in_every_target() {
+            let lookup = |slug: &str| match slug {
+                "a" => Some(schema(
+                    json!({"slug": "a", "fields": [{"name": "status", "type": "select", "options": ["on"]}]}),
+                )),
+                "b" => Some(schema(
+                    json!({"slug": "b", "fields": [{"name": "status", "type": "text"}]}),
+                )),
+                _ => None,
+            };
+            let fields: Vec<Field> = serde_json::from_value(json!([
+                {"name": "who", "type": "relationship", "relationTo": ["a", "b"]}
+            ]))
+            .unwrap();
+            let params = parse_query("where[who.status][equals]=x").unwrap();
+            assert_eq!(
+                parse_filter_with(&fields, &params["where"], &lookup)
+                    .unwrap_err()
+                    .to_string(),
+                "where[who.status][equals]: `who.status` means different things in a and b"
             );
         }
     }
