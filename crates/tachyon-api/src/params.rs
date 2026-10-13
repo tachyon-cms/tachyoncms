@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
-use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
+use tachyon_core::query::{Cursor, Filter, Sort, parse_filter_with, parse_query, parse_sort};
 use tachyon_core::schema::NEAR_IN_JOIN;
 use tachyon_core::select::{Select, parse_select};
 use tachyon_core::{CollectionKind, Field};
@@ -221,7 +221,8 @@ fn joins(
                 }
                 "where" => {
                     // `where[title][equals]` from the parser becomes `joins[posts][where][title][equals]`.
-                    let filter = parse_filter(target, value).map_err(|e| {
+                    let lookup = |slug: &str| schemas.lookup(slug);
+                    let filter = parse_filter_with(target, value, &lookup).map_err(|e| {
                         let rest = e.param.strip_prefix("where").unwrap_or(&e.param);
                         let hint = e.message.replace("where[", &format!("{param}["));
                         bad(format!("{param}{rest}: {hint}"))
@@ -283,7 +284,7 @@ pub(crate) fn list_params(
     };
     let filter = params
         .get("where")
-        .map(|w| parse_filter(fields, w))
+        .map(|w| parse_filter_with(fields, w, &|slug: &str| schemas.lookup(slug)))
         .transpose()
         .map_err(|e| bad(e.to_string()))?;
     let sort = single(&params, "sort")?

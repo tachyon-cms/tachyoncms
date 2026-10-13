@@ -449,3 +449,41 @@ async fn joins_through_lists_self_links_and_several_targets(pool: PgPool) {
         "through list rows with several targets"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn join_where_can_reach_through_relationships(pool: PgPool) {
+    let (app, news, _) = blog(pool).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/categories/{news}?joins[posts][where][author.name][equals]=Ann"),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(titles(&res.json["posts"]), ["c", "b", "a"]);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/categories/{news}?joins[posts][where][author.name][equals]=Nobody"),
+        None,
+    )
+    .await;
+    assert!(titles(&res.json["posts"]).is_empty());
+    // A join's schema where can reach through too.
+    let change = json!({"schema": {"slug": "categories", "fields": [
+        {"name": "name", "type": "text"},
+        {"name": "posts", "type": "join", "collection": "posts", "on": "category",
+         "where": {"author.name": {"equals": "Ann"}}}
+    ]}, "confirm": true});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/categories",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = send(&app, "GET", &format!("/api/categories/{news}"), None).await;
+    assert_eq!(titles(&res.json["posts"]), ["c", "b", "a"]);
+}

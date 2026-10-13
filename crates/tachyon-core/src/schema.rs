@@ -942,8 +942,19 @@ impl CollectionSchema {
                 )));
             }
             if let Some(w) = &j.r#where {
-                let filter = crate::query::parse_filter(target.data(), &Value::Object(w.clone()))
-                    .map_err(|e| invalid(e.to_string()))?;
+                let reach = |slug: &str| {
+                    if slug == self.slug {
+                        Some(self.clone())
+                    } else {
+                        lookup(slug).map(|s| s.borrow().clone())
+                    }
+                };
+                let filter = crate::query::parse_filter_with(
+                    target.data(),
+                    &Value::Object(w.clone()),
+                    &reach,
+                )
+                .map_err(|e| invalid(e.to_string()))?;
                 if filter.near().is_some() {
                     return Err(invalid(NEAR_IN_JOIN.into()));
                 }

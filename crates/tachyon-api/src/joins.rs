@@ -6,7 +6,7 @@ use std::sync::Arc;
 use serde_json::{Map, Value, json};
 use tachyon_core::CollectionKind;
 use tachyon_core::joins::{JoinField, on_pattern};
-use tachyon_core::query::{Filter, parse_filter, parse_sort};
+use tachyon_core::query::{Filter, parse_filter_with, parse_sort};
 use tachyon_core::select::{Select, project};
 use tachyon_db::collections::Collection;
 use tachyon_db::query::{self, JoinQuery};
@@ -63,7 +63,10 @@ fn plan(state: &AppState, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> 
         .filter(|t| t.schema.kind == CollectionKind::Collection)?;
     let pattern = on_pattern(target.schema.data(), &j.on)?;
     let schema_filter = match &j.r#where {
-        Some(w) => Some(parse_filter(target.schema.data(), &Value::Object(w.clone())).ok()?),
+        Some(w) => {
+            let lookup = |slug: &str| state.schemas.lookup(slug);
+            Some(parse_filter_with(target.schema.data(), &Value::Object(w.clone()), &lookup).ok()?)
+        }
         None => None,
     };
     // The schema's filter always applies; a request can only narrow it.
