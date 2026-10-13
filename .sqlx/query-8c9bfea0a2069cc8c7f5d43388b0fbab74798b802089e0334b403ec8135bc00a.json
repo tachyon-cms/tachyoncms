@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at)\n           VALUES ($1, $2, $3, 'published', $4, now())\n           RETURNING id, status, created_at, updated_at, published AS \"data!: Json<Map<String, Value>>\"",
+  "query": "UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3\n           RETURNING id, status, created_at, updated_at, published AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -64,7 +64,8 @@
         "Uuid",
         "Uuid",
         "Uuid",
-        "Jsonb"
+        "Jsonb",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -75,5 +76,5 @@
       true
     ]
   },
-  "hash": "1b0f05917fbbb7eb175654d42c12eff1045ad7b4d3a64bd2782280a5b122e982"
+  "hash": "8c9bfea0a2069cc8c7f5d43388b0fbab74798b802089e0334b403ec8135bc00a"
 }

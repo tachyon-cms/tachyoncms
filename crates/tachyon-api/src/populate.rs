@@ -279,6 +279,7 @@ mod tests {
         let state = AppState {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
         };
         let b = collections::create(&pool, &schema(json!({"slug": "b", "fields": []})))
             .await

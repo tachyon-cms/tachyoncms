@@ -33,6 +33,9 @@ pub enum DbError {
     /// A list request that can't be answered as asked.
     #[error("{0}")]
     InvalidQuery(&'static str),
+    /// The caller may only change documents they created, and this isn't one.
+    #[error("not the owner")]
+    NotOwner,
     /// The collection's schema changed after the caller validated against it.
     #[error("schema changed")]
     SchemaChanged,

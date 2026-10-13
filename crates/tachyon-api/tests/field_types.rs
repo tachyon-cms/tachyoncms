@@ -6,7 +6,7 @@ use sqlx::PgPool;
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn new_field_types_work_through_the_api(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let schema = json!({"slug": "recipes", "fields": [
         {"name": "title", "type": "text", "admin": {"description": "What's it called?"}},
         {"name": "course", "type": "radio", "options": [{"label": "Starter", "value": "starter"}, {"label": "Main", "value": "main"}]},
@@ -57,7 +57,7 @@ async fn new_field_types_work_through_the_api(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn layout_fields_end_to_end(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     let flat = json!({"slug": "pages", "fields": [{"name": "title", "type": "text"}, {"name": "rank", "type": "number"}]});
     assert_eq!(
         send(

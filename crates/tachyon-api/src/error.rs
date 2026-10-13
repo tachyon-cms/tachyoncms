@@ -10,6 +10,10 @@ pub enum ApiError {
     NotFound,
     MethodNotAllowed,
     BadRequest(String),
+    /// No credentials, or ones that don't work.
+    Unauthorized(String),
+    /// Credentials that work, for someone who may not do this.
+    Forbidden(String),
     BodyTooLarge,
     /// The request ran past its time limit.
     Timeout,
@@ -37,6 +41,9 @@ impl From<DbError> for ApiError {
                 "{n} other documents link to this one; remove those links first"
             )),
             DbError::InvalidQuery(message) => Self::BadRequest(message.to_owned()),
+            DbError::NotOwner => {
+                Self::Forbidden("You can only change documents you created.".into())
+            }
             DbError::SchemaChanged => Self::Conflict(
                 "This collection's fields just changed. Reload and try again.".into(),
             ),
@@ -66,6 +73,8 @@ impl IntoResponse for ApiError {
                 None,
             ),
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
+            Self::Unauthorized(d) => (StatusCode::UNAUTHORIZED, "Unauthorized", Some(d), None),
+            Self::Forbidden(d) => (StatusCode::FORBIDDEN, "Forbidden", Some(d), None),
             Self::BodyTooLarge => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Content too large",

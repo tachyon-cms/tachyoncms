@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE documents SET deleted_at = now() WHERE id = $1",
+  "query": "DELETE FROM sessions WHERE user_id = $1",
   "describe": {
     "columns": [],
     "parameters": {
@@ -10,5 +10,5 @@
     },
     "nullable": []
   },
-  "hash": "3a8c8be50bbfb19b178e0883a7814f03120dd4069fdcfdac07423b7d2e3cc258"
+  "hash": "e9ee477fc969775d4a868a773162a3d14a8bdb38cbdad2069ecea6b100bee629"
 }

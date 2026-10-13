@@ -6,6 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tachyon_core::auth::Action;
 use tachyon_core::diff::Renames;
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
@@ -14,6 +15,8 @@ use tachyon_db::collections::{self, Collection};
 use tachyon_db::indexes::reconcile_indexes;
 use tachyon_db::schema_change::{self, ChangeError};
 
+use crate::auth::authorize;
+use crate::auth::principal::Principal;
 use crate::documents::json_body;
 use crate::{ApiError, AppState};
 
@@ -46,7 +49,11 @@ fn log_index_failure(indexed: &Result<(), tachyon_db::DbError>, slug: &str) {
     }
 }
 
-pub async fn list(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
+pub async fn list(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<Value>, ApiError> {
+    principal.require()?;
     let docs: Vec<Value> = collections::list(&state.pool)
         .await?
         .iter()
@@ -57,8 +64,10 @@ pub async fn list(State(state): State<AppState>) -> Result<Json<Value>, ApiError
 
 pub async fn create(
     State(state): State<AppState>,
+    principal: Principal,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
+    authorize(&principal, Action::Schemas, "")?;
     let body = json_body(body)?;
     let schema = parse_schema(&body)?;
     for target in schema.relation_targets() {
@@ -85,8 +94,10 @@ pub async fn create(
 
 pub async fn get_one(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    principal.require()?;
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = state.schemas.get(&slug).ok_or(ApiError::NotFound)?;
     Ok(Json(to_json(&c)))
@@ -170,9 +181,11 @@ fn change_error(e: ChangeError) -> ApiError {
 
 pub async fn preview(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;
@@ -184,9 +197,11 @@ pub async fn preview(
 
 pub async fn update(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
+    authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;

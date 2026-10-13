@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (SELECT 1 FROM accounts WHERE user_id = $1) AS \"is!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "is!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "318432a17f15efb7019bbc93de6c60c9d2a46afbddfd921a5435bab00225ccb0"
+}

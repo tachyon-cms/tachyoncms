@@ -7,6 +7,7 @@ use axum::http::StatusCode;
 use serde_json::{Value, json};
 use std::sync::Arc;
 
+use tachyon_core::auth::Action;
 use tachyon_core::query::value_kind;
 use tachyon_core::select::{Select, project};
 use tachyon_core::{CollectionKind, FieldError, validate_document};
@@ -16,6 +17,8 @@ use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
+use crate::auth::principal::Principal;
+use crate::auth::{actor, authorize};
 use crate::joins::fill_joins;
 use crate::params::{Joins, list_params, read_params};
 use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
@@ -65,10 +68,12 @@ pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Valu
 
 pub async fn list(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
+    authorize(&principal, Action::Read, &slug)?;
     let c = collection(&state, &slug)?;
     let p = list_params(raw.as_deref(), &c, &state.schemas)?;
     let page = p.page.unwrap_or(1);
@@ -153,20 +158,23 @@ async fn respond(
 
 pub async fn create(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
+    let decision = authorize(&principal, Action::Create, &slug)?;
     let data = validate_document(c.schema.data(), &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
     let targets = link_targets(&state, &c).await?;
-    let doc = documents::insert(
+    let doc = documents::insert_as(
         &state.pool,
         c.id,
         c.schema_version,
         None,
         &prepare(&targets, &c, data)?,
+        actor(&principal, decision).map(|a| a.id),
     )
     .await
     .map_err(|e| unique_error(&c, e.into()))?;
@@ -175,10 +183,12 @@ pub async fn create(
 
 pub async fn get(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<(String, String)>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    authorize(&principal, Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let p = read_params(raw.as_deref(), &c, &state.schemas)?;
@@ -205,15 +215,18 @@ pub async fn get(
 
 pub async fn update(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    let decision = authorize(&principal, Action::Update, &slug)?;
     let patch = json_body(body)?;
     let targets = link_targets(&state, &c).await?;
-    let doc = documents::update(&state.pool, c.id, c.schema_version, id, |current| {
+    let who = actor(&principal, decision);
+    let doc = documents::update_as(&state.pool, c.id, c.schema_version, id, who, |current| {
         let data = validate_document(c.schema.data(), &patch, Some(current))
             .map_err(ApiError::Validation)?;
         prepare(&targets, &c, data)
@@ -225,20 +238,24 @@ pub async fn update(
 
 pub async fn delete(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    documents::delete(&state.pool, c.id, id).await?;
+    let decision = authorize(&principal, Action::Delete, &slug)?;
+    documents::delete_as(&state.pool, c.id, id, actor(&principal, decision)).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
 pub async fn references(
     State(state): State<AppState>,
+    principal: Principal,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    authorize(&principal, Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     documents::get(&state.pool, c.id, id).await?;

@@ -424,6 +424,31 @@ pub(crate) async fn guard_last_admin(
     Ok(())
 }
 
+/// When the document being deleted is a user: keeps the last Admin, and ends their sessions
+/// and API keys. Runs inside the delete's transaction. Other documents pass straight through.
+pub(crate) async fn before_removing(conn: &mut PgConnection, id: Uuid) -> Result<(), DbError> {
+    let is_account = sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM accounts WHERE user_id = $1) AS "is!""#,
+        id,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    if !is_account {
+        return Ok(());
+    }
+    guard_last_admin(conn, id, None).await?;
+    sqlx::query!("DELETE FROM sessions WHERE user_id = $1", id)
+        .execute(&mut *conn)
+        .await?;
+    sqlx::query!(
+        "UPDATE api_keys SET revoked_at = now() WHERE user_id = $1 AND revoked_at IS NULL",
+        id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
 /// Changes a user's role, never leaving the install without an Admin.
 pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;

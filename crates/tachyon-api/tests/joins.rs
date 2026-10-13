@@ -13,7 +13,7 @@ async fn create(app: &Router, url: &str, body: Value) -> Value {
 
 /// Categories that list their posts; `news` has posts a, b, c (oldest first), `guides` has g.
 async fn blog(pool: PgPool) -> (Router, String, String) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     create(
         &app,
         "/api/admin/collections",
@@ -382,7 +382,7 @@ async fn join_where_hints_and_near_are_explained(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn joins_through_lists_self_links_and_several_targets(pool: PgPool) {
-    let app = tachyon_api::router(pool).await.unwrap();
+    let app = common::admin_app(pool).await;
     create(
         &app,
         "/api/admin/collections",

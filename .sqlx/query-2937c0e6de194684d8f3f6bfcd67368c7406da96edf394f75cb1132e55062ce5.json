@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE documents SET deleted_at = now(), updated_by = COALESCE($2, updated_by) WHERE id = $1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "2937c0e6de194684d8f3f6bfcd67368c7406da96edf394f75cb1132e55062ce5"
+}
