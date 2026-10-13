@@ -200,7 +200,7 @@ mod tests {
             parse_filter(s.data(), &params["where"])
                 .unwrap_err()
                 .to_string(),
-            "where[authorName][equals]: `authorName` is read through a relationship and can't be filtered yet"
+            "where[authorName][equals]: `authorName` goes through a relationship; this filter can't look at other collections"
         );
         assert_eq!(
             parse_sort(s.data(), "authorName").unwrap_err().to_string(),

@@ -115,19 +115,47 @@ pub enum Target {
         path: Vec<String>,
         kind: ValueKind,
     },
+    /// Some document linked at `link` (of one of `collections`) matches `inner`, which is
+    /// read in that document.
+    Via {
+        link: Vec<String>,
+        many: bool,
+        polymorphic: bool,
+        collections: Vec<String>,
+        inner: Box<Target>,
+    },
+    /// Some row of the list at `list` matches `inner`, whose path is relative to the row.
+    Row {
+        list: Vec<String>,
+        inner: Box<Target>,
+    },
 }
 
 impl Target {
     pub fn kind(&self) -> ValueKind {
-        match self {
+        match self.innermost() {
             Self::Id => ValueKind::Text,
             Self::CreatedAt | Self::UpdatedAt => ValueKind::Date,
             Self::Field { kind, .. } => *kind,
+            Self::Via { .. } | Self::Row { .. } => unreachable!("innermost is never Via or Row"),
         }
     }
 
+    /// The target a value is finally compared with, inside any links and lists.
+    pub fn innermost(&self) -> &Target {
+        match self {
+            Self::Via { inner, .. } | Self::Row { inner, .. } => inner.innermost(),
+            other => other,
+        }
+    }
+
+    /// Reaches through a relationship or into a list.
+    pub fn is_nested(&self) -> bool {
+        matches!(self, Self::Via { .. } | Self::Row { .. })
+    }
+
     fn is_builtin(&self) -> bool {
-        !matches!(self, Self::Field { .. })
+        matches!(self, Self::Id | Self::CreatedAt | Self::UpdatedAt)
     }
 }
 
@@ -288,12 +316,36 @@ fn err(param: &str, message: impl Into<String>) -> FilterError {
     }
 }
 
-/// Parses the `where` subtree of a query into a filter checked against `fields`.
+/// Finds another collection's schema by slug, so a filter can reach through a relationship.
+pub type Lookup<'a> = &'a dyn Fn(&str) -> Option<crate::CollectionSchema>;
+
+/// The most relationships, and the most nested lists, one filter path may reach through.
+const MAX_HOPS: u8 = 3;
+
+/// Parses the `where` subtree of a query into a filter checked against `fields`. Paths
+/// can go into lists but not through relationships; see `parse_filter_with`.
 pub fn parse_filter(fields: &[Field], input: &Value) -> Result<Filter, FilterError> {
     let fields = data_fields(fields);
     Parser {
         fields: &fields,
         count: 0,
+        lookup: None,
+    }
+    .group(input, "where", 0)
+}
+
+/// `parse_filter`, with paths through relationships (`author.name`) resolved in the
+/// collections `lookup` finds.
+pub fn parse_filter_with(
+    fields: &[Field],
+    input: &Value,
+    lookup: Lookup<'_>,
+) -> Result<Filter, FilterError> {
+    let fields = data_fields(fields);
+    Parser {
+        fields: &fields,
+        count: 0,
+        lookup: Some(lookup),
     }
     .group(input, "where", 0)
 }
@@ -301,6 +353,7 @@ pub fn parse_filter(fields: &[Field], input: &Value) -> Result<Filter, FilterErr
 struct Parser<'a> {
     fields: &'a [Field],
     count: usize,
+    lookup: Option<Lookup<'a>>,
 }
 
 impl Parser<'_> {
@@ -377,11 +430,25 @@ impl Parser<'_> {
                 "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             )
         })?;
-        let (target, field) = resolve(self.fields, name, "filtered").map_err(|m| err(param, m))?;
-        if field.is_some_and(|f| f.virtual_path.is_some()) {
+        let (target, field) = resolve(
+            &Scope {
+                root: self.fields,
+                fields: self.fields,
+                collection: None,
+                in_row: false,
+            },
+            name,
+            name,
+            "filtered",
+            self.lookup,
+            Hops::default(),
+        )
+        .map_err(|m| err(param, m))?;
+        let field = field.as_ref();
+        if op == Op::Near && target.is_nested() {
             return Err(err(
                 param,
-                format!("`{name}` is read through a relationship and can't be filtered yet"),
+                "near can't be used through a relationship or into a list yet",
             ));
         }
         if !op.allowed(&target) {
@@ -409,7 +476,7 @@ impl Parser<'_> {
                 })?;
                 let values = items
                     .iter()
-                    .map(|v| scalar(&target, field, v))
+                    .map(|v| scalar(target.innermost(), field, v))
                     .collect::<Result<_, _>>()
                     .map_err(|m| err(param, m))?;
                 Operand::Many(values)
@@ -420,78 +487,208 @@ impl Parser<'_> {
                     .ok_or_else(|| err(param, "expected text"))?
                     .to_owned(),
             )),
-            _ => Operand::One(scalar(&target, field, operand).map_err(|m| err(param, m))?),
+            _ => {
+                Operand::One(scalar(target.innermost(), field, operand).map_err(|m| err(param, m))?)
+            }
         };
         Ok(Filter::Cond(Cond { target, op, value }))
     }
 }
 
-/// The target a field name points at. `verb` is what's being done with it, `filtered` or
-/// `sorted`, for the error when it can't be.
-fn resolve<'a>(
+/// Where a path is being resolved: `fields` at this level, `root` the top of the document
+/// (virtual fields name paths from there), `collection` its slug when it's a linked one.
+struct Scope<'a> {
+    root: &'a [Field],
     fields: &'a [Field],
+    collection: Option<&'a str>,
+    /// List rows have no `id` or timestamps of their own.
+    in_row: bool,
+}
+
+#[derive(Clone, Copy, Default)]
+struct Hops {
+    links: u8,
+    lists: u8,
+}
+
+/// The target `name` points at, and its innermost field (owned: it may live in another
+/// collection's schema). `full` is the whole path, for errors; `verb` is what's being done,
+/// `filtered` or `sorted`. Without a `lookup`, paths stop at relationships.
+fn resolve(
+    scope: &Scope<'_>,
     name: &str,
+    full: &str,
     verb: &str,
-) -> Result<(Target, Option<&'a Field>), String> {
-    match name {
-        "id" => return Ok((Target::Id, None)),
-        "createdAt" => return Ok((Target::CreatedAt, None)),
-        "updatedAt" => return Ok((Target::UpdatedAt, None)),
-        _ => {}
+    lookup: Option<Lookup<'_>>,
+    hops: Hops,
+) -> Result<(Target, Option<Field>), String> {
+    if !scope.in_row {
+        match name {
+            "id" => return Ok((Target::Id, None)),
+            "createdAt" => return Ok((Target::CreatedAt, None)),
+            "updatedAt" => return Ok((Target::UpdatedAt, None)),
+            _ => {}
+        }
     }
-    let mut current = fields;
+    let unknown = |segment: &str| match scope.collection {
+        Some(slug) => format!("`{full}`: {slug} has no field `{segment}`"),
+        None => format!("unknown field `{full}`"),
+    };
+    let mut current = scope.fields;
     let mut path = Vec::new();
-    let mut segments = name.split('.').peekable();
-    while let Some(segment) = segments.next() {
+    let segments: Vec<&str> = name.split('.').collect();
+    let mut i = 0;
+    while i < segments.len() {
+        let segment = segments[i];
         let f = current
             .iter()
             .find(|f| f.name == segment)
-            .ok_or_else(|| format!("unknown field `{name}`"))?;
+            .ok_or_else(|| unknown(segment))?;
         path.push(f.name.clone());
-        let last = segments.peek().is_none();
+        let rest = segments[i + 1..].join(".");
+        let last = rest.is_empty();
         match &f.kind {
-            FieldKind::Array { .. } if !last => {
-                return Err(format!(
-                    "`{name}` is inside a list; filtering inside lists isn't supported yet"
+            _ if last && f.virtual_path.is_some() => {
+                let source = f.virtual_path.as_deref().expect("checked above");
+                let root = Scope {
+                    root: scope.root,
+                    fields: scope.root,
+                    collection: scope.collection,
+                    in_row: false,
+                };
+                return resolve(&root, source, full, verb, lookup, hops);
+            }
+            FieldKind::Array { fields, .. } if !last => {
+                if hops.lists >= MAX_HOPS {
+                    return Err(format!(
+                        "`{full}` reaches into too many nested lists ({MAX_HOPS} at most)"
+                    ));
+                }
+                let inner_scope = Scope {
+                    root: scope.root,
+                    fields,
+                    collection: scope.collection,
+                    in_row: true,
+                };
+                let hops = Hops {
+                    lists: hops.lists + 1,
+                    ..hops
+                };
+                let (inner, field) = resolve(&inner_scope, &rest, full, verb, lookup, hops)?;
+                return Ok((
+                    Target::Row {
+                        list: path,
+                        inner: Box::new(inner),
+                    },
+                    field,
                 ));
             }
             FieldKind::Group { fields } if !last => current = fields,
-            // A polymorphic link is an object: filter its `value` (the default) or `relationTo`.
+            // A polymorphic link is an object: its `relationTo`, or its `value` (the default).
             FieldKind::Relationship {
                 relation_to,
                 has_many: false,
                 ..
-            } if relation_to.is_polymorphic() => {
-                let part = match segments.next() {
-                    None | Some("value") => "value",
-                    Some("relationTo") => "relationTo",
-                    Some(_) => return Err(format!("unknown field `{name}`")),
-                };
-                if segments.next().is_some() {
-                    return Err(format!("unknown field `{name}`"));
-                }
-                path.push(part.to_owned());
+            } if relation_to.is_polymorphic()
+                && (last || rest == "relationTo" || rest == "value") =>
+            {
+                path.push(
+                    if rest == "relationTo" {
+                        "relationTo"
+                    } else {
+                        "value"
+                    }
+                    .to_owned(),
+                );
                 return Ok((
                     Target::Field {
                         path,
                         kind: ValueKind::Text,
                     },
-                    Some(f),
+                    Some(f.clone()),
                 ));
             }
-            _ if !last => return Err(format!("unknown field `{name}`")),
+            FieldKind::Relationship {
+                relation_to,
+                has_many,
+                ..
+            } if !last => {
+                let Some(lookup) = lookup else {
+                    return Err(if verb == "sorted" {
+                        format!("`{full}` goes through a relationship and can't be sorted yet")
+                    } else {
+                        format!(
+                            "`{full}` goes through a relationship; this filter can't look at other collections"
+                        )
+                    });
+                };
+                if hops.links >= MAX_HOPS {
+                    return Err(format!(
+                        "`{full}` reaches through too many relationships ({MAX_HOPS} at most)"
+                    ));
+                }
+                // `who.value.name` reads the same as `who.name` for a polymorphic link.
+                let rest = match rest.strip_prefix("value.") {
+                    Some(r) if relation_to.is_polymorphic() => r.to_owned(),
+                    _ => rest,
+                };
+                let hops = Hops {
+                    links: hops.links + 1,
+                    ..hops
+                };
+                let mut found: Option<(String, Target, Option<Field>)> = None;
+                for slug in relation_to.targets() {
+                    let target = lookup(slug)
+                        .ok_or_else(|| format!("`{full}`: collection `{slug}` doesn't exist"))?;
+                    let data = target.data();
+                    let linked = Scope {
+                        root: data,
+                        fields: data,
+                        collection: Some(slug),
+                        in_row: false,
+                    };
+                    let (inner, field) = resolve(&linked, &rest, full, verb, Some(lookup), hops)?;
+                    if let Some((first, seen, _)) = &found
+                        && *seen != inner
+                    {
+                        return Err(format!(
+                            "`{full}` means different things in {first} and {slug}"
+                        ));
+                    }
+                    if found.is_none() {
+                        found = Some((slug.to_owned(), inner, field));
+                    }
+                }
+                let (_, inner, field) = found.expect("a relationship has at least one target");
+                return Ok((
+                    Target::Via {
+                        link: path,
+                        many: *has_many,
+                        polymorphic: relation_to.is_polymorphic(),
+                        collections: relation_to
+                            .targets()
+                            .iter()
+                            .map(|s| (*s).to_owned())
+                            .collect(),
+                        inner: Box::new(inner),
+                    },
+                    field,
+                ));
+            }
+            _ if !last => return Err(unknown(segment)),
             FieldKind::Join { .. } => {
                 return Err(format!(
-                    "`{name}` is filled from other documents and can't be {verb}"
+                    "`{full}` is filled from other documents and can't be {verb}"
                 ));
             }
             kind => {
-                let kind = value_kind(kind).ok_or_else(|| format!("`{name}` can't be {verb}"))?;
-                return Ok((Target::Field { path, kind }, Some(f)));
+                let kind = value_kind(kind).ok_or_else(|| format!("`{full}` can't be {verb}"))?;
+                return Ok((Target::Field { path, kind }, Some(f.clone())));
             }
         }
+        i += 1;
     }
-    Err(format!("unknown field `{name}`"))
+    Err(unknown(name))
 }
 
 /// `lng,lat[,maxDistance[,minDistance]]`, distances in metres.
@@ -636,11 +833,24 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         None => (input, false),
     };
     let fields = data_fields(fields);
-    let (target, field) = resolve(&fields, name, "sorted").map_err(|m| err("sort", m))?;
-    if field.is_some_and(|f| f.virtual_path.is_some()) {
+    if crate::schema::find_field(&fields, name).is_some_and(|f| f.virtual_path.is_some()) {
         return Err(err(
             "sort",
             format!("`{name}` is read through a relationship and can't be sorted yet"),
+        ));
+    }
+    let scope = Scope {
+        root: &fields,
+        fields: &fields,
+        collection: None,
+        in_row: false,
+    };
+    let (target, _) =
+        resolve(&scope, name, name, "sorted", None, Hops::default()).map_err(|m| err("sort", m))?;
+    if let Target::Row { .. } = target {
+        return Err(err(
+            "sort",
+            format!("`{name}` is inside a list and can't be sorted"),
         ));
     }
     if matches!(target.kind(), ValueKind::List | ValueKind::LinkList) {
@@ -937,8 +1147,8 @@ mod tests {
                 "where[seo][equals]: `seo` can't be filtered",
             ),
             (
-                "where[links.url][equals]=1",
-                "where[links.url][equals]: `links.url` is inside a list; filtering inside lists isn't supported yet",
+                "where[links.url][near]=0,0",
+                "where[links.url][near]: near can't be used through a relationship or into a list yet",
             ),
             (
                 "where[live][gt]=true",
@@ -1255,5 +1465,239 @@ mod tests {
             parse_sort(&fields(), "data").unwrap_err().to_string(),
             "sort: `data` can't be sorted"
         );
+    }
+
+    mod cross {
+        use super::*;
+        use crate::CollectionSchema;
+
+        fn schema(v: Value) -> CollectionSchema {
+            serde_json::from_value(v).unwrap()
+        }
+
+        fn lookup(slug: &str) -> Option<CollectionSchema> {
+            match slug {
+                "authors" => Some(schema(json!({"slug": "authors", "fields": [
+                    {"name": "name", "type": "text"},
+                    {"name": "age", "type": "number"},
+                    {"name": "company", "type": "relationship", "relationTo": "companies"}
+                ]}))),
+                "companies" => Some(schema(json!({"slug": "companies", "fields": [
+                    {"name": "name", "type": "text"},
+                    {"name": "owner", "type": "relationship", "relationTo": "authors"}
+                ]}))),
+                "guests" => Some(schema(json!({"slug": "guests", "fields": [
+                    {"name": "name", "type": "text"}
+                ]}))),
+                "pets" => Some(schema(json!({"slug": "pets", "fields": [
+                    {"name": "age", "type": "text"}
+                ]}))),
+                _ => None,
+            }
+        }
+
+        fn posts() -> Vec<Field> {
+            serde_json::from_value(json!([
+                {"name": "title", "type": "text"},
+                {"name": "author", "type": "relationship", "relationTo": "authors"},
+                {"name": "tags", "type": "relationship", "relationTo": "authors", "hasMany": true},
+                {"name": "who", "type": "relationship", "relationTo": ["authors", "guests"]},
+                {"name": "odd", "type": "relationship", "relationTo": ["authors", "pets"]},
+                {"name": "authorName", "type": "text", "virtual": "author.name"},
+                {"name": "links", "type": "array", "fields": [
+                    {"name": "url", "type": "url"},
+                    {"name": "by", "type": "relationship", "relationTo": "authors"},
+                    {"name": "parts", "type": "array", "fields": [{"name": "n", "type": "number"}]}
+                ]}
+            ]))
+            .unwrap()
+        }
+
+        fn filter(qs: &str) -> Result<Filter, String> {
+            let params = parse_query(qs).unwrap();
+            parse_filter_with(&posts(), &params["where"], &lookup).map_err(|e| e.to_string())
+        }
+
+        fn target(qs: &str) -> Target {
+            match filter(qs).unwrap() {
+                Filter::Cond(c) => c.target,
+                other => panic!("{other:?}"),
+            }
+        }
+
+        fn via(
+            link: &str,
+            many: bool,
+            polymorphic: bool,
+            collections: &[&str],
+            inner: Target,
+        ) -> Target {
+            Target::Via {
+                link: link.split('.').map(str::to_owned).collect(),
+                many,
+                polymorphic,
+                collections: collections.iter().map(|s| (*s).to_owned()).collect(),
+                inner: Box::new(inner),
+            }
+        }
+
+        fn row(list: &str, inner: Target) -> Target {
+            Target::Row {
+                list: list.split('.').map(str::to_owned).collect(),
+                inner: Box::new(inner),
+            }
+        }
+
+        #[test]
+        fn paths_through_relationships_resolve_to_via() {
+            assert_eq!(
+                target("where[author.name][equals]=Ann"),
+                via(
+                    "author",
+                    false,
+                    false,
+                    &["authors"],
+                    field("name", ValueKind::Text)
+                )
+            );
+            assert_eq!(
+                target("where[tags.age][gt]=3"),
+                via(
+                    "tags",
+                    true,
+                    false,
+                    &["authors"],
+                    field("age", ValueKind::Number)
+                )
+            );
+            assert_eq!(
+                target("where[author.company.name][equals]=Acme"),
+                via(
+                    "author",
+                    false,
+                    false,
+                    &["authors"],
+                    via(
+                        "company",
+                        false,
+                        false,
+                        &["companies"],
+                        field("name", ValueKind::Text)
+                    )
+                )
+            );
+            assert_eq!(
+                target("where[author.createdAt][gt]=2026-01-01T00:00:00Z"),
+                via("author", false, false, &["authors"], Target::CreatedAt)
+            );
+            assert_eq!(
+                target("where[who.name][like]=a"),
+                via(
+                    "who",
+                    false,
+                    true,
+                    &["authors", "guests"],
+                    field("name", ValueKind::Text)
+                )
+            );
+            assert_eq!(
+                target("where[who.value.name][like]=a"),
+                via(
+                    "who",
+                    false,
+                    true,
+                    &["authors", "guests"],
+                    field("name", ValueKind::Text)
+                )
+            );
+            assert_eq!(
+                target("where[who.relationTo][equals]=guests"),
+                field("who.relationTo", ValueKind::Text)
+            );
+        }
+
+        #[test]
+        fn paths_into_lists_resolve_to_row() {
+            assert_eq!(
+                target("where[links.url][like]=docs"),
+                row("links", field("url", ValueKind::Text))
+            );
+            assert_eq!(
+                target("where[links.parts.n][gt]=1"),
+                row("links", row("parts", field("n", ValueKind::Number)))
+            );
+            assert_eq!(
+                target("where[links.by.name][equals]=Ann"),
+                row(
+                    "links",
+                    via(
+                        "by",
+                        false,
+                        false,
+                        &["authors"],
+                        field("name", ValueKind::Text)
+                    )
+                )
+            );
+        }
+
+        #[test]
+        fn virtual_fields_filter_as_their_source() {
+            assert_eq!(
+                target("where[authorName][equals]=Ann"),
+                target("where[author.name][equals]=Ann")
+            );
+        }
+
+        #[test]
+        fn polymorphic_paths_need_every_target_to_have_the_field() {
+            assert_eq!(
+                filter("where[who.age][gt]=1").unwrap_err(),
+                "where[who.age][gt]: `who.age`: guests has no field `age`"
+            );
+            assert_eq!(
+                filter("where[odd.age][equals]=1").unwrap_err(),
+                "where[odd.age][equals]: `odd.age` means different things in authors and pets"
+            );
+        }
+
+        #[test]
+        fn too_many_hops_and_near_through_links_are_refused() {
+            assert_eq!(
+                filter("where[author.company.owner.company.name][equals]=x").unwrap_err(),
+                "where[author.company.owner.company.name][equals]: `author.company.owner.company.name` reaches through too many relationships (3 at most)"
+            );
+            assert!(
+                filter("where[author.company.owner.name][equals]=x").is_ok(),
+                "3 hops is fine"
+            );
+            assert_eq!(
+                filter("where[author.nope][equals]=x").unwrap_err(),
+                "where[author.nope][equals]: `author.nope`: authors has no field `nope`"
+            );
+        }
+
+        #[test]
+        fn without_a_lookup_relationship_paths_explain_themselves() {
+            let params = parse_query("where[author.name][equals]=Ann").unwrap();
+            assert_eq!(
+                parse_filter(&posts(), &params["where"])
+                    .unwrap_err()
+                    .to_string(),
+                "where[author.name][equals]: `author.name` goes through a relationship; this filter can't look at other collections"
+            );
+        }
+
+        #[test]
+        fn sorting_through_relationships_and_lists_is_refused() {
+            assert_eq!(
+                parse_sort(&posts(), "author.name").unwrap_err().to_string(),
+                "sort: `author.name` goes through a relationship and can't be sorted yet"
+            );
+            assert_eq!(
+                parse_sort(&posts(), "links.url").unwrap_err().to_string(),
+                "sort: `links.url` is inside a list and can't be sorted"
+            );
+        }
     }
 }
