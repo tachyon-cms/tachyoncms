@@ -85,9 +85,20 @@ pub(crate) async fn fill_virtuals(
     items: &mut [(Value, Arc<Collection>)],
     select: Option<&Select>,
 ) -> Result<(), ApiError> {
+    let selects = vec![select; items.len()];
+    fill_virtuals_each(state, items, &selects).await
+}
+
+/// `fill_virtuals` where each document has its own `select`, still in one query.
+async fn fill_virtuals_each(
+    state: &AppState,
+    items: &mut [(Value, Arc<Collection>)],
+    selects: &[Option<&Select>],
+) -> Result<(), ApiError> {
     let wanted: Vec<Vec<VirtualField>> = items
         .iter()
-        .map(|(_, c)| {
+        .zip(selects)
+        .map(|((_, c), select)| {
             c.schema
                 .virtual_fields()
                 .into_iter()
@@ -124,25 +135,24 @@ pub(crate) async fn fill_virtuals(
 /// `populate[collection]` choices: how documents of each collection look when populated.
 pub(crate) type Shapes = HashMap<String, Select>;
 
-/// Cuts a populated document down by `populate[its collection]`, or else by its
-/// collection's `defaultPopulate`.
-fn shape_child(c: &Collection, shapes: &Shapes, value: &mut Value) {
-    let Value::Object(doc) = value else { return };
+/// How a populated document of `c` is cut down: `populate[its collection]`, or else its
+/// collection's `defaultPopulate`, or not at all.
+// ponytail: defaultPopulate is parsed per populated document; cache the parsed Select on the
+// collection if it shows up in a profile.
+fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     if let Some(select) = shapes.get(&c.schema.slug) {
-        project(select, doc);
-    } else if let Some(dp) = &c.schema.default_populate {
-        // Checked when the schema was saved, so this only fails on a hand-edited row.
-        if let Ok(select) = parse_select(
-            c.schema.data(),
-            &Value::Object(dp.clone()),
-            "defaultPopulate",
-        ) {
-            project(&select, doc);
-        }
+        return Some(select.clone());
     }
+    let dp = c.schema.default_populate.as_ref()?;
+    // Checked when the schema was saved, so this only fails on a hand-edited row.
+    parse_select(
+        c.schema.data(),
+        &Value::Object(dp.clone()),
+        "defaultPopulate",
+    )
+    .ok()
 }
 
-/// Replaces relationship IDs with the documents they point at, `depth` levels deep.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
     docs: Vec<(Value, Arc<Collection>)>,
@@ -207,17 +217,28 @@ fn populate_each<'a>(
                 child_keys.push(key);
             }
         }
-        // Populated documents show their virtual fields too, before their shape applies.
-        let mut pairs: Vec<(Value, Arc<Collection>)> = fetched
+        // Populated documents show their virtual fields too (those their shape keeps),
+        // then take that shape.
+        let shapes_of: Vec<Option<Select>> = fetched
             .iter()
-            .map(|(v, c, _)| (v.clone(), c.clone()))
+            .map(|(_, c, _)| child_shape(c, shapes))
             .collect();
-        fill_virtuals(state, &mut pairs, None).await?;
+        let mut pairs = Vec::with_capacity(fetched.len());
+        let mut depths = Vec::with_capacity(fetched.len());
+        for (value, c, remaining) in fetched {
+            pairs.push((value, c));
+            depths.push(remaining);
+        }
+        let refs: Vec<Option<&Select>> = shapes_of.iter().map(Option::as_ref).collect();
+        fill_virtuals_each(state, &mut pairs, &refs).await?;
         let children: Vec<(Value, Arc<Collection>, u8)> = pairs
             .into_iter()
-            .zip(fetched)
-            .map(|((mut value, c), (_, _, remaining))| {
-                shape_child(&c, shapes, &mut value);
+            .zip(shapes_of)
+            .zip(depths)
+            .map(|(((mut value, c), shape), remaining)| {
+                if let (Some(select), Value::Object(doc)) = (&shape, &mut value) {
+                    project(select, doc);
+                }
                 (value, c, remaining)
             })
             .collect();

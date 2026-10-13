@@ -241,4 +241,100 @@ mod tests {
             json!({"title": "T"})
         );
     }
+
+    fn orgs() -> CollectionSchema {
+        schema(json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "tags", "type": "text", "hasMany": true},
+            {"name": "colour", "type": "select", "options": ["red"], "multiple": true},
+            {"name": "rows", "type": "array", "fields": [{"name": "label", "type": "text"}]},
+            {"name": "about", "type": "textarea"}
+        ]}))
+    }
+
+    #[test]
+    fn slugs_cant_be_virtual() {
+        assert_eq!(
+            check(json!({"name": "v", "type": "slug", "from": "title", "virtual": "author.name"})),
+            "field `v`: slug fields can't be virtual; a slug is stored so it can stay unique"
+        );
+    }
+
+    #[test]
+    fn virtual_targets_must_hold_the_same_shape() {
+        let lookup = |slug: &str| (slug == "authors").then(orgs);
+        let ok = posts(json!({"name": "v", "type": "text", "virtual": "author.about"}));
+        assert_eq!(
+            ok.check_virtual_targets(lookup),
+            Ok(()),
+            "text reads textarea: same stored shape"
+        );
+        for (field, message) in [
+            (
+                json!({"name": "v", "type": "text", "virtual": "author.tags"}),
+                "field `v`: authors.tags is a list of text, which a text field can't hold",
+            ),
+            (
+                json!({"name": "v", "type": "select", "options": ["red"], "virtual": "author.colour"}),
+                "field `v`: authors.colour is a list of select values, which a select field can't hold",
+            ),
+            (
+                json!({"name": "v", "type": "text", "virtual": "author.rows.label"}),
+                "field `v`: authors.rows.label is inside a list, so it can't be read",
+            ),
+        ] {
+            let s = posts(field);
+            assert_eq!(s.check(), Ok(()));
+            assert_eq!(
+                s.check_virtual_targets(lookup).unwrap_err().to_string(),
+                message
+            );
+        }
+    }
+
+    #[test]
+    fn null_virtual_and_default_populate_mean_none() {
+        let input = json!({"slug": "posts", "defaultPopulate": null, "fields": [
+            {"name": "title", "type": "text", "virtual": null}
+        ]});
+        let s = schema(input.clone());
+        assert_eq!(s.reject_unknown_options(&input), Ok(()));
+        assert_eq!(s.fields[0].virtual_path, None);
+    }
+
+    #[test]
+    fn renaming_a_field_while_making_it_virtual_reports_both() {
+        let stored = posts(json!({"name": "old", "type": "text"}));
+        let virt = posts(json!({"name": "authorName", "type": "text", "virtual": "author.name"}));
+        let renames: Renames = [("old".to_owned(), "authorName".to_owned())]
+            .into_iter()
+            .collect();
+        let d = diff(&stored, &virt, &renames).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Renamed {
+                    from: "old".into(),
+                    to: "authorName".into()
+                },
+                Change::TypeChanged {
+                    path: "authorName".into(),
+                    from: "text",
+                    to: "virtual"
+                },
+            ]
+        );
+    }
+
+    #[test]
+    fn globals_cant_have_default_populate() {
+        let g = schema(
+            json!({"slug": "settings", "kind": "global", "defaultPopulate": {"name": true},
+                             "fields": [{"name": "name", "type": "text"}]}),
+        );
+        assert_eq!(
+            g.check().unwrap_err().to_string(),
+            "defaultPopulate: globals are never populated, so they can't have one"
+        );
+    }
 }

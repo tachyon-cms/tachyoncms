@@ -200,6 +200,12 @@ fn compare(
             });
             continue;
         };
+        if renamed {
+            out.push(Change::Renamed {
+                from: old_path.clone(),
+                to: new_path.clone(),
+            });
+        }
         // A stored field turned virtual: what it stored goes.
         if o.virtual_path.is_none() && n.virtual_path.is_some() {
             out.push(Change::TypeChanged {
@@ -208,12 +214,6 @@ fn compare(
                 to: "virtual",
             });
             continue;
-        }
-        if renamed {
-            out.push(Change::Renamed {
-                from: old_path.clone(),
-                to: new_path.clone(),
-            });
         }
         match (&o.kind, &n.kind) {
             (FieldKind::Group { fields: a }, FieldKind::Group { fields: b })
@@ -326,7 +326,7 @@ fn options_ignoring_targets(f: &Field) -> Field {
     f
 }
 
-fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
+pub(crate) fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
     use FieldKind::{Code, Number, Radio, Select, Text, Textarea};
     match (a, b) {
         // Turning `hasMany` on or off changes the stored shape.

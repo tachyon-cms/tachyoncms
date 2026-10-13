@@ -20,11 +20,7 @@ pub struct CollectionSchema {
     pub kind: CollectionKind,
     pub fields: Vec<Field>,
     /// What other collections get when they populate a link to this one, as a `select`.
-    #[serde(
-        default,
-        rename = "defaultPopulate",
-        skip_serializing_if = "Option::is_none"
-    )]
+    #[serde(default, rename = "defaultPopulate")]
     pub default_populate: Option<Map<String, Value>>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
@@ -80,7 +76,7 @@ pub struct Field {
     #[serde(default, deserialize_with = "null_as_default")]
     pub admin: Admin,
     /// Read through a relationship instead of stored, such as `author.name`.
-    #[serde(default, rename = "virtual", skip_serializing_if = "Option::is_none")]
+    #[serde(default, rename = "virtual")]
     pub virtual_path: Option<String>,
     #[serde(flatten)]
     pub kind: FieldKind,
@@ -513,6 +509,9 @@ fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result
     if in_list {
         return Err("virtual fields can't be inside a list yet".into());
     }
+    if matches!(f.kind, FieldKind::Slug { .. }) {
+        return Err("slug fields can't be virtual; a slug is stored so it can stay unique".into());
+    }
     if matches!(
         f.kind,
         FieldKind::Group { .. } | FieldKind::Array { .. } | FieldKind::Relationship { .. }
@@ -550,6 +549,32 @@ fn split_virtual<'a>(root: &'a [Field], path: &str) -> Option<(&'a Field, String
         }
     }
     None
+}
+
+enum ReadError {
+    Missing,
+    InList,
+}
+
+/// The field a virtual reads, through groups only: a value inside a list has no one place.
+fn read_field<'a>(fields: &'a [Field], path: &str) -> Result<&'a Field, ReadError> {
+    let mut current = fields;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let f = current
+            .iter()
+            .find(|f| f.name == segment)
+            .ok_or(ReadError::Missing)?;
+        if segments.peek().is_none() {
+            return Ok(f);
+        }
+        current = match &f.kind {
+            FieldKind::Group { fields } => fields,
+            FieldKind::Array { .. } => return Err(ReadError::InList),
+            _ => return Err(ReadError::Missing),
+        };
+    }
+    Err(ReadError::Missing)
 }
 
 /// A field whose value is read through a relationship.
@@ -841,23 +866,41 @@ impl CollectionSchema {
                     None if slug == self.slug => self,
                     None => continue,
                 };
-                let Some(read) = find_field(target.data(), &v.read) else {
-                    return Err(invalid(format!("{slug} has no field `{}` to read", v.read)));
-                };
+                let read = read_field(target.data(), &v.read).map_err(|e| {
+                    invalid(match e {
+                        ReadError::Missing => format!("{slug} has no field `{}` to read", v.read),
+                        ReadError::InList => {
+                            format!("{slug}.{} is inside a list, so it can't be read", v.read)
+                        }
+                    })
+                })?;
                 if read.virtual_path.is_some() {
                     return Err(invalid(format!(
                         "{slug}.{} is itself virtual; read the field it reads",
                         v.read
                     )));
                 }
-                if read.kind.name() != field.kind.name() {
-                    return Err(invalid(format!(
-                        "{slug}.{} is a {} field, but {} is a {} field",
-                        v.read,
-                        read.kind.name(),
-                        field.name,
-                        field.kind.name()
-                    )));
+                if !crate::diff::same_type(&read.kind, &field.kind) {
+                    let list_of = match &read.kind {
+                        FieldKind::Text { has_many: true, .. } => Some("text"),
+                        FieldKind::Number { has_many: true, .. } => Some("numbers"),
+                        FieldKind::Select { multiple: true, .. } => Some("select values"),
+                        _ => None,
+                    };
+                    return Err(invalid(match list_of {
+                        Some(what) => format!(
+                            "{slug}.{} is a list of {what}, which a {} field can't hold",
+                            v.read,
+                            field.kind.name()
+                        ),
+                        None => format!(
+                            "{slug}.{} is a {} field, but {} is a {} field",
+                            v.read,
+                            read.kind.name(),
+                            field.name,
+                            field.kind.name()
+                        ),
+                    }));
                 }
             }
         }
@@ -870,6 +913,9 @@ impl CollectionSchema {
         let mut v = serde_json::to_value(self).expect("schemas always serialize");
         if let Some(fields) = v.get_mut("fields") {
             compact_fields(fields);
+        }
+        if let Value::Object(top) = &mut v {
+            top.retain(|_, value| !value.is_null());
         }
         v
     }
@@ -913,6 +959,11 @@ impl CollectionSchema {
         let data = self.data();
         check_layout(&self.fields, data, "fields", "")?;
         check_fields(data, true, data, "", false)?;
+        if self.default_populate.is_some() && self.kind == CollectionKind::Global {
+            return Err(SchemaError::InvalidOption(
+                "defaultPopulate: globals are never populated, so they can't have one".into(),
+            ));
+        }
         if let Some(dp) = &self.default_populate {
             crate::select::parse_select(data, &Value::Object(dp.clone()), "defaultPopulate")
                 .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;

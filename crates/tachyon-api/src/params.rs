@@ -88,7 +88,9 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
             .filter(|c| c.schema.kind == CollectionKind::Collection)
             .ok_or_else(|| bad(format!("populate[{slug}]: no such collection")))?;
         if !tree.is_object() {
-            return Err(shape());
+            return Err(bad(format!(
+                "populate[{slug}]: expected populate[{slug}][field]=true"
+            )));
         }
         let select = parse_select(c.schema.data(), tree, &format!("populate[{slug}]"))
             .map_err(|e| bad(e.to_string()))?;

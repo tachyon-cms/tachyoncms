@@ -478,6 +478,15 @@ async fn virtual_fields_in_populated_documents(pool: PgPool) {
     let id = list.json["id"].as_str().unwrap();
     let res = send(&app, "GET", &format!("/api/lists/{id}"), None).await;
     assert_eq!(res.json["post"]["authorName"], "Ann", "{}", res.json);
+    let shaped = send(
+        &app,
+        "GET",
+        &format!("/api/lists/{id}?populate[posts][authorName]=true"),
+        None,
+    )
+    .await;
+    let keys: Vec<&String> = shaped.json["post"].as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["authorName", "id"], "{}", shaped.json);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -551,4 +560,71 @@ async fn virtual_targets_must_have_the_field(pool: PgPool) {
     )
     .await;
     assert_problem(&res, 422);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtuals_skip_deleted_documents_and_fill_inside_groups(pool: PgPool) {
+    let app = tachyon_api::router(pool.clone()).await.unwrap();
+    for schema in [
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+        json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "people", "type": "relationship", "relationTo": "authors", "hasMany": true},
+            {"name": "meta", "type": "group", "fields": [
+                {"name": "by", "type": "text", "virtual": "author.name"}
+            ]},
+            {"name": "names", "type": "text", "virtual": "people.name"}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let ann = send(&app, "POST", "/api/authors", Some(r#"{"name": "Ann"}"#)).await;
+    let bo = send(&app, "POST", "/api/authors", Some(r#"{"name": "Bo"}"#)).await;
+    let body = json!({"author": ann.json["id"], "people": [ann.json["id"], bo.json["id"]]});
+    let post = send(&app, "POST", "/api/posts", Some(&body.to_string())).await;
+    assert_eq!(
+        post.json["meta"]["by"], "Ann",
+        "a virtual inside a group: {}",
+        post.json
+    );
+
+    // Deleted behind the API's back (deleting through it is refused while linked).
+    sqlx::query("UPDATE documents SET deleted_at = now() WHERE id = $1")
+        .bind(uuid::Uuid::parse_str(ann.json["id"].as_str().unwrap()).unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let id = post.json["id"].as_str().unwrap();
+    let res = send(&app, "GET", &format!("/api/posts/{id}"), None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert!(
+        res.json.get("meta").and_then(|m| m.get("by")).is_none(),
+        "{}",
+        res.json
+    );
+    assert_eq!(res.json["names"], json!(["Bo"]));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn populate_without_fields_names_the_collection(pool: PgPool) {
+    let (app, post) = blog(pool, None).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/posts/{post}?populate[authors]=true"),
+        None,
+    )
+    .await;
+    assert_problem(&res, 400);
+    assert_eq!(
+        res.json["detail"],
+        "populate[authors]: expected populate[authors][field]=true"
+    );
 }
