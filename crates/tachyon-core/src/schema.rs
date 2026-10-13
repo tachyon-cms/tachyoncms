@@ -82,6 +82,19 @@ pub struct Field {
     pub kind: FieldKind,
 }
 
+/// A join's `where`: an object of conditions, or nothing.
+fn object_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Map<String, Value>>, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        Value::Object(o) => Ok(Some(o)),
+        _ => Err(serde::de::Error::custom(
+            "where must be an object like {\"draft\": {\"equals\": \"false\"}}",
+        )),
+    }
+}
+
 /// `null` reads as the default, like a missing key.
 fn null_as_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(
     d: D,
@@ -214,6 +227,18 @@ pub enum FieldKind {
         max_depth: Option<u8>,
     },
     Json,
+    /// The documents of `collection` whose `on` relationship links here. Read, not stored.
+    Join {
+        collection: String,
+        on: String,
+        /// Always applied, on top of any filter a request adds.
+        #[serde(default, deserialize_with = "object_or_none")]
+        r#where: Option<Map<String, Value>>,
+        #[serde(default)]
+        default_limit: Option<u8>,
+        #[serde(default)]
+        default_sort: Option<String>,
+    },
     Group {
         fields: Vec<Field>,
     },
@@ -514,7 +539,10 @@ fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result
     }
     if matches!(
         f.kind,
-        FieldKind::Group { .. } | FieldKind::Array { .. } | FieldKind::Relationship { .. }
+        FieldKind::Group { .. }
+            | FieldKind::Array { .. }
+            | FieldKind::Relationship { .. }
+            | FieldKind::Join { .. }
     ) || f.kind.is_layout()
     {
         return Err(format!(
@@ -575,6 +603,24 @@ fn read_field<'a>(fields: &'a [Field], path: &str) -> Result<&'a Field, ReadErro
         };
     }
     Err(ReadError::Missing)
+}
+
+/// Joins page by their own sort, so a filter whose results only make sense nearest-first
+/// doesn't fit them yet.
+pub const NEAR_IN_JOIN: &str =
+    "joins can't be ordered by distance yet, so `near` isn't allowed in their where";
+
+/// A join field: the documents of `collection` whose `on` relationship links here.
+#[derive(Debug, Clone, PartialEq)]
+pub struct JoinField {
+    /// Where the value goes, such as `posts` or `meta.posts`.
+    pub path: String,
+    pub name: String,
+    pub collection: String,
+    pub on: String,
+    pub r#where: Option<Map<String, Value>>,
+    pub limit: u8,
+    pub sort: Option<String>,
 }
 
 /// A field whose value is read through a relationship.
@@ -764,6 +810,7 @@ impl FieldKind {
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
             Self::Json => "json",
+            Self::Join { .. } => "join",
             Self::Group { .. } => "group",
             Self::Array { .. } => "array",
             Self::Row { .. } => "row",
@@ -790,6 +837,7 @@ impl FieldKind {
             } => !has_many && !relation_to.is_polymorphic(),
             Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
+            | Self::Join { .. }
             | Self::Group { .. }
             | Self::Array { .. }
             | Self::Row { .. }
@@ -812,6 +860,100 @@ impl CollectionSchema {
     pub fn data(&self) -> &[Field] {
         self.data
             .get_or_init(|| data_fields(&self.fields).into_owned())
+    }
+
+    /// Every join field, with how to find its documents.
+    pub fn join_fields(&self) -> Vec<JoinField> {
+        fn walk(fields: &[Field], prefix: &str, out: &mut Vec<JoinField>) {
+            for f in fields {
+                let path = join(prefix, &f.name);
+                match &f.kind {
+                    FieldKind::Join {
+                        collection,
+                        on,
+                        r#where,
+                        default_limit,
+                        default_sort,
+                    } => out.push(JoinField {
+                        path,
+                        name: f.name.clone(),
+                        collection: collection.clone(),
+                        on: on.clone(),
+                        r#where: r#where.clone(),
+                        limit: default_limit.unwrap_or(10),
+                        sort: default_sort.clone(),
+                    }),
+                    FieldKind::Group { fields } => walk(fields, &path, out),
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.data(), "", &mut out);
+        out
+    }
+
+    /// Checks each join's collection exists, its `on` field links here, and its default
+    /// filter and sort fit that collection. `lookup` finds other collections.
+    pub fn check_join_targets<S: std::borrow::Borrow<CollectionSchema>>(
+        &self,
+        lookup: impl Fn(&str) -> Option<S>,
+    ) -> Result<(), SchemaError> {
+        for j in self.join_fields() {
+            let invalid = |message: String| SchemaError::InvalidField {
+                field: j.name.clone(),
+                message,
+            };
+            let found = if j.collection == self.slug {
+                None
+            } else {
+                lookup(&j.collection)
+            };
+            let target: &CollectionSchema = match &found {
+                Some(s) => s.borrow(),
+                None if j.collection == self.slug => self,
+                None => {
+                    return Err(invalid(format!(
+                        "collection `{}` doesn't exist",
+                        j.collection
+                    )));
+                }
+            };
+            if target.kind != CollectionKind::Collection {
+                return Err(invalid(format!(
+                    "collection `{}` doesn't exist",
+                    j.collection
+                )));
+            }
+            let slug = &j.collection;
+            let Some(on) = find_field(target.data(), &j.on) else {
+                return Err(invalid(format!("{slug} has no field `{}`", j.on)));
+            };
+            let FieldKind::Relationship { relation_to, .. } = &on.kind else {
+                return Err(invalid(format!(
+                    "{slug}.{} isn't a relationship field",
+                    j.on
+                )));
+            };
+            if !relation_to.allows(&self.slug) {
+                return Err(invalid(format!(
+                    "{slug}.{} links to {relation_to}, not {}",
+                    j.on, self.slug
+                )));
+            }
+            if let Some(w) = &j.r#where {
+                let filter = crate::query::parse_filter(target.data(), &Value::Object(w.clone()))
+                    .map_err(|e| invalid(e.to_string()))?;
+                if filter.near().is_some() {
+                    return Err(invalid(NEAR_IN_JOIN.into()));
+                }
+            }
+            if let Some(sort) = &j.sort {
+                crate::query::parse_sort(target.data(), sort)
+                    .map_err(|e| invalid(e.to_string()))?;
+            }
+        }
+        Ok(())
     }
 
     /// Every virtual field, with where it reads from.
@@ -959,6 +1101,14 @@ impl CollectionSchema {
         let data = self.data();
         check_layout(&self.fields, data, "fields", "")?;
         check_fields(data, true, data, "", false)?;
+        if self.kind == CollectionKind::Global
+            && let Some(j) = self.join_fields().first()
+        {
+            return Err(SchemaError::InvalidField {
+                field: j.name.clone(),
+                message: "globals can't have join fields, since nothing links to a global".into(),
+            });
+        }
         if self.default_populate.is_some() && self.kind == CollectionKind::Global {
             return Err(SchemaError::InvalidOption(
                 "defaultPopulate: globals are never populated, so they can't have one".into(),
@@ -1251,6 +1401,41 @@ fn check_fields(
                 check_fields(fields, false, root, &join(prefix, &f.name), true)?
             }
             _ => {}
+        }
+        if let FieldKind::Join {
+            collection,
+            on,
+            default_limit,
+            ..
+        } = &f.kind
+        {
+            if in_list {
+                return Err(invalid("join fields can't be inside a list".into()));
+            }
+            if f.required
+                || f.unique
+                || f.filterable
+                || f.default.is_some()
+                || f.virtual_path.is_some()
+            {
+                return Err(invalid(
+                    "join fields can't be required, unique, filterable, virtual or have a default"
+                        .into(),
+                ));
+            }
+            if default_limit.is_some_and(|l| !(1..=100).contains(&l)) {
+                return Err(invalid("defaultLimit must be between 1 and 100".into()));
+            }
+            if !is_identifier(collection, false) {
+                return Err(invalid(format!(
+                    "collection `{collection}` isn't a valid collection slug"
+                )));
+            }
+            if !on.split('.').all(|s| is_identifier(s, true)) {
+                return Err(invalid(format!(
+                    "on `{on}` must be a field path like category or links.target"
+                )));
+            }
         }
         if let Some(path) = &f.virtual_path {
             check_virtual(f, path, root, in_list).map_err(invalid)?;

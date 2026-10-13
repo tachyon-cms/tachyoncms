@@ -4,6 +4,7 @@ mod collections;
 mod documents;
 mod error;
 mod globals;
+mod joins;
 mod params;
 mod populate;
 mod request_id;

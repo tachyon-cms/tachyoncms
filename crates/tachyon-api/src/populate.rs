@@ -90,7 +90,7 @@ pub(crate) async fn fill_virtuals(
 }
 
 /// `fill_virtuals` where each document has its own `select`, still in one query.
-async fn fill_virtuals_each(
+pub(crate) async fn fill_virtuals_each(
     state: &AppState,
     items: &mut [(Value, Arc<Collection>)],
     selects: &[Option<&Select>],
@@ -139,7 +139,7 @@ pub(crate) type Shapes = HashMap<String, Select>;
 /// collection's `defaultPopulate`, or not at all.
 // ponytail: defaultPopulate is parsed per populated document; cache the parsed Select on the
 // collection if it shows up in a profile.
-fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
+pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     if let Some(select) = shapes.get(&c.schema.slug) {
         return Some(select.clone());
     }

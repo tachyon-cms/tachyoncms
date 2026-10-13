@@ -78,7 +78,7 @@ fn describe(slug: &str, p: &Preview) -> String {
             Change::OptionsChanged { path } => format!("update options on {path}"),
             Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::CollectionOptionsChanged => "update collection options".to_owned(),
-            Change::VirtualRemoved { path } => format!("remove virtual field {path}"),
+            Change::VirtualRemoved { path } => format!("remove {path} (it stored nothing)"),
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")
             }
@@ -143,15 +143,37 @@ pub async fn run(
     }
 
     for s in &wanted {
-        s.check_virtual_targets(|slug| {
+        let lookup = |slug: &str| {
             wanted.iter().find(|o| o.slug == slug).or_else(|| {
                 existing
                     .iter()
                     .map(|c| &c.schema.0)
                     .find(|o| o.slug == slug)
             })
-        })
-        .with_context(|| s.slug.clone())?;
+        };
+        s.check_virtual_targets(lookup)
+            .and_then(|()| s.check_join_targets(lookup))
+            .with_context(|| s.slug.clone())?;
+    }
+
+    // Collections left out of the file must still work with the ones it changes.
+    for c in &existing {
+        let other = &c.schema.0;
+        if wanted.iter().any(|s| s.slug == other.slug) {
+            continue;
+        }
+        let lookup = |slug: &str| {
+            wanted.iter().find(|o| o.slug == slug).or_else(|| {
+                existing
+                    .iter()
+                    .map(|c| &c.schema.0)
+                    .find(|o| o.slug == slug)
+            })
+        };
+        other
+            .check_virtual_targets(lookup)
+            .and_then(|()| other.check_join_targets(lookup))
+            .with_context(|| format!("{} (not in the file) would break", other.slug))?;
     }
 
     let none = Renames::new();
@@ -421,5 +443,67 @@ mod tests {
         run(&pool, &file("author.name"), &BTreeMap::new(), Some(false))
             .await
             .unwrap();
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn joins_must_read_a_field_that_links_here(pool: PgPool) {
+        let file = |on: &str| {
+            json!({"collections": [
+                {"slug": "categories", "fields": [
+                    {"name": "posts", "type": "join", "collection": "posts", "on": on}
+                ]},
+                {"slug": "posts", "fields": [
+                    {"name": "title", "type": "text"},
+                    {"name": "category", "type": "relationship", "relationTo": "categories"}
+                ]}
+            ]})
+            .to_string()
+        };
+        let err = run(&pool, &file("title"), &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "categories: field `posts`: posts.title isn't a relationship field"
+        );
+        run(&pool, &file("category"), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn changes_that_break_a_join_elsewhere_are_refused(pool: PgPool) {
+        let both = json!({"collections": [
+            {"slug": "categories", "fields": [
+                {"name": "posts", "type": "join", "collection": "posts", "on": "category"}
+            ]},
+            {"slug": "posts", "fields": [
+                {"name": "category", "type": "relationship", "relationTo": "categories"}
+            ]}
+        ]})
+        .to_string();
+        run(&pool, &both, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        let only_posts = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "title", "type": "text"}
+        ]}]})
+        .to_string();
+        let err = run(&pool, &only_posts, &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "categories (not in the file) would break: field `posts`: posts has no field `category`"
+        );
+        let plan = run(
+            &pool,
+            &json!({"collections": [{"slug": "categories", "fields": []}]}).to_string(),
+            &BTreeMap::new(),
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(plan.contains("remove posts (it stored nothing)"), "{plan}");
     }
 }

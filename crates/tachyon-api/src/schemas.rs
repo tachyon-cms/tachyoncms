@@ -63,6 +63,11 @@ impl Schemas {
         self.current.load().by_slug.get(slug).cloned()
     }
 
+    /// Every collection and global, in no particular order.
+    pub fn all(&self) -> Vec<Arc<Collection>> {
+        self.current.load().by_id.values().cloned().collect()
+    }
+
     pub fn get_by_id(&self, id: Uuid) -> Option<Arc<Collection>> {
         self.current.load().by_id.get(&id).cloned()
     }

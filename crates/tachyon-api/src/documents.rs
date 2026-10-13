@@ -16,7 +16,8 @@ use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
-use crate::params::{list_params, read_params};
+use crate::joins::fill_joins;
+use crate::params::{Joins, list_params, read_params};
 use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
@@ -89,6 +90,15 @@ pub async fn list(
         .map(|d| Ok((to_value(d)?, c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
     fill_virtuals(&state, &mut docs, p.select.as_ref()).await?;
+    fill_joins(
+        &state,
+        &mut docs,
+        p.select.as_ref(),
+        &p.joins,
+        p.depth,
+        &p.populate,
+    )
+    .await?;
     let docs = docs
         .into_iter()
         .map(|(v, c)| (shaped(v, p.select.as_ref()), c))
@@ -125,6 +135,15 @@ async fn respond(
 ) -> Result<Json<Value>, ApiError> {
     let mut items = vec![(to_value(doc)?, c)];
     fill_virtuals(state, &mut items, None).await?;
+    fill_joins(
+        state,
+        &mut items,
+        None,
+        &Joins::all(),
+        depth,
+        &Shapes::new(),
+    )
+    .await?;
     Ok(Json(
         populate(state, items, depth, &Shapes::new())
             .await?
@@ -162,10 +181,19 @@ pub async fn get(
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
+    let p = read_params(raw.as_deref(), &c, &state.schemas)?;
     let doc = documents::get(&state.pool, c.id, id).await?;
     let mut items = vec![(to_value(&doc)?, c)];
     fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    fill_joins(
+        &state,
+        &mut items,
+        p.select.as_ref(),
+        &p.joins,
+        p.depth,
+        &p.populate,
+    )
+    .await?;
     let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(

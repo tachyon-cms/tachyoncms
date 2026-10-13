@@ -3,6 +3,8 @@
 //! The only text spliced into SQL here is static, a schema-validated field name (checked
 //! again by `assert_identifier`), or a `Uuid`. Every user-supplied value is bound.
 
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder};
@@ -368,6 +370,109 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         next,
         has_more,
     })
+}
+
+/// The documents of one collection that link to each of several parents: a join field.
+pub struct JoinQuery<'a> {
+    pub collection_id: Uuid,
+    /// Matches `relations.field_path` for the linking field (see `tachyon_core::joins::on_pattern`).
+    pub pattern: &'a str,
+    pub filter: Option<&'a Filter>,
+    pub sort: Option<&'a Sort>,
+    pub limit: i64,
+    pub offset: i64,
+    pub count: bool,
+}
+
+#[derive(sqlx::FromRow)]
+struct JoinedRow {
+    parent: Uuid,
+    #[sqlx(flatten)]
+    doc: Document,
+}
+
+/// ` AND` the document links to `p.parent` through a path `pattern` matches. `EXISTS`, so a
+/// document linking twice still counts once.
+fn push_linked(qb: &mut QueryBuilder<Postgres>, pattern: &str) {
+    qb.push(
+        " AND EXISTS (SELECT 1 FROM relations r WHERE r.from_doc = documents.id \
+         AND r.to_doc = p.parent AND r.tenant_id = ",
+    )
+    .push_bind(DEFAULT_TENANT)
+    .push(" AND r.field_path ~ ")
+    .push_bind(pattern.to_owned())
+    .push(")");
+}
+
+/// One page of linking documents for every parent, in one query: a `LATERAL` subquery
+/// pages each parent's documents on its own. Every parent gets an entry, empty or not.
+pub async fn joined(
+    pool: &PgPool,
+    parents: &[Uuid],
+    q: &JoinQuery<'_>,
+) -> Result<HashMap<Uuid, Page>, DbError> {
+    // Each parent once, or `unnest` would answer it twice into the same page.
+    let mut unique = parents.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let parents = unique.as_slice();
+    let mut out: HashMap<Uuid, Page> = parents
+        .iter()
+        .map(|p| {
+            let page = Page {
+                docs: Vec::new(),
+                total: None,
+                next: None,
+                has_more: false,
+            };
+            (*p, page)
+        })
+        .collect();
+    if parents.is_empty() {
+        return Ok(out);
+    }
+    let order = order_by(q.sort);
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT p.parent, d.id, d.status, d.created_at, d.updated_at, d.data FROM unnest(",
+    );
+    qb.push_bind(parents.to_vec())
+        .push("::uuid[]) AS p(parent) CROSS JOIN LATERAL (SELECT id, status, created_at, updated_at, published AS data, ")
+        .push(format!("row_number() OVER (ORDER BY {order}) AS n FROM documents"));
+    push_where(&mut qb, q.collection_id, q.filter);
+    push_linked(&mut qb, q.pattern);
+    qb.push(format!(" ORDER BY {order} LIMIT "))
+        .push_bind(q.limit.saturating_add(1))
+        .push(" OFFSET ")
+        .push_bind(q.offset)
+        .push(") AS d ORDER BY p.parent, d.n");
+    let rows: Vec<JoinedRow> = qb.build_query_as().fetch_all(pool).await?;
+    let limit = usize::try_from(q.limit).unwrap_or(usize::MAX);
+    for row in rows {
+        if let Some(page) = out.get_mut(&row.parent) {
+            if page.docs.len() < limit {
+                page.docs.push(row.doc);
+            } else {
+                page.has_more = true;
+            }
+        }
+    }
+
+    if q.count {
+        let mut qb =
+            QueryBuilder::<Postgres>::new("SELECT p.parent, (SELECT count(*) FROM documents");
+        push_where(&mut qb, q.collection_id, q.filter);
+        push_linked(&mut qb, q.pattern);
+        qb.push(") FROM unnest(")
+            .push_bind(parents.to_vec())
+            .push("::uuid[]) AS p(parent)");
+        let counts: Vec<(Uuid, i64)> = qb.build_query_as().fetch_all(pool).await?;
+        for (parent, total) in counts {
+            if let Some(page) = out.get_mut(&parent) {
+                page.total = Some(total);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.

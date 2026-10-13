@@ -170,6 +170,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         | FieldKind::Slug { .. }
         | FieldKind::Relationship { .. } => ValueKind::Text,
         FieldKind::Json
+        | FieldKind::Join { .. }
         | FieldKind::Group { .. }
         | FieldKind::Array { .. }
         | FieldKind::Row { .. }
@@ -376,7 +377,7 @@ impl Parser<'_> {
                 "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
             )
         })?;
-        let (target, field) = resolve(self.fields, name).map_err(|m| err(param, m))?;
+        let (target, field) = resolve(self.fields, name, "filtered").map_err(|m| err(param, m))?;
         if field.is_some_and(|f| f.virtual_path.is_some()) {
             return Err(err(
                 param,
@@ -425,7 +426,13 @@ impl Parser<'_> {
     }
 }
 
-fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Field>), String> {
+/// The target a field name points at. `verb` is what's being done with it, `filtered` or
+/// `sorted`, for the error when it can't be.
+fn resolve<'a>(
+    fields: &'a [Field],
+    name: &str,
+    verb: &str,
+) -> Result<(Target, Option<&'a Field>), String> {
     match name {
         "id" => return Ok((Target::Id, None)),
         "createdAt" => return Ok((Target::CreatedAt, None)),
@@ -473,8 +480,13 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
                 ));
             }
             _ if !last => return Err(format!("unknown field `{name}`")),
+            FieldKind::Join { .. } => {
+                return Err(format!(
+                    "`{name}` is filled from other documents and can't be {verb}"
+                ));
+            }
             kind => {
-                let kind = value_kind(kind).ok_or_else(|| format!("`{name}` can't be filtered"))?;
+                let kind = value_kind(kind).ok_or_else(|| format!("`{name}` can't be {verb}"))?;
                 return Ok((Target::Field { path, kind }, Some(f)));
             }
         }
@@ -624,7 +636,7 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         None => (input, false),
     };
     let fields = data_fields(fields);
-    let (target, field) = resolve(&fields, name).map_err(|m| err("sort", m))?;
+    let (target, field) = resolve(&fields, name, "sorted").map_err(|m| err("sort", m))?;
     if field.is_some_and(|f| f.virtual_path.is_some()) {
         return Err(err(
             "sort",
@@ -1235,5 +1247,13 @@ mod tests {
         for f in &schema.fields {
             assert_eq!(value_kind(&f.kind), None, "{}", f.kind.name());
         }
+    }
+
+    #[test]
+    fn sorting_on_a_value_that_cant_be_sorted_says_sorted() {
+        assert_eq!(
+            parse_sort(&fields(), "data").unwrap_err().to_string(),
+            "sort: `data` can't be sorted"
+        );
     }
 }

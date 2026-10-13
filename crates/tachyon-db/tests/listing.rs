@@ -547,3 +547,218 @@ async fn big_integers_filter_and_page_exactly(pool: PgPool) {
     .unwrap();
     assert_eq!(prices(&second), [9007199254740992]);
 }
+
+mod joins {
+    use super::*;
+    use std::collections::HashMap;
+    use tachyon_core::joins::on_pattern;
+    use tachyon_db::documents::Relation;
+    use tachyon_db::query::{JoinQuery, joined};
+
+    struct Fixture {
+        posts: Uuid,
+        categories: Uuid,
+        cats: [Uuid; 2],
+        schema: CollectionSchema,
+    }
+
+    async fn fixture(pool: &PgPool) -> Fixture {
+        let categories: CollectionSchema = serde_json::from_value(
+            json!({"slug": "categories", "fields": [{"name": "name", "type": "text"}]}),
+        )
+        .unwrap();
+        let categories = collections::create(pool, &categories).await.unwrap().id;
+        let schema: CollectionSchema = serde_json::from_value(json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "category", "type": "relationship", "relationTo": "categories"},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "target", "type": "relationship", "relationTo": "categories"}
+            ]}
+        ]}))
+        .unwrap();
+        let posts = collections::create(pool, &schema).await.unwrap().id;
+        let mut cats = [Uuid::nil(); 2];
+        for (i, name) in ["news", "guides"].into_iter().enumerate() {
+            let data = json!({"name": name}).as_object().unwrap().clone();
+            cats[i] = documents::insert(pool, categories, 1, None, &Prepared::plain(data))
+                .await
+                .unwrap()
+                .id;
+        }
+        Fixture {
+            posts,
+            categories,
+            cats,
+            schema,
+        }
+    }
+
+    /// A post titled `title`, linking at each `(path, category)`.
+    async fn post(pool: &PgPool, f: &Fixture, title: &str, links: &[(&str, Uuid)]) -> Uuid {
+        let relations = links
+            .iter()
+            .map(|(path, id)| Relation {
+                path: (*path).to_owned(),
+                collection_id: f.categories,
+                id: *id,
+            })
+            .collect();
+        let data = json!({"title": title}).as_object().unwrap().clone();
+        documents::insert(pool, f.posts, 1, None, &Prepared { data, relations })
+            .await
+            .unwrap()
+            .id
+    }
+
+    fn titles(pages: &HashMap<Uuid, query::Page>, parent: Uuid) -> Vec<String> {
+        pages
+            .get(&parent)
+            .map(|p| {
+                p.docs
+                    .iter()
+                    .map(|d| d.data.0["title"].as_str().unwrap().to_owned())
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    fn q<'a>(f: &Fixture, pattern: &'a str) -> JoinQuery<'a> {
+        JoinQuery {
+            collection_id: f.posts,
+            pattern,
+            filter: None,
+            sort: None,
+            limit: 10,
+            offset: 0,
+            count: false,
+        }
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn joined_documents_page_sort_filter_and_count_per_parent(pool: PgPool) {
+        let f = fixture(&pool).await;
+        let [news, guides] = f.cats;
+        for t in ["a", "b", "c"] {
+            post(&pool, &f, t, &[("category", news)]).await;
+        }
+        post(&pool, &f, "g", &[("category", guides)]).await;
+        let pattern = on_pattern(f.schema.data(), "category").unwrap();
+
+        let all = joined(&pool, &[news, guides], &q(&f, &pattern))
+            .await
+            .unwrap();
+        assert_eq!(titles(&all, news), ["c", "b", "a"], "newest first");
+        assert_eq!(titles(&all, guides), ["g"]);
+
+        let by_title = parse_sort(&f.schema.fields, "title").unwrap();
+        let page = JoinQuery {
+            sort: Some(&by_title),
+            limit: 2,
+            offset: 0,
+            count: true,
+            ..q(&f, &pattern)
+        };
+        let pages = joined(&pool, &[news, guides], &page).await.unwrap();
+        assert_eq!(titles(&pages, news), ["a", "b"]);
+        assert!(pages[&news].has_more);
+        assert_eq!(pages[&news].total, Some(3));
+        assert!(!pages[&guides].has_more);
+        assert_eq!(pages[&guides].total, Some(1));
+        let second = JoinQuery { offset: 2, ..page };
+        assert_eq!(
+            titles(&joined(&pool, &[news], &second).await.unwrap(), news),
+            ["c"]
+        );
+
+        let not_b = parse_filter(
+            &f.schema.fields,
+            &parse_query("where[title][not_equals]=b").unwrap()["where"],
+        )
+        .unwrap();
+        let filtered = JoinQuery {
+            filter: Some(&not_b),
+            count: true,
+            ..q(&f, &pattern)
+        };
+        let pages = joined(&pool, &[news], &filtered).await.unwrap();
+        assert_eq!(titles(&pages, news), ["c", "a"]);
+        assert_eq!(pages[&news].total, Some(2));
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn links_in_arrays_match_their_pattern_and_count_once(pool: PgPool) {
+        let f = fixture(&pool).await;
+        let [news, _] = f.cats;
+        post(
+            &pool,
+            &f,
+            "twice",
+            &[("links.0.target", news), ("links.1.target", news)],
+        )
+        .await;
+        post(&pool, &f, "direct", &[("category", news)]).await;
+        let pattern = on_pattern(f.schema.data(), "links.target").unwrap();
+        let pages = joined(
+            &pool,
+            &[news],
+            &JoinQuery {
+                count: true,
+                ..q(&f, &pattern)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            titles(&pages, news),
+            ["twice"],
+            "only links through links.target, once"
+        );
+        assert_eq!(pages[&news].total, Some(1));
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn deleted_linking_documents_are_left_out(pool: PgPool) {
+        let f = fixture(&pool).await;
+        let [news, _] = f.cats;
+        let gone = post(&pool, &f, "gone", &[("category", news)]).await;
+        post(&pool, &f, "kept", &[("category", news)]).await;
+        sqlx::query("UPDATE documents SET deleted_at = now() WHERE id = $1")
+            .bind(gone)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let pattern = on_pattern(f.schema.data(), "category").unwrap();
+        let pages = joined(
+            &pool,
+            &[news],
+            &JoinQuery {
+                count: true,
+                ..q(&f, &pattern)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(titles(&pages, news), ["kept"]);
+        assert_eq!(pages[&news].total, Some(1));
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn repeated_parents_are_answered_once(pool: PgPool) {
+        let f = fixture(&pool).await;
+        let [news, _] = f.cats;
+        post(&pool, &f, "a", &[("category", news)]).await;
+        let pattern = on_pattern(f.schema.data(), "category").unwrap();
+        let pages = joined(
+            &pool,
+            &[news, news],
+            &JoinQuery {
+                limit: 1,
+                ..q(&f, &pattern)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(titles(&pages, news), ["a"]);
+        assert!(!pages[&news].has_more);
+    }
+}
