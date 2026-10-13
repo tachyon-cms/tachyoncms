@@ -50,7 +50,7 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
-    let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
+    let p = read_params(raw.as_deref(), &c, &state.schemas)?;
     let value = match documents::get(&state.pool, c.id, c.id).await {
         Ok(doc) => to_value(&doc)?,
         Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),

@@ -143,15 +143,17 @@ pub async fn run(
     }
 
     for s in &wanted {
-        s.check_virtual_targets(|slug| {
+        let lookup = |slug: &str| {
             wanted.iter().find(|o| o.slug == slug).or_else(|| {
                 existing
                     .iter()
                     .map(|c| &c.schema.0)
                     .find(|o| o.slug == slug)
             })
-        })
-        .with_context(|| s.slug.clone())?;
+        };
+        s.check_virtual_targets(lookup)
+            .and_then(|()| s.check_join_targets(lookup))
+            .with_context(|| s.slug.clone())?;
     }
 
     let none = Renames::new();
@@ -419,6 +421,32 @@ mod tests {
             "posts: field `authorName`: authors has no field `nope` to read"
         );
         run(&pool, &file("author.name"), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn joins_must_read_a_field_that_links_here(pool: PgPool) {
+        let file = |on: &str| {
+            json!({"collections": [
+                {"slug": "categories", "fields": [
+                    {"name": "posts", "type": "join", "collection": "posts", "on": on}
+                ]},
+                {"slug": "posts", "fields": [
+                    {"name": "title", "type": "text"},
+                    {"name": "category", "type": "relationship", "relationTo": "categories"}
+                ]}
+            ]})
+            .to_string()
+        };
+        let err = run(&pool, &file("title"), &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "categories: field `posts`: posts.title isn't a relationship field"
+        );
+        run(&pool, &file("category"), &BTreeMap::new(), Some(false))
             .await
             .unwrap();
     }

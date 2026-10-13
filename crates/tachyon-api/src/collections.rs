@@ -102,10 +102,12 @@ struct ChangeRequest {
     confirm: bool,
 }
 
-/// Every virtual field must read a field its targets have.
+/// Every virtual field must read a field its targets have, and every join a field that links here.
 fn check_virtuals(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+    let lookup = |slug: &str| state.schemas.get(slug).map(|c| c.schema.0.clone());
     schema
-        .check_virtual_targets(|slug| state.schemas.get(slug).map(|c| c.schema.0.clone()))
+        .check_virtual_targets(lookup)
+        .and_then(|()| schema.check_join_targets(lookup))
         .map_err(schema_error)
 }
 

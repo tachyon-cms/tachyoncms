@@ -1,10 +1,11 @@
 //! Query parameters for listing and reading documents.
 
+use std::collections::HashMap;
+
 use serde_json::{Map, Value};
-use tachyon_core::CollectionKind;
-use tachyon_core::Field;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
 use tachyon_core::select::{Select, parse_select};
+use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
 
 use crate::ApiError;
@@ -26,6 +27,7 @@ pub(crate) struct ListParams {
     pub sort: Option<Sort>,
     pub select: Option<Select>,
     pub populate: Shapes,
+    pub joins: Joins,
 }
 
 /// How a single read is shaped.
@@ -33,6 +35,28 @@ pub(crate) struct ReadParams {
     pub depth: u8,
     pub select: Option<Select>,
     pub populate: Shapes,
+    pub joins: Joins,
+}
+
+/// `joins=false`, or per join field: `joins[posts][limit]=5` and the like.
+pub(crate) enum Joins {
+    Off,
+    On(HashMap<String, JoinRequest>),
+}
+
+impl Joins {
+    pub fn all() -> Self {
+        Joins::On(HashMap::new())
+    }
+}
+
+#[derive(Default, Clone)]
+pub(crate) struct JoinRequest {
+    pub limit: Option<i64>,
+    pub page: Option<i64>,
+    pub sort: Option<Sort>,
+    pub filter: Option<Filter>,
+    pub count: bool,
 }
 
 fn bad(message: impl Into<String>) -> ApiError {
@@ -99,6 +123,92 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
     Ok(out)
 }
 
+fn joins(
+    params: &Map<String, Value>,
+    c: &Collection,
+    schemas: &Schemas,
+) -> Result<Joins, ApiError> {
+    let by_name = match params.get("joins") {
+        None => return Ok(Joins::all()),
+        Some(Value::String(s)) if s == "false" => return Ok(Joins::Off),
+        Some(Value::Object(by_name)) => by_name,
+        Some(_) => return Err(bad("joins: use joins=false, or joins[field][option]")),
+    };
+    let fields = c.schema.join_fields();
+    let mut out = HashMap::new();
+    for (name, options) in by_name {
+        let here = format!("joins[{name}]");
+        let j = fields
+            .iter()
+            .find(|j| &j.path == name)
+            .ok_or_else(|| bad(format!("{here}: no such join field")))?;
+        let Value::Object(options) = options else {
+            return Err(bad(format!("{here}: expected {here}[option]=value")));
+        };
+        // The joined collection's fields, for its sort and filter. A join whose collection
+        // has gone comes back empty, so its options only need to be well formed.
+        let target = schemas.get(&j.collection).map(|t| t.schema.data().to_vec());
+        let target = target.as_deref().unwrap_or_default();
+        let mut req = JoinRequest::default();
+        for (option, value) in options {
+            let param = format!("{here}[{option}]");
+            let text = || {
+                value
+                    .as_str()
+                    .ok_or_else(|| bad(format!("{param}: must be a single value")))
+            };
+            let whole = || {
+                text()?
+                    .parse::<i64>()
+                    .map_err(|_| bad(format!("{param}: must be a whole number")))
+            };
+            match option.as_str() {
+                "limit" => {
+                    let limit = whole()?;
+                    if !(1..=MAX_LIMIT).contains(&limit) {
+                        return Err(bad(format!("{param}: must be between 1 and {MAX_LIMIT}")));
+                    }
+                    req.limit = Some(limit);
+                }
+                "page" => {
+                    let page = whole()?;
+                    if page < 1 {
+                        return Err(bad(format!("{param}: must be at least 1")));
+                    }
+                    req.page = Some(page);
+                }
+                "count" => {
+                    req.count = match text()? {
+                        "true" => true,
+                        "false" => false,
+                        _ => return Err(bad(format!("{param}: must be true or false"))),
+                    }
+                }
+                "sort" => {
+                    req.sort = Some(
+                        parse_sort(target, text()?)
+                            .map_err(|e| bad(format!("{param}: {}", e.message)))?,
+                    );
+                }
+                "where" => {
+                    // `where[title][equals]` from the parser becomes `joins[posts][where][title][equals]`.
+                    req.filter = Some(parse_filter(target, value).map_err(|e| {
+                        let rest = e.param.strip_prefix("where").unwrap_or(&e.param);
+                        bad(format!("{param}{rest}: {}", e.message))
+                    })?);
+                }
+                _ => {
+                    return Err(bad(format!(
+                        "{param}: unknown option; use limit, page, sort, where or count"
+                    )));
+                }
+            }
+        }
+        out.insert(name.clone(), req);
+    }
+    Ok(Joins::On(out))
+}
+
 fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     match single(params, "depth")? {
         None => Ok(DEFAULT_DEPTH),
@@ -119,6 +229,7 @@ pub(crate) fn list_params(
         raw,
         &[
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
+            "joins",
         ],
     )?;
     let fields = c.schema.data();
@@ -168,6 +279,7 @@ pub(crate) fn list_params(
         depth: depth(&params)?,
         select: select(&params, fields)?,
         populate: populate(&params, schemas)?,
+        joins: joins(&params, c, schemas)?,
         filter,
         sort,
     })
@@ -175,13 +287,14 @@ pub(crate) fn list_params(
 
 pub(crate) fn read_params(
     raw: Option<&str>,
-    fields: &[Field],
+    c: &Collection,
     schemas: &Schemas,
 ) -> Result<ReadParams, ApiError> {
-    let params = params(raw, &["depth", "select", "populate"])?;
+    let params = params(raw, &["depth", "select", "populate", "joins"])?;
     Ok(ReadParams {
         depth: depth(&params)?,
-        select: select(&params, fields)?,
+        select: select(&params, c.schema.data())?,
         populate: populate(&params, schemas)?,
+        joins: joins(&params, c, schemas)?,
     })
 }
