@@ -99,47 +99,84 @@ fn shape_child(c: &Collection, shapes: &Shapes, value: &mut Value) {
     }
 }
 
+/// Replaces relationship IDs with the documents they point at, `depth` levels deep.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
     shapes: &'a Shapes,
 ) -> Populated<'a> {
+    let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
+    populate_each(state, items, shapes)
+}
+
+/// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
+/// short. One query per level for every distinct link, whatever the depths.
+fn populate_each<'a>(
+    state: &'a AppState,
+    items: Vec<(Value, Arc<Collection>, u8)>,
+    shapes: &'a Shapes,
+) -> Populated<'a> {
     Box::pin(async move {
-        if depth == 0 {
-            return Ok(docs.into_iter().map(|(v, _)| v).collect());
-        }
-        let mut ids: Vec<_> = docs
+        // For each document: the link at each path, and how deep to populate it.
+        let wanted: Vec<HashMap<String, (Uuid, u8)>> = items
             .iter()
-            .filter_map(|(v, c)| v.as_object().map(|o| relations(c.schema.data(), o)))
-            .flatten()
-            .map(|r| r.id)
+            .map(|(v, c, depth)| {
+                let Some(obj) = v.as_object().filter(|_| *depth > 0) else {
+                    return HashMap::new();
+                };
+                relations(c.schema.data(), obj)
+                    .into_iter()
+                    .filter_map(|r| {
+                        let reach = r.max_depth.map_or(*depth, |cap| cap.min(*depth));
+                        (reach > 0).then(|| (r.path, (r.id, reach - 1)))
+                    })
+                    .collect()
+            })
+            .collect();
+        let mut ids: Vec<Uuid> = wanted
+            .iter()
+            .flat_map(|w| w.values().map(|(id, _)| *id))
             .collect();
         ids.sort_unstable();
         ids.dedup();
         if ids.is_empty() {
-            return Ok(docs.into_iter().map(|(v, _)| v).collect());
+            return Ok(items.into_iter().map(|(v, _, _)| v).collect());
         }
 
+        let found: HashMap<Uuid, (Uuid, Document)> = documents::get_many(&state.pool, &ids)
+            .await?
+            .into_iter()
+            .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
+            .collect();
+        // The same document wanted at two depths is populated once for each.
+        let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
+        keys.sort_unstable();
+        keys.dedup();
         let mut children = Vec::new();
-        for (collection_id, doc) in documents::get_many(&state.pool, &ids).await? {
-            if let Some(c) = state.schemas.get_by_id(collection_id) {
-                let mut value = to_value(&doc)?;
+        let mut child_keys = Vec::new();
+        for key @ (id, remaining) in keys {
+            let Some((collection_id, doc)) = found.get(&id) else {
+                continue;
+            };
+            if let Some(c) = state.schemas.get_by_id(*collection_id) {
+                let mut value = to_value(doc)?;
                 shape_child(&c, shapes, &mut value);
-                children.push((value, c));
+                children.push((value, c, remaining));
+                child_keys.push(key);
             }
         }
-        let children = populate(state, children, depth - 1, shapes).await?;
-        let by_id: HashMap<String, Value> = children
-            .into_iter()
-            .filter_map(|v| Some((v.get("id")?.as_str()?.to_owned(), v)))
-            .collect();
+        let children = populate_each(state, children, shapes).await?;
+        let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 
-        Ok(docs
+        Ok(items
             .into_iter()
-            .map(|(mut v, c)| {
+            .zip(wanted)
+            .map(|((mut v, c, _), wanted)| {
                 if let Some(obj) = v.as_object_mut() {
-                    map_relations(c.schema.data(), obj, &mut |id| by_id.get(id).cloned());
+                    map_relations(c.schema.data(), obj, &mut |path, _| {
+                        wanted.get(path).and_then(|key| by_key.get(key)).cloned()
+                    });
                 }
                 v
             })

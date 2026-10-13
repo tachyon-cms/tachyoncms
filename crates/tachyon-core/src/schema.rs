@@ -210,6 +210,9 @@ pub enum FieldKind {
         relation_to: RelationTo,
         #[serde(default)]
         has_many: bool,
+        /// Populate through this field at most this deep, whatever `depth` asks for.
+        #[serde(default)]
+        max_depth: Option<u8>,
     },
     Json,
     Group {
@@ -697,6 +700,7 @@ impl FieldKind {
             Self::Relationship {
                 relation_to,
                 has_many,
+                ..
             } => !has_many && !relation_to.is_polymorphic(),
             Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
@@ -1030,6 +1034,11 @@ fn check_fields(
                     "from must name a top-level text field, not `{source}`"
                 )));
             }
+            FieldKind::Relationship {
+                max_depth: Some(d), ..
+            } if *d > 5 => {
+                return Err(invalid("maxDepth can be at most 5".into()));
+            }
             FieldKind::Relationship { relation_to, .. } => {
                 let targets = relation_to.targets();
                 if targets.is_empty() {
@@ -1230,7 +1239,8 @@ mod tests {
             s.fields[2].kind,
             FieldKind::Relationship {
                 relation_to: RelationTo::One("authors".into()),
-                has_many: false
+                has_many: false,
+                max_depth: None,
             }
         );
         assert_eq!(s.relation_targets(), ["authors", "posts"]);
@@ -1898,5 +1908,24 @@ mod tests {
         );
         let plain = schema(json!({"slug": "authors", "fields": []}));
         assert!(plain.to_compact_json().get("defaultPopulate").is_none());
+    }
+
+    #[test]
+    fn max_depth_is_checked_and_parsed() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors", "maxDepth": 1}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let FieldKind::Relationship { max_depth, .. } = &s.fields[0].kind else {
+            panic!()
+        };
+        assert_eq!(*max_depth, Some(1));
+        let deep = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors", "maxDepth": 6}
+        ]}));
+        assert_eq!(
+            deep.check().unwrap_err().to_string(),
+            "field `author`: maxDepth can be at most 5"
+        );
     }
 }

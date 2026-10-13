@@ -150,6 +150,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Relationship {
             relation_to,
             has_many: true,
+            ..
         } if relation_to.is_polymorphic() => ValueKind::LinkList,
         FieldKind::Select { multiple: true, .. }
         | FieldKind::Text { has_many: true, .. }
@@ -446,6 +447,7 @@ fn resolve<'a>(fields: &'a [Field], name: &str) -> Result<(Target, Option<&'a Fi
             FieldKind::Relationship {
                 relation_to,
                 has_many: false,
+                ..
             } if relation_to.is_polymorphic() => {
                 let part = match segments.next() {
                     None | Some("value") => "value",

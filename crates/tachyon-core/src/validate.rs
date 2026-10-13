@@ -418,12 +418,10 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         }),
         FieldKind::Relationship {
             relation_to: RelationTo::One(_),
-            has_many: false,
-        } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
+            has_many: false, .. } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
         FieldKind::Relationship {
             relation_to: RelationTo::One(_),
-            has_many: true,
-        } => {
+            has_many: true, .. } => {
             let ok = v
                 .as_array()
                 .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
@@ -431,16 +429,14 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         }
         FieldKind::Relationship {
             relation_to,
-            has_many: false,
-        } => (!is_link(v, relation_to)).then(|| {
+            has_many: false, .. } => (!is_link(v, relation_to)).then(|| {
             format!(
                 "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
             )
         }),
         FieldKind::Relationship {
             relation_to,
-            has_many: true,
-        } => {
+            has_many: true, .. } => {
             let ok = v
                 .as_array()
                 .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
@@ -578,6 +574,8 @@ pub struct RelationRef {
     pub path: String,
     pub relation_to: String,
     pub id: Uuid,
+    /// The field's `maxDepth`, if it caps population.
+    pub max_depth: Option<u8>,
 }
 
 /// Every relationship ID in a validated document, in schema order.
@@ -589,6 +587,10 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 continue;
             };
             let path = join(prefix, &f.name);
+            let max_depth = match f.kind {
+                FieldKind::Relationship { max_depth, .. } => max_depth,
+                _ => None,
+            };
             let mut push = |path: String, relation_to: &RelationTo, link: &Value| {
                 let (slug, id) = match (relation_to, link) {
                     (RelationTo::One(slug), Value::String(id)) => (slug.as_str(), id.as_str()),
@@ -608,6 +610,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                         path,
                         relation_to: slug.to_owned(),
                         id,
+                        max_depth,
                     });
                 }
             };
@@ -616,6 +619,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     FieldKind::Relationship {
                         relation_to,
                         has_many: false,
+                        ..
                     },
                     id,
                 ) => push(path, relation_to, id),
@@ -623,6 +627,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     FieldKind::Relationship {
                         relation_to,
                         has_many: true,
+                        ..
                     },
                     Value::Array(ids),
                 ) => {
@@ -649,41 +654,47 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
     out
 }
 
-/// Replaces each relationship ID with `f(id)` wherever `f` returns a value. Used to populate.
+/// Replaces each relationship ID with `f(path, id)` wherever `f` returns a value. Paths are
+/// the ones `relations` reports (`author`, `related.1`, `links.0.author`). Used to populate.
 pub fn map_relations(
     fields: &[Field],
     doc: &mut Map<String, Value>,
-    f: &mut impl FnMut(&str) -> Option<Value>,
+    f: &mut impl FnMut(&str, &str) -> Option<Value>,
 ) {
-    map_inner(&data_fields(fields), doc, f)
+    map_inner(&data_fields(fields), doc, "", f)
 }
 
 fn map_inner(
     fields: &[Field],
     doc: &mut Map<String, Value>,
-    f: &mut impl FnMut(&str) -> Option<Value>,
+    prefix: &str,
+    f: &mut impl FnMut(&str, &str) -> Option<Value>,
 ) {
     for field in fields {
         let Some(value) = doc.get_mut(&field.name) else {
             continue;
         };
+        let path = join(prefix, &field.name);
         match (&field.kind, value) {
             (
                 FieldKind::Relationship {
                     has_many: false, ..
                 },
                 slot,
-            ) => replace_link(slot, f),
+            ) => replace_link(slot, &mut |id| f(&path, id)),
             (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
-                for slot in links {
-                    replace_link(slot, f);
+                for (i, slot) in links.iter_mut().enumerate() {
+                    let here = format!("{path}.{i}");
+                    replace_link(slot, &mut |id| f(&here, id));
                 }
             }
-            (FieldKind::Group { fields }, Value::Object(inner)) => map_inner(fields, inner, f),
+            (FieldKind::Group { fields }, Value::Object(inner)) => {
+                map_inner(fields, inner, &path, f)
+            }
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
-                for row in rows {
+                for (i, row) in rows.iter_mut().enumerate() {
                     if let Value::Object(inner) = row {
-                        map_inner(fields, inner, f);
+                        map_inner(fields, inner, &format!("{path}.{i}"), f);
                     }
                 }
             }
@@ -1088,7 +1099,7 @@ mod tests {
         assert_eq!(found, expected);
 
         let mut doc = doc;
-        map_relations(&f, &mut doc, &mut |id| {
+        map_relations(&f, &mut doc, &mut |_, id| {
             (id == b).then(|| json!({"id": b, "name": "Bee"}))
         });
         assert_eq!(doc["author"], a, "unmatched IDs stay as they are");
@@ -1246,7 +1257,7 @@ mod tests {
         }
 
         let mut doc = doc;
-        map_relations(&f, &mut doc, &mut |id| {
+        map_relations(&f, &mut doc, &mut |_, id| {
             Some(json!({"id": id, "title": "T"}))
         });
         assert_eq!(doc["link"]["relationTo"], "pages");

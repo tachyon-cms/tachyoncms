@@ -309,3 +309,67 @@ async fn bad_populate_is_a_400(pool: PgPool) {
         assert_eq!(res.json["detail"], detail, "{q}");
     }
 }
+
+async fn capped(pool: PgPool) -> (Router, String) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    for schema in [
+        json!({"slug": "people", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "mentor", "type": "relationship", "relationTo": "people"}
+        ]}),
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "people", "maxDepth": 1},
+            {"name": "editor", "type": "relationship", "relationTo": "people"},
+            {"name": "pinned", "type": "relationship", "relationTo": "people", "maxDepth": 0}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let bo = send(&app, "POST", "/api/people", Some(r#"{"name": "Bo"}"#)).await;
+    let ann = send(
+        &app,
+        "POST",
+        "/api/people",
+        Some(&json!({"name": "Ann", "mentor": bo.json["id"]}).to_string()),
+    )
+    .await;
+    let body = json!({"title": "Hi", "author": ann.json["id"], "editor": ann.json["id"], "pinned": ann.json["id"]});
+    let post = send(&app, "POST", "/api/posts", Some(&body.to_string())).await;
+    (app, post.json["id"].as_str().unwrap().to_owned())
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn max_depth_caps_population_per_field(pool: PgPool) {
+    let (app, post) = capped(pool).await;
+    let res = send(&app, "GET", &format!("/api/posts/{post}?depth=2"), None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert!(
+        res.json["pinned"].is_string(),
+        "maxDepth 0 never populates: {}",
+        res.json
+    );
+    assert_eq!(res.json["author"]["name"], "Ann");
+    assert!(
+        res.json["author"]["mentor"].is_string(),
+        "maxDepth 1 stops after one level"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_same_document_through_two_fields_gets_each_fields_depth(pool: PgPool) {
+    let (app, post) = capped(pool).await;
+    let res = send(&app, "GET", &format!("/api/posts/{post}?depth=2"), None).await;
+    assert!(res.json["author"]["mentor"].is_string());
+    assert_eq!(
+        res.json["editor"]["mentor"]["name"], "Bo",
+        "no cap: full depth"
+    );
+}

@@ -212,10 +212,12 @@ fn compare(
                 FieldKind::Relationship {
                     relation_to: from,
                     has_many: h1,
+                    ..
                 },
                 FieldKind::Relationship {
                     relation_to: to,
                     has_many: h2,
+                    ..
                 },
             ) if from != to || h1 != h2 => {
                 let keeps_every_target = from.targets().iter().all(|t| to.allows(t));
@@ -298,6 +300,7 @@ fn options_ignoring_targets(f: &Field) -> Field {
     if let FieldKind::Relationship {
         relation_to,
         has_many,
+        ..
     } = &mut f.kind
     {
         *relation_to = RelationTo::One(String::new());
