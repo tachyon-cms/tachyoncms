@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT EXISTS (\n             SELECT 1 FROM accounts a JOIN documents d ON d.id = a.user_id\n             WHERE a.tenant_id = $1 AND d.deleted_at IS NULL\n           ) AS \"any!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "any!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "4de2ac86d9a394f94c11bbf44f60f9fcc3012c83d4ee3d90376b5d1d481d5927"
+}

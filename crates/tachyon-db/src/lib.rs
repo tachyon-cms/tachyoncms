@@ -1,5 +1,6 @@
 //! PostgreSQL storage for TachyonCMS.
 
+pub mod auth;
 pub mod collections;
 pub mod documents;
 pub mod indexes;

@@ -1,0 +1,64 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT slug, name, builtin, abilities FROM roles WHERE tenant_id = $1 ORDER BY builtin DESC, slug",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "slug"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "name",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "name"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "builtin",
+        "type_info": "Bool",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "builtin"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "abilities",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "roles",
+            "name": "abilities"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "f87b52ed5e855de9c4643a9843367666de1436769661c6e5c39fd3eee6d21861"
+}
