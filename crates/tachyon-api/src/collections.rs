@@ -111,6 +111,34 @@ fn check_virtuals(state: &AppState, schema: &CollectionSchema) -> Result<(), Api
         .map_err(schema_error)
 }
 
+/// A change to `schema` must not break the virtual or join fields other collections read
+/// from it, such as a join on a relationship this change removes.
+fn check_dependents(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+    let lookup = |slug: &str| {
+        if slug == schema.slug {
+            Some(schema.clone())
+        } else {
+            state.schemas.get(slug).map(|c| c.schema.0.clone())
+        }
+    };
+    for other in state.schemas.all() {
+        let other = &other.schema.0;
+        if other.slug == schema.slug {
+            continue;
+        }
+        other
+            .check_virtual_targets(lookup)
+            .and_then(|()| other.check_join_targets(lookup))
+            .map_err(|e| {
+                schema_error(SchemaError::InvalidChange(format!(
+                    "this change would break {}: {e}",
+                    other.slug
+                )))
+            })?;
+    }
+    Ok(())
+}
+
 fn change_request(
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
@@ -147,6 +175,7 @@ pub async fn preview(
 ) -> Result<Json<Value>, ApiError> {
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
+    check_dependents(&state, &schema)?;
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
         .await
         .map_err(change_error)?;
@@ -160,6 +189,7 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
+    check_dependents(&state, &schema)?;
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;

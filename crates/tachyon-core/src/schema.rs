@@ -82,6 +82,19 @@ pub struct Field {
     pub kind: FieldKind,
 }
 
+/// A join's `where`: an object of conditions, or nothing.
+fn object_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Map<String, Value>>, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        Value::Object(o) => Ok(Some(o)),
+        _ => Err(serde::de::Error::custom(
+            "where must be an object like {\"draft\": {\"equals\": \"false\"}}",
+        )),
+    }
+}
+
 /// `null` reads as the default, like a missing key.
 fn null_as_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(
     d: D,
@@ -219,7 +232,7 @@ pub enum FieldKind {
         collection: String,
         on: String,
         /// Always applied, on top of any filter a request adds.
-        #[serde(default)]
+        #[serde(default, deserialize_with = "object_or_none")]
         r#where: Option<Map<String, Value>>,
         #[serde(default)]
         default_limit: Option<u8>,
@@ -592,6 +605,11 @@ fn read_field<'a>(fields: &'a [Field], path: &str) -> Result<&'a Field, ReadErro
     Err(ReadError::Missing)
 }
 
+/// Joins page by their own sort, so a filter whose results only make sense nearest-first
+/// doesn't fit them yet.
+pub const NEAR_IN_JOIN: &str =
+    "joins can't be ordered by distance yet, so `near` isn't allowed in their where";
+
 /// A join field: the documents of `collection` whose `on` relationship links here.
 #[derive(Debug, Clone, PartialEq)]
 pub struct JoinField {
@@ -924,8 +942,11 @@ impl CollectionSchema {
                 )));
             }
             if let Some(w) = &j.r#where {
-                crate::query::parse_filter(target.data(), &Value::Object(w.clone()))
+                let filter = crate::query::parse_filter(target.data(), &Value::Object(w.clone()))
                     .map_err(|e| invalid(e.to_string()))?;
+                if filter.near().is_some() {
+                    return Err(invalid(NEAR_IN_JOIN.into()));
+                }
             }
             if let Some(sort) = &j.sort {
                 crate::query::parse_sort(target.data(), sort)

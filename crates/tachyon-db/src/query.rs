@@ -411,6 +411,11 @@ pub async fn joined(
     parents: &[Uuid],
     q: &JoinQuery<'_>,
 ) -> Result<HashMap<Uuid, Page>, DbError> {
+    // Each parent once, or `unnest` would answer it twice into the same page.
+    let mut unique = parents.to_vec();
+    unique.sort_unstable();
+    unique.dedup();
+    let parents = unique.as_slice();
     let mut out: HashMap<Uuid, Page> = parents
         .iter()
         .map(|p| {

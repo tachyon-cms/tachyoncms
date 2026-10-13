@@ -232,4 +232,56 @@ mod tests {
             ("posts", "category", 10)
         );
     }
+
+    #[test]
+    fn turning_a_join_into_a_stored_field_loses_nothing() {
+        let with = categories(
+            json!({"name": "posts", "type": "join", "collection": "posts", "on": "category"}),
+        );
+        let text = categories(json!({"name": "posts", "type": "text"}));
+        let d = diff(&with, &text, &Renames::new()).unwrap();
+        assert!(!d.is_destructive(), "{:?}", d.changes);
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::VirtualRemoved {
+                    path: "posts".into()
+                },
+                Change::Added {
+                    path: "posts".into(),
+                    kind: "text"
+                }
+            ]
+        );
+    }
+
+    #[test]
+    fn a_join_where_must_be_an_object() {
+        let raw = json!({"slug": "categories", "fields": [
+            {"name": "posts", "type": "join", "collection": "posts", "on": "category", "where": "draft"}
+        ]});
+        let e = serde_json::from_value::<CollectionSchema>(raw.clone()).unwrap_err();
+        assert_eq!(
+            crate::explain_parse_error(&raw, &e),
+            "field `posts`: where must be an object like {\"draft\": {\"equals\": \"false\"}}"
+        );
+    }
+
+    #[test]
+    fn joins_cant_filter_by_distance() {
+        let places = schema(json!({"slug": "posts", "fields": [
+            {"name": "category", "type": "relationship", "relationTo": "categories"},
+            {"name": "spot", "type": "point"}
+        ]}));
+        let s = categories(
+            json!({"name": "posts", "type": "join", "collection": "posts", "on": "category",
+                                  "where": {"spot": {"near": "0,0,1000"}}}),
+        );
+        assert_eq!(
+            s.check_join_targets(|slug| (slug == "posts").then(|| places.clone()))
+                .unwrap_err()
+                .to_string(),
+            "field `posts`: joins can't be ordered by distance yet, so `near` isn't allowed in their where"
+        );
+    }
 }

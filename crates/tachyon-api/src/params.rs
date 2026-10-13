@@ -4,6 +4,7 @@ use std::collections::HashMap;
 
 use serde_json::{Map, Value};
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
+use tachyon_core::schema::NEAR_IN_JOIN;
 use tachyon_core::select::{Select, parse_select};
 use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
@@ -135,13 +136,41 @@ fn joins(
         Some(_) => return Err(bad("joins: use joins=false, or joins[field][option]")),
     };
     let fields = c.schema.join_fields();
+    // A join inside a group can be named `joins[meta.recent]` or `joins[meta][recent]`.
+    fn named<'a>(
+        prefix: &str,
+        obj: &'a Map<String, Value>,
+        paths: &[String],
+        out: &mut Vec<(String, &'a Value)>,
+    ) -> Result<(), ApiError> {
+        for (key, value) in obj {
+            let path = if prefix.is_empty() {
+                key.clone()
+            } else {
+                format!("{prefix}.{key}")
+            };
+            if paths.contains(&path) {
+                out.push((path, value));
+            } else if let Value::Object(inner) = value
+                && paths.iter().any(|p| p.starts_with(&format!("{path}.")))
+            {
+                named(&path, inner, paths, out)?;
+            } else {
+                return Err(bad(format!("joins[{path}]: no such join field")));
+            }
+        }
+        Ok(())
+    }
+    let paths: Vec<String> = fields.iter().map(|j| j.path.clone()).collect();
+    let mut requested = Vec::new();
+    named("", by_name, &paths, &mut requested)?;
     let mut out = HashMap::new();
-    for (name, options) in by_name {
+    for (name, options) in requested {
         let here = format!("joins[{name}]");
         let j = fields
             .iter()
-            .find(|j| &j.path == name)
-            .ok_or_else(|| bad(format!("{here}: no such join field")))?;
+            .find(|j| j.path == name)
+            .expect("named only returns join paths");
         let Value::Object(options) = options else {
             return Err(bad(format!("{here}: expected {here}[option]=value")));
         };
@@ -192,10 +221,15 @@ fn joins(
                 }
                 "where" => {
                     // `where[title][equals]` from the parser becomes `joins[posts][where][title][equals]`.
-                    req.filter = Some(parse_filter(target, value).map_err(|e| {
+                    let filter = parse_filter(target, value).map_err(|e| {
                         let rest = e.param.strip_prefix("where").unwrap_or(&e.param);
-                        bad(format!("{param}{rest}: {}", e.message))
-                    })?);
+                        let hint = e.message.replace("where[", &format!("{param}["));
+                        bad(format!("{param}{rest}: {hint}"))
+                    })?;
+                    if filter.near().is_some() {
+                        return Err(bad(format!("{param}: {NEAR_IN_JOIN}")));
+                    }
+                    req.filter = Some(filter);
                 }
                 _ => {
                     return Err(bad(format!(
@@ -204,7 +238,7 @@ fn joins(
                 }
             }
         }
-        out.insert(name.clone(), req);
+        out.insert(name, req);
     }
     Ok(Joins::On(out))
 }

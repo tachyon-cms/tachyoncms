@@ -54,6 +54,8 @@ struct Plan {
     sort: Option<tachyon_core::query::Sort>,
 }
 
+// ponytail: the schema's `where` and `defaultSort` are parsed on every read; cache them on
+// the collection if that shows up in a profile.
 fn plan(state: &AppState, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> {
     let target = state
         .schemas

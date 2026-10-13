@@ -741,4 +741,24 @@ mod joins {
         assert_eq!(titles(&pages, news), ["kept"]);
         assert_eq!(pages[&news].total, Some(1));
     }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn repeated_parents_are_answered_once(pool: PgPool) {
+        let f = fixture(&pool).await;
+        let [news, _] = f.cats;
+        post(&pool, &f, "a", &[("category", news)]).await;
+        let pattern = on_pattern(f.schema.data(), "category").unwrap();
+        let pages = joined(
+            &pool,
+            &[news, news],
+            &JoinQuery {
+                limit: 1,
+                ..q(&f, &pattern)
+            },
+        )
+        .await
+        .unwrap();
+        assert_eq!(titles(&pages, news), ["a"]);
+        assert!(!pages[&news].has_more);
+    }
 }

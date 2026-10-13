@@ -208,6 +208,17 @@ fn compare(
                 to: new_path.clone(),
             });
         }
+        // A join turned into a stored field: the join stored nothing, so nothing goes.
+        if matches!(o.kind, FieldKind::Join { .. }) && !matches!(n.kind, FieldKind::Join { .. }) {
+            out.push(Change::VirtualRemoved {
+                path: old_path.clone(),
+            });
+            out.push(Change::Added {
+                path: new_path,
+                kind: n.kind.name(),
+            });
+            continue;
+        }
         // A stored field turned virtual: what it stored goes.
         if o.virtual_path.is_none() && n.virtual_path.is_some() {
             out.push(Change::TypeChanged {

@@ -327,3 +327,125 @@ async fn stale_join_targets_return_empty(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["posts"], json!({"docs": [], "hasNextPage": false}));
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn changes_that_break_another_collections_join_are_refused(pool: PgPool) {
+    let (app, _, _) = blog(pool).await;
+    let drop_category = json!({"schema": {"slug": "posts", "fields": [
+        {"name": "title", "type": "text"},
+        {"name": "draft", "type": "boolean"},
+        {"name": "author", "type": "relationship", "relationTo": "authors"}
+    ]}, "confirm": true});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(&drop_category.to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "this change would break categories: field `posts`: posts has no field `category`"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn nested_joins_take_either_path_form(pool: PgPool) {
+    let (app, news, _) = blog(pool).await;
+    for q in [
+        "joins[meta.recent][limit]=2",
+        "joins[meta][recent][limit]=2",
+    ] {
+        let res = send(&app, "GET", &format!("/api/categories/{news}?{q}"), None).await;
+        assert_eq!(res.status, 200, "{q}: {}", res.json);
+        assert_eq!(titles(&res.json["meta"]["recent"]).len(), 2, "{q}");
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn join_where_hints_and_near_are_explained(pool: PgPool) {
+    let (app, news, _) = blog(pool).await;
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/categories/{news}?joins[posts][where]=x"),
+        None,
+    )
+    .await;
+    assert_problem(&res, 400);
+    assert_eq!(
+        res.json["detail"],
+        "joins[posts][where]: expected conditions like joins[posts][where][title][equals]=Hello"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn joins_through_lists_self_links_and_several_targets(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    create(
+        &app,
+        "/api/admin/collections",
+        json!({"slug": "topics", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "parent", "type": "relationship", "relationTo": "topics"}
+        ]}),
+    )
+    .await;
+    create(
+        &app,
+        "/api/admin/collections",
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "tags", "type": "relationship", "relationTo": "topics", "hasMany": true},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "target", "type": "relationship", "relationTo": ["topics", "posts"]}
+            ]}
+        ]}),
+    )
+    .await;
+    let change = json!({"schema": {"slug": "topics", "fields": [
+        {"name": "name", "type": "text"},
+        {"name": "parent", "type": "relationship", "relationTo": "topics"},
+        {"name": "children", "type": "join", "collection": "topics", "on": "parent"},
+        {"name": "tagged", "type": "join", "collection": "posts", "on": "tags"},
+        {"name": "linked", "type": "join", "collection": "posts", "on": "links.target"}
+    ]}});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/topics",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let rust = create(&app, "/api/topics", json!({"name": "rust"})).await;
+    create(
+        &app,
+        "/api/topics",
+        json!({"name": "axum", "parent": rust["id"]}),
+    )
+    .await;
+    let link = json!({"relationTo": "topics", "value": rust["id"]});
+    create(&app, "/api/posts", json!({"title": "p", "tags": [rust["id"], rust["id"]], "links": [{"target": link}, {"target": link}]})).await;
+    let id = rust["id"].as_str().unwrap();
+    let res = send(&app, "GET", &format!("/api/topics/{id}"), None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let names: Vec<&str> = res.json["children"]["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["name"].as_str().unwrap())
+        .collect();
+    assert_eq!(names, ["axum"]);
+    assert_eq!(
+        titles(&res.json["tagged"]),
+        ["p"],
+        "linked twice through a list, listed once"
+    );
+    assert_eq!(
+        titles(&res.json["linked"]),
+        ["p"],
+        "through list rows with several targets"
+    );
+}
