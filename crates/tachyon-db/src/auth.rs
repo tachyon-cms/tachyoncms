@@ -709,3 +709,45 @@ pub async fn list_api_keys(pool: &PgPool, user_id: Uuid) -> Result<Vec<ApiKeyInf
     .fetch_all(pool)
     .await?)
 }
+
+/// Replaces a key's secret: a new key with the same name, scopes and expiry, and the old one
+/// revoked, together. `None` when the key isn't the user's or is already revoked.
+pub async fn rotate_api_key(
+    pool: &PgPool,
+    user_id: Uuid,
+    id: Uuid,
+    prefix: &str,
+    secret_hash: &[u8],
+) -> Result<Option<ApiKeyInfo>, DbError> {
+    let mut tx = pool.begin().await?;
+    let Some(old) = sqlx::query!(
+        r#"UPDATE api_keys SET revoked_at = now()
+           WHERE id = $1 AND user_id = $2 AND revoked_at IS NULL
+           RETURNING name, scopes, expires_at"#,
+        id,
+        user_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let new = sqlx::query_as!(
+        ApiKeyInfo,
+        r#"INSERT INTO api_keys (id, tenant_id, user_id, name, prefix, secret_hash, scopes, expires_at)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
+           RETURNING id, name, prefix, scopes, expires_at, last_used_at, created_at"#,
+        Uuid::now_v7(),
+        DEFAULT_TENANT,
+        user_id,
+        old.name,
+        prefix,
+        secret_hash,
+        &old.scopes,
+        old.expires_at,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    Ok(Some(new))
+}

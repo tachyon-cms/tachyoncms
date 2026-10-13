@@ -36,6 +36,12 @@ pub(crate) fn routes() -> Router<AppState> {
         .route("/api/auth/sessions/{id}", delete(end_session))
         .route("/api/auth/password", post(change_password))
         .route(
+            "/api/auth/keys",
+            get(super::keys::list).post(super::keys::create),
+        )
+        .route("/api/auth/keys/{id}", delete(super::keys::revoke))
+        .route("/api/auth/keys/{id}/rotate", post(super::keys::rotate))
+        .route(
             "/api/users",
             get(super::users::list).post(super::users::create),
         )

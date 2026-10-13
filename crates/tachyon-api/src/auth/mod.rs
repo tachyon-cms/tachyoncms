@@ -1,5 +1,6 @@
 //! Signing in: passwords, sessions, API keys, and who is asking.
 
+mod keys;
 pub(crate) mod password;
 pub(crate) mod principal;
 mod roles;
