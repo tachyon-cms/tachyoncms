@@ -108,11 +108,11 @@ Anyone can read. Signed-in users write according to their role:
 | Editor | change all content and globals |
 | Admin | everything, including content types, users and roles |
 
-Admins manage users at `/api/users` and roles at `/api/admin/roles`; custom roles can be added alongside the four built-in ones. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
+Admins manage users at `/api/users` and roles at `/api/admin/roles`. A user's email, role and password stay private, but their profile fields (such as `name`) show wherever another document links to them, so keep private details out of profile fields; custom roles can be added alongside the four built-in ones. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
 
 ### Putting it online
 
-Set `public_url` to the address people use, such as `https://cms.example.com`, and serve it over HTTPS. The server won't start on a public address without it, because browser sign-ins only accept changes coming from that address. Other settings live under `[auth]` in `tachyon.toml` (see `tachyon.example.toml`), or in the environment as `TACHYON_AUTH__SETTING`.
+Set `public_url` to the address people use, such as `https://cms.example.com`, and serve it over HTTPS. Set it behind a reverse proxy too, even though the server itself listens on `127.0.0.1`: browser sign-ins compare against it. The server won't start on a public address without it, because browser sign-ins only accept changes coming from that address. Other settings live under `[auth]` in `tachyon.toml` (see `tachyon.example.toml`), or in the environment as `TACHYON_AUTH__SETTING`.
 
 ## Changing your content types
 

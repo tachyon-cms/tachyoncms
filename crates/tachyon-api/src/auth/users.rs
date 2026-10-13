@@ -17,12 +17,11 @@ use uuid::Uuid;
 use super::principal::Principal;
 use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
-use crate::documents::{collection, json_body, unique_error};
+use crate::documents::{any_collection, json_body, unique_error};
 use crate::populate::{link_targets, prepare};
 use crate::{ApiError, AppState};
 
-/// Keys a user body may carry besides profile fields. They can't be field names.
-pub(crate) const ACCOUNT_KEYS: &[&str] = &["email", "role", "password", "currentPassword"];
+pub(crate) use tachyon_db::auth::ACCOUNT_KEYS;
 
 fn field(path: &str, message: &str) -> FieldError {
     FieldError {
@@ -104,13 +103,8 @@ pub(crate) async fn list(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Users, "users")?;
-    let Json(mut body) = crate::documents::list(
-        State(state.clone()),
-        principal,
-        Ok(Path(auth::USERS.to_owned())),
-        RawQuery(raw),
-    )
-    .await?;
+    let users = any_collection(&state, auth::USERS)?;
+    let Json(mut body) = crate::documents::list_in(&state, users, raw).await?;
     if let Some(Value::Array(docs)) = body.get_mut("docs") {
         with_accounts(&state, docs).await?;
     }
@@ -163,7 +157,7 @@ pub(crate) async fn create(
     if let Err(m) = check_password(&password) {
         errors.push(field("password", m));
     }
-    let users = collection(&state, auth::USERS)?;
+    let users = any_collection(&state, auth::USERS)?;
     let data = validate_document(users.schema.data(), &Value::Object(profile), None);
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
@@ -243,7 +237,15 @@ pub(crate) async fn update(
                 ));
             }
         }
-        auth::set_email(&state.pool, id, email).await?;
+        // Saying the address is taken would tell any signed-in user who has an account.
+        auth::set_email(&state.pool, id, email)
+            .await
+            .map_err(|e| match e {
+                tachyon_db::DbError::Conflict(_) => {
+                    ApiError::Conflict("That email can't be used. Choose another.".into())
+                }
+                e => e.into(),
+            })?;
     }
     if let Some(password) = text(&account, "password")? {
         if !admin {
@@ -259,11 +261,17 @@ pub(crate) async fn update(
             .await
             .map_err(ApiError::Internal)?;
         auth::set_password(&state.pool, id, &hash).await?;
-        // Someone else set it, so every existing session of theirs ends.
-        auth::revoke_other_sessions(&state.pool, id, None).await?;
+        // Every other session of theirs ends; an Admin setting their own keeps this one.
+        let keep = match &principal {
+            Principal::User {
+                identity, session, ..
+            } if identity.user_id == id => Some(*session),
+            _ => None,
+        };
+        auth::revoke_other_sessions(&state.pool, id, keep).await?;
     }
     if !profile.is_empty() {
-        let users = collection(&state, auth::USERS)?;
+        let users = any_collection(&state, auth::USERS)?;
         let targets = link_targets(&state, &users).await?;
         let patch = Value::Object(profile);
         let who = principal.identity().map(|i| Actor {
@@ -295,7 +303,7 @@ pub(crate) async fn delete(
 ) -> Result<StatusCode, ApiError> {
     let id = user_id(path)?;
     authorize(&principal, Action::Users, "users")?;
-    let users = collection(&state, auth::USERS)?;
+    let users = any_collection(&state, auth::USERS)?;
     let who = actor(&principal, Decision::Allow);
     documents::delete_as(&state.pool, users.id, id, who).await?;
     Ok(StatusCode::NO_CONTENT)

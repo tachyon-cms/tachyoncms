@@ -16,6 +16,46 @@ use crate::{DEFAULT_TENANT, DbError};
 /// The slug of the system collection admin users live in.
 pub const USERS: &str = "users";
 
+/// Keys a user's account holds, which their profile can't use as field names.
+pub const ACCOUNT_KEYS: &[&str] = &["email", "role", "password", "currentPassword"];
+
+/// The users collection keeps a text `name` (setup and sign-in fill it), and no profile field
+/// may take a name its account uses.
+pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core::SchemaError> {
+    use tachyon_core::{FieldKind, SchemaError};
+    if schema.slug != USERS {
+        return Ok(());
+    }
+    if let Some(f) = schema
+        .data()
+        .iter()
+        .find(|f| ACCOUNT_KEYS.contains(&f.name.as_str()))
+    {
+        return Err(SchemaError::InvalidField {
+            field: f.name.clone(),
+            message: "users keep email, role and password in their account, so a field can't use that name".into(),
+        });
+    }
+    let named = schema.data().iter().any(|f| {
+        f.name == "name"
+            && f.virtual_path.is_none()
+            && matches!(
+                f.kind,
+                FieldKind::Text {
+                    has_many: false,
+                    ..
+                }
+            )
+    });
+    if !named {
+        return Err(SchemaError::InvalidField {
+            field: "name".into(),
+            message: "users need a text field called name, which setup and sign-in fill".into(),
+        });
+    }
+    Ok(())
+}
+
 /// Session lifetimes and lockout rules, from configuration.
 #[derive(Debug, Clone)]
 pub struct Limits {
@@ -419,22 +459,23 @@ pub async fn revoke_other_sessions(
     Ok(())
 }
 
-pub async fn list_sessions(pool: &PgPool, user_id: Uuid) -> Result<Vec<SessionInfo>, DbError> {
+/// A user's sessions that still work: not past their end, and not idle too long.
+pub async fn list_sessions(
+    pool: &PgPool,
+    user_id: Uuid,
+    limits: &Limits,
+) -> Result<Vec<SessionInfo>, DbError> {
     Ok(sqlx::query_as!(
         SessionInfo,
         r#"SELECT id, created_at, last_seen_at, expires_at, user_agent, ip
            FROM sessions WHERE user_id = $1 AND expires_at > now()
+             AND last_seen_at > now() - make_interval(secs => $2)
            ORDER BY last_seen_at DESC"#,
         user_id,
+        secs(limits.idle),
     )
     .fetch_all(pool)
     .await?)
-}
-
-/// Fails when `user_id` is the only remaining Admin, so the install never loses its last one.
-pub async fn guard_removal(pool: &PgPool, user_id: Uuid) -> Result<(), DbError> {
-    let mut conn = pool.acquire().await?;
-    guard_last_admin(&mut conn, user_id, None).await
 }
 
 /// Locks the Admin accounts and refuses a change that would leave none: `new_role` is the
@@ -624,7 +665,7 @@ pub async fn create_api_key(
     scopes: &[String],
     expires_at: Option<OffsetDateTime>,
 ) -> Result<ApiKeyInfo, DbError> {
-    Ok(sqlx::query_as!(
+    sqlx::query_as!(
         ApiKeyInfo,
         r#"INSERT INTO api_keys (id, tenant_id, user_id, name, prefix, secret_hash, scopes, expires_at)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8)
@@ -639,7 +680,8 @@ pub async fn create_api_key(
         expires_at,
     )
     .fetch_one(pool)
-    .await?)
+    .await
+    .map_err(crate::map_unique)
 }
 
 /// A live key by its public prefix: not revoked, not expired, its owner still a user.
@@ -747,7 +789,8 @@ pub async fn rotate_api_key(
         old.expires_at,
     )
     .fetch_one(&mut *tx)
-    .await?;
+    .await
+    .map_err(crate::map_unique)?;
     tx.commit().await?;
     Ok(Some(new))
 }

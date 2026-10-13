@@ -41,10 +41,18 @@ impl Principal {
         }
     }
 
-    /// The signed-in person, or a 401.
+    /// Someone acting as themselves: a signed-in session, or an API key with the `admin`
+    /// scope. Other keys are limited to the collections their scopes name, so they can't
+    /// see schemas, roles, accounts or sessions.
     pub(crate) fn require(&self) -> Result<&Identity, ApiError> {
-        self.identity()
-            .ok_or_else(|| ApiError::Unauthorized("Sign in first.".into()))
+        match self {
+            Self::User { identity, .. } => Ok(identity),
+            Self::Key { identity, scopes } if scopes.contains(&Scope::Admin) => Ok(identity),
+            Self::Key { .. } => Err(ApiError::Forbidden(
+                "This API key can't do that; it needs the admin scope.".into(),
+            )),
+            Self::Anonymous => Err(ApiError::Unauthorized("Sign in first.".into())),
+        }
     }
 }
 
@@ -60,7 +68,9 @@ impl<S: Send + Sync> FromRequestParts<S> for Principal {
     }
 }
 
-/// Middleware: works out the principal once per request. Credentials that are present but
+/// Middleware: works out the principal once per request. Login itself needs no origin check:
+/// it takes JSON, which a cross-site form can't send and a cross-site fetch can't send
+/// without a CORS preflight this API never answers. Credentials that are present but
 /// don't work are a 401, never a quiet fall back to anonymous, so a broken client finds out.
 pub(crate) async fn resolve(
     State(state): State<AppState>,
@@ -111,10 +121,14 @@ async fn principal(state: &AppState, headers: &HeaderMap) -> Result<Principal, A
                 "Use Authorization: Bearer followed by an API key or a session token.".into(),
             )
         };
+        // The scheme is case-insensitive (RFC 9110), the token isn't.
         let token = value
             .to_str()
             .ok()
-            .and_then(|v| v.strip_prefix("Bearer "))
+            .and_then(|v| {
+                let (scheme, rest) = v.split_at_checked(7)?;
+                scheme.eq_ignore_ascii_case("bearer ").then_some(rest)
+            })
             .map(str::trim)
             .ok_or_else(malformed)?;
         if let Some(rest) = token.strip_prefix("tcy_") {

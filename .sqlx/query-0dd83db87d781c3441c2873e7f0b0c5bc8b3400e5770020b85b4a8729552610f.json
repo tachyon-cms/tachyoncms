@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, created_at, last_seen_at, expires_at, user_agent, ip\n           FROM sessions WHERE user_id = $1 AND expires_at > now()\n           ORDER BY last_seen_at DESC",
+  "query": "SELECT id, created_at, last_seen_at, expires_at, user_agent, ip\n           FROM sessions WHERE user_id = $1 AND expires_at > now()\n             AND last_seen_at > now() - make_interval(secs => $2)\n           ORDER BY last_seen_at DESC",
   "describe": {
     "columns": [
       {
@@ -72,7 +72,8 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "Float8"
       ]
     },
     "nullable": [
@@ -84,5 +85,5 @@
       true
     ]
   },
-  "hash": "82835a63569a60d786e3294b1c705731bd503fbb05d11ed78ca56d3c5e3b4087"
+  "hash": "0dd83db87d781c3441c2873e7f0b0c5bc8b3400e5770020b85b4a8729552610f"
 }

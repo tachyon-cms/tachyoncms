@@ -267,15 +267,16 @@ async fn sessions(
         Principal::User { session, .. } => Some(*session),
         _ => None,
     };
-    let docs: Vec<Value> = auth::list_sessions(&state.pool, identity.user_id)
-        .await?
-        .into_iter()
-        .map(|s| {
-            let mut v = json!(s);
-            v["current"] = (Some(s.id) == current).into();
-            v
-        })
-        .collect();
+    let docs: Vec<Value> =
+        auth::list_sessions(&state.pool, identity.user_id, &state.auth.config.limits())
+            .await?
+            .into_iter()
+            .map(|s| {
+                let mut v = json!(s);
+                v["current"] = (Some(s.id) == current).into();
+                v
+            })
+            .collect();
     Ok(Json(json!({ "docs": docs })))
 }
 

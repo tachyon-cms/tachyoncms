@@ -118,24 +118,6 @@ struct ChangeRequest {
     confirm: bool,
 }
 
-/// The users collection's profile fields can't take the names its account keys use.
-fn check_users_schema(schema: &CollectionSchema) -> Result<(), ApiError> {
-    if schema.slug != tachyon_db::auth::USERS {
-        return Ok(());
-    }
-    match schema
-        .data()
-        .iter()
-        .find(|f| crate::auth::ACCOUNT_KEYS.contains(&f.name.as_str()))
-    {
-        Some(f) => Err(schema_error(SchemaError::InvalidField {
-            field: f.name.clone(),
-            message: "users keep email, role and password in their account, so a field can't use that name".into(),
-        })),
-        None => Ok(()),
-    }
-}
-
 /// Every virtual field must read a field its targets have, and every join a field that links here.
 fn check_virtuals(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
     let lookup = |slug: &str| state.schemas.get(slug).map(|c| c.schema.0.clone());
@@ -210,7 +192,6 @@ pub async fn preview(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
-    check_users_schema(&schema)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
@@ -227,7 +208,6 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
-    check_users_schema(&schema)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)

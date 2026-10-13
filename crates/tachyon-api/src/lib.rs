@@ -50,13 +50,17 @@ pub enum StartError {
     Config(String),
 }
 
-/// The API with default options; see `router_with`.
+/// The API with default options; see `router_with`. The defaults suit development and tests:
+/// the public URL is `http://localhost:3000` and the password breach check is off. A server
+/// facing people should pass real settings to `router_with`.
 pub async fn router(pool: PgPool) -> Result<Router, StartError> {
     router_with(pool, Options::default()).await
 }
 
 pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
+    // Users are a collection like any other, so make sure it's there before serving.
+    tachyon_db::auth::ensure_users_collection(&pool).await?;
     let schemas = Arc::new(Schemas::load(&pool).await?);
     // Builds any index a failed change left missing, in the background: a big build, or one
     // waiting on another server's, mustn't keep this one from answering.

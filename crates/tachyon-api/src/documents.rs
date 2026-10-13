@@ -26,6 +26,18 @@ use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
 pub(crate) fn collection(state: &AppState, slug: &str) -> Result<Arc<Collection>, ApiError> {
+    // Users have their own routes, which check who's asking and keep accounts apart. This is
+    // decided on the slug the route resolved to, not the path, so `/api/%75sers` can't slip
+    // past them.
+    if slug == tachyon_db::auth::USERS {
+        return Err(ApiError::NotFound);
+    }
+    any_collection(state, slug)
+}
+
+/// A collection by slug, including `users`: only for code that has already decided the
+/// caller may reach it.
+pub(crate) fn any_collection(state: &AppState, slug: &str) -> Result<Arc<Collection>, ApiError> {
     state
         .schemas
         .get(slug)
@@ -75,6 +87,17 @@ pub async fn list(
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     authorize(&principal, Action::Read, &slug)?;
     let c = collection(&state, &slug)?;
+    list_in(&state, c, raw).await
+}
+
+/// A page of `c`'s documents, shaped and populated as the query asks. The caller has
+/// already authorized the read.
+pub(crate) async fn list_in(
+    state: &AppState,
+    c: Arc<Collection>,
+    raw: Option<String>,
+) -> Result<Json<Value>, ApiError> {
+    let state = state.clone();
     let p = list_params(raw.as_deref(), &c, &state.schemas)?;
     let page = p.page.unwrap_or(1);
     let offset = (page - 1)

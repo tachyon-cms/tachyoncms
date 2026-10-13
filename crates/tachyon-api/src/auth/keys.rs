@@ -92,18 +92,28 @@ pub(crate) async fn create(
     {
         return Err(field("expiresAt", "must be in the future"));
     }
-    let (prefix, secret) = new_secret();
-    let info = auth::create_api_key(
-        &state.pool,
-        me.user_id,
-        req.name.trim(),
-        &prefix,
-        &token_hash(&secret),
-        &req.scopes,
-        req.expires_at,
-    )
-    .await?;
-    Ok((StatusCode::CREATED, shown(&info, &secret)))
+    // A prefix collision is very unlikely (36^8), but a fresh draw is cheaper than a 500.
+    for _ in 0..3 {
+        let (prefix, secret) = new_secret();
+        match auth::create_api_key(
+            &state.pool,
+            me.user_id,
+            req.name.trim(),
+            &prefix,
+            &token_hash(&secret),
+            &req.scopes,
+            req.expires_at,
+        )
+        .await
+        {
+            Ok(info) => return Ok((StatusCode::CREATED, shown(&info, &secret))),
+            Err(tachyon_db::DbError::UniqueViolation(_)) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::Internal(
+        "couldn't draw a unique key prefix".into(),
+    ))
 }
 
 pub(crate) async fn list(
@@ -140,15 +150,18 @@ pub(crate) async fn rotate(
     path: Result<Path<String>, PathRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let me = session_user(&principal)?;
-    let (prefix, secret) = new_secret();
-    let info = auth::rotate_api_key(
-        &state.pool,
-        me.user_id,
-        key_id(path)?,
-        &prefix,
-        &token_hash(&secret),
-    )
-    .await?
-    .ok_or(ApiError::NotFound)?;
-    Ok((StatusCode::CREATED, shown(&info, &secret)))
+    let id = key_id(path)?;
+    for _ in 0..3 {
+        let (prefix, secret) = new_secret();
+        match auth::rotate_api_key(&state.pool, me.user_id, id, &prefix, &token_hash(&secret)).await
+        {
+            Ok(Some(info)) => return Ok((StatusCode::CREATED, shown(&info, &secret))),
+            Ok(None) => return Err(ApiError::NotFound),
+            Err(tachyon_db::DbError::UniqueViolation(_)) => continue,
+            Err(e) => return Err(e.into()),
+        }
+    }
+    Err(ApiError::Internal(
+        "couldn't draw a unique key prefix".into(),
+    ))
 }

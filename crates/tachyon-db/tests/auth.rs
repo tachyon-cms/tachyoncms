@@ -212,7 +212,13 @@ async fn revoking_other_sessions_keeps_the_current_one(pool: PgPool) {
             .unwrap()
             .is_none()
     );
-    assert_eq!(auth::list_sessions(&pool, id).await.unwrap().len(), 1);
+    assert_eq!(
+        auth::list_sessions(&pool, id, &limits())
+            .await
+            .unwrap()
+            .len(),
+        1
+    );
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -222,8 +228,9 @@ async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
         auth::set_role(&pool, first, "editor").await,
         Err(DbError::Refused(_))
     ));
+    let users = auth::ensure_users_collection(&pool).await.unwrap();
     assert!(matches!(
-        auth::guard_removal(&pool, first).await,
+        tachyon_db::documents::delete(&pool, users.id, first).await,
         Err(DbError::Refused(_))
     ));
     let second = account(&pool, "c@d.co", "admin").await;
@@ -312,4 +319,17 @@ async fn api_keys_resolve_until_revoked_or_expired(pool: PgPool) {
             .unwrap()
             .is_none()
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_reused_key_prefix_is_a_unique_violation(pool: PgPool) {
+    let id = account(&pool, "a@b.co", "editor").await;
+    let scopes = vec!["posts:read".to_owned()];
+    auth::create_api_key(&pool, id, "one", "samepfx1", b"a", &scopes, None)
+        .await
+        .unwrap();
+    assert!(matches!(
+        auth::create_api_key(&pool, id, "two", "samepfx1", b"b", &scopes, None).await,
+        Err(DbError::UniqueViolation(_))
+    ));
 }

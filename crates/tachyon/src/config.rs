@@ -85,6 +85,17 @@ impl Config {
     /// Serving beyond this machine needs a public URL: cookie-signed writes are only accepted
     /// from it, so without one nobody could sign in from a browser.
     pub fn check_serve(&self) -> Result<(), String> {
+        if let Some(url) = &self.public_url {
+            let ok = url::Url::parse(url).is_ok_and(|u| {
+                matches!(u.scheme(), "http" | "https")
+                    && u.host_str().is_some_and(|h| !h.is_empty())
+            });
+            if !ok {
+                return Err(
+                    "public_url must be a full web address, like https://cms.example.com".into(),
+                );
+            }
+        }
         if self.public_url.is_none() && !self.listen.ip().to_canonical().is_loopback() {
             return Err(
                 "set public_url (such as https://cms.example.com) when listening beyond this machine"
@@ -173,6 +184,28 @@ mod tests {
                 .public_url,
             "http://localhost:4000",
             "locally the public URL defaults to this machine"
+        );
+    }
+
+    #[test]
+    fn public_url_must_be_a_full_web_address() {
+        for bad in [
+            "cms.example.com",
+            "ftp://cms.example.com",
+            "https://",
+            "not a url",
+        ] {
+            let config = load(&format!("public_url = \"{bad}\""));
+            assert_eq!(
+                config.check_serve().unwrap_err(),
+                "public_url must be a full web address, like https://cms.example.com",
+                "{bad}"
+            );
+        }
+        assert!(
+            load("public_url = \"https://cms.example.com/admin\"")
+                .check_serve()
+                .is_ok()
         );
     }
 
