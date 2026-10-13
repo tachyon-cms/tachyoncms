@@ -5,6 +5,7 @@ pub mod query;
 pub mod schema;
 pub mod select;
 pub mod validate;
+pub mod virtuals;
 
 pub use schema::{
     Admin, CollectionKind, CollectionSchema, Condition, ConditionTest, Field, FieldKind, Position,

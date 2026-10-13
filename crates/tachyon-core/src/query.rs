@@ -377,6 +377,12 @@ impl Parser<'_> {
             )
         })?;
         let (target, field) = resolve(self.fields, name).map_err(|m| err(param, m))?;
+        if field.is_some_and(|f| f.virtual_path.is_some()) {
+            return Err(err(
+                param,
+                format!("`{name}` is read through a relationship and can't be filtered yet"),
+            ));
+        }
         if !op.allowed(&target) {
             return Err(err(
                 param,
@@ -618,7 +624,13 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         None => (input, false),
     };
     let fields = data_fields(fields);
-    let (target, _) = resolve(&fields, name).map_err(|m| err("sort", m))?;
+    let (target, field) = resolve(&fields, name).map_err(|m| err("sort", m))?;
+    if field.is_some_and(|f| f.virtual_path.is_some()) {
+        return Err(err(
+            "sort",
+            format!("`{name}` is read through a relationship and can't be sorted yet"),
+        ));
+    }
     if matches!(target.kind(), ValueKind::List | ValueKind::LinkList) {
         return Err(err(
             "sort",

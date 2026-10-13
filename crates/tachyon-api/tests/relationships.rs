@@ -373,3 +373,182 @@ async fn the_same_document_through_two_fields_gets_each_fields_depth(pool: PgPoo
         "no cap: full depth"
     );
 }
+
+async fn with_virtuals(pool: PgPool) -> (Router, Value) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    for schema in [
+        json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "profile", "type": "group", "fields": [{"name": "city", "type": "text"}]}
+        ]}),
+        json!({"slug": "guests", "fields": [{"name": "name", "type": "text"}]}),
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "authorName", "type": "text", "virtual": "author.name"},
+            {"name": "authorCity", "type": "text", "virtual": "author.profile.city"},
+            {"name": "people", "type": "relationship", "relationTo": ["authors", "guests"], "hasMany": true},
+            {"name": "peopleNames", "type": "text", "virtual": "people.name"}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let ann = send(
+        &app,
+        "POST",
+        "/api/authors",
+        Some(r#"{"name": "Ann", "profile": {"city": "Leeds"}}"#),
+    )
+    .await;
+    let gus = send(&app, "POST", "/api/guests", Some(r#"{"name": "Gus"}"#)).await;
+    let body = json!({
+        "title": "Hi",
+        "author": ann.json["id"],
+        "people": [
+            {"relationTo": "authors", "value": ann.json["id"]},
+            {"relationTo": "guests", "value": gus.json["id"]}
+        ]
+    });
+    let post = send(&app, "POST", "/api/posts", Some(&body.to_string())).await;
+    assert_eq!(post.status, 201, "{}", post.json);
+    (app, post.json)
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtual_fields_read_through_links(pool: PgPool) {
+    let (app, created) = with_virtuals(pool).await;
+    assert_eq!(
+        created["authorName"], "Ann",
+        "write responses show virtuals too"
+    );
+    let id = created["id"].as_str().unwrap();
+    for depth in [0, 1] {
+        let res = send(&app, "GET", &format!("/api/posts/{id}?depth={depth}"), None).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["authorName"], "Ann");
+        assert_eq!(res.json["authorCity"], "Leeds");
+        assert_eq!(res.json["peopleNames"], json!(["Ann", "Gus"]));
+    }
+    let list = send(&app, "GET", "/api/posts", None).await;
+    assert_eq!(list.json["docs"][0]["authorName"], "Ann");
+
+    // No link: no value.
+    let bare = send(&app, "POST", "/api/posts", Some(r#"{"title": "Alone"}"#)).await;
+    assert!(bare.json.get("authorName").is_none(), "{}", bare.json);
+    assert!(bare.json.get("peopleNames").is_none(), "{}", bare.json);
+
+    let refused = send(
+        &app,
+        "PATCH",
+        &format!("/api/posts/{id}"),
+        Some(r#"{"authorName": "x"}"#),
+    )
+    .await;
+    assert_problem(&refused, 422);
+    assert_eq!(refused.json["errors"][0]["path"], "authorName");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtual_fields_in_populated_documents(pool: PgPool) {
+    let (app, created) = with_virtuals(pool).await;
+    let schema = json!({"slug": "lists", "fields": [
+        {"name": "post", "type": "relationship", "relationTo": "posts"}
+    ]});
+    send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema.to_string()),
+    )
+    .await;
+    let list = send(
+        &app,
+        "POST",
+        "/api/lists",
+        Some(&json!({"post": created["id"]}).to_string()),
+    )
+    .await;
+    let id = list.json["id"].as_str().unwrap();
+    let res = send(&app, "GET", &format!("/api/lists/{id}"), None).await;
+    assert_eq!(res.json["post"]["authorName"], "Ann", "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn select_picks_virtual_fields(pool: PgPool) {
+    let (app, created) = with_virtuals(pool).await;
+    let id = created["id"].as_str().unwrap();
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/posts/{id}?select[authorName]=true"),
+        None,
+    )
+    .await;
+    let keys: Vec<&String> = res.json.as_object().unwrap().keys().collect();
+    assert_eq!(keys, ["authorName", "id"]);
+    let res = send(
+        &app,
+        "GET",
+        &format!("/api/posts/{id}?select[authorName]=false"),
+        None,
+    )
+    .await;
+    assert!(res.json.get("authorName").is_none());
+    assert_eq!(res.json["authorCity"], "Leeds");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtual_targets_must_have_the_field(pool: PgPool) {
+    let app = tachyon_api::router(pool).await.unwrap();
+    let authors = json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]});
+    send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&authors.to_string()),
+    )
+    .await;
+    let posts = json!({"slug": "posts", "fields": [
+        {"name": "author", "type": "relationship", "relationTo": "authors"},
+        {"name": "v", "type": "text", "virtual": "author.nope"}
+    ]});
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&posts.to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "field `v`: authors has no field `nope` to read"
+    );
+
+    let ok = json!({"slug": "posts", "fields": [
+        {"name": "author", "type": "relationship", "relationTo": "authors"}
+    ]});
+    send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&ok.to_string()),
+    )
+    .await;
+    let change = json!({"schema": posts});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+}

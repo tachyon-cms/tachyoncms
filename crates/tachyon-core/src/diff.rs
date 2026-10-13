@@ -44,6 +44,10 @@ pub enum Change {
     LayoutChanged,
     /// A collection-wide option such as `defaultPopulate` changed; stored data is untouched.
     CollectionOptionsChanged,
+    /// A virtual field went. It stored nothing, so nothing is lost.
+    VirtualRemoved {
+        path: String,
+    },
     /// A relationship's targets widened without losing any (one collection to several that
     /// include it); existing links are kept and reshaped.
     Relinked {
@@ -186,12 +190,25 @@ fn compare(
                     "can't rename `{old_path}` to `{name}`: there's no `{new_path}` in the new fields"
                 )));
             }
-            out.push(Change::Removed {
-                path: old_path,
-                kind: o.kind.name(),
+            out.push(if o.virtual_path.is_some() {
+                Change::VirtualRemoved { path: old_path }
+            } else {
+                Change::Removed {
+                    path: old_path,
+                    kind: o.kind.name(),
+                }
             });
             continue;
         };
+        // A stored field turned virtual: what it stored goes.
+        if o.virtual_path.is_none() && n.virtual_path.is_some() {
+            out.push(Change::TypeChanged {
+                path: new_path,
+                from: o.kind.name(),
+                to: "virtual",
+            });
+            continue;
+        }
         if renamed {
             out.push(Change::Renamed {
                 from: old_path.clone(),
@@ -520,7 +537,12 @@ fn convert_link(v: &Value, change: &LinkChange) -> Option<Value> {
 }
 
 fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
-    obj.retain(|key, _| fields.iter().any(|f| &f.name == key));
+    // Virtual values are read on the way out, never stored.
+    obj.retain(|key, _| {
+        fields
+            .iter()
+            .any(|f| &f.name == key && f.virtual_path.is_none())
+    });
     for f in fields {
         match (&f.kind, obj.get_mut(&f.name)) {
             (FieldKind::Group { fields }, Some(Value::Object(inner))) => prune(fields, inner),

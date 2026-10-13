@@ -17,7 +17,7 @@ use tachyon_db::query::{self, ListQuery};
 use uuid::Uuid;
 
 use crate::params::{list_params, read_params};
-use crate::populate::{Shapes, link_targets, populate, prepare, to_value};
+use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -83,11 +83,16 @@ pub async fn list(
         count: p.count,
     };
     let found = query::list(&state.pool, c.id, &q).await?;
-    let docs = found
+    let mut docs = found
         .docs
         .iter()
-        .map(|d| Ok((shaped(to_value(d)?, p.select.as_ref()), c.clone())))
+        .map(|d| Ok((to_value(d)?, c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
+    fill_virtuals(&state, &mut docs, p.select.as_ref()).await?;
+    let docs = docs
+        .into_iter()
+        .map(|(v, c)| (shaped(v, p.select.as_ref()), c))
+        .collect();
     let docs = populate(&state, docs, p.depth, &p.populate).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
     if p.after.is_none() {
@@ -118,8 +123,10 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    let mut items = vec![(to_value(doc)?, c)];
+    fill_virtuals(state, &mut items, None).await?;
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth, &Shapes::new())
+        populate(state, items, depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -157,7 +164,10 @@ pub async fn get(
     let c = collection(&state, &slug)?;
     let p = read_params(raw.as_deref(), c.schema.data(), &state.schemas)?;
     let doc = documents::get(&state.pool, c.id, id).await?;
-    let value = shaped(to_value(&doc)?, p.select.as_ref());
+    let mut items = vec![(to_value(&doc)?, c)];
+    fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    let (value, c) = items.remove(0);
+    let value = shaped(value, p.select.as_ref());
     Ok(Json(
         populate(&state, vec![(value, c)], p.depth, &p.populate)
             .await?

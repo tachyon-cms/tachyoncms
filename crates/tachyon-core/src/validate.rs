@@ -225,6 +225,15 @@ fn check_object(
     }
     for f in fields {
         let path = join(prefix, &f.name);
+        if let Some(source) = &f.virtual_path {
+            if obj.contains_key(&f.name) {
+                errors.push(error(
+                    path,
+                    &format!("is read from {source}; set that instead"),
+                ));
+            }
+            continue;
+        }
         match obj.get(&f.name) {
             None | Some(Value::Null) if f.required => errors.push(error(path, "is required")),
             None | Some(Value::Null) => {}

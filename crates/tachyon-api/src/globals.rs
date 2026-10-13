@@ -14,7 +14,7 @@ use tachyon_db::documents::{self, Document};
 
 use crate::documents::{json_body, shaped, unique_error};
 use crate::params::read_params;
-use crate::populate::{Shapes, link_targets, populate, prepare, to_value};
+use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -35,8 +35,10 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    let mut items = vec![(to_value(doc)?, c)];
+    fill_virtuals(state, &mut items, None).await?;
     Ok(Json(
-        populate(state, vec![(to_value(doc)?, c)], depth, &Shapes::new())
+        populate(state, items, depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -54,6 +56,9 @@ pub async fn get(
         Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
         Err(e) => return Err(e.into()),
     };
+    let mut items = vec![(value, c)];
+    fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
         populate(&state, vec![(value, c)], p.depth, &p.populate)

@@ -7,6 +7,7 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value};
 use tachyon_core::select::{Select, parse_select, project};
+use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
@@ -76,6 +77,48 @@ pub(crate) fn prepare(
 
 pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
     serde_json::to_value(doc).map_err(|e| ApiError::Internal(e.to_string()))
+}
+
+/// Fills each document's virtual fields (those `select` keeps) with one query for all of them.
+pub(crate) async fn fill_virtuals(
+    state: &AppState,
+    items: &mut [(Value, Arc<Collection>)],
+    select: Option<&Select>,
+) -> Result<(), ApiError> {
+    let wanted: Vec<Vec<VirtualField>> = items
+        .iter()
+        .map(|(_, c)| {
+            c.schema
+                .virtual_fields()
+                .into_iter()
+                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)))
+                .collect()
+        })
+        .collect();
+    let mut ids: Vec<Uuid> = items
+        .iter()
+        .zip(&wanted)
+        .filter_map(|((v, _), wanted)| Some((v.as_object()?, wanted)))
+        .flat_map(|(doc, wanted)| wanted.iter().flat_map(|v| virtuals::linked_ids(v, doc)))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    let linked: HashMap<Uuid, Value> = documents::get_many(&state.pool, &ids)
+        .await?
+        .into_iter()
+        .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
+        .collect();
+    for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
+        if let Some(doc) = value.as_object_mut() {
+            for v in wanted {
+                virtuals::fill(v, doc, |id| linked.get(&id).cloned());
+            }
+        }
+    }
+    Ok(())
 }
 
 /// `populate[collection]` choices: how documents of each collection look when populated.
@@ -153,19 +196,31 @@ fn populate_each<'a>(
         let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
         keys.sort_unstable();
         keys.dedup();
-        let mut children = Vec::new();
+        let mut fetched = Vec::new();
         let mut child_keys = Vec::new();
         for key @ (id, remaining) in keys {
             let Some((collection_id, doc)) = found.get(&id) else {
                 continue;
             };
             if let Some(c) = state.schemas.get_by_id(*collection_id) {
-                let mut value = to_value(doc)?;
-                shape_child(&c, shapes, &mut value);
-                children.push((value, c, remaining));
+                fetched.push((to_value(doc)?, c, remaining));
                 child_keys.push(key);
             }
         }
+        // Populated documents show their virtual fields too, before their shape applies.
+        let mut pairs: Vec<(Value, Arc<Collection>)> = fetched
+            .iter()
+            .map(|(v, c, _)| (v.clone(), c.clone()))
+            .collect();
+        fill_virtuals(state, &mut pairs, None).await?;
+        let children: Vec<(Value, Arc<Collection>, u8)> = pairs
+            .into_iter()
+            .zip(fetched)
+            .map(|((mut value, c), (_, _, remaining))| {
+                shape_child(&c, shapes, &mut value);
+                (value, c, remaining)
+            })
+            .collect();
         let children = populate_each(state, children, shapes).await?;
         let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 

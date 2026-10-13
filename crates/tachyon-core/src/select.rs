@@ -97,6 +97,37 @@ fn parse_tree(
     Ok(tree)
 }
 
+impl Select {
+    /// Whether the value at a dotted path survives `project`.
+    pub fn keeps(&self, path: &str) -> bool {
+        let mut parts = path.split('.');
+        match self {
+            Select::Include(tree) => {
+                let mut tree = tree;
+                for part in parts.by_ref() {
+                    match tree.0.get(part) {
+                        None => return false,
+                        Some(None) => return true,
+                        Some(Some(child)) => tree = child,
+                    }
+                }
+                true
+            }
+            Select::Exclude(tree) => {
+                let mut tree = tree;
+                for part in parts.by_ref() {
+                    match tree.0.get(part) {
+                        None => return true,
+                        Some(None) => return false,
+                        Some(Some(child)) => tree = child,
+                    }
+                }
+                true
+            }
+        }
+    }
+}
+
 /// Shapes `doc` in place.
 pub fn project(select: &Select, doc: &mut Map<String, Value>) {
     match select {
