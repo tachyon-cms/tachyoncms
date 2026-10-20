@@ -286,21 +286,23 @@ pub(crate) async fn update(
             Some(hash)
         }
     };
-    let targets = link_targets(&state, &users).await?;
-    let patch = profile;
-    let apply = |current: &Map<String, Value>| {
-        validate_document(users.schema.data(), &patch, Some(current))
-            .map_err(ApiError::Validation)
-            .and_then(|data| prepare(&targets, &users, data))
-            .map_err(|e| hide_errors(&users, e, &caller))
-    };
-    let vouched = if patch.as_object().is_some_and(|p| !p.is_empty()) {
+    // An account-only change (role, email, password) leaves the profile alone.
+    let profile_write = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+        let targets = link_targets(&state, &users).await?;
+        let (users, patch, caller) = (&users, &profile, &caller);
+        let apply = move |current: &Map<String, Value>| {
+            validate_document(users.schema.data(), patch, Some(current))
+                .map_err(ApiError::Validation)
+                .and_then(|data| prepare(&targets, users, data))
+                .map_err(|e| hide_errors(users, e, caller))
+        };
         // Links the profile gains must point at documents the caller can read (all of
         // them, for an Admin editing someone else's).
-        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+        let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
         let stored = documents::get(&state.pool, users.id, id).await?.data.0;
         let next = apply(&stored)?;
-        Some(check_links(&state, &access, &next, &link_ids(&users, &stored)).await?)
+        let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
+        Some((apply, vouched))
     } else {
         None
     };
@@ -311,7 +313,7 @@ pub(crate) async fn update(
         .begin()
         .await
         .map_err(tachyon_db::DbError::from)?;
-    if let Some(vouched) = &vouched {
+    if let Some((apply, vouched)) = &profile_write {
         let who = principal.identity().map(|i| Actor {
             id: i.user_id,
             own_only: false,
