@@ -241,7 +241,15 @@ mod tests {
                 Scope::Admin
             ]
         );
-        for bad in ["posts", "posts:delete", "Posts:read", ":read", "admin:read"] {
+        for bad in [
+            "posts",
+            "posts:delete",
+            "Posts:read",
+            ":read",
+            "admin:read",
+            "access:read",
+            "access:write",
+        ] {
             assert!(parse_scopes(&owned(&[bad])).is_err(), "{bad}");
         }
         assert!(parse_scopes(&[]).is_err(), "a key needs at least one scope");

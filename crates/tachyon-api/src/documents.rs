@@ -207,9 +207,8 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    // A create rule can't depend on a document that doesn't exist yet. Schemas refuse such
-    // rules when saved; one that got through anyway refuses.
-    if access.permit(Action::Create, &c)?.is_some() {
+    access.scope(Action::Create, &c.schema.slug)?;
+    if !access.may_create(&c) {
         return Err(access.refuse());
     }
     let body = json_body(body)?;

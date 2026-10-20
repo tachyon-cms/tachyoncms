@@ -67,6 +67,17 @@ impl Deref for Visible<'_> {
     }
 }
 
+/// Why an update or delete is refused before any document is looked at.
+pub(crate) enum WriteRefusal {
+    /// The caller can't read the collection at all.
+    Hidden,
+    /// The caller may not do this to any of it.
+    Refused,
+}
+
+/// The read and write filters a write must match on the stored document (`None`: anywhere).
+pub(crate) type WriteRules = Result<(Option<Filter>, Option<Filter>), WriteRefusal>;
+
 /// Which collections' rules a request can reach, to decide whether it needs the profile.
 pub(crate) enum Reach<'a> {
     /// Nothing: the route names no collection that exists.
@@ -450,15 +461,37 @@ impl Access {
         })
     }
 
-    /// What `action` (update or delete) on `c` comes to, as `write_guard` and the global
-    /// update enforce it: refused outright when the caller can't read `c` at all, and
-    /// conditional when either rule is a filter or the role default is own-only.
-    fn write_answer(&self, read: &Compiled, action: Action, c: &Collection) -> Value {
+    /// The rules an update or delete (`action`) on `c` runs under, before any document is
+    /// looked at. `write_guard`, the global update and `/api/access` all decide by this.
+    pub(crate) fn write_rules(&self, action: Action, c: &Collection) -> WriteRules {
+        let read = match self.allows(Action::Read, c) {
+            Compiled::Deny => return Err(WriteRefusal::Hidden),
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        let write = match self.allows(action, c) {
+            Compiled::Deny => return Err(WriteRefusal::Refused),
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        Ok((read, write))
+    }
+
+    /// Whether the caller may create in `c`. A create rule can't depend on a document that
+    /// doesn't exist yet: schemas refuse such rules when saved, and one that got through
+    /// anyway refuses here.
+    pub(crate) fn may_create(&self, c: &Collection) -> bool {
+        self.allows(Action::Create, c) == Compiled::Allow
+    }
+
+    /// `/api/access`'s answer for `action` (update or delete) on `c`: conditional when either
+    /// rule is a filter or the role default is own-only.
+    fn write_answer(&self, action: Action, c: &Collection) -> Value {
         let own_only = self.actor(action, c).is_some_and(|a| a.own_only);
-        match (read, self.allows(action, c)) {
-            (Compiled::Deny, _) | (_, Compiled::Deny) => false.into(),
-            (Compiled::Allow, Compiled::Allow) if !own_only => true.into(),
-            _ => "conditional".into(),
+        match self.write_rules(action, c) {
+            Err(_) => false.into(),
+            Ok((None, None)) if !own_only => true.into(),
+            Ok(_) => "conditional".into(),
         }
     }
 
@@ -548,17 +581,12 @@ impl Access {
         id: Uuid,
     ) -> Result<Option<Filter>, ApiError> {
         self.scope(action, &c.schema.slug)?;
-        let read = match self.allows(Action::Read, c) {
-            Compiled::Deny => return Err(ApiError::NotFound),
-            Compiled::Allow => None,
-            Compiled::Filter(f) => Some(f),
-        };
-        let write = match self.allows(action, c) {
+        let (read, write) = match self.write_rules(action, c) {
+            Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
             // Refused for the whole collection, so a 403 before the readability check is
             // intended: it says nothing about this document.
-            Compiled::Deny => return Err(self.refuse()),
-            Compiled::Allow => None,
-            Compiled::Filter(f) => Some(f),
+            Err(WriteRefusal::Refused) => return Err(self.refuse()),
+            Ok(filters) => filters,
         };
         // Checked first so a hidden document is a 404; the guard checks it again under the
         // lock, so a change in between can only turn this into a 403.
@@ -642,11 +670,13 @@ fn answer(c: &Compiled) -> Value {
 }
 
 /// Each field of `c` the caller may do something with, by dotted path: `{read, create,
-/// update}`, or `{read, update}` for a global, which is only ever updated.
-fn field_map(c: &Collection, caller: &Caller) -> Value {
+/// update}`, or `{read, update}` for a global, which is only ever updated. `gate` is the
+/// collection's own `[read, create, update]`: no field allows more than that.
+fn field_map(c: &Collection, caller: &Caller, gate: [bool; 3]) -> Value {
     let global = c.schema.kind == CollectionKind::Global;
     let fields = field_answers(c.schema.data(), caller)
         .into_iter()
+        .map(|(path, a)| (path, [0, 1, 2].map(|i| a[i] && gate[i])))
         .filter(|(_, [read, create, update])| *read || *update || (*create && !global))
         .map(|(path, [read, create, update])| {
             let a = if global {
@@ -667,8 +697,10 @@ fn field_map(c: &Collection, caller: &Caller) -> Value {
 /// - `"conditional"` means the answer depends on the document, even when every stored one
 ///   happens to pass, and for a global with a filter rule that hasn't been saved yet.
 /// - Answers agree with what the routes enforce: update and delete are false where the
-///   caller can't read at all; a list (and everything in it) is updatable only when all of
-///   it is; a create rule shaped like a filter is false; a global's fields have no create.
+///   caller can't read at all; a field allows no more than its collection or global does;
+///   a list (and everything in it) is updatable only when all of it is; join and virtual
+///   fields are never written; a create rule shaped like a filter is false; a global's
+///   fields have no create.
 pub(crate) async fn report(
     State(state): State<AppState>,
     principal: Principal,
@@ -680,31 +712,28 @@ pub(crate) async fn report(
     let caller = access.caller();
     let (mut collections, mut globals) = (Map::new(), Map::new());
     for c in access.schemas().all().iter() {
-        let read = access.allows(Action::Read, c);
         let mut a = if c.schema.slug == USERS {
             accounts.clone()
         } else if c.schema.kind == CollectionKind::Global {
             json!({
-                "read": answer(&read),
-                "update": access.write_answer(&read, Action::UpdateGlobal, c),
+                "read": answer(&access.allows(Action::Read, c)),
+                "update": access.write_answer(Action::UpdateGlobal, c),
             })
         } else {
-            // A create rule that's a filter refuses: there's no document yet to match.
-            let create = matches!(access.allows(Action::Create, c), Compiled::Allow);
             json!({
-                "read": answer(&read),
-                "create": create,
-                "update": access.write_answer(&read, Action::Update, c),
-                "delete": access.write_answer(&read, Action::Delete, c),
+                "read": answer(&access.allows(Action::Read, c)),
+                "create": access.may_create(c),
+                "update": access.write_answer(Action::Update, c),
+                "delete": access.write_answer(Action::Delete, c),
             })
         };
-        let none = a
-            .as_object()
-            .is_some_and(|m| m.values().all(|v| v == false));
-        if none {
+        if a.as_object()
+            .is_some_and(|m| m.values().all(|v| v == false))
+        {
             continue;
         }
-        a["fields"] = field_map(c, &caller);
+        let gate = ["read", "create", "update"].map(|k| a[k] != false && !a[k].is_null());
+        a["fields"] = field_map(c, &caller, gate);
         match c.schema.kind {
             CollectionKind::Global => globals.insert(c.schema.slug.clone(), a),
             _ => collections.insert(c.schema.slug.clone(), a),

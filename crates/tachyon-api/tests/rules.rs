@@ -2141,6 +2141,19 @@ fn went_through(res: &Res) -> bool {
     }
 }
 
+/// `went_through` for a write of one field, where a join or virtual field's "can't be set"
+/// 422 is a refusal too.
+fn wrote(res: &Res) -> bool {
+    let unsettable = res.status == 422
+        && res.json["errors"].as_array().is_some_and(|errors| {
+            errors.iter().all(|e| {
+                let m = e["message"].as_str().unwrap_or_default();
+                m.ends_with("it can't be set") || m.ends_with("set that instead")
+            })
+        });
+    !unsettable && went_through(res)
+}
+
 /// Holds `answer` against what the requests behind `outcomes` did: `true` when every one
 /// went through, `false` when none did, "conditional" when only some did.
 fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
@@ -2151,6 +2164,13 @@ fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
         _ => json!("conditional"),
     };
     assert_eq!(answer, &expected, "{what}: {outcomes:?}");
+}
+
+/// Holds a field's read answer against the documents the caller could read, each of which
+/// holds every field: shown in all of them, or in none. With none readable, it's false.
+fn field_read_agrees(what: &str, answer: &Value, readable: &[Value], path: &str) {
+    let seen: Vec<bool> = readable.iter().map(|doc| has(doc, path)).collect();
+    agrees(what, answer, if seen.is_empty() { &[false] } else { &seen });
 }
 
 /// Whether `doc` holds the field at dotted `path`, through groups and every row of a list.
@@ -2169,6 +2189,7 @@ fn has(doc: &Value, path: &str) -> bool {
 }
 
 const LISTS: &[&str] = &["links"];
+const GROUPS: &[&str] = &["seo", "box"];
 
 /// Every collection and global in `access_answers_match_what_the_api_allows`, with its fields.
 const KNOWN: &[(&str, &str, &[&str])] = &[
@@ -2182,7 +2203,12 @@ const KNOWN: &[(&str, &str, &[&str])] = &[
             "links",
             "links.label",
             "links.url",
+            "note",
+            "noteBody",
             "owner",
+            "peek",
+            "refs",
+            "related",
             "secret",
             "seo",
             "seo.note",
@@ -2255,7 +2281,6 @@ fn filled(a: &Value) -> Value {
     }
     a
 }
-const GROUPS: &[&str] = &["seo", "box"];
 
 /// A body that writes only the field at dotted `path`: `leaf` for a value, an empty group
 /// or list for a container, wrapped in its groups and one list row.
@@ -2274,22 +2299,40 @@ fn body_at(path: &str, leaf: Value) -> Value {
     out
 }
 
-/// One collection's answers for `who`, held against what `app` actually lets them do. The
-/// Admin makes `seeds` (marked with `who` in `mark`, so a list can find them); the caller
-/// tries to create `own`, reads each singly and in a list, checks each field is shown or
-/// left out as answered, writes each field alone, then updates and deletes each document.
-#[allow(clippy::too_many_arguments)]
-async fn bears_out(
-    who: &str,
-    app: &Router,
-    admin: &Router,
-    slug: &str,
-    answers: &Value,
-    mark: &str,
+/// One collection's answers for one caller, and what to probe them with.
+struct Probe<'a, L> {
+    who: &'a str,
+    app: &'a Router,
+    admin: &'a Router,
+    slug: &'a str,
+    /// The caller's answers for this collection, with what was left out filled back in.
+    answers: &'a Value,
+    /// A text field set to `who` on every document made here, so a list can find them.
+    mark: &'a str,
+    /// What the Admin makes. Each holds every field, so reads show which are left out.
     seeds: Vec<Value>,
+    /// What the caller tries to create.
     own: Value,
-    leaf: impl Fn(&str) -> Value,
-) {
+    /// A value that's valid for the field at a path.
+    leaf: L,
+}
+
+/// Holds one collection's answers against what the caller can actually do: the Admin makes
+/// the seeds; the caller tries to create one, reads each singly and in a list, checks each
+/// field is shown or left out as answered, writes each field alone, then updates and
+/// deletes each document.
+async fn bears_out<L: Fn(&str) -> Value>(p: Probe<'_, L>) {
+    let Probe {
+        who,
+        app,
+        admin,
+        slug,
+        answers,
+        mark,
+        seeds,
+        own,
+        leaf,
+    } = p;
     let what = |x: &str| format!("{who}: {slug} {x}");
     let url = |d: &str| format!("/api/{slug}/{d}");
     let marked = |mut v: Value| {
@@ -2302,7 +2345,6 @@ async fn bears_out(
             &create(admin, &format!("/api/{slug}"), marked(seed)).await
         ));
     }
-    // Only the seeds hold every field, so only they can show which are left out.
     let seeded = docs.len();
     let mine = marked(own).to_string();
     let made = send(app, "POST", &format!("/api/{slug}"), Some(&mine)).await;
@@ -2355,10 +2397,8 @@ async fn bears_out(
 
     let fields = answers["fields"].as_object().unwrap();
     for (path, f) in fields {
-        let seen: Vec<bool> = readable.iter().map(|doc| has(doc, path)).collect();
-        if !seen.is_empty() {
-            agrees(&what(&format!("field {path} read")), &f["read"], &seen);
-        }
+        let what = what(&format!("field {path} read"));
+        field_read_agrees(&what, &f["read"], &readable, path);
     }
 
     let mut updates = Vec::new();
@@ -2368,35 +2408,27 @@ async fn bears_out(
         ));
     }
     agrees(&what("update"), &answers["update"], &updates);
-    let writable = docs
+    // A document the caller could change, or (when there's none) any: that must refuse.
+    let target = docs
         .iter()
         .zip(&updates)
         .find(|(_, u)| **u)
-        .map(|(d, _)| d.clone());
+        .map_or(&docs[0], |(d, _)| d)
+        .clone();
     for (path, f) in fields {
         let body = body_at(path, leaf(path));
-        if answers["create"] == json!(true) {
-            let res = send(
-                app,
-                "POST",
-                &format!("/api/{slug}"),
-                Some(&body.to_string()),
-            )
-            .await;
-            agrees(
-                &what(&format!("field {path} create")),
-                &f["create"],
-                &[went_through(&res)],
-            );
-        }
-        if let Some(d) = &writable {
-            let res = patch(app, &url(d), body).await;
-            agrees(
-                &what(&format!("field {path} update")),
-                &f["update"],
-                &[went_through(&res)],
-            );
-        }
+        let res = send(
+            app,
+            "POST",
+            &format!("/api/{slug}"),
+            Some(&body.to_string()),
+        )
+        .await;
+        let created = what(&format!("field {path} create"));
+        agrees(&created, &f["create"], &[wrote(&res)]);
+        let res = patch(app, &url(&target), body).await;
+        let updated = what(&format!("field {path} update"));
+        agrees(&updated, &f["update"], &[wrote(&res)]);
     }
 
     let mut deletes = Vec::new();
@@ -2411,8 +2443,19 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
     let admin = admin_app(pool.clone()).await;
     let editor = json!({"role": "editor"});
     let writers = json!({"role": ["author", "editor"]});
+    // Allow and Deny outright, by role, and an own-only default (Authors' deletes) on a
+    // collection everyone reads.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "notes",
+        "access": {"read": true, "create": writers, "update": false},
+        "fields": [{"name": "body", "type": "text"}]}),
+    )
+    .await;
     // A filter (`or` with a role, so Editors pass outright), a `$user` filter, and role
-    // defaults for create and delete; field rules on containers and inside them.
+    // defaults for create and delete; field rules on containers and inside them; a join
+    // and a virtual field, which are never written.
     create(
         &admin,
         "/api/admin/collections",
@@ -2424,6 +2467,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             {"name": "owner", "type": "relationship", "relationTo": "users"},
             {"name": "secret", "type": "text",
              "access": {"read": editor, "create": editor, "update": editor}},
+            {"name": "peek", "type": "text", "access": {"read": editor}},
             {"name": "seo", "type": "group", "access": {"update": editor}, "fields": [
                 {"name": "title", "type": "text"},
                 {"name": "note", "type": "text", "access": {"create": editor}}
@@ -2435,18 +2479,12 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             {"type": "row", "fields": [{"name": "inRow", "type": "text"}]},
             {"name": "box", "type": "group", "access": {"read": editor}, "fields": [
                 {"name": "y", "type": "text"}
-            ]}
+            ]},
+            {"name": "note", "type": "relationship", "relationTo": "notes"},
+            {"name": "noteBody", "type": "text", "virtual": "note.body"},
+            {"name": "related", "type": "relationship", "relationTo": "posts"},
+            {"name": "refs", "type": "join", "collection": "posts", "on": "related"}
         ]}),
-    )
-    .await;
-    // Allow and Deny outright, by role, and an own-only default (Authors' deletes) on a
-    // collection everyone reads.
-    create(
-        &admin,
-        "/api/admin/collections",
-        json!({"slug": "notes",
-        "access": {"read": true, "create": writers, "update": false},
-        "fields": [{"name": "body", "type": "text"}]}),
     )
     .await;
     // Anyone may write, but only Editors read: changing what you can't read is refused.
@@ -2458,7 +2496,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         "fields": [{"name": "body", "type": "text"}]}),
     )
     .await;
-    create(
+    let home = create(
         &admin,
         "/api/admin/collections",
         json!({"slug": "home", "kind": "global",
@@ -2470,6 +2508,15 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         ]}),
     )
     .await;
+    let home_id: uuid::Uuid = id(&home).parse().unwrap();
+    // Every reader can read these, so links to them show for everyone.
+    let shared_note = id(&create(&admin, "/api/notes", json!({"body": "shared"})).await);
+    let anchor = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "anchor", "stage": "published"}),
+    )
+    .await);
     let me = get(&admin, "/api/auth/me").await;
     let admin_id: uuid::Uuid = me.json["id"].as_str().unwrap().parse().unwrap();
     let made = create(
@@ -2506,35 +2553,30 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
     for (who, app, me) in &callers {
         let res = get(app, "/api/access").await;
         assert_eq!(res.status, 200, "{who}: {}", res.json);
-        let a = res.json;
+        let raw = res.json;
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
         // Only what the caller can do something with is listed.
-        lists_only_what_it_allows(who, &a);
+        lists_only_what_it_allows(who, &raw);
         let (collections, globals): (&[&str], &[&str]) = match *who {
             "anonymous" => (&["inbox", "notes", "posts"], &["home"]),
             "key" => (&["notes", "posts"], &[]),
             _ => (&["inbox", "notes", "posts", "users"], &["home"]),
         };
-        assert_eq!(keys(&a["collections"]), collections, "{who}");
-        assert_eq!(keys(&a["globals"]), globals, "{who}");
-        let posts = keys(&a["collections"]["posts"]["fields"]);
-        assert_eq!(
-            posts.contains(&"secret".to_owned()),
-            ["editor", "admin", "key"].contains(who),
-            "{who}: {posts:?}"
-        );
+        assert_eq!(keys(&raw["collections"]), collections, "{who}");
+        assert_eq!(keys(&raw["globals"]), globals, "{who}");
         if *who == "admin" {
             // Dotted data paths at every depth, layout flattened, list fields without an index.
+            let posts = keys(&raw["collections"]["posts"]["fields"]);
             assert_eq!(posts, KNOWN[0].2, "{who}");
         }
         // What's left out is no access at all, which the requests below bear out.
-        let a = filled(&a);
+        let a = filled(&raw);
         let mine = me.unwrap_or(admin_id);
 
-        // posts
         let full = |stage: &str, owner: uuid::Uuid| {
-            json!({"stage": stage, "owner": owner, "secret": "s", "seo": {"title": "t", "note": "n"},
-                   "links": [{"url": "u", "label": "l"}], "inRow": "r", "box": {"y": "y"}})
+            json!({"stage": stage, "owner": owner, "secret": "s", "peek": "p",
+                   "seo": {"title": "t", "note": "n"}, "links": [{"url": "u", "label": "l"}],
+                   "inRow": "r", "box": {"y": "y"}, "note": shared_note, "related": anchor})
         };
         let seeds = vec![
             full("published", mine),
@@ -2542,103 +2584,122 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             full("published", admin_id),
             full("draft", admin_id),
         ];
-        let own = json!({"stage": "published", "owner": mine});
         let leaf = |path: &str| match path {
             "stage" => json!("published"),
             "owner" => json!(mine),
+            "note" => json!(shared_note),
+            "related" => json!(anchor),
             _ => json!("v"),
         };
-        let posts = &a["collections"]["posts"];
-        bears_out(who, app, &admin, "posts", posts, "title", seeds, own, leaf).await;
-
-        // notes
+        bears_out(Probe {
+            who,
+            app,
+            admin: &admin,
+            slug: "posts",
+            answers: &a["collections"]["posts"],
+            mark: "title",
+            seeds,
+            own: json!({"stage": "published", "owner": mine}),
+            leaf,
+        })
+        .await;
         for slug in ["notes", "inbox"] {
-            let answers = &a["collections"][slug];
-            let seeds = vec![json!({}), json!({})];
-            let leaf = |_: &str| json!("v");
-            bears_out(
+            bears_out(Probe {
                 who,
                 app,
-                &admin,
+                admin: &admin,
                 slug,
-                answers,
-                "body",
-                seeds,
-                json!({}),
-                leaf,
-            )
+                answers: &a["collections"][slug],
+                mark: "body",
+                seeds: vec![json!({}), json!({})],
+                own: json!({}),
+                leaf: |_: &str| json!("v"),
+            })
             .await;
         }
 
-        // home: read and changed while it matches its read rule and while it doesn't.
-        let home = &a["globals"]["home"];
-        let (mut reads, mut updates) = (Vec::new(), Vec::new());
-        let mut seen: std::collections::BTreeMap<&str, Vec<bool>> = Default::default();
-        for live in [true, false] {
-            let set = json!({"live": live, "banner": "b", "memo": "m"});
-            assert_eq!(patch(&admin, "/api/globals/home", set).await.status, 200);
+        // home: before it's ever saved, while it matches its read rule, and while it doesn't.
+        let g = &a["globals"]["home"];
+        sqlx::query("DELETE FROM documents WHERE id = $1")
+            .bind(home_id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let (mut reads, mut updates, mut readable) = (Vec::new(), Vec::new(), Vec::new());
+        for live in [None, Some(true), Some(false)] {
+            if let Some(live) = live {
+                let set = json!({"live": live, "banner": "b", "memo": "m"});
+                assert_eq!(patch(&admin, "/api/globals/home", set).await.status, 200);
+            }
             let res = get(app, "/api/globals/home").await;
             reads.push(went_through(&res));
-            if went_through(&res) {
-                for path in home["fields"].as_object().unwrap().keys() {
-                    seen.entry(path).or_default().push(has(&res.json, path));
-                }
+            // An unsaved global shows defaults, which needn't hold every field.
+            if went_through(&res) && live.is_some() {
+                readable.push(res.json);
             }
             let res = patch(app, "/api/globals/home", json!({"banner": who})).await;
             updates.push(went_through(&res));
         }
-        agrees(&format!("{who}: home read"), &home["read"], &reads);
-        agrees(&format!("{who}: home update"), &home["update"], &updates);
-        for (path, seen) in &seen {
-            let f = &home["fields"][path];
-            agrees(&format!("{who}: home field {path} read"), &f["read"], seen);
-        }
+        agrees(&format!("{who}: home read"), &g["read"], &reads);
+        agrees(&format!("{who}: home update"), &g["update"], &updates);
         let set = json!({"live": true});
         assert_eq!(patch(&admin, "/api/globals/home", set).await.status, 200);
-        if home["update"] != json!(false) {
-            for (path, f) in home["fields"].as_object().unwrap() {
-                let value = if path == "live" {
-                    json!(true)
-                } else {
-                    json!("v")
-                };
-                let res = patch(app, "/api/globals/home", json!({ path: value })).await;
-                let what = format!("{who}: home field {path} update");
-                agrees(&what, &f["update"], &[went_through(&res)]);
-            }
+        for (path, f) in g["fields"].as_object().unwrap() {
+            let what = format!("{who}: home field {path} read");
+            field_read_agrees(&what, &f["read"], &readable, path);
+            let value = if path == "live" {
+                json!(true)
+            } else {
+                json!("v")
+            };
+            let res = patch(app, "/api/globals/home", json!({ path: value })).await;
+            let what = format!("{who}: home field {path} update");
+            agrees(&what, &f["update"], &[went_through(&res)]);
         }
 
         // users: their own account, someone else's, a new one.
-        let users = &a["collections"]["users"];
+        let u = &a["collections"]["users"];
         let victim = add_user(&pool, &format!("victim-{who}@example.com"), "viewer").await;
         let targets: Vec<uuid::Uuid> = me.iter().copied().chain([victim]).collect();
-        let (mut reads, mut updates) = (Vec::new(), Vec::new());
+        let (mut reads, mut updates, mut readable) = (Vec::new(), Vec::new(), Vec::new());
         for t in &targets {
             let res = get(app, &format!("/api/users/{t}")).await;
             reads.push(went_through(&res));
             if went_through(&res) {
-                for (path, f) in users["fields"].as_object().unwrap() {
-                    let what = format!("{who}: users field {path} read");
-                    agrees(&what, &f["read"], &[has(&res.json, path)]);
-                }
+                readable.push(res.json);
             }
             let res = patch(app, &format!("/api/users/{t}"), json!({})).await;
             updates.push(went_through(&res));
         }
-        agrees(&format!("{who}: users read"), &users["read"], &reads);
-        agrees(&format!("{who}: users update"), &users["update"], &updates);
-        let new = json!({"email": format!("new-{who}@example.com"), "password": common::PASSWORD,
-                         "role": "viewer", "name": "New"});
-        let res = send(app, "POST", "/api/users", Some(&new.to_string())).await;
-        agrees(
-            &format!("{who}: users create"),
-            &users["create"],
-            &[went_through(&res)],
-        );
+        agrees(&format!("{who}: users read"), &u["read"], &reads);
+        agrees(&format!("{who}: users update"), &u["update"], &updates);
+        let target = targets
+            .iter()
+            .zip(&updates)
+            .find(|(_, ok)| **ok)
+            .map_or(victim, |(t, _)| *t);
+        for (path, f) in u["fields"].as_object().unwrap() {
+            let what = format!("{who}: users field {path} read");
+            field_read_agrees(&what, &f["read"], &readable, path);
+            let res = patch(app, &format!("/api/users/{target}"), json!({ path: "N" })).await;
+            let what = format!("{who}: users field {path} update");
+            agrees(&what, &f["update"], &[went_through(&res)]);
+            // `name` is required, so creating an account always writes it.
+            let new = json!({"email": format!("new-{who}-{path}@example.com"),
+                             "password": common::PASSWORD, "role": "viewer", path: "N"});
+            let res = send(app, "POST", "/api/users", Some(&new.to_string())).await;
+            let what = format!("{who}: users field {path} create");
+            agrees(&what, &f["create"], &[went_through(&res)]);
+            agrees(
+                &format!("{who}: users create"),
+                &u["create"],
+                &[went_through(&res)],
+            );
+        }
         let res = send(app, "DELETE", &format!("/api/users/{victim}"), None).await;
         agrees(
             &format!("{who}: users delete"),
-            &users["delete"],
+            &u["delete"],
             &[went_through(&res)],
         );
         let res = get(app, "/api/users").await;
@@ -2647,10 +2708,10 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             &a["users"],
             &[went_through(&res)],
         );
-        answers.push((*who, a));
+        answers.push((*who, raw, a));
     }
     // Last, since a new collection changes everyone's answers.
-    for ((who, app, _), (_, a)) in callers.iter().zip(&answers) {
+    for ((who, app, _), (_, _, a)) in callers.iter().zip(&answers) {
         let schema =
             json!({"slug": format!("made_{who}"), "fields": [{"name": "t", "type": "text"}]});
         let res = send(
@@ -2671,7 +2732,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
     let c = "conditional";
     let table: Vec<(&str, Value)> = answers
         .iter()
-        .map(|(who, a)| {
+        .map(|(who, _, a)| {
             let row = |v: &Value, actions: &[&str]| -> Vec<Value> {
                 actions.iter().map(|k| v[*k].clone()).collect()
             };
@@ -2764,27 +2825,27 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         ),
     ];
     assert_eq!(table, expected);
-    // Fields: hidden in a hidden container, and a list changed only whole.
-    let field =
-        |who: usize, path: &str| answers[who].1["collections"]["posts"]["fields"][path].clone();
-    assert_eq!(
-        field(1, "box.y"),
-        json!({"read": false, "create": true, "update": true})
-    );
-    assert_eq!(
-        field(2, "links.url"),
-        json!({"read": true, "create": true, "update": false})
-    );
-    assert_eq!(
-        field(2, "seo.note"),
-        json!({"read": true, "create": false, "update": false})
-    );
-    assert_eq!(
-        field(3, "seo.note"),
-        json!({"read": true, "create": true, "update": true})
-    );
-    assert_eq!(
-        answers[0].1["globals"]["home"]["fields"]["memo"],
-        json!({"read": false, "update": true})
-    );
+    // Left out for the callers they're hidden from: fields nobody of that kind may touch.
+    let fields = |who: usize, section: &str, slug: &str| {
+        let raw = &answers[who].1;
+        raw[section][slug]["fields"]
+            .as_object()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    for (who, section, slug, path) in [
+        (0, "collections", "posts", "box.y"),
+        (0, "collections", "posts", "peek"),
+        (0, "globals", "home", "memo"),
+        (1, "collections", "posts", "secret"),
+        (2, "collections", "posts", "secret"),
+    ] {
+        let listed = fields(who, section, slug);
+        assert!(
+            !listed.iter().any(|p| p == path),
+            "{who}: {slug} {path} {listed:?}"
+        );
+    }
 }

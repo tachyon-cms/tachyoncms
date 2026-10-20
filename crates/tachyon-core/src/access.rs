@@ -538,8 +538,9 @@ fn children(f: &Field) -> &[Field] {
 
 /// What the caller may do with each of `fields` (data fields), at any depth, by dotted path
 /// (a list's fields without a row index): `[read, create, update]`. A field inside one the
-/// caller can't read, create or update can't be either. An update replaces a list whole,
-/// so a list and everything in it can be updated only when all of it can.
+/// caller can't read, create or update can't be either. An update replaces a list whole
+/// (as `unwritable` counts it), so a list and everything in it can be updated only when all
+/// of it can. Join and virtual fields are filled on read, so they're never written.
 pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3])> {
     fn updatable(fields: &[Field], caller: &Caller) -> bool {
         fields
@@ -567,6 +568,9 @@ pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3
             ];
             if matches!(f.kind, FieldKind::Array { .. }) {
                 answer[2] = answer[2] && updatable(children(f), caller);
+            }
+            if matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some() {
+                (answer[1], answer[2]) = (false, false);
             }
             out.push((path.clone(), answer));
             walk(children(f), &path, answer, caller, out);
@@ -755,6 +759,7 @@ pub fn unwritable(
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
                     walk(fields, inner, &path, action, caller, out)
                 }
+                // `field_answers` reports a list as updatable only as a whole, to match.
                 (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, _)
                     if action != Action::Create =>
                 {

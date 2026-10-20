@@ -106,10 +106,12 @@ pub async fn update(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
-    let guard = both(
-        access.permit(Action::Read, &c)?,
-        access.permit(Action::UpdateGlobal, &c)?,
-    );
+    access.scope(Action::UpdateGlobal, &c.schema.slug)?;
+    // A global's existence isn't secret, so one the caller can't read is refused, not hidden.
+    let guard = match access.write_rules(Action::UpdateGlobal, &c) {
+        Err(_) => return Err(access.refuse()),
+        Ok((read, write)) => both(read, write),
+    };
     let who = access.actor(Action::UpdateGlobal, &c);
     let patch = json_body(body)?;
     access.writes(&c, &patch, Action::UpdateGlobal)?;
