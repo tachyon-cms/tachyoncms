@@ -233,12 +233,23 @@ async fn unique_values_are_field_errors(pool: PgPool) {
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn saves_against_a_changed_schema_are_409(pool: PgPool) {
     let app = app_with_posts(pool.clone()).await;
-    // Changed behind the server's back: no NOTIFY, so its cache still holds version 1.
-    sqlx::query("UPDATE collections SET schema_version = schema_version + 1")
-        .execute(&pool)
-        .await
-        .unwrap();
-    let res = send(&app, "POST", "/api/posts", Some(r#"{"title": "x"}"#)).await;
+    // Changed behind the server's back: no NOTIFY, so its cache keeps the old version. The
+    // listener's startup reload, or the one for the create's NOTIFY, can still land after the
+    // bump and catch up; once those have run, nothing else reloads, so bump again.
+    let mut res = None;
+    for _ in 0..50 {
+        sqlx::query("UPDATE collections SET schema_version = schema_version + 1")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let sent = send(&app, "POST", "/api/posts", Some(r#"{"title": "x"}"#)).await;
+        if sent.status != 201 {
+            res = Some(sent);
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    let res = res.expect("the cache never went stale");
     assert_problem(&res, 409);
     assert_eq!(
         res.json["detail"],
