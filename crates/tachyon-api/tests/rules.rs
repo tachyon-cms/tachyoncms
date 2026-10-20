@@ -1144,9 +1144,20 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         let res = get(&anon, &format!("/api/posts?sort={sort}")).await;
         assert_eq!(res.status, 400, "sort={sort}: {}", res.json);
     }
-    // Sorting by the link field itself orders by the stored ID, which is the post's own data.
-    // By ID, so Ann's posts, then Mia's, then Bo's (names would put Bo before Mia), then
-    // the posts left with no author.
+    // Sorting by the link field itself orders by the stored ID, which is the post's own data:
+    // author IDs ascending (a uuid sorts as its hex text does), the posts left with no author
+    // last, and ties newest ID first, never by the authors' names.
+    let mut expected: Vec<(Option<&str>, &str, &str)> = posts
+        .iter()
+        .zip(&made)
+        .map(|((title, a, ..), doc)| (a.filter(|a| *a != hid), doc.as_str(), *title))
+        .collect();
+    expected.sort_by(|x, y| {
+        (x.0.is_none(), x.0)
+            .cmp(&(y.0.is_none(), y.0))
+            .then(y.1.cmp(x.1))
+    });
+    let expected: Vec<&str> = expected.iter().map(|e| e.2).collect();
     let by_link = get(&anon, "/api/posts?sort=author").await;
     let order: Vec<&str> = by_link.json["docs"]
         .as_array()
@@ -1154,7 +1165,7 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         .iter()
         .map(|d| d["title"].as_str().unwrap())
         .collect();
-    assert_eq!(order, ["p3", "p1", "p5", "p6", "p7", "p4", "p2"]);
+    assert_eq!(order, expected);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
