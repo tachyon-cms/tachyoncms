@@ -2569,7 +2569,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         // Only what the caller can do something with is listed.
         lists_only_what_it_allows(who, &raw);
         let (collections, globals): (&[&str], &[&str]) = match *who {
-            "anonymous" => (&["inbox", "notes", "posts"], &["home"]),
+            "anonymous" => (&["inbox", "notes", "posts", "users"], &["home"]),
             "key" => (&["notes", "posts"], &[]),
             _ => (&["inbox", "notes", "posts", "users"], &["home"]),
         };
@@ -2668,17 +2668,24 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             agrees(&what, &f["update"], &[went_through(&res)]);
         }
 
-        // users: their own account, someone else's, a new one.
+        // users: their own account, someone else's, a new one. A profile is read the way
+        // content reaches it, through a link; the account routes are for changing it.
         let u = &a["collections"]["users"];
         let victim = add_user(&pool, &format!("victim-{who}@example.com"), "viewer").await;
         let targets: Vec<uuid::Uuid> = me.iter().copied().chain([victim]).collect();
         let (mut reads, mut updates, mut readable) = (Vec::new(), Vec::new(), Vec::new());
         for t in &targets {
-            let res = get(app, &format!("/api/users/{t}")).await;
-            reads.push(went_through(&res));
-            if went_through(&res) {
-                readable.push(res.json);
+            let byline = json!({"title": "byline", "stage": "published", "owner": t});
+            let post = id(&create(&admin, "/api/posts", byline).await);
+            let res = get(app, &format!("/api/posts/{post}?depth=1")).await;
+            let owner = &res.json["owner"];
+            reads.push(went_through(&res) && owner.is_object());
+            if owner.is_object() {
+                readable.push(owner.clone());
             }
+            // The victim is deleted below, which a link would refuse.
+            let gone = send(&admin, "DELETE", &format!("/api/posts/{post}"), None).await;
+            assert_eq!(gone.status, 204, "{}", gone.json);
             let res = patch(app, &format!("/api/users/{t}"), json!({})).await;
             updates.push(went_through(&res));
         }
@@ -2774,7 +2781,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
                 json!([c, f, f, f]),
                 json!([t, f, f, f]),
                 json!([f, t, f, f]),
-                json!([f, f, f, f]),
+                json!([t, f, f, f]),
                 json!([c, f]),
                 f,
             ),
@@ -2785,7 +2792,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
                 json!([c, f, c, f]),
                 json!([t, f, f, f]),
                 json!([f, t, f, f]),
-                json!([c, f, c, f]),
+                json!([t, f, c, f]),
                 json!([c, f]),
                 f,
             ),
@@ -2796,7 +2803,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
                 json!([c, t, c, c]),
                 json!([t, t, f, c]),
                 json!([f, t, f, f]),
-                json!([c, f, c, f]),
+                json!([t, f, c, f]),
                 json!([c, c]),
                 f,
             ),
@@ -2807,7 +2814,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
                 json!([t, t, c, t]),
                 json!([t, t, f, t]),
                 json!([t, t, t, t]),
-                json!([c, f, c, f]),
+                json!([t, f, c, f]),
                 json!([c, c]),
                 f,
             ),
@@ -3158,4 +3165,75 @@ async fn roles_named_by_rules_cant_be_deleted(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     let res = send(&admin, "DELETE", "/api/admin/roles/reviewer", None).await;
     assert_eq!(res.status, 204, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn linked_profiles_read_like_content(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    // A profile field only Admins read, and posts that link to a profile.
+    let users = json!({"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "salary", "type": "number", "access": {"read": {"role": "admin"}}}
+    ]});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&json!({ "schema": users }).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "users"},
+            {"name": "byline", "type": "text", "virtual": "author.name"}
+        ]}),
+    )
+    .await;
+    let me = get(&admin, "/api/auth/me").await.json["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let res = patch(&admin, &format!("/api/users/{me}"), json!({"salary": 100})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let post = id(&create(&admin, "/api/posts", json!({"title": "p1", "author": me})).await);
+    create(&admin, "/api/posts", json!({"title": "p2"})).await;
+
+    // Ada's profile shows wherever a post links to it, to a visitor and to a Viewer alike;
+    // the field only Admins read stays out, and can't be filtered on.
+    let viewer = app_as(&pool, "viv@example.com", "viewer").await;
+    for (who, app) in [
+        ("visitor", visitor(&pool).await),
+        ("viewer", viewer.clone()),
+    ] {
+        let deep = get(&app, &format!("/api/posts/{post}?depth=1")).await;
+        assert_eq!(deep.status, 200, "{who}: {}", deep.json);
+        assert_eq!(deep.json["author"]["name"], "Ada", "{who}: {}", deep.json);
+        assert!(deep.json["author"].get("salary").is_none(), "{who}");
+        assert_eq!(deep.json["byline"], "Ada", "{who}: {}", deep.json);
+        let url = "/api/posts?where[author.name][equals]=Ada";
+        assert_eq!(titles(&get(&app, url).await), ["p1"], "{who}");
+        let url = "/api/posts?where[author.salary][equals]=100";
+        assert_problem(&get(&app, url).await, 403);
+    }
+
+    // `/api/access` says the same: a profile reads, its Admin-only field doesn't.
+    for (who, app) in [
+        ("visitor", visitor(&pool).await),
+        ("viewer", viewer.clone()),
+    ] {
+        let users = &get(&app, "/api/access").await.json["collections"]["users"];
+        assert_eq!(users["read"], true, "{who}: {users}");
+        assert_eq!(users["fields"]["name"]["read"], true, "{who}: {users}");
+        assert_ne!(users["fields"]["salary"]["read"], true, "{who}: {users}");
+    }
+
+    // The account routes keep to self-or-admin: a Viewer lists nobody and reads only their own.
+    assert_problem(&get(&viewer, "/api/users").await, 403);
+    assert_problem(&get(&viewer, &format!("/api/users/{me}")).await, 403);
+    let listed = get(&admin, "/api/users").await;
+    assert_eq!(listed.json["docs"].as_array().unwrap().len(), 2);
 }

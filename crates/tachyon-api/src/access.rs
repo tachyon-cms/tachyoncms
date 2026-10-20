@@ -18,7 +18,7 @@ use tachyon_core::access::{
     unwritable, visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
-use tachyon_core::query::{Filter, Target, parse_filter};
+use tachyon_core::query::{Filter, Target};
 use tachyon_core::{CollectionKind, CollectionSchema, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
@@ -407,14 +407,13 @@ impl Access {
         if self.scope(action, slug).is_err() {
             return Compiled::Deny;
         }
-        // Accounts keep their own rules: Admins see every profile, others only their own.
+        // A profile reads like content wherever a document links to it (populate, filters,
+        // virtuals, joins, references); field rules hide what's private. Accounts are
+        // listed and changed only through their own routes, which check self-or-admin.
         if slug == USERS {
-            return match self.principal.identity() {
-                _ if action != Action::Read => Compiled::Deny,
-                _ if self.by_role(Action::Users, USERS) == Decision::Allow => Compiled::Allow,
-                None => Compiled::Deny,
-                Some(i) => parse_filter(c.schema.data(), &json!({"id": {"equals": i.user_id}}))
-                    .map_or(Compiled::Deny, Compiled::Filter),
+            return match action {
+                Action::Read if self.by_role(action, USERS) != Decision::Deny => Compiled::Allow,
+                _ => Compiled::Deny,
             };
         }
         match self.rule(action, c) {
@@ -701,6 +700,8 @@ fn field_map(c: &Collection, caller: &Caller, gate: [bool; 3]) -> Value {
 ///   a list (and everything in it) is updatable only when all of it is; join and virtual
 ///   fields are never written; a create rule shaped like a filter is false; a global's
 ///   fields have no create.
+/// - For `users`, `read` is about profiles as links show them, like content; create,
+///   update and delete are about the account routes, which keep to self-or-admin.
 pub(crate) async fn report(
     State(state): State<AppState>,
     principal: Principal,
@@ -713,7 +714,9 @@ pub(crate) async fn report(
     let (mut collections, mut globals) = (Map::new(), Map::new());
     for c in access.schemas().all().iter() {
         let mut a = if c.schema.slug == USERS {
-            accounts.clone()
+            let mut a = accounts.clone();
+            a["read"] = answer(&access.allows(Action::Read, c));
+            a
         } else if c.schema.kind == CollectionKind::Global {
             json!({
                 "read": answer(&access.allows(Action::Read, c)),

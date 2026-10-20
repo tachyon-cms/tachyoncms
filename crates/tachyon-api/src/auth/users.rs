@@ -62,9 +62,9 @@ pub(crate) fn manages_users(principal: &Principal) -> bool {
     authorize(principal, Action::Users, "users").is_ok()
 }
 
-/// What these routes let the caller do with accounts, for `/api/access`: anything when
-/// they manage users, otherwise read and change only their own (when acting as
-/// themselves), never create or delete.
+/// What these routes let the caller change, for `/api/access`: anything when they manage
+/// users, otherwise only their own account (when acting as themselves), never create or
+/// delete. Reading profiles is answered like content: they show wherever linked.
 pub(crate) fn account_answers(principal: &Principal) -> Value {
     let all = manages_users(principal);
     let own: Value = match (all, principal.require()) {
@@ -72,7 +72,7 @@ pub(crate) fn account_answers(principal: &Principal) -> Value {
         (false, Ok(_)) => "conditional".into(),
         (false, Err(_)) => false.into(),
     };
-    serde_json::json!({"read": own, "create": all, "update": own, "delete": all})
+    serde_json::json!({"create": all, "update": own, "delete": all})
 }
 
 /// Admins may act on anyone; everyone else only on themselves.
@@ -116,6 +116,8 @@ pub(crate) async fn list(
     principal: Principal,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
+    // Only those who manage users list them: profiles read like content through links,
+    // but the directory of accounts isn't content.
     authorize(&principal, Action::Users, "users")?;
     let users = any_collection(&state, auth::USERS)?;
     let access = Access::new(&state, principal, Reach::From(&users)).await?;
