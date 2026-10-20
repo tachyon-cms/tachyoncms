@@ -3237,3 +3237,89 @@ async fn linked_profiles_read_like_content(pool: PgPool) {
     let listed = get(&admin, "/api/users").await;
     assert_eq!(listed.json["docs"].as_array().unwrap().len(), 2);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn profile_joins_and_references_read_like_content(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let posts = |fields: Value| json!({"slug": "posts", "fields": fields});
+    create(
+        &admin,
+        "/api/admin/collections",
+        posts(json!([{"name": "title", "type": "text"}])),
+    )
+    .await;
+    // Profiles link to posts, once in the open and once in a field only Admins read.
+    let admin_only = json!({"read": {"role": "admin"}});
+    let users = json!({"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "salary", "type": "number", "access": admin_only},
+        {"name": "favourite", "type": "relationship", "relationTo": "posts"},
+        {"name": "secretPick", "type": "relationship", "relationTo": "posts", "access": admin_only}
+    ]});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&json!({ "schema": users }).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // A post lists the profiles that picked it.
+    let with_fans = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "fans", "type": "join", "collection": "users", "on": "favourite"}
+    ]));
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(&json!({ "schema": with_fans }).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let post = id(&create(&admin, "/api/posts", json!({"title": "p1"})).await);
+    let me = get(&admin, "/api/auth/me").await.json["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let picks = json!({"salary": 100, "favourite": post, "secretPick": post});
+    let res = patch(&admin, &format!("/api/users/{me}"), picks).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let paths = |res: &Res| -> Vec<String> {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut out: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| {
+                format!(
+                    "{}.{}",
+                    r["collection"].as_str().unwrap(),
+                    r["path"].as_str().unwrap()
+                )
+            })
+            .collect();
+        out.sort();
+        out
+    };
+    let refs = format!("/api/posts/{post}/references");
+    assert_eq!(
+        paths(&get(&admin, &refs).await),
+        ["users.favourite", "users.secretPick"]
+    );
+
+    // A visitor and a Viewer see Ada among the post's fans, without her salary, and her
+    // profile among its references, but not the link they can't read.
+    let viewer = app_as(&pool, "viv@example.com", "viewer").await;
+    for (who, app) in [("visitor", visitor(&pool).await), ("viewer", viewer)] {
+        let res = get(&app, &format!("/api/posts/{post}")).await;
+        assert_eq!(res.status, 200, "{who}: {}", res.json);
+        let fans = res.json["fans"]["docs"].as_array().unwrap();
+        assert_eq!(fans.len(), 1, "{who}: {}", res.json);
+        assert_eq!(fans[0]["name"], "Ada", "{who}: {}", res.json);
+        assert!(fans[0].get("salary").is_none(), "{who}: {}", res.json);
+        assert!(fans[0].get("secretPick").is_none(), "{who}: {}", res.json);
+        assert_eq!(paths(&get(&app, &refs).await), ["users.favourite"], "{who}");
+    }
+}

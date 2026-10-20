@@ -109,7 +109,7 @@ Unless an access rule says otherwise, anyone can read, and signed-in users write
 | Editor | change all content and globals |
 | Admin | everything, including content types, users and roles |
 
-Admins manage users at `/api/users` and roles at `/api/admin/roles`, and custom roles can sit alongside the four built-in ones. A user's email, role and password stay private. Their profile is different: `name` and every other profile field show wherever a document links to them, to anyone who can read that document. Got a field that shouldn't travel, like a phone number? Give it a field rule such as `"access": {"read": {"role": "admin"}}` and only Admins will see it in a populated author or be able to filter on it. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
+Admins manage users at `/api/users` and roles at `/api/admin/roles`, and custom roles can sit alongside the four built-in ones. A user's email, role and password stay private. Their profile is different: `name` and every other profile field show wherever a document links to them, to anyone who can read that document. An API key needs one more thing: a scope that covers `users`, or the author comes back as a bare ID and `where[author.name]` is refused. Got a field that shouldn't travel, like a phone number? Give it a field rule such as `"access": {"read": {"role": "admin"}}` and only Admins will see it in a populated author or be able to filter on it. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
 
 ### Access rules
 

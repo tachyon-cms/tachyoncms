@@ -109,7 +109,10 @@ pub(crate) async fn check_links(
         return Ok(Vouched::new());
     }
     // Any existing user may be linked (an author, an assignee): users aren't governed by
-    // rules until front-end accounts land, so only their existence is checked.
+    // rules until front-end accounts land, so only their existence is checked. Profiles
+    // read like content, so `readable()` already holds users for most callers; this keeps
+    // it true for an API key whose scopes don't cover reading users, which may still link
+    // any existing user it holds the ID of.
     let mut linkable = access.readable().clone();
     if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
         linkable.insert(users.id, None);
