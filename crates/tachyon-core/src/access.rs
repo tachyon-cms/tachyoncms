@@ -232,6 +232,9 @@ fn members(v: &Value) -> Option<Vec<&Map<String, Value>>> {
 
 /// Compiled one condition at a time, so a `$user` value that can't be used rules out only
 /// its own condition.
+// ponytail: the parser's MAX_CONDITIONS and MAX_DEPTH apply per condition here, not to the
+// whole rule. Rules are written by admins and serde bounds JSON depth; count conditions
+// across the rule in `check_rules` if rules ever come from less trusted hands.
 fn compile_group(
     group: &Map<String, Value>,
     caller: &Caller,
@@ -240,7 +243,7 @@ fn compile_group(
 ) -> Compiled {
     let (conds, groups) = split(group);
     let conds = conds.into_iter().map(|(name, op, value)| {
-        let Some(value) = substitute(value, caller.user) else {
+        let Some(value) = substitute(op, value, caller.user) else {
             return Compiled::Deny;
         };
         let one = json!({ name: { op: value } });
@@ -264,17 +267,51 @@ fn compile_group(
     all(conds.chain(groups))
 }
 
+/// Operators that would read a `$user` value as something other than one value to
+/// compare: `near` as a point and distances, `exists` as a flag.
+const NO_USER_VALUES: [&str; 2] = ["exists", "near"];
+
+/// The caller's value for `s` when it's a `$user.<name>` reference: `Some(None)` when the
+/// caller has none. Empty text and empty lists count as none, so `like` can't match all.
+fn user_value<'a>(s: &str, user: Option<&'a Map<String, Value>>) -> Option<Option<&'a Value>> {
+    let name = s.strip_prefix("$user.")?;
+    Some(user.and_then(|u| u.get(name)).filter(|v| match v {
+        Value::Null => false,
+        Value::String(s) => !s.is_empty(),
+        Value::Array(items) => !items.is_empty(),
+        _ => true,
+    }))
+}
+
 /// `value` with each `$user.<name>` replaced by the caller's, or `None` when the caller
-/// has no such value.
-fn substitute(value: &Value, user: Option<&Map<String, Value>>) -> Option<Value> {
-    match value {
-        Value::String(s) => match s.strip_prefix("$user.") {
-            Some(name) => user?.get(name).filter(|v| !v.is_null()).cloned(),
-            None => Some(value.clone()),
-        },
-        Value::Array(items) => items.iter().map(|v| substitute(v, user)).collect(),
-        _ => Some(value.clone()),
+/// has no such value. A `$user` value is always one value, or a list's members: `in`
+/// gets a list, so text with commas in it is never split into several values.
+fn substitute(op: &str, value: &Value, user: Option<&Map<String, Value>>) -> Option<Value> {
+    let refs = user_refs(value);
+    if refs.is_empty() {
+        return Some(value.clone());
     }
+    if NO_USER_VALUES.contains(&op) {
+        return None;
+    }
+    let items = match value {
+        Value::Array(items) => items.as_slice(),
+        _ if matches!(op, "in" | "not_in") => std::slice::from_ref(value),
+        // One `$user` value, used as it is.
+        Value::String(s) => return user_value(s, user).flatten().cloned(),
+        _ => return Some(value.clone()),
+    };
+    let mut out = Vec::new();
+    for item in items {
+        match item.as_str().and_then(|s| user_value(s, user)) {
+            None => out.push(item.clone()),
+            Some(found) => match found? {
+                Value::Array(members) => out.extend(members.iter().cloned()),
+                v => out.push(v.clone()),
+            },
+        }
+    }
+    Some(Value::Array(out))
 }
 
 /// The `$user.<name>` references in a condition's value.
@@ -320,7 +357,7 @@ pub fn check_rules(
             checker.rule(rule, fixed).map_err(fail)?;
         }
     }
-    checker.fields(&schema.fields, "", "fields", false)
+    checker.fields(&schema.fields, "", "fields")
 }
 
 struct Checker<'a> {
@@ -369,26 +406,36 @@ impl Checker<'_> {
             }) {
                 return Err(format!("`$user.{bad}` isn't id, role or a users field"));
             }
-            let checked = if refs.is_empty() {
-                parse_filter_with(self.fields, &json!({ name: { op: value } }), self.lookup)
+            let parse = |v: &Value| {
+                parse_filter_with(self.fields, &json!({ name: { op: v } }), self.lookup)
                     .map(|_| ())
-            } else {
-                check_target(self.fields, name, op, self.lookup)
+                    .map_err(|e| e.to_string())
             };
-            checked.map_err(|e| e.to_string())?;
+            if refs.is_empty() {
+                parse(value)?;
+                continue;
+            }
+            if NO_USER_VALUES.contains(&op) {
+                return Err("`$user` values can't be used with exists or near".into());
+            }
+            check_target(self.fields, name, op, self.lookup).map_err(|e| e.to_string())?;
+            // The literal members of a list beside `$user` values are known now.
+            if let Value::Array(items) = value {
+                let literals: Vec<&Value> = items
+                    .iter()
+                    .filter(|v| !v.as_str().is_some_and(|s| s.starts_with("$user.")))
+                    .collect();
+                if !literals.is_empty() {
+                    parse(&json!(literals))?;
+                }
+            }
         }
         Ok(())
     }
 
-    /// Field rules: static, on top-level data fields only, and only `read` on fields that
-    /// are never written. `loc` names layout fields, which have no name.
-    fn fields(
-        &self,
-        fields: &[Field],
-        prefix: &str,
-        loc: &str,
-        nested: bool,
-    ) -> Result<(), SchemaError> {
+    /// Field rules, at any depth: static, never on layout fields, and only `read` on fields
+    /// that are never written. `loc` names layout fields, which have no name.
+    fn fields(&self, fields: &[Field], prefix: &str, loc: &str) -> Result<(), SchemaError> {
         for (i, f) in fields.iter().enumerate() {
             let path = if prefix.is_empty() {
                 f.name.clone()
@@ -412,9 +459,6 @@ impl Checker<'_> {
                             .into(),
                     ));
                 }
-                if nested {
-                    return Err(fail("only top-level fields can have access rules".into()));
-                }
                 let written = f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. });
                 for (action, rule) in [
                     ("read", &a.read),
@@ -436,10 +480,10 @@ impl Checker<'_> {
             }
             match &f.kind {
                 FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                    self.fields(fields, &path, &format!("{here}.fields"), true)?
+                    self.fields(fields, &path, &format!("{here}.fields"))?
                 }
                 FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
-                    self.fields(fields, prefix, &format!("{here}.fields"), nested)?
+                    self.fields(fields, prefix, &format!("{here}.fields"))?
                 }
                 FieldKind::Tabs { tabs } => {
                     for (t, tab) in tabs.iter().enumerate() {
@@ -451,9 +495,9 @@ impl Checker<'_> {
                                 } else {
                                     format!("{prefix}.{name}")
                                 };
-                                self.fields(&tab.fields, &inner, &loc, true)?
+                                self.fields(&tab.fields, &inner, &loc)?
                             }
-                            None => self.fields(&tab.fields, prefix, &loc, nested)?,
+                            None => self.fields(&tab.fields, prefix, &loc)?,
                         }
                     }
                 }
@@ -479,6 +523,8 @@ mod tests {
             {"name": "team", "type": "text"},
             {"name": "author", "type": "relationship", "relationTo": "users"},
             {"name": "seo", "type": "group", "fields": [{"name": "title", "type": "text"}]},
+            {"name": "links", "type": "array", "fields": [{"name": "url", "type": "url"}]},
+            {"type": "tabs", "tabs": [{"name": "meta", "label": "Meta", "fields": [{"name": "note", "type": "text"}]}]},
             {"type": "row", "fields": [{"name": "summary", "type": "text"}]},
             {"name": "byline", "type": "text", "virtual": "author.name"}
         ]}))
@@ -735,6 +781,53 @@ mod tests {
             filter(json!({"and": [{"status": {"equals": "draft"}}, {"price": {"lt": 5}}]}))
         );
 
+        // A `$user` value is always one value: a comma in it never splits it into several.
+        let commas = json!({"id": id, "role": "author", "team": "red,blue", "tags": ["a", "b"]});
+        let commas = Caller {
+            user: commas.as_object(),
+            ..signed_in("author")
+        };
+        assert_eq!(
+            run(json!({"team": {"in": "$user.team"}}), &commas),
+            filter(json!({"team": {"in": ["red,blue"]}}))
+        );
+        assert_eq!(
+            run(
+                json!({"team": {"not_in": ["$user.team", "green"]}}),
+                &commas
+            ),
+            filter(json!({"team": {"not_in": ["red,blue", "green"]}}))
+        );
+        // A list value is its members.
+        assert_eq!(
+            run(json!({"team": {"in": "$user.tags"}}), &commas),
+            filter(json!({"team": {"in": ["a", "b"]}}))
+        );
+        // Signed out, a list holding a `$user` value matches nothing, literals included.
+        assert_eq!(
+            run(json!({"team": {"in": ["$user.team", "blue"]}}), &anon),
+            Compiled::Deny
+        );
+        // `near` and `exists` would read a `$user` value as distances or a flag.
+        assert_eq!(
+            run(json!({"team": {"exists": "$user.team"}}), &me),
+            Compiled::Deny
+        );
+
+        // An empty value counts as missing, so `like` can't match everything.
+        let empty = json!({"id": id, "role": "author", "team": ""});
+        let empty = Caller {
+            user: empty.as_object(),
+            ..signed_in("author")
+        };
+        for op in ["equals", "like", "in", "not_equals"] {
+            assert_eq!(
+                run(json!({"team": {op: "$user.team"}}), &empty),
+                Compiled::Deny,
+                "{op}"
+            );
+        }
+
         // A value the user doesn't have, or that doesn't fit the field, matches nothing too.
         let bare = json!({"id": id, "role": "author"});
         let bare = Caller {
@@ -773,31 +866,50 @@ mod tests {
         // A field inside a row is still top-level data.
         assert_eq!(
             check(&with_field_access(
-                "/fields/6/fields/0/access",
+                "/fields/8/fields/0/access",
                 json!({"read": false})
             )),
             Ok(())
         );
         assert_eq!(
-            check(&with_field_access("/fields/6/access", json!({"read": false}))),
-            Err("field `fields.6`: layout fields hold no data, so access rules go on the fields inside".into())
+            check(&with_field_access("/fields/8/access", json!({"read": false}))),
+            Err("field `fields.8`: layout fields hold no data, so access rules go on the fields inside".into())
         );
         assert_eq!(
             check(&with_field_access(
                 "/fields/5/fields/0/access",
                 json!({"read": false})
             )),
-            Err("field `seo.title`: only top-level fields can have access rules".into())
+            Ok(())
+        );
+        // Nested fields take rules at any depth: list rows and named tabs too.
+        assert_eq!(
+            check(&with_field_access(
+                "/fields/6/fields/0/access",
+                json!({"update": {"role": "editor"}})
+            )),
+            Ok(())
         );
         assert_eq!(
             check(&with_field_access(
-                "/fields/7/access",
+                "/fields/7/tabs/0/fields/0/access",
+                json!({"read": {"signedIn": true}})
+            )),
+            Ok(())
+        );
+        assert_eq!(
+            check(&with_field_access("/fields/6/fields/0/access", json!({"read": {"status": "draft"}}))),
+            Err("field `links.url`: access.read: field rules can use only roles, signedIn, true and false".into())
+        );
+        assert_eq!(
+            check(&with_field_access(
+                "/fields/9/access",
                 json!({"read": {"role": "editor"}})
             )),
             Ok(())
         );
         assert_eq!(
-            check(&with_field_access("/fields/7/access", json!({"update": false}))),
+            check(&with_field_access("/fields/9/access", json!({"update": false}))),
             Err("field `byline`: access.update: virtual and join fields are never written, so they take only a read rule".into())
         );
 
@@ -882,6 +994,14 @@ mod tests {
             assert_eq!(read(ok.clone()), Ok(()), "{ok}");
         }
         assert_eq!(
+            read(json!({"status": {"in": ["$user.team", "bogus"]}})),
+            Err("access.read: where[status][in]: expected one of: draft, published".into())
+        );
+        assert_eq!(
+            read(json!({"team": {"exists": "$user.team"}})),
+            Err("access.read: `$user` values can't be used with exists or near".into())
+        );
+        assert_eq!(
             read(json!({"team": "$user.nope"})),
             Err("access.read: `$user.nope` isn't id, role or a users field".into())
         );
@@ -915,7 +1035,7 @@ mod tests {
         assert!(!d.is_destructive());
 
         // A field inside a row is compared as data too.
-        let new = with_field_access("/fields/6/fields/0/access", json!({"read": false}));
+        let new = with_field_access("/fields/8/fields/0/access", json!({"read": false}));
         let d = diff(&old, &new, &Renames::new()).unwrap();
         assert_eq!(
             d.changes,
