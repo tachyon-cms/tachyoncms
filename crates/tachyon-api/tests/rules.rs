@@ -448,11 +448,11 @@ async fn update_rules_on_own_documents(pool: PgPool) {
     assert_problem(&send(&amy, "DELETE", &url(&bdraft), None).await, 404);
     let stored = get(&admin, &url(&b1)).await;
     assert_eq!(stored.json["title"], "b1", "refused writes change nothing");
-    // Amy can't hand it to Bob: she can't read his profile, so the link is refused as if he
-    // didn't exist. Once an Admin does, it isn't hers to change.
+    // Giving a document away is a change to your own (any existing user may be linked, but
+    // not a made-up one); after that it isn't yours.
+    let nobody = json!({"author": uuid::Uuid::now_v7()});
+    assert_problem(&patch(&amy, &url(&a1), nobody).await, 422);
     let res = patch(&amy, &url(&a1), json!({"author": bob_id})).await;
-    assert_problem(&res, 422);
-    let res = patch(&admin, &url(&a1), json!({"author": bob_id})).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_problem(&patch(&amy, &url(&a1), rename.clone()).await, 403);
     assert_eq!(send(&viv, "DELETE", &url(&v1), None).await.status, 204);

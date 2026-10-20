@@ -108,7 +108,13 @@ pub(crate) async fn check_links(
     if ids.is_empty() {
         return Ok(Vouched::new());
     }
-    let vouched = get_many_readable(&state.pool, &ids, access.readable())
+    // Any existing user may be linked (an author, an assignee): users aren't governed by
+    // rules until front-end accounts land, so only their existence is checked.
+    let mut linkable = access.readable().clone();
+    if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
+        linkable.insert(users.id, None);
+    }
+    let vouched = get_many_readable(&state.pool, &ids, &linkable)
         .await?
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))
