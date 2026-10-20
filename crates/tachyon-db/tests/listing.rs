@@ -1077,6 +1077,36 @@ mod cross {
             .await,
             ["by-ann", "by-bo"]
         );
+        // Negatives treat a hidden author exactly like an absent one.
+        assert_eq!(
+            titles_guarded(
+                "where[author.name][not_equals]=Ann",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            ["alone", "broken", "by-ann", "by-bo", "by-gone"]
+        );
+        assert_eq!(
+            titles_guarded(
+                "where[author.name][exists]=false",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            ["alone", "broken", "by-ann", "by-gone"]
+        );
+        // Links inside list rows are guarded too.
+        assert_eq!(
+            titles_guarded("where[links.by.name][equals]=Ann", &all(None, None)).await,
+            ["by-ann"]
+        );
+        assert_eq!(
+            titles_guarded(
+                "where[links.by.name][equals]=Ann",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            none
+        );
         // Each hop has its own guard: Ann is readable, her company isn't.
         assert_eq!(
             titles_guarded(

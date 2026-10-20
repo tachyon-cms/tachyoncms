@@ -704,6 +704,9 @@ pub async fn get_many_readable(
         .push(" AND id = ANY(")
         .push_bind(ids.to_vec())
         .push(") AND deleted_at IS NULL AND (FALSE");
+    // Sorted, so the same map always builds the same SQL text (and reuses its statement).
+    let mut read: Vec<_> = read.iter().collect();
+    read.sort_unstable_by_key(|(id, _)| **id);
     for (collection_id, filter) in read {
         qb.push(" OR (collection_id = ").push_bind(*collection_id);
         if let Some(f) = filter {
@@ -724,10 +727,12 @@ pub(crate) async fn matches(
     id: Uuid,
     filter: &Filter,
 ) -> Result<bool, DbError> {
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT EXISTS (SELECT 1 FROM documents WHERE deleted_at IS NULL AND id = ",
-    );
-    qb.push_bind(id).push(" AND ");
+    let mut qb =
+        QueryBuilder::<Postgres>::new("SELECT EXISTS (SELECT 1 FROM documents WHERE tenant_id = ");
+    qb.push_bind(DEFAULT_TENANT)
+        .push(" AND deleted_at IS NULL AND id = ")
+        .push_bind(id)
+        .push(" AND ");
     push_filter(&mut qb, filter);
     qb.push(")");
     Ok(qb.build_query_scalar().fetch_one(conn).await?)
