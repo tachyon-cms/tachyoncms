@@ -1542,6 +1542,11 @@ mod tests {
     fn rejects_reserved_slug() {
         let s = schema(json!({"slug": "admin", "fields": []}));
         assert_eq!(s.check(), Err(SchemaError::ReservedSlug("admin".into())));
+        // `/api/access` answers what the caller may do, for collections and globals alike.
+        for kind in ["collection", "global"] {
+            let s = schema(json!({"slug": "access", "kind": kind, "fields": []}));
+            assert_eq!(s.check(), Err(SchemaError::ReservedSlug("access".into())));
+        }
     }
 
     #[test]

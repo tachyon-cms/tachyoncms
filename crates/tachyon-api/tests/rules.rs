@@ -2169,6 +2169,92 @@ fn has(doc: &Value, path: &str) -> bool {
 }
 
 const LISTS: &[&str] = &["links"];
+
+/// Every collection and global in `access_answers_match_what_the_api_allows`, with its fields.
+const KNOWN: &[(&str, &str, &[&str])] = &[
+    (
+        "collections",
+        "posts",
+        &[
+            "box",
+            "box.y",
+            "inRow",
+            "links",
+            "links.label",
+            "links.url",
+            "owner",
+            "secret",
+            "seo",
+            "seo.note",
+            "seo.title",
+            "stage",
+            "title",
+        ],
+    ),
+    ("collections", "notes", &["body"]),
+    ("collections", "inbox", &["body"]),
+    ("collections", "users", &["name"]),
+    ("globals", "home", &["banner", "live", "memo"]),
+];
+
+/// Holds `/api/access` to listing only what the caller can do something with: no collection,
+/// global or field whose answers are all false, and nothing that isn't in `KNOWN`.
+fn lists_only_what_it_allows(who: &str, a: &Value) {
+    for section in ["collections", "globals"] {
+        for (slug, entry) in a[section].as_object().unwrap() {
+            let known = KNOWN.iter().find(|k| k.0 == section && k.1 == slug);
+            let known = known.unwrap_or_else(|| panic!("{who}: unexpected {slug}"));
+            let entry = entry.as_object().unwrap();
+            let actions = entry.iter().filter(|(k, _)| *k != "fields");
+            assert!(
+                actions.clone().any(|(_, v)| v != &json!(false)),
+                "{who}: {slug} {entry:?}"
+            );
+            for (path, f) in entry["fields"].as_object().unwrap() {
+                assert!(
+                    known.2.contains(&path.as_str()),
+                    "{who}: unexpected {slug} {path}"
+                );
+                let any = f.as_object().unwrap().values().any(|v| v == &json!(true));
+                assert!(any, "{who}: {slug} field {path} {f}");
+            }
+        }
+    }
+}
+
+/// `a` with what it leaves out put back as all false: a missing collection, global or field
+/// means no access.
+fn filled(a: &Value) -> Value {
+    let none = |actions: &[&str]| -> Value {
+        actions
+            .iter()
+            .map(|k| ((*k).to_owned(), json!(false)))
+            .collect()
+    };
+    let mut a = a.clone();
+    for (section, slug, fields) in KNOWN {
+        let global = *section == "globals";
+        let (actions, field_actions): (&[&str], &[&str]) = if global {
+            (&["read", "update"], &["read", "update"])
+        } else {
+            (
+                &["read", "create", "update", "delete"],
+                &["read", "create", "update"],
+            )
+        };
+        let entry = &mut a[*section][*slug];
+        if entry.is_null() {
+            *entry = none(actions);
+            entry["fields"] = json!({});
+        }
+        for f in *fields {
+            if entry["fields"][*f].is_null() {
+                entry["fields"][*f] = none(field_actions);
+            }
+        }
+    }
+    a
+}
 const GROUPS: &[&str] = &["seo", "box"];
 
 /// A body that writes only the field at dotted `path`: `leaf` for a value, an empty group
@@ -2336,7 +2422,8 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
             {"name": "title", "type": "text"},
             {"name": "stage", "type": "select", "options": ["draft", "published"]},
             {"name": "owner", "type": "relationship", "relationTo": "users"},
-            {"name": "secret", "type": "text", "access": {"read": editor}},
+            {"name": "secret", "type": "text",
+             "access": {"read": editor, "create": editor, "update": editor}},
             {"name": "seo", "type": "group", "access": {"update": editor}, "fields": [
                 {"name": "title", "type": "text"},
                 {"name": "note", "type": "text", "access": {"create": editor}}
@@ -2421,32 +2508,27 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         assert_eq!(res.status, 200, "{who}: {}", res.json);
         let a = res.json;
         let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        // Only what the caller can do something with is listed.
+        lists_only_what_it_allows(who, &a);
+        let (collections, globals): (&[&str], &[&str]) = match *who {
+            "anonymous" => (&["inbox", "notes", "posts"], &["home"]),
+            "key" => (&["notes", "posts"], &[]),
+            _ => (&["inbox", "notes", "posts", "users"], &["home"]),
+        };
+        assert_eq!(keys(&a["collections"]), collections, "{who}");
+        assert_eq!(keys(&a["globals"]), globals, "{who}");
+        let posts = keys(&a["collections"]["posts"]["fields"]);
         assert_eq!(
-            keys(&a["collections"]),
-            ["inbox", "notes", "posts", "users"],
-            "{who}"
+            posts.contains(&"secret".to_owned()),
+            ["editor", "admin", "key"].contains(who),
+            "{who}: {posts:?}"
         );
-        assert_eq!(keys(&a["globals"]), ["home"], "{who}");
-        // Dotted data paths at every depth, layout flattened, list fields without an index.
-        assert_eq!(
-            keys(&a["collections"]["posts"]["fields"]),
-            [
-                "box",
-                "box.y",
-                "inRow",
-                "links",
-                "links.label",
-                "links.url",
-                "owner",
-                "secret",
-                "seo",
-                "seo.note",
-                "seo.title",
-                "stage",
-                "title"
-            ],
-            "{who}"
-        );
+        if *who == "admin" {
+            // Dotted data paths at every depth, layout flattened, list fields without an index.
+            assert_eq!(posts, KNOWN[0].2, "{who}");
+        }
+        // What's left out is no access at all, which the requests below bear out.
+        let a = filled(&a);
         let mine = me.unwrap_or(admin_id);
 
         // posts

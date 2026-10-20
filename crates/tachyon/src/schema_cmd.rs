@@ -394,6 +394,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_access_slug_is_reserved() {
+        for kind in ["collection", "global"] {
+            let file = json!({"collections": [{"slug": "access", "kind": kind, "fields": []}]});
+            let err = parse_bundle(&file.to_string()).unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                "access: collection slug `access` is reserved"
+            );
+        }
+    }
+
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn duplicate_slugs_and_renames_on_new_collections_are_refused(pool: PgPool) {
         let twice = json!({"collections": [

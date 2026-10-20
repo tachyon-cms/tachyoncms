@@ -92,3 +92,17 @@ async fn the_listener_reloads_after_reconnecting(pool: PgPool) {
     }
     panic!("the listener never reloaded after reconnecting");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_access_slug_is_reserved(pool: PgPool) {
+    let app = common::admin_app(pool).await;
+    for kind in ["collection", "global"] {
+        let body = serde_json::json!({"slug": "access", "kind": kind, "fields": []}).to_string();
+        let res = send(&app, "POST", "/api/admin/collections", Some(&body)).await;
+        common::assert_problem(&res, 422);
+        assert_eq!(
+            res.json["errors"][0]["message"],
+            "collection slug `access` is reserved"
+        );
+    }
+}

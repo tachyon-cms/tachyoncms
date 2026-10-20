@@ -641,26 +641,34 @@ fn answer(c: &Compiled) -> Value {
     }
 }
 
-/// Each field of `c` by dotted path, with what the caller may do with it: `{read, create,
+/// Each field of `c` the caller may do something with, by dotted path: `{read, create,
 /// update}`, or `{read, update}` for a global, which is only ever updated.
 fn field_map(c: &Collection, caller: &Caller) -> Value {
     let global = c.schema.kind == CollectionKind::Global;
-    let fields =
-        field_answers(c.schema.data(), caller)
-            .into_iter()
-            .map(|(path, [read, create, update])| {
-                let a = if global {
-                    json!({"read": read, "update": update})
-                } else {
-                    json!({"read": read, "create": create, "update": update})
-                };
-                (path, a)
-            });
+    let fields = field_answers(c.schema.data(), caller)
+        .into_iter()
+        .filter(|(_, [read, create, update])| *read || *update || (*create && !global))
+        .map(|(path, [read, create, update])| {
+            let a = if global {
+                json!({"read": read, "update": update})
+            } else {
+                json!({"read": read, "create": create, "update": update})
+            };
+            (path, a)
+        });
     Value::Object(fields.collect())
 }
 
 /// `GET /api/access`: what the caller may do with each collection, global and field, and
 /// whether they may change schemas and manage users. Signed out is an answer too.
+///
+/// - Only what the caller can do something with is listed: a collection, global or field
+///   whose answers would all be false is left out, so a missing key means no access.
+/// - `"conditional"` means the answer depends on the document, even when every stored one
+///   happens to pass, and for a global with a filter rule that hasn't been saved yet.
+/// - Answers agree with what the routes enforce: update and delete are false where the
+///   caller can't read at all; a list (and everything in it) is updatable only when all of
+///   it is; a create rule shaped like a filter is false; a global's fields have no create.
 pub(crate) async fn report(
     State(state): State<AppState>,
     principal: Principal,
@@ -690,6 +698,12 @@ pub(crate) async fn report(
                 "delete": access.write_answer(&read, Action::Delete, c),
             })
         };
+        let none = a
+            .as_object()
+            .is_some_and(|m| m.values().all(|v| v == false));
+        if none {
+            continue;
+        }
         a["fields"] = field_map(c, &caller);
         match c.schema.kind {
             CollectionKind::Global => globals.insert(c.schema.slug.clone(), a),
