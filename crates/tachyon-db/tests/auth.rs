@@ -225,7 +225,7 @@ async fn revoking_other_sessions_keeps_the_current_one(pool: PgPool) {
 async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
     let first = account(&pool, "a@b.co", "admin").await;
     assert!(matches!(
-        auth::set_role(&pool, first, "editor").await,
+        auth::set_role(&mut pool.acquire().await.unwrap(), first, "editor").await,
         Err(DbError::Refused(_))
     ));
     let users = auth::ensure_users_collection(&pool).await.unwrap();
@@ -234,10 +234,12 @@ async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
         Err(DbError::Refused(_))
     ));
     let second = account(&pool, "c@d.co", "admin").await;
-    auth::set_role(&pool, first, "editor").await.unwrap();
+    auth::set_role(&mut pool.acquire().await.unwrap(), first, "editor")
+        .await
+        .unwrap();
     assert_eq!(auth::count_admins(&pool).await.unwrap(), 1);
     assert!(matches!(
-        auth::set_role(&pool, second, "viewer").await,
+        auth::set_role(&mut pool.acquire().await.unwrap(), second, "viewer").await,
         Err(DbError::Refused(_))
     ));
 }
@@ -272,7 +274,9 @@ async fn roles_in_use_and_builtin_roles_cant_be_deleted(pool: PgPool) {
         auth::role_delete(&pool, "reviewer").await,
         Err(DbError::Refused(_))
     ));
-    auth::set_role(&pool, id, "viewer").await.unwrap();
+    auth::set_role(&mut pool.acquire().await.unwrap(), id, "viewer")
+        .await
+        .unwrap();
     auth::role_delete(&pool, "reviewer").await.unwrap();
     assert!(matches!(
         auth::role_delete(&pool, "reviewer").await,

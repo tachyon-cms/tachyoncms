@@ -12,7 +12,7 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionKind;
 use tachyon_core::access::{Caller, Compiled, Rule, compile};
-use tachyon_core::auth::{Action, Decision, decide, decide_anonymous, scopes_allow};
+use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{Filter, Target, parse_filter};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
@@ -331,9 +331,15 @@ impl Access {
             .collect()
     }
 
-    /// Whether the caller passes every rule.
-    pub(crate) fn admin(&self) -> bool {
+    /// Whether the caller is an Admin whose credential no key scope narrows: a session, or
+    /// a key with the `admin` scope. Only they may see everything, such as how many
+    /// documents link to one.
+    pub(crate) fn unscoped_admin(&self) -> bool {
         self.caller().admin
+            && match &self.principal {
+                Principal::Key { scopes, .. } => scopes.contains(&Scope::Admin),
+                _ => true,
+            }
     }
 
     /// Whether the caller may read `doc` of `c`, which they just wrote.

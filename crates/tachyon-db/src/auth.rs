@@ -335,24 +335,32 @@ pub async fn reset_failures(pool: &PgPool, user_id: Uuid) -> Result<(), DbError>
     Ok(())
 }
 
-pub async fn set_password(pool: &PgPool, user_id: Uuid, hash: &str) -> Result<(), DbError> {
+pub async fn set_password(
+    db: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+    hash: &str,
+) -> Result<(), DbError> {
     sqlx::query!(
         "UPDATE accounts SET password_hash = $2, password_changed_at = now() WHERE user_id = $1",
         user_id,
         hash,
     )
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
 
-pub async fn set_email(pool: &PgPool, user_id: Uuid, email: &str) -> Result<(), DbError> {
+pub async fn set_email(
+    db: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+    email: &str,
+) -> Result<(), DbError> {
     sqlx::query!(
         "UPDATE accounts SET email = $2 WHERE user_id = $1",
         user_id,
         email.to_lowercase(),
     )
-    .execute(pool)
+    .execute(db)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(ref db) if db.is_unique_violation() => {
@@ -445,7 +453,7 @@ pub async fn revoke_session(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<bo
 
 /// Ends every session of a user except `keep`.
 pub async fn revoke_other_sessions(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     user_id: Uuid,
     keep: Option<Uuid>,
 ) -> Result<(), DbError> {
@@ -454,7 +462,7 @@ pub async fn revoke_other_sessions(
         user_id,
         keep,
     )
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -527,16 +535,16 @@ pub(crate) async fn before_removing(conn: &mut PgConnection, id: Uuid) -> Result
     Ok(())
 }
 
-/// Changes a user's role, never leaving the install without an Admin.
-pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), DbError> {
-    let mut tx = pool.begin().await?;
-    guard_last_admin(&mut tx, user_id, Some(role)).await?;
+/// Changes a user's role, never leaving the install without an Admin. Run it in a
+/// transaction, so the check and the change hold together.
+pub async fn set_role(conn: &mut PgConnection, user_id: Uuid, role: &str) -> Result<(), DbError> {
+    guard_last_admin(&mut *conn, user_id, Some(role)).await?;
     let done = sqlx::query!(
         "UPDATE accounts SET role = $2 WHERE user_id = $1",
         user_id,
         role
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(ref db) if db.is_foreign_key_violation() => DbError::NotFound,
@@ -545,7 +553,6 @@ pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), Db
     if done.rows_affected() == 0 {
         return Err(DbError::NotFound);
     }
-    tx.commit().await?;
     Ok(())
 }
 

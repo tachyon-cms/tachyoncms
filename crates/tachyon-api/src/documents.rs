@@ -327,7 +327,7 @@ pub async fn delete(
     .await
     .map_err(|e| match e {
         // How many link here would count documents the caller may not be able to see.
-        DbError::Referenced(_) if !access.admin() => {
+        DbError::Referenced(_) if !access.unscoped_admin() => {
             ApiError::Conflict("Other documents link to this one; remove those links first".into())
         }
         e => e.into(),

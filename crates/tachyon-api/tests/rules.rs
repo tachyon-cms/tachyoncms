@@ -305,7 +305,8 @@ async fn published_only_reads_on_every_path(pool: PgPool) {
     // visitor, are refused rather than shown everything (or an error).
     let users = json!({"schema": {"slug": "users", "fields": [
         {"name": "name", "type": "text", "required": true},
-        {"name": "team", "type": "text"}
+        {"name": "team", "type": "text"},
+        {"name": "fav", "type": "relationship", "relationTo": "posts"}
     ]}});
     let res = send(
         &b.admin,
@@ -346,7 +347,23 @@ async fn published_only_reads_on_every_path(pool: PgPool) {
 
     // Linking to a hidden document is refused exactly like linking to none, on create and
     // on change, in every kind of link; only the request ID differs.
-    let writer = app_as(&pool, "wes@example.com", "author").await;
+    for global in [
+        json!({"slug": "front", "kind": "global",
+               "fields": [{"name": "feature", "type": "relationship", "relationTo": "posts"}]}),
+        json!({"slug": "notice", "kind": "global", "access": {"read": {"stage": "published"}},
+               "fields": [{"name": "stage", "type": "select", "options": ["draft", "published"]}]}),
+    ] {
+        create(&b.admin, "/api/admin/collections", global).await;
+    }
+    let res = patch(
+        &b.admin,
+        "/api/globals/notice",
+        json!({"stage": "published"}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let wes = add_user(&pool, "wes@example.com", "author").await;
+    let writer = signed_in(visitor(&pool).await, "wes@example.com").await;
     let random = uuid::Uuid::now_v7().to_string();
     let without_id = |r: &Res| {
         let mut json = r.json.clone();
@@ -391,6 +408,36 @@ async fn published_only_reads_on_every_path(pool: PgPool) {
     .await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["author"], hid.as_str());
+
+    // The same on a global's link, and on a profile's.
+    let same = |a: Res, b: Res| {
+        assert_problem(&a, 422);
+        assert_eq!(without_id(&a), without_id(&b));
+    };
+    same(
+        patch(&editor, "/api/globals/front", json!({"feature": draft1})).await,
+        patch(&editor, "/api/globals/front", json!({"feature": random})).await,
+    );
+    let me = format!("/api/users/{wes}");
+    same(
+        patch(&writer, &me, json!({"fav": draft1})).await,
+        patch(&writer, &me, json!({"fav": random})).await,
+    );
+    // A refused profile leaves the account alone too: the new email isn't kept.
+    let res = patch(
+        &writer,
+        &me,
+        json!({"email": "new@example.com", "currentPassword": common::PASSWORD, "fav": draft1}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(get(&b.admin, &me).await.json["email"], "wes@example.com");
+
+    // A change that leaves a global unreadable to its writer answers with its ID only.
+    let res = patch(&editor, "/api/globals/notice", json!({"stage": "draft"})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json.as_object().unwrap().len(), 1, "{}", res.json);
+    assert!(res.json["id"].is_string());
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -546,6 +593,21 @@ async fn update_rules_on_own_documents(pool: PgPool) {
         "{}",
         res.json
     );
+    // An Admin's key narrowed by its scopes isn't told the count either.
+    let key = create(
+        &admin,
+        "/api/auth/keys",
+        json!({"name": "k", "scopes": ["articles:write"]}),
+    )
+    .await;
+    let req = Request::delete(url(&linked)).header(
+        "authorization",
+        format!("Bearer {}", key["key"].as_str().unwrap()),
+    );
+    let res = send_with(&admin, req, None).await;
+    assert_problem(&res, 409);
+    let detail = res.json["detail"].as_str().unwrap();
+    assert!(!detail.chars().any(|c| c.is_ascii_digit()), "{detail}");
 
     // A global's update rule replaces the default too.
     let name = json!({"name": "x"});

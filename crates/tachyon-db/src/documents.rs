@@ -191,7 +191,31 @@ pub async fn update_as<E: From<DbError>>(
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
     let mut tx = pool.begin().await.map_err(DbError::from)?;
-    check_schema(&mut tx, collection_id, schema_version).await?;
+    let doc = update_in(
+        &mut tx,
+        collection_id,
+        schema_version,
+        id,
+        actor,
+        guard,
+        apply,
+    )
+    .await?;
+    tx.commit().await.map_err(DbError::from)?;
+    Ok(doc)
+}
+
+/// `update_as`, inside the caller's transaction, so other changes can commit with it.
+pub async fn update_in<E: From<DbError>>(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+    id: Uuid,
+    actor: Option<Actor>,
+    guard: Option<&Filter>,
+    apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
+) -> Result<Document, E> {
+    check_schema(&mut *tx, collection_id, schema_version).await?;
     let current = sqlx::query!(
         r#"SELECT published AS "data!: Json<Map<String, Value>>", created_by
            FROM documents
@@ -211,7 +235,7 @@ pub async fn update_as<E: From<DbError>>(
     {
         return Err(DbError::NotOwner.into());
     }
-    check_guard(&mut tx, id, guard).await?;
+    check_guard(&mut *tx, id, guard).await?;
     let next = apply(&current.data.0)?;
     let doc = sqlx::query_as!(
         Document,
@@ -227,8 +251,7 @@ pub async fn update_as<E: From<DbError>>(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_unique)?;
-    sync_relations(&mut tx, id, &next.relations).await?;
-    tx.commit().await.map_err(DbError::from)?;
+    sync_relations(&mut *tx, id, &next.relations).await?;
     Ok(doc)
 }
 

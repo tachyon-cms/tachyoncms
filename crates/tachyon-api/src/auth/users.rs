@@ -210,17 +210,19 @@ pub(crate) async fn update(
         .await?
         .ok_or(ApiError::NotFound)?;
 
-    if let Some(role) = text(&account, "role")? {
+    // Everything is checked before anything is written, then written in one transaction,
+    // so a refused part leaves the whole account as it was.
+    let role = text(&account, "role")?;
+    if let Some(role) = role {
         if !admin {
             return Err(ApiError::Forbidden(
                 "Only an Admin can change a role.".into(),
             ));
         }
         known_role(&state, role).await?;
-        auth::set_role(&state.pool, id, role).await?;
     }
-    if let Some(email) = text(&account, "email")? {
-        let email = email.trim();
+    let email = text(&account, "email")?.map(str::trim);
+    if let Some(email) = email {
         if !is_email(email) {
             return Err(ApiError::Validation(vec![field(
                 "email",
@@ -239,8 +241,77 @@ pub(crate) async fn update(
                 ));
             }
         }
+    }
+    let password_hash = match text(&account, "password")? {
+        None => None,
+        Some(password) => {
+            if !admin {
+                return Err(ApiError::Forbidden(
+                    "Change your own password with POST /api/auth/password.".into(),
+                ));
+            }
+            check_new_password(&state, "password", password).await?;
+            let hash = state
+                .auth
+                .hasher
+                .hash(password)
+                .await
+                .map_err(ApiError::Internal)?;
+            Some(hash)
+        }
+    };
+    let users = any_collection(&state, auth::USERS)?;
+    let targets = link_targets(&state, &users).await?;
+    let patch = Value::Object(profile);
+    let apply = |current: &Map<String, Value>| {
+        let data = validate_document(users.schema.data(), &patch, Some(current))
+            .map_err(ApiError::Validation)?;
+        prepare(&targets, &users, data)
+    };
+    let vouched = if patch.as_object().is_some_and(|p| !p.is_empty()) {
+        // Links the profile gains must point at documents the caller can read (all of
+        // them, for an Admin editing someone else's).
+        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        let next = apply(&stored)?;
+        Some(check_links(&state, &access, &next, &link_ids(&users, &stored)).await?)
+    } else {
+        None
+    };
+
+    // The profile's row first, then the account's: the order a delete locks them in.
+    let mut tx = state
+        .pool
+        .begin()
+        .await
+        .map_err(tachyon_db::DbError::from)?;
+    if let Some(vouched) = &vouched {
+        let who = principal.identity().map(|i| Actor {
+            id: i.user_id,
+            own_only: false,
+        });
+        documents::update_in(
+            &mut tx,
+            users.id,
+            users.schema_version,
+            id,
+            who,
+            None,
+            |current| {
+                let next = apply(current)?;
+                vouched_links(&next, &link_ids(&users, current), vouched)?;
+                Ok(next)
+            },
+        )
+        .await
+        .map_err(|e| unique_error(&users, e))?;
+    }
+    if let Some(role) = role {
+        auth::set_role(&mut tx, id, role).await?;
+    }
+    if let Some(email) = email {
         // Saying the address is taken would tell any signed-in user who has an account.
-        auth::set_email(&state.pool, id, email)
+        auth::set_email(&mut *tx, id, email)
             .await
             .map_err(|e| match e {
                 tachyon_db::DbError::Conflict(_) => {
@@ -249,20 +320,8 @@ pub(crate) async fn update(
                 e => e.into(),
             })?;
     }
-    if let Some(password) = text(&account, "password")? {
-        if !admin {
-            return Err(ApiError::Forbidden(
-                "Change your own password with POST /api/auth/password.".into(),
-            ));
-        }
-        check_new_password(&state, "password", password).await?;
-        let hash = state
-            .auth
-            .hasher
-            .hash(password)
-            .await
-            .map_err(ApiError::Internal)?;
-        auth::set_password(&state.pool, id, &hash).await?;
+    if let Some(hash) = &password_hash {
+        auth::set_password(&mut *tx, id, hash).await?;
         // Every other session of theirs ends; an Admin setting their own keeps this one.
         let keep = match &principal {
             Principal::User {
@@ -270,47 +329,9 @@ pub(crate) async fn update(
             } if identity.user_id == id => Some(*session),
             _ => None,
         };
-        auth::revoke_other_sessions(&state.pool, id, keep).await?;
+        auth::revoke_other_sessions(&mut *tx, id, keep).await?;
     }
-    if !profile.is_empty() {
-        let users = any_collection(&state, auth::USERS)?;
-        let targets = link_targets(&state, &users).await?;
-        let patch = Value::Object(profile);
-        let who = principal.identity().map(|i| Actor {
-            id: i.user_id,
-            own_only: false,
-        });
-        let apply = |current: &Map<String, Value>| {
-            let data = validate_document(users.schema.data(), &patch, Some(current))
-                .map_err(ApiError::Validation)?;
-            prepare(&targets, &users, data)
-        };
-        // Links the profile gains must point at documents its owner may read.
-        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
-        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
-        let vouched = check_links(
-            &state,
-            &access,
-            &apply(&stored)?,
-            &link_ids(&users, &stored),
-        )
-        .await?;
-        documents::update_as(
-            &state.pool,
-            users.id,
-            users.schema_version,
-            id,
-            who,
-            None,
-            |current| {
-                let next = apply(current)?;
-                vouched_links(&next, &link_ids(&users, current), &vouched)?;
-                Ok(next)
-            },
-        )
-        .await
-        .map_err(|e| unique_error(&users, e))?;
-    }
+    tx.commit().await.map_err(tachyon_db::DbError::from)?;
     Ok(Json(user_json(&state, id).await?))
 }
 
