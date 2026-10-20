@@ -777,7 +777,21 @@ pub fn explain_parse_error(raw: &Value, e: &serde_json::Error) -> String {
         }
         None
     }
-    locate(raw.get("fields"), "fields", "").unwrap_or_else(|| e.to_string())
+    /// The collection's own `access`, by the rule at fault.
+    fn locate_access(raw: &Value) -> Option<String> {
+        let access = raw.get("access")?;
+        for (action, rule) in access.as_object().into_iter().flatten() {
+            if let Err(e) = crate::access::parse_rule(rule) {
+                return Some(format!("access.{action}: {e}"));
+            }
+        }
+        crate::access::CollectionAccess::deserialize(access)
+            .err()
+            .map(|e| format!("access: {e}"))
+    }
+    locate(raw.get("fields"), "fields", "")
+        .or_else(|| locate_access(raw))
+        .unwrap_or_else(|| e.to_string())
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]

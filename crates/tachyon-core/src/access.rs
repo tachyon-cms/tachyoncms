@@ -364,6 +364,34 @@ pub fn check_rules(
     checker.fields(&schema.fields, "", "fields")
 }
 
+/// Whether any of the schema's rules, on it or on a field at any depth, names `role`.
+pub fn names_role(schema: &CollectionSchema, role: &str) -> bool {
+    fn in_rule(rule: &Rule, role: &str) -> bool {
+        match rule {
+            Rule::Role(roles) => roles.iter().any(|r| r == role),
+            Rule::And(rules) | Rule::Or(rules) => rules.iter().any(|r| in_rule(r, role)),
+            _ => false,
+        }
+    }
+    // Saving refuses rules on layout fields, so the data fields hold every field rule.
+    fn in_fields(fields: &[Field], role: &str) -> bool {
+        fields.iter().any(|f| {
+            f.access.as_ref().is_some_and(|a| {
+                [&a.read, &a.create, &a.update]
+                    .into_iter()
+                    .flatten()
+                    .any(|r| in_rule(r, role))
+            }) || in_fields(children(f), role)
+        })
+    }
+    schema.access.as_ref().is_some_and(|a| {
+        [&a.read, &a.create, &a.update, &a.delete]
+            .into_iter()
+            .flatten()
+            .any(|r| in_rule(r, role))
+    }) || in_fields(&data_fields(&schema.fields), role)
+}
+
 struct Checker<'a> {
     fields: &'a [Field],
     user_fields: &'a [Field],
@@ -409,6 +437,31 @@ impl Checker<'_> {
                 !matches!(**r, "id" | "role") && !self.user_fields.iter().any(|f| f.name == **r)
             }) {
                 return Err(format!("`$user.{bad}` isn't id, role or a users field"));
+            }
+            // `substitute` hands a list to `in` and `not_in` only; anything else gets one value.
+            for f in refs
+                .iter()
+                .filter_map(|r| self.user_fields.iter().find(|f| f.name == *r))
+            {
+                let list = matches!(
+                    &f.kind,
+                    FieldKind::Text { has_many: true, .. }
+                        | FieldKind::Number { has_many: true, .. }
+                        | FieldKind::Select { multiple: true, .. }
+                ) || matches!(&f.kind, FieldKind::Relationship { has_many: true, relation_to, .. }
+                    if !relation_to.is_polymorphic());
+                if list && !matches!(op, "in" | "not_in") {
+                    return Err(format!(
+                        "`$user.{}` holds a list, so it works only with in or not_in",
+                        f.name
+                    ));
+                }
+                if !list && !f.kind.is_indexable() {
+                    return Err(format!(
+                        "`$user.{}` isn't one value or a list of them, so a rule can't compare with it",
+                        f.name
+                    ));
+                }
             }
             let parse = |v: &Value| {
                 parse_filter_with(self.fields, &json!({ name: { op: v } }), self.lookup)

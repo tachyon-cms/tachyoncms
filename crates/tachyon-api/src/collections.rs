@@ -6,6 +6,7 @@ use axum::extract::{Path, State};
 use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tachyon_core::access;
 use tachyon_core::auth::Action;
 use tachyon_core::diff::Renames;
 use tachyon_core::{
@@ -88,6 +89,7 @@ pub async fn create(
         }
     }
     check_virtuals(&state, &schema)?;
+    check_rules(&state, &schema).await?;
     let created = collections::create(&state.pool, &schema).await?;
     // The schema is saved either way, so serve it even if its indexes failed to build.
     let indexed = reconcile_indexes(&state.pool, created.id).await;
@@ -155,6 +157,37 @@ fn check_dependents(state: &AppState, schema: &CollectionSchema) -> Result<(), A
     Ok(())
 }
 
+/// Every collection's access rules must hold with `schema` saved: its own, and the others',
+/// which may filter through it or, when it's `users`, read its fields as `$user` values.
+async fn check_rules(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+    let roles = tachyon_db::auth::roles_list(&state.pool).await?;
+    let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
+    let lookup = |slug: &str| {
+        if slug == schema.slug {
+            Some(schema.clone())
+        } else {
+            state.schemas.get(slug).map(|c| c.schema.0.clone())
+        }
+    };
+    let users = lookup(tachyon_db::auth::USERS)
+        .map(|u| u.fields)
+        .unwrap_or_default();
+    access::check_rules(schema, &users, &roles, &lookup).map_err(schema_error)?;
+    for other in state.schemas.all() {
+        let other = &other.schema.0;
+        if other.slug == schema.slug {
+            continue;
+        }
+        access::check_rules(other, &users, &roles, &lookup).map_err(|e| {
+            schema_error(SchemaError::InvalidChange(format!(
+                "this change would break {}: {e}",
+                other.slug
+            )))
+        })?;
+    }
+    Ok(())
+}
+
 fn change_request(
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
@@ -194,6 +227,7 @@ pub async fn preview(
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;
+    check_rules(&state, &schema).await?;
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
         .await
         .map_err(change_error)?;
@@ -210,6 +244,7 @@ pub async fn update(
     let (slug, req, schema) = change_request(path, body)?;
     check_virtuals(&state, &schema)?;
     check_dependents(&state, &schema)?;
+    check_rules(&state, &schema).await?;
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;

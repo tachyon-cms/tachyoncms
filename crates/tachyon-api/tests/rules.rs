@@ -2849,3 +2849,267 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         );
     }
 }
+
+/// `posts` (or the global `settings`) as `edit` leaves it.
+fn rule_schema(global: bool, edit: impl Fn(&mut Value)) -> Value {
+    let mut s = if global {
+        json!({"slug": "settings", "kind": "global", "fields": [{"name": "title", "type": "text"}]})
+    } else {
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "stage", "type": "select", "options": ["draft", "published"]},
+            {"name": "author", "type": "relationship", "relationTo": "users"}
+        ]})
+    };
+    edit(&mut s);
+    s
+}
+
+/// Every route that saves a schema (create, preview and change) refuses `schema` with
+/// `status`, naming the problem in `message`.
+async fn refused(admin: &Router, schema: &Value, status: u16, message: &str) {
+    let slug = schema["slug"].as_str().unwrap();
+    let mut fresh = schema.clone();
+    fresh["slug"] = json!("fresh");
+    let change = json!({ "schema": schema }).to_string();
+    let attempts = [
+        (
+            "POST",
+            "/api/admin/collections".to_owned(),
+            fresh.to_string(),
+        ),
+        (
+            "POST",
+            format!("/api/admin/collections/{slug}/preview"),
+            change.clone(),
+        ),
+        ("PUT", format!("/api/admin/collections/{slug}"), change),
+    ];
+    for (method, url, body) in attempts {
+        if slug == "users" && method == "POST" && !url.ends_with("preview") {
+            continue; // users is built in, so it's never created
+        }
+        let res = send(admin, method, &url, Some(&body)).await;
+        assert_problem(&res, status);
+        let said = res.json["errors"][0]["message"]
+            .as_str()
+            .or(res.json["detail"].as_str())
+            .unwrap_or_default();
+        assert!(said.contains(message), "{method} {url}: {}", res.json);
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_rules_are_refused_when_saved(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let users = json!({"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "team", "type": "text"},
+        {"name": "tags", "type": "text", "hasMany": true}
+    ]});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&json!({ "schema": users }).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    create(&admin, "/api/admin/collections", rule_schema(false, |_| {})).await;
+    create(&admin, "/api/admin/collections", rule_schema(true, |_| {})).await;
+    let reviewer = json!({"slug": "reviewer", "name": "Reviewer",
+        "abilities": {"content": "read", "schemas": false, "users": false}});
+    create(&admin, "/api/admin/roles", reviewer).await;
+
+    let read = |rule: Value| rule_schema(false, move |s| s["access"] = json!({"read": rule}));
+    for (schema, status, message) in [
+        (
+            read(json!(1)),
+            400,
+            "access.read: a rule is true, false, {\"role\": …}",
+        ),
+        (
+            read(json!({"role": ["editor", "ghost"]})),
+            422,
+            "access.read: there's no role `ghost`",
+        ),
+        (
+            read(json!({"team": "$user.nope"})),
+            422,
+            "access.read: `$user.nope` isn't id, role or a users field",
+        ),
+        (
+            read(json!({"nope": "x"})),
+            422,
+            "access.read: where[nope][equals]: ",
+        ),
+        (
+            read(json!({"title": {"bogus": "x"}})),
+            422,
+            "access.read: where[title][bogus]: unknown operator",
+        ),
+        (
+            read(json!({"title": {"equals": "$user.tags"}})),
+            422,
+            "access.read: `$user.tags` holds a list, so it works only with in or not_in",
+        ),
+        (
+            rule_schema(false, |s| {
+                s["access"] = json!({"create": {"stage": "published"}})
+            }),
+            422,
+            "access.create: can use only roles, signedIn, true and false",
+        ),
+        (
+            rule_schema(false, |s| {
+                s["fields"][0]["access"] = json!({"read": {"stage": "published"}})
+            }),
+            422,
+            "field `title`: access.read: field rules can use only roles, signedIn, true and false",
+        ),
+        (
+            rule_schema(false, |s| {
+                s["fields"].as_array_mut().unwrap().push(
+                    json!({"type": "row", "access": {"read": false}, "fields": [
+                        {"name": "summary", "type": "text"}
+                    ]}),
+                )
+            }),
+            422,
+            "field `fields.3`: layout fields hold no data, so access rules go on the fields inside",
+        ),
+        (
+            rule_schema(true, |s| s["access"] = json!({"delete": true})),
+            422,
+            "access.delete: globals have only read and update rules",
+        ),
+        (
+            rule_schema(true, |s| {
+                s["access"] = json!({"create": {"role": "editor"}})
+            }),
+            422,
+            "access.create: globals have only read and update rules",
+        ),
+        (
+            {
+                let mut u = users.clone();
+                u["access"] = json!({"read": true});
+                u
+            },
+            422,
+            "access: rules on users aren't enforced yet",
+        ),
+    ] {
+        refused(&admin, &schema, status, message).await;
+    }
+
+    // What the checks allow: custom roles, profile fields, and a list with `in`.
+    for ok in [
+        json!({"role": "reviewer"}),
+        json!({"author": "$user.id", "title": "$user.team"}),
+        json!({"title": {"in": "$user.tags"}}),
+    ] {
+        let res = send(
+            &admin,
+            "PUT",
+            "/api/admin/collections/posts",
+            Some(&json!({ "schema": read(ok.clone()) }).to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{ok}: {}", res.json);
+    }
+
+    // The README's example, as written there apart from its slug.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "stories",
+        "access": {
+            "read": {"or": [{"published": true}, {"author": "$user.id"}]},
+            "update": {"author": "$user.id"}
+        },
+        "fields": [
+            {"name": "title", "type": "text", "required": true},
+            {"name": "published", "type": "checkbox"},
+            {"name": "author", "type": "relationship", "relationTo": "users"}
+        ]}),
+    )
+    .await;
+
+    // A change elsewhere that would break a saved rule is refused too: posts reads
+    // `$user.team`, and its author's profile.
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(
+            &json!({ "schema": read(json!({"title": "$user.team", "author.team": "red"})) })
+                .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let mut no_team = users.clone();
+    no_team["fields"].as_array_mut().unwrap().remove(1);
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&json!({ "schema": no_team, "confirm": true }).to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert!(
+        res.json["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("this change would break posts: access.read: "),
+        "{}",
+        res.json
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn roles_named_by_rules_cant_be_deleted(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    for slug in ["reviewer", "proofer"] {
+        let role = json!({"slug": slug, "name": slug,
+            "abilities": {"content": "read", "schemas": false, "users": false}});
+        create(&admin, "/api/admin/roles", role).await;
+    }
+    create(
+        &admin,
+        "/api/admin/collections",
+        rule_schema(false, |s| {
+            s["fields"][0]["access"] = json!({"update": {"or": [false, {"role": "proofer"}]}})
+        }),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        rule_schema(true, |s| {
+            s["access"] = json!({"read": {"role": ["editor", "reviewer"]}})
+        }),
+    )
+    .await;
+    for (slug, holder) in [("reviewer", "settings"), ("proofer", "posts")] {
+        let res = send(&admin, "DELETE", &format!("/api/admin/roles/{slug}"), None).await;
+        assert_problem(&res, 409);
+        assert_eq!(
+            res.json["detail"],
+            format!("access rules in {holder} name the role `{slug}`; change them first"),
+        );
+    }
+    let open = json!({ "schema": rule_schema(true, |_| {}) }).to_string();
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/settings",
+        Some(&open),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = send(&admin, "DELETE", "/api/admin/roles/reviewer", None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+}

@@ -19,12 +19,18 @@ pub const USERS: &str = "users";
 /// Keys a user's account holds, which their profile can't use as field names.
 pub const ACCOUNT_KEYS: &[&str] = &["email", "role", "password", "currentPassword"];
 
-/// The users collection keeps a text `name` (setup and sign-in fill it), and no profile field
-/// may take a name its account uses.
+/// The users collection keeps a text `name` (setup and sign-in fill it), no profile field
+/// may take a name its account uses, and it has no collection rules, which its fixed read
+/// model wouldn't enforce.
 pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core::SchemaError> {
     use tachyon_core::{FieldKind, SchemaError};
     if schema.slug != USERS {
         return Ok(());
+    }
+    if schema.access.is_some() {
+        return Err(SchemaError::InvalidOption(
+            "access: rules on users aren't enforced yet, so they can't be saved; rules on its fields are".into(),
+        ));
     }
     if let Some(f) = schema
         .data()
