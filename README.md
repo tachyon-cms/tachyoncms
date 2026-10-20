@@ -111,8 +111,6 @@ Unless an access rule says otherwise, anyone can read, and signed-in users write
 
 Admins manage users at `/api/users` and roles at `/api/admin/roles`. A user's email, role and password stay private, but their profile fields (such as `name`) show wherever another document links to them, so keep private details out of profile fields; custom roles can be added alongside the four built-in ones. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
 
-That table is the default. Access rules change it per collection, per global and per field.
-
 ### Access rules
 
 Roles answer "who are you?". Most real sites also need "which documents?": visitors see what's published, authors edit their own posts and nobody else's. That's what a rule in the schema's `access` says. Rules live in the schema, so they export and apply with it like any other change.
@@ -131,7 +129,7 @@ A rule is one of these:
 - `{"and": [rules]}` or `{"or": [rules]}`;
 - any other object, which is a filter written exactly as `where` takes it: `{"published": {"equals": true}}`, or `{"published": true}` for short. Filters reach through relationships (`{"author.team": "red"}`) and into lists, just as `where` does.
 
-A filter can compare with the person asking. `$user.id`, `$user.role` and `$user.` plus any `users` profile field (`$user.team`) stand in for their values. A profile field that holds a list works with `in` and `not_in` only. For someone who isn't signed in there's no `$user`, so a condition that uses it matches nothing.
+A filter can compare with the person asking. `$user.id`, `$user.role` and `$user.` plus a `users` profile field (`$user.team`) stand in for their values. The profile field has to store one value or a list of them; virtual and join fields are filled on read, not stored, so rules can't use them. A list works with `in` and `not_in` only. For someone who isn't signed in there's no `$user`, so a condition that uses it matches nothing.
 
 Here's a blog where everyone reads what's published, and authors read their own drafts and change only their own posts:
 
@@ -155,9 +153,11 @@ A rule replaces the role defaults for the action it covers, and only that action
 **How it's enforced.**
 
 - Reads: the rule's filter goes into the database query wherever a document can appear. That covers lists and single reads, references, joins, populated links (one you can't read stays a bare ID) and virtual fields (no value from a document you can't read). It covers filters through relationships too, so nobody can probe hidden documents with `where[author.team]`. A document you can't read is a 404. A list the rule refuses outright, such as `false` or a role you don't have, answers 401 when you're signed out and 403 when you're not.
-- Updates and deletes are checked against the stored document inside the write. If you can't read the document it's a 404; if you can read it but the rule says no, it's a 403. When the rule refuses every document, such as a role you don't have, the answer is a 401 or 403 straight away.
+- Updates and deletes are checked against the stored document inside the write. If you can't read the document it's a 404; if you can read it but the rule says no, it's a 403. When the rule refuses every document, such as a role you don't have, the answer is a 401 or 403 straight away. A global's existence is no secret, so an update its rule refuses is always a 403, never a 404.
 - A create rule can only use roles, sign-in and `true`/`false`, since there's no document to compare yet. A refused create is a 401 or 403.
 - If a write succeeds but you can't read the result, the response holds only its `id`.
+- A new link to a document you can't read gets the same 422 as a link to one that doesn't exist.
+- A delete refused because other documents link to it is a 409. Only an Admin whose credential isn't narrowed by key scopes sees how many; everyone else just hears that something does.
 - Field rules can only use roles, sign-in and `true`/`false` for now. A field you can't read is left out of every response, populated and joined documents included. Filtering or sorting on it is a 403 that names the parameter. Sending it in a write you're not allowed (even as `null`) is a 403 that names the field.
 - API keys stay narrowed by their scopes on top of every rule.
 
@@ -181,7 +181,7 @@ A rule replaces the role defaults for the action it covers, and only that action
 
 A collection or global answers `true`, `false` or `"conditional"`. Conditional means it depends on the document: the rule is a filter, or your role only reaches documents you created. It stays conditional even when every document stored today would pass, because it's an answer about the rules, not the data. Field rules don't depend on the document, so a field answers `true` or `false`, and never allows more than its collection: when you can't update the collection at all, you can't update its fields either. Fields go by their dotted path (`seo.title`, and `links.url` for a field in every row of a list). `schemas` and `users` say whether you may change content types and manage users. Anything you can't do at all is left out, so a missing collection, global or field means no.
 
-**Checked when you save a schema.** Both the API and `tachyon schema apply` refuse a rule with bad syntax, a role that doesn't exist, a `$user` value that isn't `id`, `role` or a `users` profile field, a filter field or operator that doesn't exist, a list-valued `$user` field with anything but `in` or `not_in`, a filter in a create rule or a field rule, `create` or `delete` on a global, or a rule on a layout field (a row, collapsible or unnamed tab holds no data, so the rule goes on the fields inside). The error names the rule and what's wrong with it. A change that would break a rule somewhere else is refused too, such as removing a profile field another collection's rule reads as `$user.team`. So is deleting a role that a rule names; change the rule first.
+**Checked when you save a schema.** Both the API and `tachyon schema apply` refuse a rule with bad syntax, a role that doesn't exist, a `$user` value that isn't `id`, `role` or a `users` profile field, a filter field or operator that doesn't exist, a `$user` field that doesn't store one value or a list of them (a virtual, join, group or JSON field, say), a list-valued `$user` field with anything but `in` or `not_in`, a filter in a create rule or a field rule, `create` or `delete` on a global, or a rule on a layout field (a row, collapsible or unnamed tab holds no data, so the rule goes on the fields inside). The error names the rule and what's wrong with it. A change that would break a rule somewhere else is refused too, such as removing a profile field another collection's rule reads as `$user.team`. So is deleting a role that a rule names; change the rule first.
 
 **Known limits.**
 
