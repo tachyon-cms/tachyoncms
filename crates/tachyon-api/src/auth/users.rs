@@ -104,7 +104,8 @@ pub(crate) async fn list(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Users, "users")?;
     let users = any_collection(&state, auth::USERS)?;
-    let Json(mut body) = crate::documents::list_in(&state, users, raw).await?;
+    let access = crate::access::Access::new(&state, principal).await?;
+    let Json(mut body) = crate::documents::list_in(&state, &access, users, raw).await?;
     if let Some(Value::Array(docs)) = body.get_mut("docs") {
         with_accounts(&state, docs).await?;
     }

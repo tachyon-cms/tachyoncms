@@ -11,9 +11,11 @@ use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
-use tachyon_db::documents::{self, Document, Prepared, Relation};
+use tachyon_db::documents::{Document, Prepared, Relation};
+use tachyon_db::query::get_many_readable;
 use uuid::Uuid;
 
+use crate::access::Access;
 use crate::{ApiError, AppState};
 
 type Populated<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, ApiError>> + Send + 'a>>;
@@ -80,18 +82,21 @@ pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
 }
 
 /// Fills each document's virtual fields (those `select` keeps) with one query for all of them.
+/// A linked document the caller can't read gives no value.
 pub(crate) async fn fill_virtuals(
     state: &AppState,
+    access: &Access,
     items: &mut [(Value, Arc<Collection>)],
     select: Option<&Select>,
 ) -> Result<(), ApiError> {
     let selects = vec![select; items.len()];
-    fill_virtuals_each(state, items, &selects).await
+    fill_virtuals_each(state, access, items, &selects).await
 }
 
 /// `fill_virtuals` where each document has its own `select`, still in one query.
 pub(crate) async fn fill_virtuals_each(
     state: &AppState,
+    access: &Access,
     items: &mut [(Value, Arc<Collection>)],
     selects: &[Option<&Select>],
 ) -> Result<(), ApiError> {
@@ -117,7 +122,7 @@ pub(crate) async fn fill_virtuals_each(
     if ids.is_empty() {
         return Ok(());
     }
-    let linked: HashMap<Uuid, Value> = documents::get_many(&state.pool, &ids)
+    let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, &access.readable())
         .await?
         .into_iter()
         .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
@@ -153,20 +158,23 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     .ok()
 }
 
+/// A link to a document the caller can't read stays an ID.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
+    access: &'a Access,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
     shapes: &'a Shapes,
 ) -> Populated<'a> {
     let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
-    populate_each(state, items, shapes)
+    populate_each(state, access, items, shapes)
 }
 
 /// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
 /// short. One query per level for every distinct link, whatever the depths.
 fn populate_each<'a>(
     state: &'a AppState,
+    access: &'a Access,
     items: Vec<(Value, Arc<Collection>, u8)>,
     shapes: &'a Shapes,
 ) -> Populated<'a> {
@@ -197,11 +205,12 @@ fn populate_each<'a>(
             return Ok(items.into_iter().map(|(v, _, _)| v).collect());
         }
 
-        let found: HashMap<Uuid, (Uuid, Document)> = documents::get_many(&state.pool, &ids)
-            .await?
-            .into_iter()
-            .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
-            .collect();
+        let found: HashMap<Uuid, (Uuid, Document)> =
+            get_many_readable(&state.pool, &ids, &access.readable())
+                .await?
+                .into_iter()
+                .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
+                .collect();
         // The same document wanted at two depths is populated once for each.
         let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
         keys.sort_unstable();
@@ -230,7 +239,7 @@ fn populate_each<'a>(
             depths.push(remaining);
         }
         let refs: Vec<Option<&Select>> = shapes_of.iter().map(Option::as_ref).collect();
-        fill_virtuals_each(state, &mut pairs, &refs).await?;
+        fill_virtuals_each(state, access, &mut pairs, &refs).await?;
         let children: Vec<(Value, Arc<Collection>, u8)> = pairs
             .into_iter()
             .zip(shapes_of)
@@ -242,7 +251,7 @@ fn populate_each<'a>(
                 (value, c, remaining)
             })
             .collect();
-        let children = populate_each(state, children, shapes).await?;
+        let children = populate_each(state, access, children, shapes).await?;
         let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 
         Ok(items

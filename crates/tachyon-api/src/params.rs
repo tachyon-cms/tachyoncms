@@ -10,6 +10,7 @@ use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
 
 use crate::ApiError;
+use crate::access::Access;
 use crate::populate::Shapes;
 use crate::schemas::Schemas;
 
@@ -124,11 +125,8 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
     Ok(out)
 }
 
-fn joins(
-    params: &Map<String, Value>,
-    c: &Collection,
-    schemas: &Schemas,
-) -> Result<Joins, ApiError> {
+fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result<Joins, ApiError> {
+    let schemas = access.schemas();
     let by_name = match params.get("joins") {
         None => return Ok(Joins::all()),
         Some(Value::String(s)) if s == "false" => return Ok(Joins::Off),
@@ -230,7 +228,7 @@ fn joins(
                     if filter.near().is_some() {
                         return Err(bad(format!("{param}: {NEAR_IN_JOIN}")));
                     }
-                    req.filter = Some(filter);
+                    req.filter = Some(access.guard(filter));
                 }
                 _ => {
                     return Err(bad(format!(
@@ -255,11 +253,14 @@ fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     }
 }
 
+/// The parameters of a list. Filters that reach through relationships are guarded by the
+/// linked collections' read rules for the caller.
 pub(crate) fn list_params(
     raw: Option<&str>,
     c: &Collection,
-    schemas: &Schemas,
+    access: &Access,
 ) -> Result<ListParams, ApiError> {
+    let schemas = access.schemas();
     let params = params(
         raw,
         &[
@@ -286,7 +287,8 @@ pub(crate) fn list_params(
         .get("where")
         .map(|w| parse_filter_with(fields, w, &|slug: &str| schemas.lookup(slug)))
         .transpose()
-        .map_err(|e| bad(e.to_string()))?;
+        .map_err(|e| bad(e.to_string()))?
+        .map(|f| access.guard(f));
     let sort = single(&params, "sort")?
         .map(|s| parse_sort(fields, s))
         .transpose()
@@ -314,7 +316,7 @@ pub(crate) fn list_params(
         depth: depth(&params)?,
         select: select(&params, fields)?,
         populate: populate(&params, schemas)?,
-        joins: joins(&params, c, schemas)?,
+        joins: joins(&params, c, access)?,
         filter,
         sort,
     })
@@ -323,13 +325,13 @@ pub(crate) fn list_params(
 pub(crate) fn read_params(
     raw: Option<&str>,
     c: &Collection,
-    schemas: &Schemas,
+    access: &Access,
 ) -> Result<ReadParams, ApiError> {
     let params = params(raw, &["depth", "select", "populate", "joins"])?;
     Ok(ReadParams {
         depth: depth(&params)?,
         select: select(&params, c.schema.data())?,
-        populate: populate(&params, schemas)?,
-        joins: joins(&params, c, schemas)?,
+        populate: populate(&params, access.schemas())?,
+        joins: joins(&params, c, access)?,
     })
 }

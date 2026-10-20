@@ -5,6 +5,7 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use serde_json::{Value, json};
+use std::collections::HashSet;
 use std::sync::Arc;
 
 use tachyon_core::auth::Action;
@@ -14,11 +15,10 @@ use tachyon_core::{CollectionKind, FieldError, validate_document};
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 use tachyon_db::indexes::{IndexKind, index_name};
-use tachyon_db::query::{self, ListQuery};
+use tachyon_db::query::{self, ListQuery, get_many_readable};
 use uuid::Uuid;
 
-use crate::auth::principal::Principal;
-use crate::auth::{actor, authorize};
+use crate::access::{Access, both};
 use crate::joins::fill_joins;
 use crate::params::{Joins, list_params, read_params};
 use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
@@ -80,31 +80,33 @@ pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Valu
 
 pub async fn list(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    authorize(&principal, Action::Read, &slug)?;
+    access.scope(Action::Read, &slug)?;
     let c = collection(&state, &slug)?;
-    list_in(&state, c, raw).await
+    list_in(&state, &access, c, raw).await
 }
 
-/// A page of `c`'s documents, shaped and populated as the query asks. The caller has
-/// already authorized the read.
+/// A page of the documents of `c` the caller may read, shaped and populated as the query
+/// asks. Refused when they may read none of them.
 pub(crate) async fn list_in(
     state: &AppState,
+    access: &Access,
     c: Arc<Collection>,
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let state = state.clone();
-    let p = list_params(raw.as_deref(), &c, &state.schemas)?;
+    let read = access.permit(Action::Read, &c)?;
+    let p = list_params(raw.as_deref(), &c, access)?;
+    let filter = both(p.filter, read);
     let page = p.page.unwrap_or(1);
     let offset = (page - 1)
         .checked_mul(p.limit)
         .ok_or_else(|| ApiError::BadRequest("page is too large".into()))?;
     let q = ListQuery {
-        filter: p.filter.as_ref(),
+        filter: filter.as_ref(),
         sort: p.sort.as_ref(),
         limit: p.limit,
         offset: if p.after.is_some() { 0 } else { offset },
@@ -117,9 +119,10 @@ pub(crate) async fn list_in(
         .iter()
         .map(|d| Ok((to_value(d)?, c.clone())))
         .collect::<Result<Vec<_>, ApiError>>()?;
-    fill_virtuals(&state, &mut docs, p.select.as_ref()).await?;
+    fill_virtuals(state, access, &mut docs, p.select.as_ref()).await?;
     fill_joins(
-        &state,
+        state,
+        access,
         &mut docs,
         p.select.as_ref(),
         &p.joins,
@@ -131,7 +134,7 @@ pub(crate) async fn list_in(
         .into_iter()
         .map(|(v, c)| (shaped(v, p.select.as_ref()), c))
         .collect();
-    let docs = populate(&state, docs, p.depth, &p.populate).await?;
+    let docs = populate(state, access, docs, p.depth, &p.populate).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
     if p.after.is_none() {
         body["page"] = page.into();
@@ -154,17 +157,20 @@ pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
     value
 }
 
-/// The document as JSON, with its relationships populated to `depth`.
+/// The document as JSON, with its relationships populated to `depth` as far as the caller
+/// may read them.
 async fn respond(
     state: &AppState,
+    access: &Access,
     c: Arc<Collection>,
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
     let mut items = vec![(to_value(doc)?, c)];
-    fill_virtuals(state, &mut items, None).await?;
+    fill_virtuals(state, access, &mut items, None).await?;
     fill_joins(
         state,
+        access,
         &mut items,
         None,
         &Joins::all(),
@@ -173,7 +179,7 @@ async fn respond(
     )
     .await?;
     Ok(Json(
-        populate(state, items, depth, &Shapes::new())
+        populate(state, access, items, depth, &Shapes::new())
             .await?
             .remove(0),
     ))
@@ -181,13 +187,17 @@ async fn respond(
 
 pub async fn create(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    let decision = authorize(&principal, Action::Create, &slug)?;
+    // A create rule can't depend on a document that doesn't exist yet. Schemas refuse such
+    // rules when saved; one that got through anyway refuses.
+    if access.permit(Action::Create, &c)?.is_some() {
+        return Err(access.refuse());
+    }
     let data = validate_document(c.schema.data(), &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
     let targets = link_targets(&state, &c).await?;
@@ -197,29 +207,33 @@ pub async fn create(
         c.schema_version,
         None,
         &prepare(&targets, &c, data)?,
-        actor(&principal, decision).map(|a| a.id),
+        access.actor(Action::Create, &c).map(|a| a.id),
     )
     .await
     .map_err(|e| unique_error(&c, e.into()))?;
-    Ok((StatusCode::CREATED, respond(&state, c, &doc, 1).await?))
+    Ok((
+        StatusCode::CREATED,
+        respond(&state, &access, c, &doc, 1).await?,
+    ))
 }
 
 pub async fn get(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
-    authorize(&principal, Action::Read, &slug)?;
+    access.scope(Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let p = read_params(raw.as_deref(), &c, &state.schemas)?;
-    let doc = documents::get(&state.pool, c.id, id).await?;
+    let p = read_params(raw.as_deref(), &c, &access)?;
+    let doc = access.read_one(&state.pool, &c, id).await?;
     let mut items = vec![(to_value(&doc)?, c)];
-    fill_virtuals(&state, &mut items, p.select.as_ref()).await?;
+    fill_virtuals(&state, &access, &mut items, p.select.as_ref()).await?;
     fill_joins(
         &state,
+        &access,
         &mut items,
         p.select.as_ref(),
         &p.joins,
@@ -230,7 +244,7 @@ pub async fn get(
     let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
-        populate(&state, vec![(value, c)], p.depth, &p.populate)
+        populate(&state, &access, vec![(value, c)], p.depth, &p.populate)
             .await?
             .remove(0),
     ))
@@ -238,24 +252,26 @@ pub async fn get(
 
 pub async fn update(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    access.scope(Action::Update, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let decision = authorize(&principal, Action::Update, &slug)?;
+    let guard = access
+        .write_guard(&state.pool, Action::Update, &c, id)
+        .await?;
     let patch = json_body(body)?;
     let targets = link_targets(&state, &c).await?;
-    let who = actor(&principal, decision);
     let doc = documents::update_as(
         &state.pool,
         c.id,
         c.schema_version,
         id,
-        who,
-        None,
+        access.actor(Action::Update, &c),
+        guard.as_ref(),
         |current| {
             let data = validate_document(c.schema.data(), &patch, Some(current))
                 .map_err(ApiError::Validation)?;
@@ -264,33 +280,52 @@ pub async fn update(
     )
     .await
     .map_err(|e| unique_error(&c, e))?;
-    respond(&state, c, &doc, 1).await
+    respond(&state, &access, c, &doc, 1).await
 }
 
 pub async fn delete(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    access.scope(Action::Delete, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let decision = authorize(&principal, Action::Delete, &slug)?;
-    documents::delete_as(&state.pool, c.id, id, actor(&principal, decision), None).await?;
+    let guard = access
+        .write_guard(&state.pool, Action::Delete, &c, id)
+        .await?;
+    documents::delete_as(
+        &state.pool,
+        c.id,
+        id,
+        access.actor(Action::Delete, &c),
+        guard.as_ref(),
+    )
+    .await?;
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// The documents that link to this one, among those the caller may read.
 pub async fn references(
     State(state): State<AppState>,
-    principal: Principal,
+    access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
-    authorize(&principal, Action::Read, &slug)?;
+    access.scope(Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    documents::get(&state.pool, c.id, id).await?;
-    Ok(Json(
-        json!({ "docs": documents::references(&state.pool, id).await? }),
-    ))
+    access.read_one(&state.pool, &c, id).await?;
+    let mut refs = documents::references(&state.pool, id).await?;
+    if !refs.is_empty() {
+        let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
+        let readable: HashSet<Uuid> = get_many_readable(&state.pool, &ids, &access.readable())
+            .await?
+            .into_iter()
+            .map(|(_, doc)| doc.id)
+            .collect();
+        refs.retain(|r| readable.contains(&r.id));
+    }
+    Ok(Json(json!({ "docs": refs })))
 }

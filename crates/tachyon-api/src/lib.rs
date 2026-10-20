@@ -1,5 +1,6 @@
 //! HTTP API for TachyonCMS.
 
+mod access;
 pub mod auth;
 mod collections;
 mod documents;

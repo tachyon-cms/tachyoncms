@@ -135,11 +135,15 @@ pub fn decide(
         (Update | Delete, Content::Own) => Decision::OwnOnly,
     };
     match scopes {
-        Some(scopes) if !scopes.iter().any(|s| scope_allows(s, action, collection)) => {
-            Decision::Deny
-        }
+        Some(scopes) if !scopes_allow(scopes, action, collection) => Decision::Deny,
         _ => by_role,
     }
+}
+
+/// Whether a key with `scopes` may do `action` on `collection` at all, whatever its owner's
+/// role or the collection's rules say.
+pub fn scopes_allow(scopes: &[Scope], action: Action, collection: &str) -> bool {
+    scopes.iter().any(|s| scope_allows(s, action, collection))
 }
 
 fn yes(allowed: bool) -> Decision {
