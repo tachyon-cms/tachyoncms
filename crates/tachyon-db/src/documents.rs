@@ -7,6 +7,7 @@ use serde_json::{Map, Value};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::FieldError;
+use tachyon_core::query::Filter;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -174,17 +175,19 @@ pub async fn update<E: From<DbError>>(
     id: Uuid,
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
-    update_as(pool, collection_id, schema_version, id, None, apply).await
+    update_as(pool, collection_id, schema_version, id, None, None, apply).await
 }
 
 /// `update`, as `actor`: recorded as the last editor, and refused with `NotOwner` when they
-/// may only change their own documents and this isn't one.
+/// may only change their own documents and this isn't one. With a `guard`, the stored
+/// document must match it, checked on the locked row, or the update is `Forbidden`.
 pub async fn update_as<E: From<DbError>>(
     pool: &PgPool,
     collection_id: Uuid,
     schema_version: i32,
     id: Uuid,
     actor: Option<Actor>,
+    guard: Option<&Filter>,
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
     let mut tx = pool.begin().await.map_err(DbError::from)?;
@@ -208,6 +211,7 @@ pub async fn update_as<E: From<DbError>>(
     {
         return Err(DbError::NotOwner.into());
     }
+    check_guard(&mut tx, id, guard).await?;
     let next = apply(&current.data.0)?;
     let doc = sqlx::query_as!(
         Document,
@@ -230,16 +234,18 @@ pub async fn update_as<E: From<DbError>>(
 
 /// Soft delete. Refused while other live documents link here. Restoring from Trash arrives in M4.
 pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), DbError> {
-    delete_as(pool, collection_id, id, None).await
+    delete_as(pool, collection_id, id, None, None).await
 }
 
-/// `delete`, as `actor` (see `update_as`). Deleting a user also ends their sessions and keys,
-/// and is refused when they're the last Admin, all in the same transaction.
+/// `delete`, as `actor` and under `guard` (see `update_as`). Deleting a user also ends
+/// their sessions and keys, and is refused when they're the last Admin, all in the same
+/// transaction.
 pub async fn delete_as(
     pool: &PgPool,
     collection_id: Uuid,
     id: Uuid,
     actor: Option<Actor>,
+    guard: Option<&Filter>,
 ) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
     // Lock first, so a concurrent write can't add a link between the check and the delete.
@@ -260,6 +266,7 @@ pub async fn delete_as(
     {
         return Err(DbError::NotOwner);
     }
+    check_guard(&mut tx, id, guard).await?;
     let linked = sqlx::query_scalar!(
         r#"SELECT count(*) AS "n!" FROM relations r
            JOIN documents d ON d.id = r.from_doc
@@ -281,6 +288,18 @@ pub async fn delete_as(
     .await?;
     tx.commit().await?;
     Ok(())
+}
+
+/// Refuses the write unless the locked document matches `guard`.
+async fn check_guard(
+    conn: &mut PgConnection,
+    id: Uuid,
+    guard: Option<&Filter>,
+) -> Result<(), DbError> {
+    match guard {
+        Some(f) if !crate::query::matches(conn, id, f).await? => Err(DbError::Forbidden),
+        _ => Ok(()),
+    }
 }
 
 /// Live documents that link to `id`.

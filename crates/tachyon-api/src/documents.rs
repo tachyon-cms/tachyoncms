@@ -249,11 +249,19 @@ pub async fn update(
     let patch = json_body(body)?;
     let targets = link_targets(&state, &c).await?;
     let who = actor(&principal, decision);
-    let doc = documents::update_as(&state.pool, c.id, c.schema_version, id, who, |current| {
-        let data = validate_document(c.schema.data(), &patch, Some(current))
-            .map_err(ApiError::Validation)?;
-        prepare(&targets, &c, data)
-    })
+    let doc = documents::update_as(
+        &state.pool,
+        c.id,
+        c.schema_version,
+        id,
+        who,
+        None,
+        |current| {
+            let data = validate_document(c.schema.data(), &patch, Some(current))
+                .map_err(ApiError::Validation)?;
+            prepare(&targets, &c, data)
+        },
+    )
     .await
     .map_err(|e| unique_error(&c, e))?;
     respond(&state, c, &doc, 1).await
@@ -268,7 +276,7 @@ pub async fn delete(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let decision = authorize(&principal, Action::Delete, &slug)?;
-    documents::delete_as(&state.pool, c.id, id, actor(&principal, decision)).await?;
+    documents::delete_as(&state.pool, c.id, id, actor(&principal, decision), None).await?;
     Ok(StatusCode::NO_CONTENT)
 }
 

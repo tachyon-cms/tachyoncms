@@ -416,3 +416,153 @@ async fn rows_cant_point_across_tenants(pool: PgPool) {
         "a link can't join documents from another tenant"
     );
 }
+
+fn filter(qs: &str) -> tachyon_core::query::Filter {
+    let schema: CollectionSchema = serde_json::from_value(json!({"slug": "any", "fields": [
+        {"name": "title", "type": "text"},
+        {"name": "author", "type": "text"}
+    ]}))
+    .unwrap();
+    let params = tachyon_core::query::parse_query(qs).unwrap();
+    tachyon_core::query::parse_filter(&schema.fields, &params["where"]).unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn read_filters_apply_to_get_many_by_collection(pool: PgPool) {
+    use std::collections::HashMap;
+    use tachyon_core::query::Filter;
+    let posts = collection(&pool, "posts").await;
+    let pages = collection(&pool, "pages").await;
+    let notes = collection(&pool, "notes").await;
+    let mut ids = Vec::new();
+    for (c, title) in [
+        (posts, "open"),
+        (posts, "hidden"),
+        (pages, "page"),
+        (notes, "note"),
+    ] {
+        let doc = documents::insert(&pool, c, 1, None, &Prepared::plain(data(title)))
+            .await
+            .unwrap();
+        ids.push(doc.id);
+    }
+    let titles = |found: Vec<(Uuid, documents::Document)>| {
+        let mut t: Vec<String> = found
+            .iter()
+            .map(|(_, d)| d.data.0["title"].as_str().unwrap().to_owned())
+            .collect();
+        t.sort();
+        t
+    };
+
+    // posts by filter, pages whole, notes not at all (missing from the map).
+    let read = HashMap::from([
+        (posts, Some(filter("where[title][equals]=open"))),
+        (pages, None),
+    ]);
+    let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
+    assert!(found.iter().all(|(c, _)| *c == posts || *c == pages));
+    assert_eq!(titles(found), ["open", "page"]);
+
+    // A filter that matches nothing hides the whole collection; no map hides everything.
+    let read = HashMap::from([(posts, Some(Filter::Any(Vec::new()))), (pages, None)]);
+    let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
+    assert_eq!(titles(found), ["page"]);
+    let found = query::get_many_readable(&pool, &ids, &HashMap::new())
+        .await
+        .unwrap();
+    assert!(found.is_empty());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn write_guards_are_checked_in_the_transaction(pool: PgPool) {
+    let posts = collection(&pool, "posts").await;
+    let insert = |title: &str| {
+        let doc = json!({"title": title, "author": "me"});
+        let pool = pool.clone();
+        async move {
+            documents::insert(
+                &pool,
+                posts,
+                1,
+                None,
+                &Prepared::plain(doc.as_object().unwrap().clone()),
+            )
+            .await
+            .unwrap()
+            .id
+        }
+    };
+    let mine = filter("where[author][equals]=me");
+    let rename = |current: &Map<String, Value>| -> Result<Prepared, DbError> {
+        let mut next = current.clone();
+        next.insert("title".into(), json!("renamed"));
+        Ok(Prepared::plain(next))
+    };
+
+    // A matching guard lets the write through.
+    let a = insert("a").await;
+    documents::update_as(&pool, posts, 1, a, None, Some(&mine), rename)
+        .await
+        .unwrap();
+    // A guard that doesn't match refuses it and leaves the document alone.
+    let other = filter("where[author][equals]=someone-else");
+    let refused = documents::update_as(&pool, posts, 1, a, None, Some(&other), rename).await;
+    assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
+    let refused = documents::delete_as(&pool, posts, a, None, Some(&other)).await;
+    assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
+    assert_eq!(
+        documents::get(&pool, posts, a).await.unwrap().data.0["title"],
+        "renamed"
+    );
+
+    // Another transaction hands the document to someone else while the guarded write waits
+    // on its lock: the write must judge the row it locked, not the one it saw first.
+    for delete in [false, true] {
+        let id = insert("b").await;
+        let mut other_tx = pool.begin().await.unwrap();
+        sqlx::query(
+            "UPDATE documents SET published = jsonb_set(published, '{author}', '\"thief\"') WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&mut *other_tx)
+        .await
+        .unwrap();
+        let write = {
+            let (pool, mine) = (pool.clone(), mine.clone());
+            tokio::spawn(async move {
+                if delete {
+                    documents::delete_as(&pool, posts, id, None, Some(&mine)).await
+                } else {
+                    documents::update_as(&pool, posts, 1, id, None, Some(&mine), rename)
+                        .await
+                        .map(|_| ())
+                }
+            })
+        };
+        // Wait until the guarded write is blocked on the row lock.
+        loop {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+            if waiting > 0 {
+                break;
+            }
+            assert!(
+                !write.is_finished(),
+                "the guarded write never waited for the lock"
+            );
+            tokio::task::yield_now().await;
+        }
+        other_tx.commit().await.unwrap();
+        let result = write.await.unwrap();
+        assert!(matches!(result, Err(DbError::Forbidden)), "{result:?}");
+        let stored = documents::get(&pool, posts, id).await.unwrap();
+        assert_eq!(stored.data.0["title"], "b");
+        assert_eq!(stored.data.0["author"], "thief");
+    }
+}

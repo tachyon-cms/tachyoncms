@@ -45,6 +45,9 @@ impl From<DbError> for ApiError {
             DbError::NotOwner => {
                 Self::Forbidden("You can only change documents you created.".into())
             }
+            DbError::Forbidden => {
+                Self::Forbidden("An access rule doesn't let you change this document.".into())
+            }
             DbError::SchemaChanged => Self::Conflict(
                 "This collection's fields just changed. Reload and try again.".into(),
             ),

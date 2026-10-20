@@ -85,13 +85,20 @@ pub async fn update(
     let targets = link_targets(&state, &c).await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
-        let updated =
-            documents::update_as(&state.pool, c.id, c.schema_version, c.id, who, |current| {
+        let updated = documents::update_as(
+            &state.pool,
+            c.id,
+            c.schema_version,
+            c.id,
+            who,
+            None,
+            |current| {
                 let data = validate_document(c.schema.data(), &patch, Some(current))
                     .map_err(ApiError::Validation)?;
                 prepare(&targets, &c, data)
-            })
-            .await;
+            },
+        )
+        .await;
         match updated {
             Ok(doc) => return respond(&state, c.clone(), &doc, 1).await,
             Err(ApiError::NotFound) => {}

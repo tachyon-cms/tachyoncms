@@ -978,4 +978,151 @@ mod cross {
             ["by-ann"]
         );
     }
+
+    /// Puts `guards` on every relationship the filter crosses, at any depth.
+    fn guarded(f: Filter, guards: &[(&str, Option<Filter>)]) -> Filter {
+        use tachyon_core::query::Target;
+        fn target(t: Target, guards: &[(&str, Option<Filter>)]) -> Target {
+            match t {
+                Target::Via {
+                    link,
+                    many,
+                    polymorphic,
+                    collections,
+                    inner,
+                    ..
+                } => Target::Via {
+                    link,
+                    many,
+                    polymorphic,
+                    collections,
+                    inner: Box::new(target(*inner, guards)),
+                    guards: guards
+                        .iter()
+                        .map(|(slug, f)| ((*slug).to_owned(), f.clone().map(Box::new)))
+                        .collect(),
+                },
+                Target::Row { list, inner } => Target::Row {
+                    list,
+                    inner: Box::new(target(*inner, guards)),
+                },
+                other => other,
+            }
+        }
+        match f {
+            Filter::All(parts) => {
+                Filter::All(parts.into_iter().map(|p| guarded(p, guards)).collect())
+            }
+            Filter::Any(parts) => {
+                Filter::Any(parts.into_iter().map(|p| guarded(p, guards)).collect())
+            }
+            Filter::Cond(mut c) => {
+                c.target = target(c.target, guards);
+                Filter::Cond(c)
+            }
+        }
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn via_guards_hide_linked_documents(pool: PgPool) {
+        let w = world(&pool).await;
+        let lookup = |slug: &str| w.schemas.iter().find(|s| s.slug == slug).cloned();
+        let parse = |slug: &str, qs: &str| {
+            let fields = &lookup(slug).unwrap().fields;
+            parse_filter_with(fields, &parse_query(qs).unwrap()["where"], &lookup).unwrap()
+        };
+        let titles_guarded = async |qs: &str, guards: &[(&str, Option<Filter>)]| {
+            let f = guarded(parse("posts", qs), guards);
+            let by_title = sort("title");
+            titles(&pool, w.posts, q(Some(&f), Some(&by_title))).await
+        };
+        let none: Vec<String> = Vec::new();
+        let not_ann = parse("authors", "where[name][not_equals]=Ann");
+        let not_acme = parse("companies", "where[name][not_equals]=Acme");
+        let all = |authors: Option<Filter>, companies: Option<Filter>| {
+            vec![("authors", authors), ("companies", companies)]
+        };
+
+        // Readable links still match; a hidden author can't be found by name or ID.
+        assert_eq!(
+            titles_guarded("where[author.name][equals]=Ann", &all(None, None)).await,
+            ["by-ann"]
+        );
+        assert_eq!(
+            titles_guarded(
+                "where[author.name][equals]=Ann",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            none
+        );
+        let by_id = format!("where[author.id][equals]={}", w.ann);
+        assert_eq!(
+            titles_guarded(&by_id, &all(Some(not_ann.clone()), None)).await,
+            none
+        );
+        assert_eq!(
+            titles_guarded(
+                "where[tags.name][equals]=Ann",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            none
+        );
+        assert_eq!(
+            titles_guarded(
+                "where[tags.name][equals]=Bo",
+                &all(Some(not_ann.clone()), None)
+            )
+            .await,
+            ["by-ann", "by-bo"]
+        );
+        // Each hop has its own guard: Ann is readable, her company isn't.
+        assert_eq!(
+            titles_guarded(
+                "where[author.company.name][equals]=Acme",
+                &all(None, Some(not_acme.clone()))
+            )
+            .await,
+            none
+        );
+        // A guard can itself reach through a link: only authors at Acme are readable.
+        let at_acme = parse("authors", "where[company.name][equals]=Acme");
+        assert_eq!(
+            titles_guarded("where[author.name][exists]=true", &all(Some(at_acme), None)).await,
+            ["by-ann"]
+        );
+
+        // Polymorphic links: each target collection's own guard applies to its documents.
+        assert_eq!(
+            titles_guarded(
+                "where[related.name][equals]=Ann",
+                &all(Some(Filter::Any(Vec::new())), None)
+            )
+            .await,
+            ["by-bo"]
+        );
+        let not_ann_co = parse("companies", "where[name][not_equals]=Ann");
+        assert_eq!(
+            titles_guarded(
+                "where[related.name][equals]=Ann",
+                &all(None, Some(not_ann_co))
+            )
+            .await,
+            none
+        );
+        assert_eq!(
+            titles_guarded("where[one.name][equals]=Acme", &all(None, Some(not_acme))).await,
+            none
+        );
+        // A guarded link with no entry for a target collection reads nothing there.
+        assert_eq!(
+            titles_guarded("where[related.name][equals]=Ann", &[("authors", None)]).await,
+            none
+        );
+        assert_eq!(
+            titles_guarded("where[author.name][equals]=Ann", &[("companies", None)]).await,
+            none
+        );
+    }
 }

@@ -123,6 +123,10 @@ pub enum Target {
         polymorphic: bool,
         collections: Vec<String>,
         inner: Box<Target>,
+        /// The read filter of each linked collection the caller may read (`None`: all of
+        /// it), so hidden documents never match. Empty means unguarded. Otherwise a
+        /// collection missing from the list is unreadable, and nothing in it matches.
+        guards: Vec<(String, Option<Box<Filter>>)>,
     },
     /// Some row of the list at `list` matches `inner`, whose path is relative to the row.
     Row {
@@ -718,6 +722,7 @@ fn resolve(
                             .map(|s| (*s).to_owned())
                             .collect(),
                         inner: Box::new(inner),
+                        guards: Vec::new(),
                     },
                     field,
                 ));
@@ -1585,6 +1590,7 @@ mod tests {
                 polymorphic,
                 collections: collections.iter().map(|s| (*s).to_owned()).collect(),
                 inner: Box::new(inner),
+                guards: Vec::new(),
             }
         }
 

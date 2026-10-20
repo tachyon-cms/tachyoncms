@@ -284,6 +284,7 @@ pub(crate) async fn update(
             users.schema_version,
             id,
             who,
+            None,
             |current| {
                 let data = validate_document(users.schema.data(), &patch, Some(current))
                     .map_err(ApiError::Validation)?;
@@ -305,6 +306,6 @@ pub(crate) async fn delete(
     authorize(&principal, Action::Users, "users")?;
     let users = any_collection(&state, auth::USERS)?;
     let who = actor(&principal, Decision::Allow);
-    documents::delete_as(&state.pool, users.id, id, who).await?;
+    documents::delete_as(&state.pool, users.id, id, who, None).await?;
     Ok(StatusCode::NO_CONTENT)
 }

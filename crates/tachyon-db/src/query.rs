@@ -313,6 +313,7 @@ fn push_exists(
             polymorphic,
             collections,
             inner,
+            guards,
         } => {
             let alias = format!("t{depth}");
             link.iter().for_each(|s| assert_identifier(s));
@@ -354,6 +355,9 @@ fn push_exists(
                 columns: format!("{alias}."),
                 depth,
             };
+            if !guards.is_empty() {
+                push_guards(qb, &alias, collections, guards, &linked);
+            }
             (inner, linked)
         }
         _ => unreachable!("push_exists is only called on nested targets"),
@@ -370,6 +374,36 @@ fn push_exists(
         push_cond(qb, &leaf, &next);
     }
     qb.push(")");
+}
+
+/// `(…) AND `: a linked document must be in a collection the caller may read, and match
+/// that collection's read filter. A collection with no guard entry reads nothing.
+fn push_guards(
+    qb: &mut QueryBuilder<Postgres>,
+    alias: &str,
+    collections: &[String],
+    guards: &[(String, Option<Box<Filter>>)],
+    linked: &Base,
+) {
+    qb.push("(FALSE");
+    for slug in collections {
+        let Some((_, guard)) = guards.iter().find(|(s, _)| s == slug) else {
+            continue;
+        };
+        qb.push(format!(
+            " OR ({alias}.collection_id = (SELECT id FROM collections WHERE tenant_id = "
+        ))
+        .push_bind(DEFAULT_TENANT)
+        .push(" AND slug = ")
+        .push_bind(slug.clone())
+        .push(")");
+        if let Some(f) = guard {
+            qb.push(" AND ");
+            push_filter_in(qb, f, linked);
+        }
+        qb.push(")");
+    }
+    qb.push(") AND ");
 }
 
 fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
@@ -645,6 +679,58 @@ pub async fn joined(
         }
     }
     Ok(out)
+}
+
+#[derive(sqlx::FromRow)]
+struct ReadableRow {
+    collection_id: Uuid,
+    #[sqlx(flatten)]
+    doc: Document,
+}
+
+/// `documents::get_many`, keeping only what the caller may read. `read` maps each readable
+/// collection's ID to its read filter (`None`: all of it); documents in any other
+/// collection don't come back.
+pub async fn get_many_readable(
+    pool: &PgPool,
+    ids: &[Uuid],
+    read: &HashMap<Uuid, Option<Filter>>,
+) -> Result<Vec<(Uuid, Document)>, DbError> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT id, collection_id, status, created_at, updated_at, published AS data \
+         FROM documents WHERE tenant_id = ",
+    );
+    qb.push_bind(DEFAULT_TENANT)
+        .push(" AND id = ANY(")
+        .push_bind(ids.to_vec())
+        .push(") AND deleted_at IS NULL AND (FALSE");
+    for (collection_id, filter) in read {
+        qb.push(" OR (collection_id = ").push_bind(*collection_id);
+        if let Some(f) = filter {
+            qb.push(" AND ");
+            push_filter(&mut qb, f);
+        }
+        qb.push(")");
+    }
+    qb.push(")");
+    let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(pool).await?;
+    Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
+}
+
+/// Whether live document `id` matches `filter`. Run after locking the row, this judges the
+/// version the rest of the transaction writes over.
+pub(crate) async fn matches(
+    conn: &mut sqlx::PgConnection,
+    id: Uuid,
+    filter: &Filter,
+) -> Result<bool, DbError> {
+    let mut qb = QueryBuilder::<Postgres>::new(
+        "SELECT EXISTS (SELECT 1 FROM documents WHERE deleted_at IS NULL AND id = ",
+    );
+    qb.push_bind(id).push(" AND ");
+    push_filter(&mut qb, filter);
+    qb.push(")");
+    Ok(qb.build_query_scalar().fetch_one(conn).await?)
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.
