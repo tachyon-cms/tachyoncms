@@ -115,9 +115,10 @@ pub async fn update(
     access.writes(&c, &patch, Action::UpdateGlobal)?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: Option<&Map<String, Value>>| {
-        let data = validate_document(c.schema.data(), &patch, current)
-            .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
-        prepare(&targets, &c, data)
+        validate_document(c.schema.data(), &patch, current)
+            .map_err(ApiError::Validation)
+            .and_then(|data| prepare(&targets, &c, data))
+            .map_err(|e| access.hide(&c, e))
     };
     let before = |current: Option<&Map<String, Value>>| {
         current.map_or_else(Vec::new, |data| link_ids(&c, data))

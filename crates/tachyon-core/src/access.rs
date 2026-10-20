@@ -583,9 +583,9 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
             doc.remove(&f.name);
             continue;
         };
+        // Something may be hidden at any depth below, so every container is walked.
         let (all, kept) = (children(f), children(v));
-        // Pruning only removes, so the same count means nothing inside is hidden.
-        if all.len() == kept.len() {
+        if all.is_empty() {
             continue;
         }
         match doc.get_mut(&f.name) {
@@ -795,6 +795,47 @@ mod tests {
     }
 
     const ROLES: &[&str] = &["admin", "editor", "author", "viewer"];
+
+    #[test]
+    fn hidden_fields_are_stripped_however_deep() {
+        let ed = json!({"read": {"role": "editor"}});
+        let pair =
+            json!([{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]);
+        let s = schema(json!({"slug": "deep", "fields": [
+            {"name": "gg", "type": "group", "fields": [
+                {"name": "g", "type": "group", "fields": pair}
+            ]},
+            {"name": "ag", "type": "array", "fields": [
+                {"name": "g", "type": "group", "fields": pair}
+            ]},
+            {"name": "ga", "type": "group", "fields": [
+                {"name": "a", "type": "array", "fields": pair}
+            ]},
+            {"type": "tabs", "tabs": [{"name": "tab", "label": "Tab", "fields": [
+                {"name": "g", "type": "group", "fields": pair}
+            ]}]},
+            {"type": "collapsible", "label": "C", "fields": [
+                {"name": "cg", "type": "group", "fields": [
+                    {"type": "row", "fields": [{"name": "g", "type": "group", "fields": pair}]}
+                ]}
+            ]}
+        ]}));
+        let xy = json!({"x": "x", "y": "y"});
+        let doc = json!({"gg": {"g": xy}, "ag": [{"g": xy}, {"g": xy}], "ga": {"a": [xy, xy]},
+                         "tab": {"g": xy}, "cg": {"g": xy}});
+        let y = json!({"y": "y"});
+        let hidden = json!({"gg": {"g": y}, "ag": [{"g": y}, {"g": y}], "ga": {"a": [y, y]},
+                            "tab": {"g": y}, "cg": {"g": y}});
+        for (caller, want) in [(signed_in("viewer"), &hidden), (signed_in("editor"), &doc)] {
+            let mut by_rule = doc.as_object().unwrap().clone();
+            strip_unreadable(s.data(), &mut by_rule, &caller);
+            assert_eq!(&Value::Object(by_rule), want);
+            let visible = readable_fields(s.data(), &caller);
+            let mut by_shape = doc.as_object().unwrap().clone();
+            strip_to(s.data(), &visible, &mut by_shape);
+            assert_eq!(&Value::Object(by_shape), want);
+        }
+    }
 
     #[test]
     fn field_rules_strip_and_refuse_at_any_depth() {

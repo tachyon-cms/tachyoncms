@@ -1366,7 +1366,20 @@ async fn staff(pool: &PgPool) -> Staff {
             {"type": "tabs", "tabs": [{"name": "extra", "label": "Extra", "fields": [
                 {"name": "code", "type": "text", "access": ed}
             ]}]},
-            {"type": "row", "fields": [{"name": "inRow", "type": "text", "access": ed}]}
+            {"type": "row", "fields": [{"name": "inRow", "type": "text", "access": ed}]},
+            // Hidden two and three levels down, beside fields that aren't.
+            {"name": "deep", "type": "group", "fields": [
+                {"name": "inner", "type": "group", "fields": [
+                    {"name": "x", "type": "text", "access": ed},
+                    {"name": "y", "type": "text"}
+                ]},
+                {"name": "rows", "type": "array", "fields": [
+                    {"name": "sub", "type": "group", "fields": [
+                        {"name": "x", "type": "text", "access": ed},
+                        {"name": "y", "type": "text"}
+                    ]}
+                ]}
+            ]}
         ]}),
     )
     .await;
@@ -1433,7 +1446,8 @@ async fn staff(pool: &PgPool) -> Staff {
         "/api/posts",
         json!({"title": "One", "secret": "s1", "rank": 1, "author": ann, "hiddenAuthor": ann,
                "meta": {"topic": "t", "note": "n"}, "links": [{"label": "l", "url": "u"}],
-               "extra": {"code": "c"}, "inRow": "r"}),
+               "extra": {"code": "c"}, "inRow": "r",
+               "deep": {"inner": {"x": "x", "y": "y"}, "rows": [{"sub": {"x": "x", "y": "y"}}]}}),
     )
     .await);
     let p2 = id(&create(
@@ -1498,6 +1512,12 @@ fn hidden_in_post(doc: &Value) -> Vec<&'static str> {
     if doc["extra"].get("code").is_some() {
         out.push("extra.code");
     }
+    if doc["deep"]["inner"].get("x").is_some() {
+        out.push("deep.inner.x");
+    }
+    if doc["deep"]["rows"][0]["sub"].get("x").is_some() {
+        out.push("deep.rows.sub.x");
+    }
     out
 }
 
@@ -1514,7 +1534,7 @@ fn hidden_in_person(doc: &Value) -> Vec<&'static str> {
     out
 }
 
-const ALL_POST: [&str; 10] = [
+const ALL_POST: [&str; 12] = [
     "secret",
     "rank",
     "authorSalary",
@@ -1525,6 +1545,8 @@ const ALL_POST: [&str; 10] = [
     "meta.note",
     "links.url",
     "extra.code",
+    "deep.inner.x",
+    "deep.rows.sub.x",
 ];
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

@@ -173,7 +173,10 @@ pub(crate) async fn create(
     known_role(&state, &role).await?;
     check_new_password(&state, "password", &password).await?;
     let targets = link_targets(&state, &users).await?;
-    let prepared = prepare(&targets, &users, data.map_err(ApiError::Validation)?)?;
+    let prepared = data
+        .map_err(ApiError::Validation)
+        .and_then(|data| prepare(&targets, &users, data))
+        .map_err(|e| hide_errors(&users, e, &caller))?;
     let hash = state
         .auth
         .hasher
@@ -273,9 +276,10 @@ pub(crate) async fn update(
     let targets = link_targets(&state, &users).await?;
     let patch = profile;
     let apply = |current: &Map<String, Value>| {
-        let data = validate_document(users.schema.data(), &patch, Some(current))
-            .map_err(|e| hide_errors(&users, ApiError::Validation(e), &caller))?;
-        prepare(&targets, &users, data)
+        validate_document(users.schema.data(), &patch, Some(current))
+            .map_err(ApiError::Validation)
+            .and_then(|data| prepare(&targets, &users, data))
+            .map_err(|e| hide_errors(&users, e, &caller))
     };
     let vouched = if patch.as_object().is_some_and(|p| !p.is_empty()) {
         // Links the profile gains must point at documents the caller can read (all of

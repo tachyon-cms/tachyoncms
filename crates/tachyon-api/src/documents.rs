@@ -214,10 +214,11 @@ pub async fn create(
     }
     let body = json_body(body)?;
     access.writes(&c, &body, Action::Create)?;
-    let data = validate_document(c.schema.data(), &body, None)
-        .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
     let targets = link_targets(&state, &c).await?;
-    let prepared = prepare(&targets, &c, data)?;
+    let prepared = validate_document(c.schema.data(), &body, None)
+        .map_err(ApiError::Validation)
+        .and_then(|data| prepare(&targets, &c, data))
+        .map_err(|e| access.hide(&c, e))?;
     check_links(&state, &access, &prepared, &[]).await?;
     let doc = documents::insert_as(
         &state.pool,
@@ -289,9 +290,10 @@ pub async fn update(
     access.writes(&c, &patch, Action::Update)?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: &Map<String, Value>| {
-        let data = validate_document(c.schema.data(), &patch, Some(current))
-            .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
-        prepare(&targets, &c, data)
+        validate_document(c.schema.data(), &patch, Some(current))
+            .map_err(ApiError::Validation)
+            .and_then(|data| prepare(&targets, &c, data))
+            .map_err(|e| access.hide(&c, e))
     };
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
