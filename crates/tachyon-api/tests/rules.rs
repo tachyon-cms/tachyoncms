@@ -343,6 +343,54 @@ async fn published_only_reads_on_every_path(pool: PgPool) {
     let teamless = signed_in(visitor(&pool).await, "viv@example.com").await;
     assert_problem(&get(&teamless, "/api/boards").await, 403);
     assert_problem(&get(&visitor(&pool).await, "/api/boards").await, 401);
+
+    // Linking to a hidden document is refused exactly like linking to none, on create and
+    // on change, in every kind of link; only the request ID differs.
+    let writer = app_as(&pool, "wes@example.com", "author").await;
+    let random = uuid::Uuid::now_v7().to_string();
+    let without_id = |r: &Res| {
+        let mut json = r.json.clone();
+        json.as_object_mut().unwrap().remove("requestId");
+        json
+    };
+    let mine = id(&create(
+        &writer,
+        "/api/posts",
+        json!({"title": "w", "stage": "published"}),
+    )
+    .await);
+    for (hidden, missing) in [
+        (json!({"author": hid}), json!({"author": random})),
+        (json!({"related": draft1}), json!({"related": random})),
+        (
+            json!({"people": [{"relationTo": "authors", "value": ann}, {"relationTo": "posts", "value": draft1}]}),
+            json!({"people": [{"relationTo": "authors", "value": ann}, {"relationTo": "posts", "value": random}]}),
+        ),
+        (
+            json!({"credits": [{"who": hid}]}),
+            json!({"credits": [{"who": random}]}),
+        ),
+    ] {
+        let a = send(&writer, "POST", "/api/posts", Some(&hidden.to_string())).await;
+        let b = send(&writer, "POST", "/api/posts", Some(&missing.to_string())).await;
+        assert_problem(&a, 422);
+        assert_eq!(without_id(&a), without_id(&b), "{hidden}");
+        let a = patch(&writer, &format!("/api/posts/{mine}"), hidden.clone()).await;
+        let b = patch(&writer, &format!("/api/posts/{mine}"), missing).await;
+        assert_problem(&a, 422);
+        assert_eq!(without_id(&a), without_id(&b), "{hidden}");
+    }
+    // Links already on a document stay: an Editor can retitle Pub two, which holds hidden
+    // ones, and keep them.
+    let editor = app_as(&pool, "eve@example.com", "editor").await;
+    let res = patch(
+        &editor,
+        &format!("/api/posts/{pub2}"),
+        json!({"title": "Pub 2"}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["author"], hid.as_str());
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -357,7 +405,8 @@ async fn update_rules_on_own_documents(pool: PgPool) {
         "fields": [
             {"name": "title", "type": "text"},
             {"name": "stage", "type": "select", "options": ["draft", "published"]},
-            {"name": "author", "type": "relationship", "relationTo": "users"}
+            {"name": "author", "type": "relationship", "relationTo": "users"},
+            {"name": "see", "type": "relationship", "relationTo": "articles"}
         ]}),
     )
     .await;
@@ -399,8 +448,11 @@ async fn update_rules_on_own_documents(pool: PgPool) {
     assert_problem(&send(&amy, "DELETE", &url(&bdraft), None).await, 404);
     let stored = get(&admin, &url(&b1)).await;
     assert_eq!(stored.json["title"], "b1", "refused writes change nothing");
-    // Giving a document away is a change to your own; after that it isn't yours.
+    // Amy can't hand it to Bob: she can't read his profile, so the link is refused as if he
+    // didn't exist. Once an Admin does, it isn't hers to change.
     let res = patch(&amy, &url(&a1), json!({"author": bob_id})).await;
+    assert_problem(&res, 422);
+    let res = patch(&admin, &url(&a1), json!({"author": bob_id})).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_problem(&patch(&amy, &url(&a1), rename.clone()).await, 403);
     assert_eq!(send(&viv, "DELETE", &url(&v1), None).await.status, 204);
@@ -435,6 +487,7 @@ async fn update_rules_on_own_documents(pool: PgPool) {
         let (amy, url) = (amy.clone(), url(&mine));
         tokio::spawn(async move { patch(&amy, &url, json!({"title": "stolen"})).await })
     };
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
     loop {
         let waiting: i64 = sqlx::query_scalar(
             "SELECT count(*) FROM pg_stat_activity
@@ -447,11 +500,52 @@ async fn update_rules_on_own_documents(pool: PgPool) {
             break;
         }
         assert!(!write.is_finished(), "the write never waited for the lock");
-        tokio::task::yield_now().await;
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the write didn't reach the lock in time"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(5)).await;
     }
     other.commit().await.unwrap();
     assert_problem(&write.await.unwrap(), 403);
     assert_eq!(get(&admin, &url(&mine)).await.json["title"], "mine");
+
+    // A change that leaves the document unreadable answers with its ID only.
+    let gone = id(&create(
+        &admin,
+        "/api/articles",
+        article("gone", "published", amy_id),
+    )
+    .await);
+    let res = patch(&amy, &url(&gone), json!({"stage": "draft"})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json, json!({"id": gone}));
+
+    // A refused delete doesn't count links from documents the caller can't see; an Admin's
+    // does.
+    let linked = id(&create(
+        &admin,
+        "/api/articles",
+        article("linked", "published", amy_id),
+    )
+    .await);
+    let mut hidden = article("hidden", "draft", bob_id);
+    hidden["see"] = linked.clone().into();
+    create(&admin, "/api/articles", hidden).await;
+    let res = send(&amy, "DELETE", &url(&linked), None).await;
+    assert_problem(&res, 409);
+    let detail = res.json["detail"].as_str().unwrap();
+    assert!(!detail.chars().any(|c| c.is_ascii_digit()), "{detail}");
+    let res = send(&admin, "DELETE", &url(&linked), None).await;
+    assert_problem(&res, 409);
+    assert!(
+        res.json["detail"]
+            .as_str()
+            .unwrap()
+            .starts_with("1 other document"),
+        "{}",
+        res.json
+    );
 
     // A global's update rule replaces the default too.
     let name = json!({"name": "x"});
@@ -491,7 +585,12 @@ async fn public_create_rule_lets_visitors_post(pool: PgPool) {
 
     let res = post(&anon, "messages").await;
     assert_eq!(res.status, 201, "{}", res.json);
-    assert_eq!(res.json["body"], "hello");
+    assert!(res.json["id"].is_string(), "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"id": res.json["id"]}),
+        "visitors can't read messages, so they get only the ID back"
+    );
     assert_eq!(post(&viewer, "messages").await.status, 201);
     // Nobody but an Admin may read them back.
     assert_problem(&get(&anon, "/api/messages").await, 401);
@@ -509,7 +608,9 @@ async fn public_create_rule_lets_visitors_post(pool: PgPool) {
     );
 
     assert_problem(&post(&anon, "members").await, 401);
-    assert_eq!(post(&viewer, "members").await.status, 201);
+    let res = post(&viewer, "members").await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["body"], "hello", "readable, so shown in full");
     assert_problem(&post(&author, "memos").await, 403);
     // Without a rule, visitors still can't post.
     assert_problem(&post(&anon, "closed").await, 401);
@@ -563,8 +664,33 @@ async fn admins_pass_every_rule(pool: PgPool) {
         get(admin, &format!("/api/authors/{}", b.hid)).await.status,
         200
     );
+    // References include globals that link here.
+    create(
+        admin,
+        "/api/admin/collections",
+        json!({"slug": "home", "kind": "global",
+               "fields": [{"name": "feature", "type": "relationship", "relationTo": "posts"}]}),
+    )
+    .await;
+    let res = patch(admin, "/api/globals/home", json!({"feature": b.draft1})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
     let refs = get(admin, &format!("/api/posts/{}/references", b.draft1)).await;
-    assert_eq!(refs.json["docs"][0]["id"], b.pub2.as_str());
+    let mut from: Vec<&str> = refs.json["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["collection"].as_str().unwrap())
+        .collect();
+    from.sort();
+    from.dedup();
+    assert_eq!(from, ["home", "posts"], "{}", refs.json);
+    assert!(
+        refs.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|r| r["id"] == b.pub2.as_str())
+    );
     for (query, admin_sees) in PROBES {
         let url = format!("/api/posts?{}", query.replace("{hid}", &b.hid));
         assert_eq!(titles(&get(admin, &url).await), [*admin_sees], "{url}");

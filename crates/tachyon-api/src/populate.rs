@@ -1,6 +1,6 @@
 //! Replaces relationship IDs with the documents they point at, one query per depth level.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,7 +11,7 @@ use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
-use tachyon_db::documents::{Document, Prepared, Relation};
+use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
 use tachyon_db::query::get_many_readable;
 use uuid::Uuid;
 
@@ -77,6 +77,69 @@ pub(crate) fn prepare(
     })
 }
 
+/// The IDs `data` of `c` links to.
+pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
+    relations(c.schema.data(), data)
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
+pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
+
+/// Refuses the links in `next` that `before` didn't hold and that the caller can't read,
+/// exactly as a link to no document is refused, so a write can't tell a hidden document
+/// from a missing one. Links already on the document stay as they are.
+pub(crate) async fn check_links(
+    state: &AppState,
+    access: &Access,
+    next: &Prepared,
+    before: &[Uuid],
+) -> Result<Vouched, ApiError> {
+    let mut ids: Vec<Uuid> = next
+        .relations
+        .iter()
+        .map(|r| r.id)
+        .filter(|id| !before.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(Vouched::new());
+    }
+    let vouched = get_many_readable(&state.pool, &ids, access.readable())
+        .await?
+        .into_iter()
+        .map(|(collection_id, doc)| (doc.id, collection_id))
+        .collect();
+    vouched_links(next, before, &vouched)?;
+    Ok(vouched)
+}
+
+/// `check_links`' answer applied to the document as locked for the write: a link added
+/// since the check (relative to `before`) that it didn't vouch for is refused the same way.
+pub(crate) fn vouched_links(
+    next: &Prepared,
+    before: &[Uuid],
+    vouched: &Vouched,
+) -> Result<(), ApiError> {
+    let missing: Vec<FieldError> = next
+        .relations
+        .iter()
+        .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
+        .map(|r| FieldError {
+            path: r.path.clone(),
+            message: MISSING_LINK.into(),
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(missing))
+    }
+}
+
 pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
     serde_json::to_value(doc).map_err(|e| ApiError::Internal(e.to_string()))
 }
@@ -122,7 +185,7 @@ pub(crate) async fn fill_virtuals_each(
     if ids.is_empty() {
         return Ok(());
     }
-    let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, &access.readable())
+    let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, access.readable())
         .await?
         .into_iter()
         .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
@@ -206,7 +269,7 @@ fn populate_each<'a>(
         }
 
         let found: HashMap<Uuid, (Uuid, Document)> =
-            get_many_readable(&state.pool, &ids, &access.readable())
+            get_many_readable(&state.pool, &ids, access.readable())
                 .await?
                 .into_iter()
                 .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))

@@ -1,11 +1,12 @@
 //! What the caller may do, per request: each collection's access rules compiled for them,
 //! or the role defaults where a collection has no rule for an action, always narrowed by an
-//! API key's scopes.
+//! API key's scopes. A join's schema `where` and the relationships inside rule filters are
+//! deliberately left unguarded: Admins write them, so they can't be used to probe.
 
 use std::collections::HashMap;
-use std::sync::Arc;
+use std::sync::{Arc, OnceLock};
 
-use axum::extract::FromRequestParts;
+use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
 use axum::http::request::Parts;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
@@ -30,6 +31,19 @@ pub(crate) struct Access {
     /// fields. `None` when signed out.
     user: Option<Map<String, Value>>,
     schemas: Arc<Schemas>,
+    /// `readable()`, worked out once per request.
+    readable: OnceLock<HashMap<Uuid, Option<Filter>>>,
+}
+
+/// Which collections' rules a request can reach, to decide whether it needs the profile.
+pub(crate) enum Reach<'a> {
+    /// Nothing: the route names no collection that exists.
+    Nothing,
+    /// This collection or global (every action), and the read rules of every collection it
+    /// links or joins to, however indirectly.
+    From(&'a Collection),
+    /// Every collection's read rule, as for references, which can come from anywhere.
+    Everything,
 }
 
 impl FromRequestParts<AppState> for Access {
@@ -41,7 +55,26 @@ impl FromRequestParts<AppState> for Access {
             .get::<Principal>()
             .cloned()
             .unwrap_or(Principal::Anonymous);
-        Access::new(state, principal).await
+        // The collection or global the route names: `{collection}` or `{slug}`.
+        let named = RawPathParams::from_request_parts(parts, state)
+            .await
+            .ok()
+            .and_then(|params| {
+                params
+                    .iter()
+                    .find(|(k, _)| *k == "collection" || *k == "slug")
+                    .and_then(|(_, slug)| state.schemas.get(slug))
+            });
+        let references = parts
+            .extensions
+            .get::<MatchedPath>()
+            .is_some_and(|m| m.as_str().ends_with("/references"));
+        let reach = match (references, &named) {
+            (true, _) => Reach::Everything,
+            (false, Some(c)) => Reach::From(c),
+            (false, None) => Reach::Nothing,
+        };
+        Access::new(state, principal, reach).await
     }
 }
 
@@ -77,24 +110,75 @@ fn uses_profile(rule: &Rule) -> bool {
     }
 }
 
+/// Whether a rule the request can reach reads a profile field. Rules that don't match the
+/// request's collections never compile for it, and a rule missing a profile value it needed
+/// fails closed anyway, so this only decides whether the lookup is worth making.
+fn needs_profile(schemas: &Schemas, reach: &Reach) -> bool {
+    let read = |c: &Collection| {
+        c.schema
+            .access
+            .as_ref()
+            .and_then(|a| a.read.as_ref())
+            .is_some_and(uses_profile)
+    };
+    let start = match reach {
+        Reach::Nothing => return false,
+        Reach::Everything => return schemas.all().iter().any(|c| read(c)),
+        Reach::From(c) => c,
+    };
+    let any_action = start.schema.access.as_ref().is_some_and(|a| {
+        [&a.read, &a.create, &a.update, &a.delete]
+            .into_iter()
+            .flatten()
+            .any(uses_profile)
+    });
+    if any_action {
+        return true;
+    }
+    // Every collection reachable through links and joins: populate, virtual fields, joins
+    // and filters only ever read those.
+    let links = |c: &Collection| -> Vec<String> {
+        c.schema
+            .relation_targets()
+            .into_iter()
+            .map(str::to_owned)
+            .chain(c.schema.join_fields().into_iter().map(|j| j.collection))
+            .collect()
+    };
+    let mut seen = vec![start.schema.slug.clone()];
+    let mut queue = links(start);
+    while let Some(slug) = queue.pop() {
+        if seen.contains(&slug) {
+            continue;
+        }
+        let Some(c) = schemas.get(&slug) else {
+            continue;
+        };
+        if read(&c) {
+            return true;
+        }
+        queue.extend(links(&c));
+        seen.push(slug);
+    }
+    false
+}
+
 impl Access {
-    /// Loads the caller's profile only when a collection's rule reads one of its fields.
-    // ponytail: scans every schema's rules per signed-in request; keep a flag on the schema
-    // snapshot if there are ever thousands of collections.
-    pub(crate) async fn new(state: &AppState, principal: Principal) -> Result<Self, ApiError> {
+    /// Loads the caller's profile once, and only when a rule the request can reach reads one
+    /// of its fields. Admins pass every rule, so theirs is never needed.
+    pub(crate) async fn new(
+        state: &AppState,
+        principal: Principal,
+        reach: Reach<'_>,
+    ) -> Result<Self, ApiError> {
         let user = match principal.identity() {
             None => None,
             Some(identity) => {
-                let needs_profile = state.schemas.all().iter().any(|c| {
-                    c.schema.access.as_ref().is_some_and(|a| {
-                        [&a.read, &a.create, &a.update, &a.delete]
-                            .into_iter()
-                            .flatten()
-                            .any(uses_profile)
-                    })
-                });
                 let mut user = Map::new();
-                if needs_profile && let Some(users) = state.schemas.get(USERS) {
+                if identity.role != "admin"
+                    && needs_profile(&state.schemas, &reach)
+                    && let Some(users) = state.schemas.get(USERS)
+                {
                     match documents::get(&state.pool, users.id, identity.user_id).await {
                         Ok(doc) => user = doc.data.0,
                         Err(DbError::NotFound) => {}
@@ -110,6 +194,7 @@ impl Access {
             principal,
             user,
             schemas: state.schemas.clone(),
+            readable: OnceLock::new(),
         })
     }
 
@@ -221,17 +306,51 @@ impl Access {
     }
 
     /// Each collection the caller may read, with its read filter (`None`: all of it).
-    pub(crate) fn readable(&self) -> HashMap<Uuid, Option<Filter>> {
+    /// Globals are left out: nothing links to them.
+    pub(crate) fn readable(&self) -> &HashMap<Uuid, Option<Filter>> {
+        self.readable
+            .get_or_init(|| self.read_filters(|c| c.schema.kind == CollectionKind::Collection))
+    }
+
+    /// `readable`, with globals too: a global can link to a document, so it can be one of
+    /// that document's references.
+    pub(crate) fn readable_with_globals(&self) -> HashMap<Uuid, Option<Filter>> {
+        self.read_filters(|_| true)
+    }
+
+    fn read_filters(&self, which: impl Fn(&Collection) -> bool) -> HashMap<Uuid, Option<Filter>> {
         self.schemas
             .all()
             .iter()
-            .filter(|c| c.schema.kind == CollectionKind::Collection)
+            .filter(|c| which(c))
             .filter_map(|c| match self.allows(Action::Read, c) {
                 Compiled::Allow => Some((c.id, None)),
                 Compiled::Filter(f) => Some((c.id, Some(f))),
                 Compiled::Deny => None,
             })
             .collect()
+    }
+
+    /// Whether the caller passes every rule.
+    pub(crate) fn admin(&self) -> bool {
+        self.caller().admin
+    }
+
+    /// Whether the caller may read `doc` of `c`, which they just wrote.
+    pub(crate) async fn can_read(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        doc: Uuid,
+    ) -> Result<bool, ApiError> {
+        Ok(match self.allows(Action::Read, c) {
+            Compiled::Allow => true,
+            Compiled::Deny => false,
+            Compiled::Filter(f) => {
+                let one = HashMap::from([(c.id, Some(f))]);
+                !get_many_readable(pool, &[doc], &one).await?.is_empty()
+            }
+        })
     }
 
     /// Document `id` of `c`, when the caller may read it; a 404 when they may not.
@@ -272,6 +391,8 @@ impl Access {
             Compiled::Filter(f) => Some(f),
         };
         let write = match self.allows(action, c) {
+            // Refused for the whole collection, so a 403 before the readability check is
+            // intended: it says nothing about this document.
             Compiled::Deny => return Err(self.refuse()),
             Compiled::Allow => None,
             Compiled::Filter(f) => Some(f),
@@ -345,5 +466,81 @@ impl Access {
             },
             other => other,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+    use tachyon_core::CollectionSchema;
+    use tachyon_core::auth::builtin_roles;
+    use tachyon_db::auth::{Identity, NewAccount, create_account, ensure_users_collection};
+    use tachyon_db::collections;
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn the_profile_loads_only_when_a_reachable_rule_reads_it(pool: PgPool) {
+        let users = ensure_users_collection(&pool).await.unwrap();
+        let new = NewAccount {
+            email: "ann@example.com",
+            name: "Ann",
+            password_hash: "x",
+            role: "viewer",
+        };
+        let me = create_account(&pool, &users, &new, false).await.unwrap();
+        let schema = |v: Value| -> CollectionSchema { serde_json::from_value(v).unwrap() };
+        for s in [
+            json!({"slug": "boards", "access": {"read": {"title": "$user.name"}},
+                   "fields": [{"name": "title", "type": "text"}]}),
+            json!({"slug": "pins", "fields": [
+                {"name": "board", "type": "relationship", "relationTo": "boards"}
+            ]}),
+            json!({"slug": "posts", "access": {"update": {"author": "$user.id"}},
+                   "fields": [{"name": "author", "type": "text"}]}),
+        ] {
+            collections::create(&pool, &schema(s)).await.unwrap();
+        }
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
+            auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+        };
+        let viewer = builtin_roles()[3].2.clone();
+        let principal = Principal::User {
+            identity: Identity {
+                user_id: me,
+                role: "viewer".into(),
+                abilities: viewer,
+            },
+            session: Uuid::now_v7(),
+            cookie: false,
+        };
+        let loaded = |slug: Option<&str>, reach_all: bool| {
+            let (state, principal) = (state.clone(), principal.clone());
+            let slug = slug.map(str::to_owned);
+            async move {
+                let c = slug.and_then(|s| state.schemas.get(&s));
+                let reach = match (&c, reach_all) {
+                    (_, true) => Reach::Everything,
+                    (Some(c), _) => Reach::From(c),
+                    (None, _) => Reach::Nothing,
+                };
+                let access = Access::new(&state, principal, reach).await.unwrap();
+                let user = access.user.unwrap();
+                assert_eq!(user["id"], me.to_string(), "always there");
+                user.contains_key("name")
+            }
+        };
+        assert!(loaded(Some("boards"), false).await, "its own rule reads it");
+        assert!(loaded(Some("pins"), false).await, "pins link to boards");
+        assert!(
+            !loaded(Some("posts"), false).await,
+            "$user.id needs no profile"
+        );
+        assert!(!loaded(None, false).await);
+        assert!(
+            loaded(None, true).await,
+            "references can come from anywhere"
+        );
     }
 }

@@ -7,7 +7,7 @@ use std::sync::Arc;
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use tachyon_core::auth::Action;
 use tachyon_core::{CollectionKind, defaults, validate_document};
 use tachyon_db::DbError;
@@ -18,7 +18,10 @@ use tachyon_db::query::get_many_readable;
 use crate::access::{Access, both};
 use crate::documents::{json_body, shaped, unique_error};
 use crate::params::read_params;
-use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
+use crate::populate::{
+    Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
+    vouched_links,
+};
 use crate::{ApiError, AppState};
 
 fn global(
@@ -40,6 +43,10 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    // Only its ID when the caller can't read what they just wrote.
+    if !access.can_read(&state.pool, &c, doc.id).await? {
+        return Ok(Json(serde_json::json!({ "id": doc.id })));
+    }
     let mut items = vec![(to_value(doc)?, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     Ok(Json(
@@ -103,6 +110,28 @@ pub async fn update(
     let who = access.actor(Action::UpdateGlobal, &c);
     let patch = json_body(body)?;
     let targets = link_targets(&state, &c).await?;
+    let apply = |current: Option<&Map<String, Value>>| {
+        let data =
+            validate_document(c.schema.data(), &patch, current).map_err(ApiError::Validation)?;
+        prepare(&targets, &c, data)
+    };
+    let before = |current: Option<&Map<String, Value>>| {
+        current.map_or_else(Vec::new, |data| link_ids(&c, data))
+    };
+    // Links the patch adds are checked against the stored document (or none), then again
+    // against the one the write locks.
+    let stored = match documents::get(&state.pool, c.id, c.id).await {
+        Ok(doc) => Some(doc.data.0),
+        Err(DbError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
+    let vouched = check_links(
+        &state,
+        &access,
+        &apply(stored.as_ref())?,
+        &before(stored.as_ref()),
+    )
+    .await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
         let updated = documents::update_as(
@@ -113,9 +142,9 @@ pub async fn update(
             who,
             guard.as_ref(),
             |current| {
-                let data = validate_document(c.schema.data(), &patch, Some(current))
-                    .map_err(ApiError::Validation)?;
-                prepare(&targets, &c, data)
+                let next = apply(Some(current))?;
+                vouched_links(&next, &before(Some(current)), &vouched)?;
+                Ok(next)
             },
         )
         .await;
@@ -125,14 +154,14 @@ pub async fn update(
             Err(ApiError::NotFound) => {}
             Err(e) => return Err(unique_error(&c, e)),
         }
-        let data =
-            validate_document(c.schema.data(), &patch, None).map_err(ApiError::Validation)?;
+        let next = apply(None)?;
+        vouched_links(&next, &[], &vouched)?;
         match documents::insert_as(
             &state.pool,
             c.id,
             c.schema_version,
             Some(c.id),
-            &prepare(&targets, &c, data)?,
+            &next,
             who.map(|a| a.id),
         )
         .await

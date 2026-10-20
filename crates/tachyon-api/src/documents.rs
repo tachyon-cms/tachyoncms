@@ -4,7 +4,7 @@ use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::collections::HashSet;
 use std::sync::Arc;
 
@@ -12,6 +12,7 @@ use tachyon_core::auth::Action;
 use tachyon_core::query::value_kind;
 use tachyon_core::select::{Select, project};
 use tachyon_core::{CollectionKind, FieldError, validate_document};
+use tachyon_db::DbError;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 use tachyon_db::indexes::{IndexKind, index_name};
@@ -21,7 +22,10 @@ use uuid::Uuid;
 use crate::access::{Access, both};
 use crate::joins::fill_joins;
 use crate::params::{Joins, list_params, read_params};
-use crate::populate::{Shapes, fill_virtuals, link_targets, populate, prepare, to_value};
+use crate::populate::{
+    Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
+    vouched_links,
+};
 use crate::{ApiError, AppState};
 
 /// A collection (not a global) by slug, from the in-memory cache.
@@ -85,6 +89,7 @@ pub async fn list(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again in `list_in`; here so a key's 403 comes before an unknown slug's 404.
     access.scope(Action::Read, &slug)?;
     let c = collection(&state, &slug)?;
     list_in(&state, &access, c, raw).await
@@ -157,8 +162,8 @@ pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
     value
 }
 
-/// The document as JSON, with its relationships populated to `depth` as far as the caller
-/// may read them.
+/// The document just written as JSON, with its relationships populated to `depth` as far as
+/// the caller may read them; only its ID when they can't read the document itself.
 async fn respond(
     state: &AppState,
     access: &Access,
@@ -166,6 +171,9 @@ async fn respond(
     doc: &Document,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
+    if !access.can_read(&state.pool, &c, doc.id).await? {
+        return Ok(Json(json!({ "id": doc.id })));
+    }
     let mut items = vec![(to_value(doc)?, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     fill_joins(
@@ -201,12 +209,14 @@ pub async fn create(
     let data = validate_document(c.schema.data(), &json_body(body)?, None)
         .map_err(ApiError::Validation)?;
     let targets = link_targets(&state, &c).await?;
+    let prepared = prepare(&targets, &c, data)?;
+    check_links(&state, &access, &prepared, &[]).await?;
     let doc = documents::insert_as(
         &state.pool,
         c.id,
         c.schema_version,
         None,
-        &prepare(&targets, &c, data)?,
+        &prepared,
         access.actor(Action::Create, &c).map(|a| a.id),
     )
     .await
@@ -224,6 +234,7 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
     access.scope(Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
@@ -257,6 +268,7 @@ pub async fn update(
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
     access.scope(Action::Update, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
@@ -265,6 +277,15 @@ pub async fn update(
         .await?;
     let patch = json_body(body)?;
     let targets = link_targets(&state, &c).await?;
+    let apply = |current: &Map<String, Value>| {
+        let data = validate_document(c.schema.data(), &patch, Some(current))
+            .map_err(ApiError::Validation)?;
+        prepare(&targets, &c, data)
+    };
+    // Links the patch adds are checked against the stored document, then again against the
+    // locked one, in case it changed in between.
+    let stored = documents::get(&state.pool, c.id, id).await?.data.0;
+    let vouched = check_links(&state, &access, &apply(&stored)?, &link_ids(&c, &stored)).await?;
     let doc = documents::update_as(
         &state.pool,
         c.id,
@@ -273,9 +294,9 @@ pub async fn update(
         access.actor(Action::Update, &c),
         guard.as_ref(),
         |current| {
-            let data = validate_document(c.schema.data(), &patch, Some(current))
-                .map_err(ApiError::Validation)?;
-            prepare(&targets, &c, data)
+            let next = apply(current)?;
+            vouched_links(&next, &link_ids(&c, current), &vouched)?;
+            Ok(next)
         },
     )
     .await
@@ -289,6 +310,7 @@ pub async fn delete(
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<StatusCode, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
     access.scope(Action::Delete, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
@@ -302,7 +324,14 @@ pub async fn delete(
         access.actor(Action::Delete, &c),
         guard.as_ref(),
     )
-    .await?;
+    .await
+    .map_err(|e| match e {
+        // How many link here would count documents the caller may not be able to see.
+        DbError::Referenced(_) if !access.admin() => {
+            ApiError::Conflict("Other documents link to this one; remove those links first".into())
+        }
+        e => e.into(),
+    })?;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -313,6 +342,7 @@ pub async fn references(
     path: Result<Path<(String, String)>, PathRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
     access.scope(Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
@@ -320,11 +350,12 @@ pub async fn references(
     let mut refs = documents::references(&state.pool, id).await?;
     if !refs.is_empty() {
         let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
-        let readable: HashSet<Uuid> = get_many_readable(&state.pool, &ids, &access.readable())
-            .await?
-            .into_iter()
-            .map(|(_, doc)| doc.id)
-            .collect();
+        let readable: HashSet<Uuid> =
+            get_many_readable(&state.pool, &ids, &access.readable_with_globals())
+                .await?
+                .into_iter()
+                .map(|(_, doc)| doc.id)
+                .collect();
         refs.retain(|r| readable.contains(&r.id));
     }
     Ok(Json(json!({ "docs": refs })))

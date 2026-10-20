@@ -17,8 +17,9 @@ use uuid::Uuid;
 use super::principal::Principal;
 use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
+use crate::access::{Access, Reach};
 use crate::documents::{any_collection, json_body, unique_error};
-use crate::populate::{link_targets, prepare};
+use crate::populate::{check_links, link_ids, link_targets, prepare, vouched_links};
 use crate::{ApiError, AppState};
 
 pub(crate) use tachyon_db::auth::ACCOUNT_KEYS;
@@ -104,7 +105,7 @@ pub(crate) async fn list(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Users, "users")?;
     let users = any_collection(&state, auth::USERS)?;
-    let access = crate::access::Access::new(&state, principal).await?;
+    let access = Access::new(&state, principal, Reach::From(&users)).await?;
     let Json(mut body) = crate::documents::list_in(&state, &access, users, raw).await?;
     if let Some(Value::Array(docs)) = body.get_mut("docs") {
         with_accounts(&state, docs).await?;
@@ -279,6 +280,21 @@ pub(crate) async fn update(
             id: i.user_id,
             own_only: false,
         });
+        let apply = |current: &Map<String, Value>| {
+            let data = validate_document(users.schema.data(), &patch, Some(current))
+                .map_err(ApiError::Validation)?;
+            prepare(&targets, &users, data)
+        };
+        // Links the profile gains must point at documents its owner may read.
+        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        let vouched = check_links(
+            &state,
+            &access,
+            &apply(&stored)?,
+            &link_ids(&users, &stored),
+        )
+        .await?;
         documents::update_as(
             &state.pool,
             users.id,
@@ -287,9 +303,9 @@ pub(crate) async fn update(
             who,
             None,
             |current| {
-                let data = validate_document(users.schema.data(), &patch, Some(current))
-                    .map_err(ApiError::Validation)?;
-                prepare(&targets, &users, data)
+                let next = apply(current)?;
+                vouched_links(&next, &link_ids(&users, current), &vouched)?;
+                Ok(next)
             },
         )
         .await

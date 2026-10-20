@@ -318,6 +318,9 @@ pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbErr
     .await?)
 }
 
+/// What a link to no document (in its collection) is told.
+pub const MISSING_LINK: &str = "doesn't match any document in the related collection";
+
 /// Checks every link points at a live document in the expected collection, then replaces
 /// the document's rows in `relations`. Targets are key-share locked: that blocks a
 /// concurrent delete (which takes FOR UPDATE) but not an ordinary save (FOR NO KEY UPDATE),
@@ -358,7 +361,7 @@ pub(crate) async fn sync_relations(
         .filter(|r| !found.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
             path: r.path.clone(),
-            message: "doesn't match any document in the related collection".into(),
+            message: MISSING_LINK.into(),
         })
         .collect();
     if !missing.is_empty() {
