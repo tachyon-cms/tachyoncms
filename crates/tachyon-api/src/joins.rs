@@ -70,6 +70,10 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         Compiled::Allow => None,
         Compiled::Filter(f) => Some(f),
     };
+    // Which documents link here through a field the caller can't read is hidden too.
+    if !access.reads(&target, &j.on) {
+        return None;
+    }
     let pattern = on_pattern(target.schema.data(), &j.on)?;
     let schema_filter = match &j.r#where {
         Some(w) => {
@@ -81,10 +85,12 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
     // The schema's filter and the caller's read rule always apply; a request can only
     // narrow them.
     let filter = both(both(schema_filter, read), req.filter.take());
+    // A default sort on a field the caller can't read would rank what they can't see, so
+    // they get the usual order instead.
     let sort = req.sort.take().or_else(|| {
         j.sort
             .as_deref()
-            .and_then(|s| parse_sort(target.schema.data(), s).ok())
+            .and_then(|s| parse_sort(&access.readable_fields(&target), s).ok())
     });
     Some(Plan {
         target,
@@ -118,7 +124,7 @@ pub(crate) async fn fill_joins(
     }
     for c in collections {
         for j in c.schema.join_fields() {
-            if select.is_some_and(|s| !s.keeps(&j.path)) {
+            if select.is_some_and(|s| !s.keeps(&j.path)) || !access.reads(&c, &j.path) {
                 continue;
             }
             let mut req = requests.get(&j.path).cloned().unwrap_or_default();
@@ -171,7 +177,9 @@ pub(crate) async fn fill_joins(
                     joined.push(if depth == 0 {
                         Value::String(doc.id.to_string())
                     } else {
-                        to_value(doc)?
+                        let mut value = to_value(doc)?;
+                        access.strip(&plan.target, &mut value);
+                        value
                     });
                 }
             }

@@ -122,7 +122,11 @@ pub(crate) async fn list_in(
     let mut docs = found
         .docs
         .iter()
-        .map(|d| Ok((to_value(d)?, c.clone())))
+        .map(|d| {
+            let mut v = to_value(d)?;
+            access.strip(&c, &mut v);
+            Ok((v, c.clone()))
+        })
         .collect::<Result<Vec<_>, ApiError>>()?;
     fill_virtuals(state, access, &mut docs, p.select.as_ref()).await?;
     fill_joins(
@@ -174,7 +178,9 @@ async fn respond(
     if !access.can_read(&state.pool, &c, doc.id).await? {
         return Ok(Json(json!({ "id": doc.id })));
     }
-    let mut items = vec![(to_value(doc)?, c)];
+    let mut value = to_value(doc)?;
+    access.strip(&c, &mut value);
+    let mut items = vec![(value, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     fill_joins(
         state,
@@ -206,8 +212,9 @@ pub async fn create(
     if access.permit(Action::Create, &c)?.is_some() {
         return Err(access.refuse());
     }
-    let data = validate_document(c.schema.data(), &json_body(body)?, None)
-        .map_err(ApiError::Validation)?;
+    let body = json_body(body)?;
+    access.writes(&c, &body, Action::Create)?;
+    let data = validate_document(c.schema.data(), &body, None).map_err(ApiError::Validation)?;
     let targets = link_targets(&state, &c).await?;
     let prepared = prepare(&targets, &c, data)?;
     check_links(&state, &access, &prepared, &[]).await?;
@@ -240,7 +247,9 @@ pub async fn get(
     let c = collection(&state, &slug)?;
     let p = read_params(raw.as_deref(), &c, &access)?;
     let doc = access.read_one(&state.pool, &c, id).await?;
-    let mut items = vec![(to_value(&doc)?, c)];
+    let mut value = to_value(&doc)?;
+    access.strip(&c, &mut value);
+    let mut items = vec![(value, c)];
     fill_virtuals(&state, &access, &mut items, p.select.as_ref()).await?;
     fill_joins(
         &state,
@@ -276,6 +285,7 @@ pub async fn update(
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
     let patch = json_body(body)?;
+    access.writes(&c, &patch, Action::Update)?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: &Map<String, Value>| {
         let data = validate_document(c.schema.data(), &patch, Some(current))
@@ -356,7 +366,14 @@ pub async fn references(
                 .into_iter()
                 .map(|(_, doc)| doc.id)
                 .collect();
-        refs.retain(|r| readable.contains(&r.id));
+        // A link held in a field the caller can't read isn't theirs to see either.
+        refs.retain(|r| {
+            readable.contains(&r.id)
+                && state
+                    .schemas
+                    .get(&r.collection)
+                    .is_some_and(|from| access.reads(&from, &r.path))
+        });
     }
     Ok(Json(json!({ "docs": refs })))
 }

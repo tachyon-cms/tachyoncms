@@ -176,7 +176,7 @@ pub(crate) async fn fill_virtuals_each(
             c.schema
                 .virtual_fields()
                 .into_iter()
-                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)))
+                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)) && access.reads(c, &v.path))
                 .collect()
         })
         .collect();
@@ -191,10 +191,15 @@ pub(crate) async fn fill_virtuals_each(
     if ids.is_empty() {
         return Ok(());
     }
+    // Each linked document as the caller may read it, so a hidden field gives no value.
     let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, access.readable())
         .await?
         .into_iter()
-        .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
+        .filter_map(|(collection_id, doc)| {
+            let mut value = Value::Object(doc.data.0);
+            access.strip(&*state.schemas.get_by_id(collection_id)?, &mut value);
+            Some((doc.id, value))
+        })
         .collect();
     for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
         if let Some(doc) = value.as_object_mut() {
@@ -291,7 +296,9 @@ fn populate_each<'a>(
                 continue;
             };
             if let Some(c) = state.schemas.get_by_id(*collection_id) {
-                fetched.push((to_value(doc)?, c, remaining));
+                let mut value = to_value(doc)?;
+                access.strip(&c, &mut value);
+                fetched.push((value, c, remaining));
                 child_keys.push(key);
             }
         }

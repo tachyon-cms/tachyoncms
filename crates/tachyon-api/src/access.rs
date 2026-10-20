@@ -10,10 +10,15 @@ use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
 use axum::http::request::Parts;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
-use tachyon_core::CollectionKind;
-use tachyon_core::access::{Caller, Compiled, Rule, compile};
+use std::borrow::Cow;
+
+use tachyon_core::access::{
+    Caller, Compiled, Rule, compile, path_readable, readable_fields, readable_schema,
+    strip_unreadable, unwritable,
+};
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{Filter, Target, parse_filter};
+use tachyon_core::{CollectionKind, CollectionSchema, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
 use tachyon_db::collections::Collection;
@@ -84,6 +89,38 @@ pub(crate) fn both(a: Option<Filter>, b: Option<Filter>) -> Option<Filter> {
         (Some(a), Some(b)) => Some(Filter::All(vec![a, b])),
         (a, b) => a.or(b),
     }
+}
+
+/// Who `principal` is, for static rules: field rules never read `$user`.
+pub(crate) fn caller_of(principal: &Principal) -> Caller<'_> {
+    let identity = principal.identity();
+    Caller {
+        signed_in: identity.is_some(),
+        admin: identity.is_some_and(|i| i.role == "admin"),
+        role: identity.map(|i| i.role.as_str()),
+        user: None,
+    }
+}
+
+/// A 403 naming each field in `input` that `caller` may not write with `action`.
+pub(crate) fn refuse_fields(
+    c: &Collection,
+    input: &Value,
+    action: Action,
+    caller: &Caller,
+) -> Result<(), ApiError> {
+    let Value::Object(input) = input else {
+        return Ok(());
+    };
+    let refused = unwritable(c.schema.data(), input, action, caller);
+    if refused.is_empty() {
+        return Ok(());
+    }
+    let names: Vec<String> = refused.iter().map(|p| format!("`{p}`")).collect();
+    Err(ApiError::Forbidden(format!(
+        "You don't have permission to write {}.",
+        names.join(", ")
+    )))
 }
 
 /// A filter that matches nothing.
@@ -202,14 +239,45 @@ impl Access {
         &self.schemas
     }
 
-    fn caller(&self) -> Caller<'_> {
-        let identity = self.principal.identity();
+    pub(crate) fn caller(&self) -> Caller<'_> {
         Caller {
-            signed_in: identity.is_some(),
-            admin: identity.is_some_and(|i| i.role == "admin"),
-            role: identity.map(|i| i.role.as_str()),
             user: self.user.as_ref(),
+            ..caller_of(&self.principal)
         }
+    }
+
+    /// `doc` of `c` without the fields the caller can't read.
+    pub(crate) fn strip(&self, c: &Collection, doc: &mut Value) {
+        if let Value::Object(doc) = doc {
+            strip_unreadable(c.schema.data(), doc, &self.caller());
+        }
+    }
+
+    /// Whether the caller can read every field along `path` in `c`.
+    pub(crate) fn reads(&self, c: &Collection, path: &str) -> bool {
+        path_readable(c.schema.data(), path, &self.caller())
+    }
+
+    /// The fields of `c` the caller can read: all a filter or sort may name.
+    pub(crate) fn readable_fields<'c>(&self, c: &'c Collection) -> Cow<'c, [Field]> {
+        readable_fields(c.schema.data(), &self.caller())
+    }
+
+    /// Another collection's schema as the caller can read it, for filters through links.
+    pub(crate) fn lookup(&self, slug: &str) -> Option<CollectionSchema> {
+        self.schemas
+            .lookup(slug)
+            .map(|s| readable_schema(&s, &self.caller()))
+    }
+
+    /// A 403 naming each field in `input` the caller may not write with `action`.
+    pub(crate) fn writes(
+        &self,
+        c: &Collection,
+        input: &Value,
+        action: Action,
+    ) -> Result<(), ApiError> {
+        refuse_fields(c, input, action, &self.caller())
     }
 
     /// The role default, narrowed by a key's scopes.

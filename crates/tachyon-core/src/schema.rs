@@ -875,6 +875,18 @@ impl CollectionSchema {
             .get_or_init(|| data_fields(&self.fields).into_owned())
     }
 
+    /// This schema with other fields, such as only those a caller may read.
+    pub fn with_fields(&self, fields: Vec<Field>) -> Self {
+        Self {
+            slug: self.slug.clone(),
+            kind: self.kind,
+            fields,
+            default_populate: self.default_populate.clone(),
+            access: self.access.clone(),
+            data: OnceLock::new(),
+        }
+    }
+
     /// Every join field, with how to find its documents.
     pub fn join_fields(&self) -> Vec<JoinField> {
         fn walk(fields: &[Field], prefix: &str, out: &mut Vec<JoinField>) {

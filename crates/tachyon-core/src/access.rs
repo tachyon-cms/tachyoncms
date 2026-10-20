@@ -1,7 +1,11 @@
 //! Access rules: who may read and write documents and fields. Rules live in the schema,
 //! are checked when it's saved, and compile per caller into allow, deny or a filter.
 
+use std::borrow::Cow;
+
 use serde::{Deserialize, Serialize};
+
+use crate::auth::Action;
 use serde_json::{Map, Value, json};
 
 use crate::query::{Filter, Lookup, check_target, parse_filter_with};
@@ -508,6 +512,178 @@ impl Checker<'_> {
     }
 }
 
+/// Whether `f`'s rule for `action` lets the caller do it. A field with no rule for the
+/// action adds nothing to the collection's rule. Field rules are static, so they come to
+/// allow or deny; a filter (which saving refuses) counts as deny.
+pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
+    let Some(a) = &f.access else {
+        return true;
+    };
+    let rule = match action {
+        Action::Read => &a.read,
+        Action::Create => &a.create,
+        Action::Update | Action::UpdateGlobal => &a.update,
+        Action::Delete | Action::Schemas | Action::Users => return true,
+    };
+    rule.as_ref()
+        .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
+}
+
+fn children(f: &Field) -> &[Field] {
+    match &f.kind {
+        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+        _ => &[],
+    }
+}
+
+/// `fields` (data fields) without those the caller can't read, at any depth: all that
+/// filters and sorts may name. Borrows when nothing is hidden.
+pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field]> {
+    fn hides(fields: &[Field], caller: &Caller) -> bool {
+        fields
+            .iter()
+            .any(|f| !field_allows(f, Action::Read, caller) || hides(children(f), caller))
+    }
+    if !hides(fields, caller) {
+        return Cow::Borrowed(fields);
+    }
+    Cow::Owned(
+        fields
+            .iter()
+            .filter(|f| field_allows(f, Action::Read, caller))
+            .map(|f| {
+                let mut f = f.clone();
+                if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &mut f.kind {
+                    *fields = readable_fields(fields, caller).into_owned();
+                }
+                f
+            })
+            .collect(),
+    )
+}
+
+/// `schema` with only the fields the caller can read.
+pub fn readable_schema(schema: &CollectionSchema, caller: &Caller) -> CollectionSchema {
+    schema.with_fields(readable_fields(schema.data(), caller).into_owned())
+}
+
+/// Removes every field the caller can't read from `doc` of `fields` (data fields), at any
+/// depth: inside groups and in each list row.
+pub fn strip_unreadable(fields: &[Field], doc: &mut Map<String, Value>, caller: &Caller) {
+    if caller.admin {
+        return;
+    }
+    for f in fields {
+        if !field_allows(f, Action::Read, caller) {
+            doc.remove(&f.name);
+            continue;
+        }
+        match (&f.kind, doc.get_mut(&f.name)) {
+            (FieldKind::Group { fields }, Some(Value::Object(inner))) => {
+                strip_unreadable(fields, inner, caller)
+            }
+            (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+                for row in rows.iter_mut().filter_map(Value::as_object_mut) {
+                    strip_unreadable(fields, row, caller);
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+/// Whether the caller can read every field along `path`, a dotted path in `fields` (data
+/// fields) whose list indices, if any, are skipped.
+pub fn path_readable(fields: &[Field], path: &str, caller: &Caller) -> bool {
+    let mut current = fields;
+    for segment in path.split('.') {
+        let Some(f) = current.iter().find(|f| f.name == segment) else {
+            continue;
+        };
+        if !field_allows(f, Action::Read, caller) {
+            return false;
+        }
+        current = children(f);
+    }
+    true
+}
+
+/// The fields in `input` the caller may not write with `action` (create or update), by
+/// path. Sending a field counts as writing it, whatever the value. An update replaces a
+/// list whole, and a group sent as anything but an object, so every field inside counts.
+pub fn unwritable(
+    fields: &[Field],
+    input: &Map<String, Value>,
+    action: Action,
+    caller: &Caller,
+) -> Vec<String> {
+    fn push(out: &mut Vec<String>, path: String) {
+        if !out.contains(&path) {
+            out.push(path);
+        }
+    }
+    fn within(
+        fields: &[Field],
+        prefix: &str,
+        action: Action,
+        caller: &Caller,
+        out: &mut Vec<String>,
+    ) {
+        for f in fields {
+            let path = format!("{prefix}.{}", f.name);
+            if field_allows(f, action, caller) {
+                within(children(f), &path, action, caller, out);
+            } else {
+                push(out, path);
+            }
+        }
+    }
+    fn walk(
+        fields: &[Field],
+        input: &Map<String, Value>,
+        prefix: &str,
+        action: Action,
+        caller: &Caller,
+        out: &mut Vec<String>,
+    ) {
+        for f in fields {
+            let Some(value) = input.get(&f.name) else {
+                continue;
+            };
+            let path = if prefix.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{prefix}.{}", f.name)
+            };
+            if !field_allows(f, action, caller) {
+                push(out, path);
+                continue;
+            }
+            match (&f.kind, value) {
+                (FieldKind::Group { fields }, Value::Object(inner)) => {
+                    walk(fields, inner, &path, action, caller, out)
+                }
+                (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, _)
+                    if action != Action::Create =>
+                {
+                    within(fields, &path, action, caller, out)
+                }
+                (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                    for row in rows.iter().filter_map(Value::as_object) {
+                        walk(fields, row, &path, action, caller, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let mut out = Vec::new();
+    if !caller.admin {
+        walk(&data_fields(fields), input, "", action, caller, &mut out);
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -568,6 +744,125 @@ mod tests {
     }
 
     const ROLES: &[&str] = &["admin", "editor", "author", "viewer"];
+
+    #[test]
+    fn field_rules_strip_and_refuse_at_any_depth() {
+        let ed = json!({"read": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "secret", "type": "text", "access": {"read": false, "create": false}},
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "note", "type": "text", "access": ed}
+            ]},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "label", "type": "text"},
+                {"name": "url", "type": "text", "access": ed}
+            ]},
+            {"type": "tabs", "tabs": [{"name": "meta", "label": "Meta", "fields": [
+                {"name": "code", "type": "text", "access": ed}
+            ]}]},
+            {"type": "row", "fields": [{"name": "inRow", "type": "text", "access": ed}]}
+        ]}));
+        let viewer = signed_in("viewer");
+        let editor = signed_in("editor");
+        let admin = Caller {
+            admin: true,
+            ..signed_in("admin")
+        };
+        let doc = json!({"title": "T", "secret": "s", "seo": {"title": "S", "note": "n"},
+            "links": [{"label": "a", "url": "u"}, {"label": "b"}], "meta": {"code": "c"},
+            "inRow": "r", "id": "x"});
+        let stripped = |caller: &Caller| {
+            let mut d = doc.as_object().unwrap().clone();
+            strip_unreadable(s.data(), &mut d, caller);
+            Value::Object(d)
+        };
+        assert_eq!(
+            stripped(&viewer),
+            json!({"title": "T", "seo": {"title": "S"}, "links": [{"label": "a"}, {"label": "b"}],
+                   "meta": {}, "id": "x"})
+        );
+        let mut all_but_secret = doc.clone();
+        all_but_secret.as_object_mut().unwrap().remove("secret");
+        assert_eq!(stripped(&editor), all_but_secret);
+        assert_eq!(stripped(&admin), doc, "Admins pass every rule");
+
+        // What filters may name.
+        let names = |fields: &[Field]| -> Vec<String> {
+            fn walk(fields: &[Field], prefix: &str, out: &mut Vec<String>) {
+                for f in fields {
+                    let path = format!("{prefix}{}", f.name);
+                    out.push(path.clone());
+                    walk(children(f), &format!("{path}."), out);
+                }
+            }
+            let mut out = Vec::new();
+            walk(fields, "", &mut out);
+            out
+        };
+        assert_eq!(
+            names(&readable_fields(s.data(), &viewer)),
+            ["title", "seo", "seo.title", "links", "links.label", "meta"]
+        );
+        assert!(matches!(
+            readable_fields(s.data(), &admin),
+            Cow::Borrowed(_)
+        ));
+        assert_eq!(
+            names(&readable_schema(&s, &editor).fields).len(),
+            names(s.data()).len() - 1
+        );
+        for (path, readable) in [
+            ("title", true),
+            ("secret", false),
+            ("seo.title", true),
+            ("seo.note", false),
+            ("links.0.label", true),
+            ("links.1.url", false),
+            ("meta.code", false),
+            ("inRow", false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert!(path_readable(s.data(), path, &admin), "{path}");
+        }
+
+        // Writes: by name, at any depth.
+        let refused = |input: Value, action: Action, caller: &Caller| {
+            unwritable(&s.fields, input.as_object().unwrap(), action, caller)
+        };
+        let input = json!({"title": "T", "secret": null, "seo": {"note": "n"},
+            "links": [{"label": "a"}, {"url": "u"}, {"url": "v"}], "inRow": "r"});
+        assert_eq!(
+            refused(input.clone(), Action::Create, &viewer),
+            ["secret"],
+            "only secret has a create rule"
+        );
+        assert_eq!(
+            refused(input.clone(), Action::Update, &viewer),
+            ["seo.note", "links.url", "inRow"]
+        );
+        assert!(refused(input.clone(), Action::Update, &editor).is_empty());
+        assert!(refused(input, Action::Create, &admin).is_empty());
+        // An update that would replace what the caller can't change.
+        assert_eq!(
+            refused(
+                json!({"seo": null, "links": [{"label": "b"}]}),
+                Action::Update,
+                &viewer
+            ),
+            ["seo.note", "links.url"]
+        );
+        assert!(refused(json!({"seo": {"title": "x"}}), Action::Update, &viewer).is_empty());
+        assert_eq!(
+            refused(
+                json!({"meta": {"code": "c"}}),
+                Action::UpdateGlobal,
+                &viewer
+            ),
+            ["meta.code"]
+        );
+    }
 
     fn check(s: &CollectionSchema) -> Result<(), String> {
         check_rules(s, &users().fields, ROLES, &lookup).map_err(|e| e.to_string())

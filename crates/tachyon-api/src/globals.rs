@@ -47,7 +47,9 @@ async fn respond(
     if !access.can_read(&state.pool, &c, doc.id).await? {
         return Ok(Json(serde_json::json!({ "id": doc.id })));
     }
-    let mut items = vec![(to_value(doc)?, c)];
+    let mut value = to_value(doc)?;
+    access.strip(&c, &mut value);
+    let mut items = vec![(value, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     Ok(Json(
         populate(state, access, items, depth, &Shapes::new())
@@ -67,7 +69,7 @@ pub async fn get(
     let c = global(&state, path)?;
     let read = access.permit(Action::Read, &c)?;
     let p = read_params(raw.as_deref(), &c, &access)?;
-    let value = match read {
+    let mut value = match read {
         Some(filter) => {
             let one = HashMap::from([(c.id, Some(filter))]);
             let (_, doc) = get_many_readable(&state.pool, &[c.id], &one)
@@ -82,6 +84,7 @@ pub async fn get(
             Err(e) => return Err(e.into()),
         },
     };
+    access.strip(&c, &mut value);
     let mut items = vec![(value, c)];
     fill_virtuals(&state, &access, &mut items, p.select.as_ref()).await?;
     let (value, c) = items.remove(0);
@@ -109,6 +112,7 @@ pub async fn update(
     );
     let who = access.actor(Action::UpdateGlobal, &c);
     let patch = json_body(body)?;
+    access.writes(&c, &patch, Action::UpdateGlobal)?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: Option<&Map<String, Value>>| {
         let data =

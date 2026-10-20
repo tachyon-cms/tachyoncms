@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::principal::Principal;
 use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
-use crate::access::{Access, Reach};
+use crate::access::{Access, Reach, caller_of, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
 use crate::populate::{check_links, link_ids, link_targets, prepare, vouched_links};
 use crate::{ApiError, AppState};
@@ -120,7 +120,7 @@ pub(crate) async fn get(
 ) -> Result<Json<Value>, ApiError> {
     let id = user_id(path)?;
     self_or_admin(&principal, id)?;
-    Ok(Json(user_json(&state, id).await?))
+    Ok(Json(user_json(&state, id, &caller_of(&principal)).await?))
 }
 
 fn user_id(path: Result<Path<String>, PathRejection>) -> Result<Uuid, ApiError> {
@@ -160,7 +160,9 @@ pub(crate) async fn create(
         errors.push(field("password", m));
     }
     let users = any_collection(&state, auth::USERS)?;
-    let data = validate_document(users.schema.data(), &Value::Object(profile), None);
+    let profile = Value::Object(profile);
+    refuse_fields(&users, &profile, Action::Create, &caller_of(&principal))?;
+    let data = validate_document(users.schema.data(), &profile, None);
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
     }
@@ -193,7 +195,10 @@ pub(crate) async fn create(
     )
     .await
     .map_err(|e| unique_error(&users, e.into()))?;
-    Ok((StatusCode::CREATED, Json(user_json(&state, id).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(user_json(&state, id, &caller_of(&principal)).await?),
+    ))
 }
 
 pub(crate) async fn update(
@@ -206,6 +211,9 @@ pub(crate) async fn update(
     self_or_admin(&principal, id)?;
     let admin = manages_users(&principal);
     let (account, profile) = split(json_body(body)?)?;
+    let users = any_collection(&state, auth::USERS)?;
+    let profile = Value::Object(profile);
+    refuse_fields(&users, &profile, Action::Update, &caller_of(&principal))?;
     let current = auth::account(&state.pool, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -260,9 +268,8 @@ pub(crate) async fn update(
             Some(hash)
         }
     };
-    let users = any_collection(&state, auth::USERS)?;
     let targets = link_targets(&state, &users).await?;
-    let patch = Value::Object(profile);
+    let patch = profile;
     let apply = |current: &Map<String, Value>| {
         let data = validate_document(users.schema.data(), &patch, Some(current))
             .map_err(ApiError::Validation)?;
@@ -332,7 +339,7 @@ pub(crate) async fn update(
         auth::revoke_other_sessions(&mut *tx, id, keep).await?;
     }
     tx.commit().await.map_err(tachyon_db::DbError::from)?;
-    Ok(Json(user_json(&state, id).await?))
+    Ok(Json(user_json(&state, id, &caller_of(&principal)).await?))
 }
 
 pub(crate) async fn delete(

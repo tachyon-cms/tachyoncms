@@ -1307,3 +1307,649 @@ async fn polymorphic_links_use_each_collections_rule(pool: PgPool) {
     let q = format!("where[mix.id][equals]={note}");
     assert_eq!(names(&ask(&anon, &q).await), ["i-both", "i-memo", "i-note"]);
 }
+
+// Field rules. Editors (and Admins) can read every field below; Viewers and Authors can't
+// read the ones marked `ed`, and only Editors may write `secret`, `links.url` and so on.
+
+struct Staff {
+    admin: Router,
+    editor: Router,
+    viewer: Router,
+    author: Router,
+    viewer_id: String,
+    ann: String,
+    /// Admin's post: by Ann, hidden-linked to Ann, every field set.
+    p1: String,
+    /// Links to `p1` through `related`.
+    p2: String,
+}
+
+async fn staff(pool: &PgPool) -> Staff {
+    let admin = admin_app(pool.clone()).await;
+    let ed = json!({"read": {"role": "editor"}});
+    let ed_all = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "people", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "salary", "type": "number", "access": ed},
+            {"name": "contact", "type": "group", "fields": [
+                {"name": "email", "type": "text"},
+                {"name": "phone", "type": "text", "access": ed}
+            ]}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "secret", "type": "text", "default": "s3", "access": ed_all},
+            {"name": "rank", "type": "number", "access": ed},
+            {"name": "author", "type": "relationship", "relationTo": "people"},
+            {"name": "authorName", "type": "text", "virtual": "author.name"},
+            {"name": "authorSalary", "type": "number", "virtual": "author.salary"},
+            {"name": "authorNameEd", "type": "text", "virtual": "author.name", "access": ed},
+            {"name": "hiddenAuthor", "type": "relationship", "relationTo": "people", "access": ed},
+            {"name": "hiddenName", "type": "text", "virtual": "hiddenAuthor.name"},
+            {"name": "related", "type": "relationship", "relationTo": "posts"},
+            {"name": "meta", "type": "group", "fields": [
+                {"name": "topic", "type": "text"},
+                {"name": "note", "type": "text", "access": {"read": {"role": "editor"}, "update": {"role": "editor"}}}
+            ]},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "label", "type": "text"},
+                {"name": "url", "type": "text", "access": ed_all}
+            ]},
+            {"type": "tabs", "tabs": [{"name": "extra", "label": "Extra", "fields": [
+                {"name": "code", "type": "text", "access": ed}
+            ]}]},
+            {"type": "row", "fields": [{"name": "inRow", "type": "text", "access": ed}]}
+        ]}),
+    )
+    .await;
+    let change = json!({"schema": {"slug": "people", "fields": [
+        {"name": "name", "type": "text"},
+        {"name": "salary", "type": "number", "access": ed},
+        {"name": "contact", "type": "group", "fields": [
+            {"name": "email", "type": "text"},
+            {"name": "phone", "type": "text", "access": ed}
+        ]},
+        {"name": "posts", "type": "join", "collection": "posts", "on": "author", "defaultSort": "rank"},
+        {"name": "hiddenPosts", "type": "join", "collection": "posts", "on": "hiddenAuthor"},
+        {"name": "edPosts", "type": "join", "collection": "posts", "on": "author", "access": ed}
+    ]}});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/people",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "site", "kind": "global", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "apiKey", "type": "text", "access": {"read": {"role": "editor"}, "update": {"role": "admin"}}}
+        ]}),
+    )
+    .await;
+    let users = json!({"schema": {"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "pay", "type": "number", "access": ed_all}
+    ]}});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&users.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let ann = id(&create(
+        &admin,
+        "/api/people",
+        json!({"name": "Ann", "salary": 100, "contact": {"email": "a@x", "phone": "555"}}),
+    )
+    .await);
+    let p1 = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "One", "secret": "s1", "rank": 1, "author": ann, "hiddenAuthor": ann,
+               "meta": {"topic": "t", "note": "n"}, "links": [{"label": "l", "url": "u"}],
+               "extra": {"code": "c"}, "inRow": "r"}),
+    )
+    .await);
+    let p2 = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Two", "rank": 2, "author": ann, "related": p1}),
+    )
+    .await);
+    let res = patch(
+        &admin,
+        "/api/globals/site",
+        json!({"name": "Site", "apiKey": "k"}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let viewer_id = add_user(pool, "vic@example.com", "viewer")
+        .await
+        .to_string();
+    let res = patch(
+        &admin,
+        &format!("/api/users/{viewer_id}"),
+        json!({"pay": 9}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let viewer = signed_in(visitor(pool).await, "vic@example.com").await;
+    Staff {
+        editor: app_as(pool, "eve@example.com", "editor").await,
+        author: app_as(pool, "al@example.com", "author").await,
+        admin,
+        viewer,
+        viewer_id,
+        ann,
+        p1,
+        p2,
+    }
+}
+
+/// The keys a post shows that only Editors may read, wherever they'd be.
+fn hidden_in_post(doc: &Value) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for key in [
+        "secret",
+        "rank",
+        "authorSalary",
+        "authorNameEd",
+        "hiddenAuthor",
+        "hiddenName",
+        "inRow",
+    ] {
+        if doc.get(key).is_some() {
+            out.push(key);
+        }
+    }
+    if doc["meta"].get("note").is_some() {
+        out.push("meta.note");
+    }
+    if doc["links"][0].get("url").is_some() {
+        out.push("links.url");
+    }
+    if doc["extra"].get("code").is_some() {
+        out.push("extra.code");
+    }
+    out
+}
+
+fn hidden_in_person(doc: &Value) -> Vec<&'static str> {
+    let mut out = Vec::new();
+    for key in ["salary", "edPosts"] {
+        if doc.get(key).is_some() {
+            out.push(key);
+        }
+    }
+    if doc["contact"].get("phone").is_some() {
+        out.push("contact.phone");
+    }
+    out
+}
+
+const ALL_POST: [&str; 10] = [
+    "secret",
+    "rank",
+    "authorSalary",
+    "authorNameEd",
+    "hiddenAuthor",
+    "hiddenName",
+    "inRow",
+    "meta.note",
+    "links.url",
+    "extra.code",
+];
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unreadable_fields_are_removed_everywhere(pool: PgPool) {
+    let s = staff(&pool).await;
+    let one = format!("/api/posts/{}", s.p1);
+
+    // Lists and single reads, with links populated.
+    for (app, hidden) in [(&s.viewer, true), (&s.editor, false), (&s.admin, false)] {
+        let list = get(app, "/api/posts?where[title][equals]=One").await;
+        assert_eq!(list.status, 200, "{}", list.json);
+        let single = get(app, &one).await;
+        assert_eq!(single.status, 200, "{}", single.json);
+        for doc in [&list.json["docs"][0], &single.json] {
+            assert_eq!(doc["title"], "One");
+            assert_eq!(doc["meta"]["topic"], "t");
+            assert_eq!(doc["links"][0]["label"], "l");
+            assert_eq!(doc["authorName"], "Ann");
+            if hidden {
+                assert!(hidden_in_post(doc).is_empty(), "{doc}");
+                assert!(hidden_in_person(&doc["author"]).is_empty(), "{doc}");
+                assert_eq!(doc["author"]["contact"]["email"], "a@x");
+            } else {
+                assert_eq!(hidden_in_post(doc), ALL_POST, "{doc}");
+                assert_eq!(
+                    hidden_in_person(&doc["author"]),
+                    ["salary", "contact.phone"]
+                );
+            }
+        }
+    }
+
+    // Populated at every depth: p2 -> p1 -> Ann.
+    let deep = get(&s.viewer, &format!("/api/posts/{}?depth=2", s.p2)).await;
+    assert_eq!(deep.json["related"]["title"], "One", "{}", deep.json);
+    assert!(
+        hidden_in_post(&deep.json["related"]).is_empty(),
+        "{}",
+        deep.json
+    );
+    assert_eq!(deep.json["related"]["author"]["name"], "Ann");
+    assert!(hidden_in_person(&deep.json["related"]["author"]).is_empty());
+    let deep = get(&s.editor, &format!("/api/posts/{}?depth=2", s.p2)).await;
+    assert_eq!(hidden_in_post(&deep.json["related"]), ALL_POST);
+    assert_eq!(deep.json["related"]["author"]["salary"], 100);
+
+    // `select` asking for a hidden field gets nothing for it, not an error.
+    let picked = get(
+        &s.viewer,
+        &format!("{one}?select[secret]=true&select[title]=true"),
+    )
+    .await;
+    assert_eq!(picked.status, 200, "{}", picked.json);
+    assert_eq!(picked.json["title"], "One");
+    assert!(picked.json.get("secret").is_none(), "{}", picked.json);
+    let picked = get(&s.editor, &format!("{one}?select[secret]=true")).await;
+    assert_eq!(picked.json["secret"], "s1");
+
+    // Joined documents, and joins that would show a hidden link or are hidden themselves.
+    let person = format!("/api/people/{}", s.ann);
+    let viewed = get(&s.viewer, &person).await;
+    assert_eq!(viewed.status, 200, "{}", viewed.json);
+    assert!(hidden_in_person(&viewed.json).is_empty(), "{}", viewed.json);
+    let joined = viewed.json["posts"]["docs"].as_array().unwrap();
+    assert_eq!(joined.len(), 2, "{}", viewed.json);
+    for doc in joined {
+        assert!(hidden_in_post(doc).is_empty(), "{doc}");
+    }
+    assert_eq!(viewed.json["hiddenPosts"]["docs"], json!([]));
+    // Its default sort is by `rank`, which a Viewer can't read, so they get the usual order
+    // (newest first) rather than one that ranks what they can't see.
+    let order = |res: &Res| -> Vec<String> {
+        res.json["posts"]["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["title"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    assert_eq!(order(&viewed), ["Two", "One"]);
+    let listed = get(&s.viewer, "/api/people").await;
+    assert!(hidden_in_person(&listed.json["docs"][0]).is_empty());
+    let viewed = get(&s.editor, &person).await;
+    assert_eq!(
+        hidden_in_person(&viewed.json),
+        ["salary", "edPosts", "contact.phone"]
+    );
+    assert_eq!(viewed.json["hiddenPosts"]["docs"][0]["id"], s.p1.as_str());
+    assert_eq!(order(&viewed), ["One", "Two"]);
+
+    // References don't show links held in hidden fields.
+    let refs = |res: Res| -> Vec<String> {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut out: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    };
+    let url = format!("{person}/references");
+    assert_eq!(refs(get(&s.viewer, &url).await), ["author", "author"]);
+    assert_eq!(
+        refs(get(&s.editor, &url).await),
+        ["author", "author", "hiddenAuthor"]
+    );
+
+    // Globals.
+    let site = get(&s.viewer, "/api/globals/site").await;
+    assert_eq!(site.json["name"], "Site", "{}", site.json);
+    assert!(site.json.get("apiKey").is_none(), "{}", site.json);
+    assert_eq!(
+        get(&s.editor, "/api/globals/site").await.json["apiKey"],
+        "k"
+    );
+
+    // What a write sends back: `secret` gets its default, which the Author can't see.
+    let made = create(&s.author, "/api/posts", json!({"title": "Mine"})).await;
+    assert!(made.get("secret").is_none(), "{made}");
+    let mine = format!("/api/posts/{}", id(&made));
+    assert_eq!(get(&s.admin, &mine).await.json["secret"], "s3");
+    let changed = patch(&s.author, &mine, json!({"title": "Mine 2"})).await;
+    assert_eq!(changed.status, 200, "{}", changed.json);
+    assert_eq!(changed.json["title"], "Mine 2");
+    assert!(changed.json.get("secret").is_none(), "{}", changed.json);
+
+    // Profiles: a Viewer can't see their own pay; an Admin can.
+    let me = format!("/api/users/{}", s.viewer_id);
+    for res in [
+        get(&s.viewer, &me).await,
+        get(&s.viewer, "/api/auth/me").await,
+    ] {
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["name"], "viewer");
+        assert!(res.json.get("pay").is_none(), "{}", res.json);
+    }
+    assert_eq!(get(&s.admin, &me).await.json["pay"], 9);
+    let listed = get(&s.admin, "/api/users").await;
+    assert!(
+        listed.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|u| u["pay"] == 9)
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unreadable_fields_cant_be_filtered_or_sorted(pool: PgPool) {
+    let s = staff(&pool).await;
+    let probes = [
+        (
+            "/api/posts?where[secret][equals]=s1",
+            "where[secret][equals]",
+        ),
+        ("/api/posts?where[rank][gt]=0", "where[rank][gt]"),
+        (
+            "/api/posts?where[meta.note][exists]=true",
+            "where[meta.note][exists]",
+        ),
+        (
+            "/api/posts?where[links.url][equals]=u",
+            "where[links.url][equals]",
+        ),
+        (
+            "/api/posts?where[extra.code][like]=c",
+            "where[extra.code][like]",
+        ),
+        ("/api/posts?where[inRow][equals]=r", "where[inRow][equals]"),
+        (
+            "/api/posts?where[or][0][title][equals]=x&where[or][1][secret][equals]=s1",
+            "where[or][1][secret][equals]",
+        ),
+        (
+            "/api/posts?where[and][0][author.salary][gt]=50",
+            "where[and][0][author.salary][gt]",
+        ),
+        (
+            "/api/posts?where[author.contact.phone][equals]=555",
+            "where[author.contact.phone][equals]",
+        ),
+        (
+            "/api/posts?where[hiddenAuthor.name][equals]=Ann",
+            "where[hiddenAuthor.name][equals]",
+        ),
+        (
+            "/api/posts?where[hiddenAuthor][exists]=true",
+            "where[hiddenAuthor][exists]",
+        ),
+        (
+            "/api/posts?where[hiddenName][equals]=Ann",
+            "where[hiddenName][equals]",
+        ),
+        (
+            "/api/posts?where[authorSalary][equals]=100",
+            "where[authorSalary][equals]",
+        ),
+        (
+            "/api/posts?where[authorNameEd][equals]=Ann",
+            "where[authorNameEd][equals]",
+        ),
+        (
+            "/api/posts?where[related.secret][equals]=s1",
+            "where[related.secret][equals]",
+        ),
+        ("/api/posts?sort=rank", "sort"),
+        ("/api/posts?sort=-secret", "sort"),
+        ("/api/people?where[salary][gt]=0", "where[salary][gt]"),
+        (
+            "/api/people?joins[posts][where][secret][equals]=s1",
+            "joins[posts][where][secret][equals]",
+        ),
+        ("/api/people?joins[posts][sort]=rank", "joins[posts][sort]"),
+    ];
+    for (url, param) in probes {
+        let res = get(&s.viewer, url).await;
+        assert_problem(&res, 403);
+        let detail = res.json["detail"].as_str().unwrap();
+        assert!(detail.starts_with(param), "{url}: {detail}");
+        // Editors can use every one of them.
+        let res = get(&s.editor, url).await;
+        assert_eq!(res.status, 200, "{url}: {}", res.json);
+    }
+    // They find what's there.
+    assert_eq!(
+        titles(&get(&s.editor, "/api/posts?where[secret][equals]=s1").await),
+        ["One"]
+    );
+    assert_eq!(
+        titles(&get(&s.editor, "/api/posts?where[author.salary][gt]=50").await).len(),
+        2
+    );
+    // A field that doesn't exist is still a 400, and readable ones work as before.
+    assert_problem(
+        &get(&s.viewer, "/api/posts?where[nope][equals]=x").await,
+        400,
+    );
+    assert_problem(
+        &get(&s.viewer, "/api/posts?where[rank][gt]=nope").await,
+        403,
+    );
+    assert_eq!(
+        titles(
+            &get(
+                &s.viewer,
+                "/api/posts?where[author.name][equals]=Ann&sort=title"
+            )
+            .await
+        ),
+        ["One", "Two"]
+    );
+    assert_eq!(
+        titles(&get(&s.viewer, "/api/posts?where[meta.topic][equals]=t").await),
+        ["One"]
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unwritable_fields_are_refused_by_name(pool: PgPool) {
+    let s = staff(&pool).await;
+    let refused = |res: Res, field: &str| {
+        assert_problem(&res, 403);
+        let detail = res.json["detail"].as_str().unwrap();
+        assert!(detail.contains(&format!("`{field}`")), "{field}: {detail}");
+    };
+    let post = |app: &Router, body: Value| {
+        let app = app.clone();
+        async move { send(&app, "POST", "/api/posts", Some(&body.to_string())).await }
+    };
+
+    // Create: `secret` and `links.url` need Editors; `meta.note` has no create rule.
+    refused(
+        post(&s.author, json!({"title": "A", "secret": "x"})).await,
+        "secret",
+    );
+    refused(
+        post(&s.author, json!({"title": "A", "secret": null})).await,
+        "secret",
+    );
+    refused(
+        post(
+            &s.author,
+            json!({"title": "A", "links": [{"label": "a"}, {"url": "u"}]}),
+        )
+        .await,
+        "links.url",
+    );
+    let mine = id(&create(
+        &s.author,
+        "/api/posts",
+        json!({"title": "A", "links": [{"label": "a"}], "meta": {"topic": "t", "note": "n"}}),
+    )
+    .await);
+    let mine = format!("/api/posts/{mine}");
+    assert_eq!(
+        post(&s.editor, json!({"title": "E", "secret": "x"}))
+            .await
+            .status,
+        201
+    );
+    assert_eq!(
+        post(&s.admin, json!({"title": "Ad", "secret": "x"}))
+            .await
+            .status,
+        201
+    );
+
+    // Update: sending the field at all counts, even with the value it already has.
+    refused(
+        patch(&s.author, &mine, json!({"secret": "x"})).await,
+        "secret",
+    );
+    refused(
+        patch(&s.author, &mine, json!({"secret": "s3"})).await,
+        "secret",
+    );
+    refused(
+        patch(&s.author, &mine, json!({"meta": {"note": "x"}})).await,
+        "meta.note",
+    );
+    // Clearing the group, or replacing the list, would change what they can't.
+    refused(
+        patch(&s.author, &mine, json!({"meta": null})).await,
+        "meta.note",
+    );
+    refused(
+        patch(&s.author, &mine, json!({"links": [{"label": "b"}]})).await,
+        "links.url",
+    );
+    refused(
+        patch(&s.author, &mine, json!({"links": null})).await,
+        "links.url",
+    );
+    // Nothing changed, and what they may change still can be.
+    let ok = patch(
+        &s.author,
+        &mine,
+        json!({"title": "B", "meta": {"topic": "u"}}),
+    )
+    .await;
+    assert_eq!(ok.status, 200, "{}", ok.json);
+    let stored = get(&s.admin, &mine).await.json;
+    assert_eq!(stored["secret"], "s3");
+    assert_eq!(stored["meta"], json!({"topic": "u", "note": "n"}));
+    assert_eq!(stored["links"][0]["label"], "a");
+    let ok = patch(
+        &s.editor,
+        &mine,
+        json!({"secret": "y", "links": [{"label": "c", "url": "v"}]}),
+    )
+    .await;
+    assert_eq!(ok.status, 200, "{}", ok.json);
+    assert_eq!(ok.json["secret"], "y");
+
+    // Globals: only Admins may set the key.
+    refused(
+        patch(&s.editor, "/api/globals/site", json!({"apiKey": "x"})).await,
+        "apiKey",
+    );
+    assert_eq!(
+        patch(&s.editor, "/api/globals/site", json!({"name": "S2"}))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        patch(&s.admin, "/api/globals/site", json!({"apiKey": "z"}))
+            .await
+            .status,
+        200
+    );
+    assert_eq!(
+        get(&s.editor, "/api/globals/site").await.json["apiKey"],
+        "z"
+    );
+
+    // Profiles: a Viewer can't give themselves a raise.
+    let me = format!("/api/users/{}", s.viewer_id);
+    refused(patch(&s.viewer, &me, json!({"pay": 1000})).await, "pay");
+    assert_eq!(
+        patch(&s.viewer, &me, json!({"name": "Vic"})).await.status,
+        200
+    );
+    assert_eq!(get(&s.admin, &me).await.json["pay"], 9);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn virtual_fields_dont_read_hidden_fields(pool: PgPool) {
+    let s = staff(&pool).await;
+    // Through a hidden field at the far end, a hidden link, or a rule of its own: no value.
+    let mut seen = Vec::new();
+    for app in [&s.viewer, &s.editor] {
+        let one = get(app, &format!("/api/posts/{}", s.p1)).await.json;
+        let two = get(app, &format!("/api/posts/{}?depth=1", s.p2)).await.json;
+        let person = get(app, &format!("/api/people/{}", s.ann)).await.json;
+        let joined = person["posts"]["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|d| d["title"] == "One")
+            .unwrap()
+            .clone();
+        for doc in [&one, &two["related"], &joined] {
+            assert_eq!(doc["authorName"], "Ann", "{doc}");
+            seen.push((
+                doc.get("authorSalary").cloned(),
+                doc.get("hiddenName").cloned(),
+                doc.get("authorNameEd").cloned(),
+            ));
+        }
+    }
+    let none = (None, None, None);
+    let all = (Some(json!(100)), Some(json!("Ann")), Some(json!("Ann")));
+    assert_eq!(
+        seen,
+        [
+            none.clone(),
+            none.clone(),
+            none,
+            all.clone(),
+            all.clone(),
+            all
+        ]
+    );
+    // Asking for them by name changes nothing.
+    let picked = get(
+        &s.viewer,
+        &format!(
+            "/api/posts/{}?select[authorSalary]=true&select[hiddenName]=true",
+            s.p1
+        ),
+    )
+    .await;
+    assert_eq!(picked.status, 200, "{}", picked.json);
+    assert!(picked.json.get("authorSalary").is_none(), "{}", picked.json);
+    assert!(picked.json.get("hiddenName").is_none(), "{}", picked.json);
+}
