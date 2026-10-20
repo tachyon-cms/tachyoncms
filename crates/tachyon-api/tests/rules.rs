@@ -941,7 +941,9 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         json!({"slug": "authors", "access": published, "fields": [
             {"name": "name", "type": "text"}, stage,
             link("mentor", "authors"),
-            {"name": "age", "type": "number"}
+            {"name": "age", "type": "number"},
+            {"name": "tags", "type": "text", "hasMany": true},
+            {"name": "friends", "type": "relationship", "relationTo": "authors", "hasMany": true}
         ]}),
     )
     .await;
@@ -956,25 +958,37 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         ]}),
     )
     .await;
-    let author = |name: &str, age: u32, stage: &str, mentor: Option<&str>| json!({"name": name, "age": age, "stage": stage, "mentor": mentor});
-    let ann = id(&create(&admin, "/api/authors", author("Ann", 30, "published", None)).await);
+    let author = |name: &str,
+                  age: u32,
+                  stage: &str,
+                  mentor: Option<&str>,
+                  tags: &[&str],
+                  friends: &[&str]| {
+        json!({"name": name, "age": age, "stage": stage, "mentor": mentor, "tags": tags, "friends": friends})
+    };
+    let ann = id(&create(
+        &admin,
+        "/api/authors",
+        author("Ann", 30, "published", None, &["y"], &[]),
+    )
+    .await);
     // Hid is a hidden author with a mentor of his own, so Mia -> Hid -> Ann has a hidden middle.
     let hid = id(&create(
         &admin,
         "/api/authors",
-        author("Hid", 50, "draft", Some(&ann)),
+        author("Hid", 50, "draft", Some(&ann), &["x"], &[&ann]),
     )
     .await);
     let mia = id(&create(
         &admin,
         "/api/authors",
-        author("Mia", 20, "published", Some(&hid)),
+        author("Mia", 20, "published", Some(&hid), &["z"], &[]),
     )
     .await);
     let bo = id(&create(
         &admin,
         "/api/authors",
-        author("Bo", 40, "published", Some(&ann)),
+        author("Bo", 40, "published", Some(&ann), &["x", "w"], &[&ann]),
     )
     .await);
     let (ann, hid, mia, bo) = (ann.as_str(), hid.as_str(), mia.as_str(), bo.as_str());
@@ -1035,6 +1049,16 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         ("where[author.mentor.age][gt]=45", true),
         ("where[author.name][like]=Hi", true),
         ("where[author.age][not_in]=50", true),
+        // `contains` on a list of the linked document: its tags and its own links.
+        ("where[author.tags][contains]=x", true),
+        ("where[writers.tags][contains]=x", true),
+        ("where[credits.who.tags][contains]=x", true),
+        ("where[author.mentor.tags][contains]=x", true),
+        ("where[author.mentor.mentor.tags][contains]=y", true),
+        ("where[author.friends][contains]={ann}", true),
+        ("where[writers.friends][contains]={ann}", true),
+        ("where[credits.who.friends][contains]={ann}", true),
+        ("where[author.mentor.friends][contains]={ann}", true),
         // Inside `or` and `and`.
         (
             "where[or][0][author.name][equals]=Hid&where[or][1][title][equals]=p1",
@@ -1121,7 +1145,16 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         assert_eq!(res.status, 400, "sort={sort}: {}", res.json);
     }
     // Sorting by the link field itself orders by the stored ID, which is the post's own data.
-    assert_eq!(get(&anon, "/api/posts?sort=author").await.status, 200);
+    // By ID, so Ann's posts, then Mia's, then Bo's (names would put Bo before Mia), then
+    // the posts left with no author.
+    let by_link = get(&anon, "/api/posts?sort=author").await;
+    let order: Vec<&str> = by_link.json["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["title"].as_str().unwrap())
+        .collect();
+    assert_eq!(order, ["p3", "p1", "p5", "p6", "p7", "p4", "p2"]);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
