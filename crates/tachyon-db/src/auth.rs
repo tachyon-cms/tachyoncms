@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::CollectionSchema;
 use tachyon_core::auth::Abilities;
@@ -27,7 +28,11 @@ pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core:
     if schema.slug != USERS {
         return Ok(());
     }
-    if schema.access.is_some() {
+    if schema
+        .access
+        .as_ref()
+        .is_some_and(|a| *a != tachyon_core::access::CollectionAccess::default())
+    {
         return Err(SchemaError::InvalidOption(
             "access: rules on users aren't enforced yet, so they can't be saved; rules on its fields are".into(),
         ));
@@ -618,9 +623,46 @@ pub async fn role_upsert(
     Ok(())
 }
 
-/// Removes a custom role nobody has.
+/// Taken inside the transaction by a role delete, and by a schema save from its role check to
+/// its commit, so a stored rule can never name a role that's gone.
+async fn lock_rule_roles(conn: &mut PgConnection) -> Result<(), DbError> {
+    // An arbitrary constant: the one lock every role delete and rule save shares.
+    sqlx::query!("SELECT pg_advisory_xact_lock(7311002)")
+        .fetch_one(conn)
+        .await?;
+    Ok(())
+}
+
+/// Refuses `schema` if a role its rules name doesn't exist. Run it in the transaction that
+/// stores the schema: it holds the role lock until that commits. The full rule check runs
+/// before the save; this catches a role deleted in between.
+pub(crate) async fn check_rule_roles(
+    conn: &mut PgConnection,
+    schema: &CollectionSchema,
+) -> Result<(), DbError> {
+    let named = tachyon_core::access::named_roles(schema);
+    if named.is_empty() {
+        return Ok(());
+    }
+    lock_rule_roles(&mut *conn).await?;
+    let roles = sqlx::query_scalar!(
+        "SELECT slug FROM roles WHERE tenant_id = $1",
+        DEFAULT_TENANT
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    match named.into_iter().find(|r| !roles.contains(r)) {
+        Some(r) => Err(DbError::Refused(format!(
+            "access rules name the role `{r}`, which doesn't exist"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Removes a custom role nobody has and no access rule names.
 pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
+    lock_rule_roles(&mut tx).await?;
     let builtin = sqlx::query_scalar!(
         "SELECT builtin FROM roles WHERE tenant_id = $1 AND slug = $2 FOR UPDATE",
         DEFAULT_TENANT,
@@ -644,6 +686,22 @@ pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     if used {
         return Err(DbError::Refused(format!(
             "Some users have the role `{slug}`. Give them another role first."
+        )));
+    }
+    let schemas = sqlx::query_scalar!(
+        r#"SELECT schema AS "schema: Json<CollectionSchema>" FROM collections
+           WHERE tenant_id = $1 ORDER BY slug"#,
+        DEFAULT_TENANT,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if let Some(s) = schemas
+        .iter()
+        .find(|s| tachyon_core::access::named_roles(s).contains(slug))
+    {
+        return Err(DbError::Refused(format!(
+            "access rules in {} name the role `{slug}`; change them first",
+            s.slug
         )));
     }
     sqlx::query!(

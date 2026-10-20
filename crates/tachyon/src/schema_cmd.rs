@@ -144,45 +144,9 @@ pub async fn run(
         }
     }
 
-    for s in &wanted {
-        let lookup = |slug: &str| {
-            wanted.iter().find(|o| o.slug == slug).or_else(|| {
-                existing
-                    .iter()
-                    .map(|c| &c.schema.0)
-                    .find(|o| o.slug == slug)
-            })
-        };
-        s.check_virtual_targets(lookup)
-            .and_then(|()| s.check_join_targets(lookup))
-            .with_context(|| s.slug.clone())?;
-    }
-
-    // Collections left out of the file must still work with the ones it changes.
-    for c in &existing {
-        let other = &c.schema.0;
-        if wanted.iter().any(|s| s.slug == other.slug) {
-            continue;
-        }
-        let lookup = |slug: &str| {
-            wanted.iter().find(|o| o.slug == slug).or_else(|| {
-                existing
-                    .iter()
-                    .map(|c| &c.schema.0)
-                    .find(|o| o.slug == slug)
-            })
-        };
-        other
-            .check_virtual_targets(lookup)
-            .and_then(|()| other.check_join_targets(lookup))
-            .with_context(|| format!("{} (not in the file) would break", other.slug))?;
-    }
-
-    // Access rules, checked against the file's schemas wherever it has them. Rules in
-    // collections left out of the file can filter through, or read `$user` fields from,
-    // the ones it changes.
-    let roles = tachyon_db::auth::roles_list(pool).await?;
-    let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
+    // Every collection must work with the file's schemas in place of the database's, those
+    // left out of the file included: virtual and join fields read other collections, and
+    // access rules filter through them or read `$user` fields from `users`.
     let lookup = |slug: &str| {
         wanted
             .iter()
@@ -195,17 +159,25 @@ pub async fn run(
             })
             .cloned()
     };
+    let roles = tachyon_db::auth::roles_list(pool).await?;
+    let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
     let users = lookup(USERS).map(|u| u.fields).unwrap_or_default();
-    for s in &wanted {
-        // Here too for a `users` the file creates, which skips the change's own check.
-        check_users_schema(s)
+    let works = |s: &CollectionSchema| {
+        s.check_virtual_targets(lookup)
+            .and_then(|()| s.check_join_targets(lookup))
             .and_then(|()| check_rules(s, &users, &roles, &lookup))
+    };
+    for s in &wanted {
+        // `check_users_schema` here too for a `users` the file creates, which skips the
+        // change's own check.
+        check_users_schema(s)
+            .and_then(|()| works(s))
             .with_context(|| s.slug.clone())?;
     }
     for c in &existing {
         let other = &c.schema.0;
         if !wanted.iter().any(|s| s.slug == other.slug) {
-            check_rules(other, &users, &roles, &lookup)
+            works(other)
                 .with_context(|| format!("{} (not in the file) would break", other.slug))?;
         }
     }

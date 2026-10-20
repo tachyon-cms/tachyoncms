@@ -273,6 +273,7 @@ async fn run(
     if p.needs_confirmation && !confirm {
         return Err(ChangeError::NeedsConfirmation(Box::new(p)));
     }
+    crate::auth::check_rule_roles(&mut tx, new).await?;
 
     // Pass 2: rewrite every document, deleted ones included so Trash restores cleanly.
     let mut after = None;

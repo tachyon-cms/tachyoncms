@@ -2905,8 +2905,17 @@ async fn bad_rules_are_refused_when_saved(pool: PgPool) {
     let users = json!({"slug": "users", "fields": [
         {"name": "name", "type": "text", "required": true},
         {"name": "team", "type": "text"},
-        {"name": "tags", "type": "text", "hasMany": true}
+        {"name": "tags", "type": "text", "hasMany": true},
+        {"name": "scores", "type": "number", "hasMany": true},
+        {"name": "colours", "type": "select", "options": ["red", "blue"], "multiple": true},
+        {"name": "friends", "type": "relationship", "relationTo": "users", "hasMany": true},
+        {"name": "address", "type": "group", "fields": [{"name": "street", "type": "text"}]},
+        {"name": "manager", "type": "relationship", "relationTo": "users"},
+        {"name": "managerName", "type": "text", "virtual": "manager.name"},
+        {"name": "writing", "type": "join", "collection": "posts", "on": "author"}
     ]});
+    // posts first: the users join reads its author links.
+    create(&admin, "/api/admin/collections", rule_schema(false, |_| {})).await;
     let res = send(
         &admin,
         "PUT",
@@ -2915,7 +2924,6 @@ async fn bad_rules_are_refused_when_saved(pool: PgPool) {
     )
     .await;
     assert_eq!(res.status, 200, "{}", res.json);
-    create(&admin, "/api/admin/collections", rule_schema(false, |_| {})).await;
     create(&admin, "/api/admin/collections", rule_schema(true, |_| {})).await;
     let reviewer = json!({"slug": "reviewer", "name": "Reviewer",
         "abilities": {"content": "read", "schemas": false, "users": false}});
@@ -2952,6 +2960,21 @@ async fn bad_rules_are_refused_when_saved(pool: PgPool) {
             read(json!({"title": {"equals": "$user.tags"}})),
             422,
             "access.read: `$user.tags` holds a list, so it works only with in or not_in",
+        ),
+        (
+            read(json!({"title": {"in": ["$user.address"]}})),
+            422,
+            "access.read: `$user.address` isn't one value or a list of them, so a rule can't compare with it",
+        ),
+        (
+            read(json!({"title": "$user.managerName"})),
+            422,
+            "access.read: `$user.managerName` is filled on read, and profiles are loaded as stored, so a rule can't compare with it",
+        ),
+        (
+            read(json!({"author": {"in": "$user.writing"}})),
+            422,
+            "access.read: `$user.writing` is filled on read, and profiles are loaded as stored, so a rule can't compare with it",
         ),
         (
             rule_schema(false, |s| {
@@ -3002,12 +3025,24 @@ async fn bad_rules_are_refused_when_saved(pool: PgPool) {
     ] {
         refused(&admin, &schema, status, message).await;
     }
+    // Every kind of list a profile can hold, with an operator that takes one value.
+    for (rule, name) in [
+        (json!({"title": {"not_equals": "$user.tags"}}), "tags"),
+        (json!({"stage": "$user.scores"}), "scores"),
+        (json!({"title": "$user.colours"}), "colours"),
+        (json!({"author": "$user.friends"}), "friends"),
+    ] {
+        let message =
+            format!("access.read: `$user.{name}` holds a list, so it works only with in or not_in");
+        refused(&admin, &read(rule), 422, &message).await;
+    }
 
     // What the checks allow: custom roles, profile fields, and a list with `in`.
     for ok in [
         json!({"role": "reviewer"}),
         json!({"author": "$user.id", "title": "$user.team"}),
         json!({"title": {"in": "$user.tags"}}),
+        json!({"author": {"not_in": ["$user.friends", "$user.manager"]}}),
     ] {
         let res = send(
             &admin,

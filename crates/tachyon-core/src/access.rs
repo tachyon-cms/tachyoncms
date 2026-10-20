@@ -2,6 +2,7 @@
 //! are checked when it's saved, and compile per caller into allow, deny or a filter.
 
 use std::borrow::Cow;
+use std::collections::BTreeSet;
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -364,32 +365,36 @@ pub fn check_rules(
     checker.fields(&schema.fields, "", "fields")
 }
 
-/// Whether any of the schema's rules, on it or on a field at any depth, names `role`.
-pub fn names_role(schema: &CollectionSchema, role: &str) -> bool {
-    fn in_rule(rule: &Rule, role: &str) -> bool {
+/// Every role the schema's rules name, on it or on a field at any depth.
+pub fn named_roles(schema: &CollectionSchema) -> BTreeSet<String> {
+    fn from_rule(rule: &Rule, out: &mut BTreeSet<String>) {
         match rule {
-            Rule::Role(roles) => roles.iter().any(|r| r == role),
-            Rule::And(rules) | Rule::Or(rules) => rules.iter().any(|r| in_rule(r, role)),
-            _ => false,
+            Rule::Role(roles) => out.extend(roles.iter().cloned()),
+            Rule::And(rules) | Rule::Or(rules) => rules.iter().for_each(|r| from_rule(r, out)),
+            _ => {}
         }
     }
     // Saving refuses rules on layout fields, so the data fields hold every field rule.
-    fn in_fields(fields: &[Field], role: &str) -> bool {
-        fields.iter().any(|f| {
-            f.access.as_ref().is_some_and(|a| {
+    fn from_fields(fields: &[Field], out: &mut BTreeSet<String>) {
+        for f in fields {
+            if let Some(a) = &f.access {
                 [&a.read, &a.create, &a.update]
                     .into_iter()
                     .flatten()
-                    .any(|r| in_rule(r, role))
-            }) || in_fields(children(f), role)
-        })
+                    .for_each(|r| from_rule(r, out));
+            }
+            from_fields(children(f), out);
+        }
     }
-    schema.access.as_ref().is_some_and(|a| {
+    let mut out = BTreeSet::new();
+    if let Some(a) = &schema.access {
         [&a.read, &a.create, &a.update, &a.delete]
             .into_iter()
             .flatten()
-            .any(|r| in_rule(r, role))
-    }) || in_fields(&data_fields(&schema.fields), role)
+            .for_each(|r| from_rule(r, &mut out));
+    }
+    from_fields(&data_fields(&schema.fields), &mut out);
+    out
 }
 
 struct Checker<'a> {
@@ -443,6 +448,12 @@ impl Checker<'_> {
                 .iter()
                 .filter_map(|r| self.user_fields.iter().find(|f| f.name == *r))
             {
+                if f.virtual_path.is_some() || matches!(f.kind, FieldKind::Join { .. }) {
+                    return Err(format!(
+                        "`$user.{}` is filled on read, and profiles are loaded as stored, so a rule can't compare with it",
+                        f.name
+                    ));
+                }
                 let list = matches!(
                     &f.kind,
                     FieldKind::Text { has_many: true, .. }

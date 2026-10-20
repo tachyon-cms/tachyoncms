@@ -337,3 +337,68 @@ async fn a_reused_key_prefix_is_a_unique_violation(pool: PgPool) {
         Err(DbError::UniqueViolation(_))
     ));
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn rules_and_the_roles_they_name_stay_in_step(pool: PgPool) {
+    let abilities = Abilities {
+        content: Content::Read,
+        schemas: false,
+        users: false,
+    };
+    auth::role_upsert(&pool, "reviewer", "Reviewer", &abilities)
+        .await
+        .unwrap();
+    let schema = |slug: &str, role: &str| {
+        serde_json::from_value::<tachyon_core::CollectionSchema>(serde_json::json!({
+            "slug": slug, "fields": [{"name": "title", "type": "text", "access": {"update": {"role": role}}}]
+        }))
+        .unwrap()
+    };
+    let refused = |r: Result<(), DbError>| match r {
+        Err(DbError::Refused(why)) => why,
+        other => panic!("{other:?}"),
+    };
+
+    // Saves recheck the roles inside their own transaction.
+    let why = refused(
+        tachyon_db::collections::create(&pool, &schema("posts", "ghost"))
+            .await
+            .map(drop),
+    );
+    assert_eq!(
+        why,
+        "access rules name the role `ghost`, which doesn't exist"
+    );
+    tachyon_db::collections::create(&pool, &schema("posts", "reviewer"))
+        .await
+        .unwrap();
+    let change = tachyon_db::schema_change::apply(
+        &pool,
+        "posts",
+        &schema("posts", "ghost"),
+        &Default::default(),
+        false,
+    )
+    .await;
+    assert!(
+        matches!(&change, Err(tachyon_db::schema_change::ChangeError::Db(DbError::Refused(why)))
+            if why == "access rules name the role `ghost`, which doesn't exist"),
+        "{change:?}"
+    );
+
+    // And a role a rule names can't go.
+    assert_eq!(
+        refused(auth::role_delete(&pool, "reviewer").await),
+        "access rules in posts name the role `reviewer`; change them first"
+    );
+    tachyon_db::schema_change::apply(
+        &pool,
+        "posts",
+        &schema("posts", "editor"),
+        &Default::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    auth::role_delete(&pool, "reviewer").await.unwrap();
+}

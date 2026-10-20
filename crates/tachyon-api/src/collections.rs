@@ -159,6 +159,11 @@ fn check_dependents(state: &AppState, schema: &CollectionSchema) -> Result<(), A
 
 /// Every collection's access rules must hold with `schema` saved: its own, and the others',
 /// which may filter through it or, when it's `users`, read its fields as `$user` values.
+/// A role deleted after this check is caught where the schema is stored, under the lock
+/// role deletes share (`tachyon_db::auth::check_rule_roles`).
+// ponytail: a rule stored before these checks existed, which they'd now refuse, blocks
+// saving every other collection until it's fixed. Fine before the first release, since no
+// deployment holds rules yet; add a migration that reports them if that changes.
 async fn check_rules(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
     let roles = tachyon_db::auth::roles_list(&state.pool).await?;
     let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();

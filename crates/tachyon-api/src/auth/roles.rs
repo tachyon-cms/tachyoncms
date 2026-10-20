@@ -7,7 +7,6 @@ use axum::http::StatusCode;
 use serde::Deserialize;
 use serde_json::{Value, json};
 use tachyon_core::FieldError;
-use tachyon_core::access::names_role;
 use tachyon_core::auth::{Abilities, Action};
 use tachyon_db::auth;
 
@@ -125,16 +124,6 @@ pub(crate) async fn delete(
 ) -> Result<StatusCode, ApiError> {
     authorize(&principal, Action::Users, "users")?;
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    // A rule naming a role that's gone would never match; refuse rather than leave it stale.
-    // ponytail: a schema saved between this check and the delete can still name the role;
-    // its rule then matches nobody (no account can hold a deleted role), so it fails closed.
-    let collections = tachyon_db::collections::list(&state.pool).await?;
-    if let Some(c) = collections.iter().find(|c| names_role(&c.schema.0, &slug)) {
-        return Err(ApiError::Conflict(format!(
-            "access rules in {} name the role `{slug}`; change them first",
-            c.schema.0.slug
-        )));
-    }
     auth::role_delete(&state.pool, &slug).await?;
     Ok(StatusCode::NO_CONTENT)
 }
