@@ -10,7 +10,7 @@ pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "sta
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
-    "admin", "auth", "globals", "media", "search", "graphql", "plugins", "setup",
+    "access", "admin", "auth", "globals", "media", "search", "graphql", "plugins", "setup",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

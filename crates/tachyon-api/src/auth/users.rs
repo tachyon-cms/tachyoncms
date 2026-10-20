@@ -58,8 +58,21 @@ fn text<'a>(account: &'a Map<String, Value>, key: &str) -> Result<Option<&'a str
     }
 }
 
-fn manages_users(principal: &Principal) -> bool {
+pub(crate) fn manages_users(principal: &Principal) -> bool {
     authorize(principal, Action::Users, "users").is_ok()
+}
+
+/// What these routes let the caller do with accounts, for `/api/access`: anything when
+/// they manage users, otherwise read and change only their own (when acting as
+/// themselves), never create or delete.
+pub(crate) fn account_answers(principal: &Principal) -> Value {
+    let all = manages_users(principal);
+    let own: Value = match (all, principal.require()) {
+        (true, _) => true.into(),
+        (false, Ok(_)) => "conditional".into(),
+        (false, Err(_)) => false.into(),
+    };
+    serde_json::json!({"read": own, "create": all, "update": own, "delete": all})
 }
 
 /// Admins may act on anyone; everyone else only on themselves.

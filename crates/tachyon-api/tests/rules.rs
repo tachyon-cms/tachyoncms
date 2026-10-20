@@ -2130,3 +2130,579 @@ async fn admins_see_links_whatever_their_path(pool: PgPool) {
     );
     assert_eq!(paths(get(&s.viewer, &url).await), ["author"]);
 }
+
+/// Whether a request went through (2xx) or was refused: 401, 403, or 404 for what the
+/// caller can't see. Anything else means the probe itself is wrong.
+fn went_through(res: &Res) -> bool {
+    match res.status.as_u16() {
+        200..=299 => true,
+        401 | 403 | 404 => false,
+        s => panic!("unexpected {s}: {}", res.json),
+    }
+}
+
+/// Holds `answer` against what the requests behind `outcomes` did: `true` when every one
+/// went through, `false` when none did, "conditional" when only some did.
+fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
+    assert!(!outcomes.is_empty(), "{what}: nothing was tried");
+    let expected = match (outcomes.iter().all(|o| *o), outcomes.iter().any(|o| *o)) {
+        (true, _) => json!(true),
+        (false, false) => json!(false),
+        _ => json!("conditional"),
+    };
+    assert_eq!(answer, &expected, "{what}: {outcomes:?}");
+}
+
+/// Whether `doc` holds the field at dotted `path`, through groups and every row of a list.
+fn has(doc: &Value, path: &str) -> bool {
+    let (head, rest) = path
+        .split_once('.')
+        .map_or((path, None), |(h, r)| (h, Some(r)));
+    match (doc.get(head), rest) {
+        (None, _) => false,
+        (Some(_), None) => true,
+        (Some(Value::Array(rows)), Some(rest)) => {
+            !rows.is_empty() && rows.iter().all(|r| has(r, rest))
+        }
+        (Some(v), Some(rest)) => has(v, rest),
+    }
+}
+
+const LISTS: &[&str] = &["links"];
+const GROUPS: &[&str] = &["seo", "box"];
+
+/// A body that writes only the field at dotted `path`: `leaf` for a value, an empty group
+/// or list for a container, wrapped in its groups and one list row.
+fn body_at(path: &str, leaf: Value) -> Value {
+    let mut segments: Vec<&str> = path.split('.').collect();
+    let last = segments.pop().unwrap();
+    let value = match last {
+        l if LISTS.contains(&l) => json!([]),
+        l if GROUPS.contains(&l) => json!({}),
+        _ => leaf,
+    };
+    let mut out = json!({ last: value });
+    for s in segments.into_iter().rev() {
+        out = json!({ s: if LISTS.contains(&s) { json!([out]) } else { out } });
+    }
+    out
+}
+
+/// One collection's answers for `who`, held against what `app` actually lets them do. The
+/// Admin makes `seeds` (marked with `who` in `mark`, so a list can find them); the caller
+/// tries to create `own`, reads each singly and in a list, checks each field is shown or
+/// left out as answered, writes each field alone, then updates and deletes each document.
+#[allow(clippy::too_many_arguments)]
+async fn bears_out(
+    who: &str,
+    app: &Router,
+    admin: &Router,
+    slug: &str,
+    answers: &Value,
+    mark: &str,
+    seeds: Vec<Value>,
+    own: Value,
+    leaf: impl Fn(&str) -> Value,
+) {
+    let what = |x: &str| format!("{who}: {slug} {x}");
+    let url = |d: &str| format!("/api/{slug}/{d}");
+    let marked = |mut v: Value| {
+        v[mark] = who.into();
+        v
+    };
+    let mut docs = Vec::new();
+    for seed in seeds {
+        docs.push(id(
+            &create(admin, &format!("/api/{slug}"), marked(seed)).await
+        ));
+    }
+    // Only the seeds hold every field, so only they can show which are left out.
+    let seeded = docs.len();
+    let mine = marked(own).to_string();
+    let made = send(app, "POST", &format!("/api/{slug}"), Some(&mine)).await;
+    agrees(&what("create"), &answers["create"], &[went_through(&made)]);
+    if went_through(&made) {
+        docs.push(id(&made.json));
+    }
+
+    let mut reads = Vec::new();
+    let mut readable = Vec::new();
+    for (i, d) in docs.iter().enumerate() {
+        let res = get(app, &url(d)).await;
+        reads.push(went_through(&res));
+        if went_through(&res) && i < seeded {
+            readable.push(res.json);
+        }
+    }
+    agrees(&what("read"), &answers["read"], &reads);
+    // A list shows exactly what single reads do, and is refused only when reads are.
+    let list = get(
+        app,
+        &format!("/api/{slug}?limit=100&where[{mark}][equals]={who}"),
+    )
+    .await;
+    assert_eq!(
+        went_through(&list),
+        answers["read"] != json!(false),
+        "{}",
+        what("list")
+    );
+    let mut listed: Vec<String> = if went_through(&list) {
+        list.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(id)
+            .collect()
+    } else {
+        Vec::new()
+    };
+    let mut shown: Vec<String> = docs
+        .iter()
+        .zip(&reads)
+        .filter(|(_, r)| **r)
+        .map(|(d, _)| d.clone())
+        .collect();
+    listed.sort();
+    shown.sort();
+    assert_eq!(listed, shown, "{}", what("list"));
+
+    let fields = answers["fields"].as_object().unwrap();
+    for (path, f) in fields {
+        let seen: Vec<bool> = readable.iter().map(|doc| has(doc, path)).collect();
+        if !seen.is_empty() {
+            agrees(&what(&format!("field {path} read")), &f["read"], &seen);
+        }
+    }
+
+    let mut updates = Vec::new();
+    for d in &docs {
+        updates.push(went_through(
+            &patch(app, &url(d), json!({ mark: who })).await,
+        ));
+    }
+    agrees(&what("update"), &answers["update"], &updates);
+    let writable = docs
+        .iter()
+        .zip(&updates)
+        .find(|(_, u)| **u)
+        .map(|(d, _)| d.clone());
+    for (path, f) in fields {
+        let body = body_at(path, leaf(path));
+        if answers["create"] == json!(true) {
+            let res = send(
+                app,
+                "POST",
+                &format!("/api/{slug}"),
+                Some(&body.to_string()),
+            )
+            .await;
+            agrees(
+                &what(&format!("field {path} create")),
+                &f["create"],
+                &[went_through(&res)],
+            );
+        }
+        if let Some(d) = &writable {
+            let res = patch(app, &url(d), body).await;
+            agrees(
+                &what(&format!("field {path} update")),
+                &f["update"],
+                &[went_through(&res)],
+            );
+        }
+    }
+
+    let mut deletes = Vec::new();
+    for d in &docs {
+        deletes.push(went_through(&send(app, "DELETE", &url(d), None).await));
+    }
+    agrees(&what("delete"), &answers["delete"], &deletes);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn access_answers_match_what_the_api_allows(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let editor = json!({"role": "editor"});
+    let writers = json!({"role": ["author", "editor"]});
+    // A filter (`or` with a role, so Editors pass outright), a `$user` filter, and role
+    // defaults for create and delete; field rules on containers and inside them.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "posts",
+        "access": {"read": {"or": [editor, {"stage": "published"}]}, "update": {"owner": "$user.id"}},
+        "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "stage", "type": "select", "options": ["draft", "published"]},
+            {"name": "owner", "type": "relationship", "relationTo": "users"},
+            {"name": "secret", "type": "text", "access": {"read": editor}},
+            {"name": "seo", "type": "group", "access": {"update": editor}, "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "note", "type": "text", "access": {"create": editor}}
+            ]},
+            {"name": "links", "type": "array", "fields": [
+                {"name": "url", "type": "text"},
+                {"name": "label", "type": "text", "access": {"update": editor}}
+            ]},
+            {"type": "row", "fields": [{"name": "inRow", "type": "text"}]},
+            {"name": "box", "type": "group", "access": {"read": editor}, "fields": [
+                {"name": "y", "type": "text"}
+            ]}
+        ]}),
+    )
+    .await;
+    // Allow and Deny outright, by role, and an own-only default (Authors' deletes) on a
+    // collection everyone reads.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "notes",
+        "access": {"read": true, "create": writers, "update": false},
+        "fields": [{"name": "body", "type": "text"}]}),
+    )
+    .await;
+    // Anyone may write, but only Editors read: changing what you can't read is refused.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "inbox",
+        "access": {"read": editor, "create": true, "update": true, "delete": true},
+        "fields": [{"name": "body", "type": "text"}]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "home", "kind": "global",
+        "access": {"read": {"live": true}, "update": writers},
+        "fields": [
+            {"name": "live", "type": "checkbox"},
+            {"name": "banner", "type": "text"},
+            {"name": "memo", "type": "text", "access": {"read": editor}}
+        ]}),
+    )
+    .await;
+    let me = get(&admin, "/api/auth/me").await;
+    let admin_id: uuid::Uuid = me.json["id"].as_str().unwrap().parse().unwrap();
+    let made = create(
+        &admin,
+        "/api/auth/keys",
+        json!({"name": "k", "scopes": ["posts:read", "notes:write"]}),
+    )
+    .await;
+    let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
+    let key = visitor(&pool).await.layer(axum::middleware::map_request(
+        move |mut req: Request<axum::body::Body>| {
+            let bearer = bearer.clone();
+            async move {
+                let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
+                req.headers_mut().insert("authorization", value);
+                req
+            }
+        },
+    ));
+    let mut callers = vec![("anonymous", visitor(&pool).await, None)];
+    for role in ["viewer", "author", "editor"] {
+        let email = format!("{role}@example.com");
+        let id = add_user(&pool, &email, role).await;
+        callers.push((
+            role,
+            signed_in(visitor(&pool).await, &email).await,
+            Some(id),
+        ));
+    }
+    callers.push(("admin", admin.clone(), Some(admin_id)));
+    callers.push(("key", key, Some(admin_id)));
+
+    let mut answers = Vec::new();
+    for (who, app, me) in &callers {
+        let res = get(app, "/api/access").await;
+        assert_eq!(res.status, 200, "{who}: {}", res.json);
+        let a = res.json;
+        let keys = |v: &Value| v.as_object().unwrap().keys().cloned().collect::<Vec<_>>();
+        assert_eq!(
+            keys(&a["collections"]),
+            ["inbox", "notes", "posts", "users"],
+            "{who}"
+        );
+        assert_eq!(keys(&a["globals"]), ["home"], "{who}");
+        // Dotted data paths at every depth, layout flattened, list fields without an index.
+        assert_eq!(
+            keys(&a["collections"]["posts"]["fields"]),
+            [
+                "box",
+                "box.y",
+                "inRow",
+                "links",
+                "links.label",
+                "links.url",
+                "owner",
+                "secret",
+                "seo",
+                "seo.note",
+                "seo.title",
+                "stage",
+                "title"
+            ],
+            "{who}"
+        );
+        let mine = me.unwrap_or(admin_id);
+
+        // posts
+        let full = |stage: &str, owner: uuid::Uuid| {
+            json!({"stage": stage, "owner": owner, "secret": "s", "seo": {"title": "t", "note": "n"},
+                   "links": [{"url": "u", "label": "l"}], "inRow": "r", "box": {"y": "y"}})
+        };
+        let seeds = vec![
+            full("published", mine),
+            full("draft", mine),
+            full("published", admin_id),
+            full("draft", admin_id),
+        ];
+        let own = json!({"stage": "published", "owner": mine});
+        let leaf = |path: &str| match path {
+            "stage" => json!("published"),
+            "owner" => json!(mine),
+            _ => json!("v"),
+        };
+        let posts = &a["collections"]["posts"];
+        bears_out(who, app, &admin, "posts", posts, "title", seeds, own, leaf).await;
+
+        // notes
+        for slug in ["notes", "inbox"] {
+            let answers = &a["collections"][slug];
+            let seeds = vec![json!({}), json!({})];
+            let leaf = |_: &str| json!("v");
+            bears_out(
+                who,
+                app,
+                &admin,
+                slug,
+                answers,
+                "body",
+                seeds,
+                json!({}),
+                leaf,
+            )
+            .await;
+        }
+
+        // home: read and changed while it matches its read rule and while it doesn't.
+        let home = &a["globals"]["home"];
+        let (mut reads, mut updates) = (Vec::new(), Vec::new());
+        let mut seen: std::collections::BTreeMap<&str, Vec<bool>> = Default::default();
+        for live in [true, false] {
+            let set = json!({"live": live, "banner": "b", "memo": "m"});
+            assert_eq!(patch(&admin, "/api/globals/home", set).await.status, 200);
+            let res = get(app, "/api/globals/home").await;
+            reads.push(went_through(&res));
+            if went_through(&res) {
+                for path in home["fields"].as_object().unwrap().keys() {
+                    seen.entry(path).or_default().push(has(&res.json, path));
+                }
+            }
+            let res = patch(app, "/api/globals/home", json!({"banner": who})).await;
+            updates.push(went_through(&res));
+        }
+        agrees(&format!("{who}: home read"), &home["read"], &reads);
+        agrees(&format!("{who}: home update"), &home["update"], &updates);
+        for (path, seen) in &seen {
+            let f = &home["fields"][path];
+            agrees(&format!("{who}: home field {path} read"), &f["read"], seen);
+        }
+        let set = json!({"live": true});
+        assert_eq!(patch(&admin, "/api/globals/home", set).await.status, 200);
+        if home["update"] != json!(false) {
+            for (path, f) in home["fields"].as_object().unwrap() {
+                let value = if path == "live" {
+                    json!(true)
+                } else {
+                    json!("v")
+                };
+                let res = patch(app, "/api/globals/home", json!({ path: value })).await;
+                let what = format!("{who}: home field {path} update");
+                agrees(&what, &f["update"], &[went_through(&res)]);
+            }
+        }
+
+        // users: their own account, someone else's, a new one.
+        let users = &a["collections"]["users"];
+        let victim = add_user(&pool, &format!("victim-{who}@example.com"), "viewer").await;
+        let targets: Vec<uuid::Uuid> = me.iter().copied().chain([victim]).collect();
+        let (mut reads, mut updates) = (Vec::new(), Vec::new());
+        for t in &targets {
+            let res = get(app, &format!("/api/users/{t}")).await;
+            reads.push(went_through(&res));
+            if went_through(&res) {
+                for (path, f) in users["fields"].as_object().unwrap() {
+                    let what = format!("{who}: users field {path} read");
+                    agrees(&what, &f["read"], &[has(&res.json, path)]);
+                }
+            }
+            let res = patch(app, &format!("/api/users/{t}"), json!({})).await;
+            updates.push(went_through(&res));
+        }
+        agrees(&format!("{who}: users read"), &users["read"], &reads);
+        agrees(&format!("{who}: users update"), &users["update"], &updates);
+        let new = json!({"email": format!("new-{who}@example.com"), "password": common::PASSWORD,
+                         "role": "viewer", "name": "New"});
+        let res = send(app, "POST", "/api/users", Some(&new.to_string())).await;
+        agrees(
+            &format!("{who}: users create"),
+            &users["create"],
+            &[went_through(&res)],
+        );
+        let res = send(app, "DELETE", &format!("/api/users/{victim}"), None).await;
+        agrees(
+            &format!("{who}: users delete"),
+            &users["delete"],
+            &[went_through(&res)],
+        );
+        let res = get(app, "/api/users").await;
+        agrees(
+            &format!("{who}: manage users"),
+            &a["users"],
+            &[went_through(&res)],
+        );
+        answers.push((*who, a));
+    }
+    // Last, since a new collection changes everyone's answers.
+    for ((who, app, _), (_, a)) in callers.iter().zip(&answers) {
+        let schema =
+            json!({"slug": format!("made_{who}"), "fields": [{"name": "t", "type": "text"}]});
+        let res = send(
+            app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        agrees(
+            &format!("{who}: schemas"),
+            &a["schemas"],
+            &[went_through(&res)],
+        );
+    }
+
+    // The table the checks above bore out: every kind of answer, for every kind of rule.
+    let c = "conditional";
+    let table: Vec<(&str, Value)> = answers
+        .iter()
+        .map(|(who, a)| {
+            let row = |v: &Value, actions: &[&str]| -> Vec<Value> {
+                actions.iter().map(|k| v[*k].clone()).collect()
+            };
+            let all = ["read", "create", "update", "delete"];
+            let cs = &a["collections"];
+            (
+                *who,
+                json!({
+                    "posts": row(&cs["posts"], &all),
+                    "notes": row(&cs["notes"], &all),
+                    "inbox": row(&cs["inbox"], &all),
+                    "users": row(&cs["users"], &all),
+                    "home": row(&a["globals"]["home"], &["read", "update"]),
+                    "schemas": a["schemas"], "manage": a["users"],
+                }),
+            )
+        })
+        .collect();
+    let (t, f) = (true, false);
+    let row = |posts: Value, notes: Value, inbox: Value, users: Value, home: Value, admin: bool| {
+        json!({"posts": posts, "notes": notes, "inbox": inbox, "users": users, "home": home,
+               "schemas": admin, "manage": admin})
+    };
+    let expected = vec![
+        (
+            "anonymous",
+            row(
+                json!([c, f, f, f]),
+                json!([t, f, f, f]),
+                json!([f, t, f, f]),
+                json!([f, f, f, f]),
+                json!([c, f]),
+                f,
+            ),
+        ),
+        (
+            "viewer",
+            row(
+                json!([c, f, c, f]),
+                json!([t, f, f, f]),
+                json!([f, t, f, f]),
+                json!([c, f, c, f]),
+                json!([c, f]),
+                f,
+            ),
+        ),
+        (
+            "author",
+            row(
+                json!([c, t, c, c]),
+                json!([t, t, f, c]),
+                json!([f, t, f, f]),
+                json!([c, f, c, f]),
+                json!([c, c]),
+                f,
+            ),
+        ),
+        (
+            "editor",
+            row(
+                json!([t, t, c, t]),
+                json!([t, t, f, t]),
+                json!([t, t, t, t]),
+                json!([c, f, c, f]),
+                json!([c, c]),
+                f,
+            ),
+        ),
+        (
+            "admin",
+            row(
+                json!([t, t, t, t]),
+                json!([t, t, t, t]),
+                json!([t, t, t, t]),
+                json!([t, t, t, t]),
+                json!([t, t]),
+                t,
+            ),
+        ),
+        (
+            "key",
+            row(
+                json!([t, f, f, f]),
+                json!([t, t, t, t]),
+                json!([f, f, f, f]),
+                json!([f, f, f, f]),
+                json!([f, f]),
+                f,
+            ),
+        ),
+    ];
+    assert_eq!(table, expected);
+    // Fields: hidden in a hidden container, and a list changed only whole.
+    let field =
+        |who: usize, path: &str| answers[who].1["collections"]["posts"]["fields"][path].clone();
+    assert_eq!(
+        field(1, "box.y"),
+        json!({"read": false, "create": true, "update": true})
+    );
+    assert_eq!(
+        field(2, "links.url"),
+        json!({"read": true, "create": true, "update": false})
+    );
+    assert_eq!(
+        field(2, "seo.note"),
+        json!({"read": true, "create": false, "update": false})
+    );
+    assert_eq!(
+        field(3, "seo.note"),
+        json!({"read": true, "create": true, "update": true})
+    );
+    assert_eq!(
+        answers[0].1["globals"]["home"]["fields"]["memo"],
+        json!({"read": false, "update": true})
+    );
+}

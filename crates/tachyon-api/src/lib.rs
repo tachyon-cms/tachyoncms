@@ -88,6 +88,7 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/admin/collections/{slug}/preview",
             post(collections::preview),
         )
+        .route("/api/access", get(access::report))
         .route(
             "/api/globals/{slug}",
             get(globals::get).patch(globals::update),

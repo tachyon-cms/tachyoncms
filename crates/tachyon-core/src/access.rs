@@ -536,6 +536,47 @@ fn children(f: &Field) -> &[Field] {
     }
 }
 
+/// What the caller may do with each of `fields` (data fields), at any depth, by dotted path
+/// (a list's fields without a row index): `[read, create, update]`. A field inside one the
+/// caller can't read, create or update can't be either. An update replaces a list whole,
+/// so a list and everything in it can be updated only when all of it can.
+pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3])> {
+    fn updatable(fields: &[Field], caller: &Caller) -> bool {
+        fields
+            .iter()
+            .all(|f| field_allows(f, Action::Update, caller) && updatable(children(f), caller))
+    }
+    fn walk(
+        fields: &[Field],
+        prefix: &str,
+        within: [bool; 3],
+        caller: &Caller,
+        out: &mut Vec<(String, [bool; 3])>,
+    ) {
+        for f in fields {
+            let path = if prefix.is_empty() {
+                f.name.clone()
+            } else {
+                format!("{prefix}.{}", f.name)
+            };
+            let [read, create, update] = within;
+            let mut answer = [
+                read && field_allows(f, Action::Read, caller),
+                create && field_allows(f, Action::Create, caller),
+                update && field_allows(f, Action::Update, caller),
+            ];
+            if matches!(f.kind, FieldKind::Array { .. }) {
+                answer[2] = answer[2] && updatable(children(f), caller);
+            }
+            out.push((path.clone(), answer));
+            walk(children(f), &path, answer, caller, out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(fields, "", [true; 3], caller, &mut out);
+    out
+}
+
 /// `fields` (data fields) without those the caller can't read, at any depth: all that
 /// filters and sorts may name. Borrows when nothing is hidden.
 pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field]> {

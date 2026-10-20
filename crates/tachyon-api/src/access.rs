@@ -8,13 +8,14 @@ use std::collections::HashMap;
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
+use axum::Json;
+use axum::extract::{FromRequestParts, MatchedPath, RawPathParams, State};
 use axum::http::request::Parts;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::access::{
-    Caller, Compiled, Rule, compile, path_exists, readable_fields, strip_to, unwritable,
-    visible_errors,
+    Caller, Compiled, Rule, compile, field_answers, path_exists, readable_fields, strip_to,
+    unwritable, visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{Filter, Target, parse_filter};
@@ -26,7 +27,9 @@ use tachyon_db::documents::{self, Actor, Document};
 use tachyon_db::query::get_many_readable;
 use uuid::Uuid;
 
+use crate::auth::authorize;
 use crate::auth::principal::Principal;
+use crate::auth::users::{account_answers, manages_users};
 use crate::schemas::Schemas;
 use crate::{ApiError, AppState};
 
@@ -73,6 +76,8 @@ pub(crate) enum Reach<'a> {
     From(&'a Collection),
     /// Every collection's read rule, as for references, which can come from anywhere.
     Everything,
+    /// Every rule of every collection, as `/api/access` answers for all of them.
+    EveryRule,
 }
 
 impl FromRequestParts<AppState> for Access {
@@ -199,18 +204,21 @@ fn needs_profile(schemas: &Schemas, reach: &Reach) -> bool {
             .and_then(|a| a.read.as_ref())
             .is_some_and(uses_profile)
     };
+    let any_action = |c: &Collection| {
+        c.schema.access.as_ref().is_some_and(|a| {
+            [&a.read, &a.create, &a.update, &a.delete]
+                .into_iter()
+                .flatten()
+                .any(uses_profile)
+        })
+    };
     let start = match reach {
         Reach::Nothing => return false,
         Reach::Everything => return schemas.all().iter().any(|c| read(c)),
+        Reach::EveryRule => return schemas.all().iter().any(|c| any_action(c)),
         Reach::From(c) => c,
     };
-    let any_action = start.schema.access.as_ref().is_some_and(|a| {
-        [&a.read, &a.create, &a.update, &a.delete]
-            .into_iter()
-            .flatten()
-            .any(uses_profile)
-    });
-    if any_action {
+    if any_action(start) {
         return true;
     }
     // Every collection reachable through links and joins: populate, virtual fields, joins
@@ -442,6 +450,18 @@ impl Access {
         })
     }
 
+    /// What `action` (update or delete) on `c` comes to, as `write_guard` and the global
+    /// update enforce it: refused outright when the caller can't read `c` at all, and
+    /// conditional when either rule is a filter or the role default is own-only.
+    fn write_answer(&self, read: &Compiled, action: Action, c: &Collection) -> Value {
+        let own_only = self.actor(action, c).is_some_and(|a| a.own_only);
+        match (read, self.allows(action, c)) {
+            (Compiled::Deny, _) | (_, Compiled::Deny) => false.into(),
+            (Compiled::Allow, Compiled::Allow) if !own_only => true.into(),
+            _ => "conditional".into(),
+        }
+    }
+
     /// Each collection the caller may read, with its read filter (`None`: all of it).
     /// Globals are left out: nothing links to them.
     pub(crate) fn readable(&self) -> &HashMap<Uuid, Option<Filter>> {
@@ -612,6 +632,78 @@ impl Access {
     }
 }
 
+/// An answer for `/api/access`.
+fn answer(c: &Compiled) -> Value {
+    match c {
+        Compiled::Allow => true.into(),
+        Compiled::Deny => false.into(),
+        Compiled::Filter(_) => "conditional".into(),
+    }
+}
+
+/// Each field of `c` by dotted path, with what the caller may do with it: `{read, create,
+/// update}`, or `{read, update}` for a global, which is only ever updated.
+fn field_map(c: &Collection, caller: &Caller) -> Value {
+    let global = c.schema.kind == CollectionKind::Global;
+    let fields =
+        field_answers(c.schema.data(), caller)
+            .into_iter()
+            .map(|(path, [read, create, update])| {
+                let a = if global {
+                    json!({"read": read, "update": update})
+                } else {
+                    json!({"read": read, "create": create, "update": update})
+                };
+                (path, a)
+            });
+    Value::Object(fields.collect())
+}
+
+/// `GET /api/access`: what the caller may do with each collection, global and field, and
+/// whether they may change schemas and manage users. Signed out is an answer too.
+pub(crate) async fn report(
+    State(state): State<AppState>,
+    principal: Principal,
+) -> Result<Json<Value>, ApiError> {
+    let schemas = authorize(&principal, Action::Schemas, "").is_ok();
+    let users = manages_users(&principal);
+    let accounts = account_answers(&principal);
+    let access = Access::new(&state, principal, Reach::EveryRule).await?;
+    let caller = access.caller();
+    let (mut collections, mut globals) = (Map::new(), Map::new());
+    for c in access.schemas().all().iter() {
+        let read = access.allows(Action::Read, c);
+        let mut a = if c.schema.slug == USERS {
+            accounts.clone()
+        } else if c.schema.kind == CollectionKind::Global {
+            json!({
+                "read": answer(&read),
+                "update": access.write_answer(&read, Action::UpdateGlobal, c),
+            })
+        } else {
+            // A create rule that's a filter refuses: there's no document yet to match.
+            let create = matches!(access.allows(Action::Create, c), Compiled::Allow);
+            json!({
+                "read": answer(&read),
+                "create": create,
+                "update": access.write_answer(&read, Action::Update, c),
+                "delete": access.write_answer(&read, Action::Delete, c),
+            })
+        };
+        a["fields"] = field_map(c, &caller);
+        match c.schema.kind {
+            CollectionKind::Global => globals.insert(c.schema.slug.clone(), a),
+            _ => collections.insert(c.schema.slug.clone(), a),
+        };
+    }
+    Ok(Json(json!({
+        "collections": collections,
+        "globals": globals,
+        "schemas": schemas,
+        "users": users,
+    })))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -685,5 +777,46 @@ mod tests {
             loaded(None, true).await,
             "references can come from anywhere"
         );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn every_rule_loads_the_profile_for_any_action(pool: PgPool) {
+        let users = ensure_users_collection(&pool).await.unwrap();
+        let new = NewAccount {
+            email: "ann@example.com",
+            name: "Ann",
+            password_hash: "x",
+            role: "viewer",
+        };
+        let me = create_account(&pool, &users, &new, false).await.unwrap();
+        // Only an update rule reads the profile, which references never need.
+        let tasks = json!({"slug": "tasks", "access": {"update": {"title": "$user.name"}},
+                           "fields": [{"name": "title", "type": "text"}]});
+        collections::create(&pool, &serde_json::from_value(tasks).unwrap())
+            .await
+            .unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
+            auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+        };
+        let principal = Principal::User {
+            identity: Identity {
+                user_id: me,
+                role: "viewer".into(),
+                abilities: builtin_roles()[3].2.clone(),
+            },
+            session: Uuid::now_v7(),
+            cookie: false,
+        };
+        let loaded = |reach| {
+            let (state, principal) = (state.clone(), principal.clone());
+            async move {
+                let access = Access::new(&state, principal, reach).await.unwrap();
+                access.user.unwrap().contains_key("name")
+            }
+        };
+        assert!(!loaded(Reach::Everything).await);
+        assert!(loaded(Reach::EveryRule).await);
     }
 }
