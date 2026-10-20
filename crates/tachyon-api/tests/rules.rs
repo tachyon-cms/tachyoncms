@@ -902,3 +902,309 @@ async fn keys_stay_narrowed_by_scopes(pool: PgPool) {
         403,
     );
 }
+
+/// Every page of a list, following `nextCursor`: the titles per page, and the total.
+async fn pages(app: &Router, query: &str) -> (Vec<Vec<String>>, Value) {
+    let mut out = Vec::new();
+    let mut after = String::new();
+    loop {
+        let res = get(
+            app,
+            &format!("/api/posts?{query}&limit=2&count=true{after}"),
+        )
+        .await;
+        let total = res.json["totalDocs"].clone();
+        let page: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{query}: {}", res.json))
+            .iter()
+            .map(|d| d["title"].as_str().unwrap().to_owned())
+            .collect();
+        out.push(page);
+        match res.json["nextCursor"].as_str() {
+            Some(c) => after = format!("&after={c}"),
+            None => return (out, total),
+        }
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let published = json!({"read": {"stage": "published"}});
+    let stage = json!({"name": "stage", "type": "select", "options": ["draft", "published"]});
+    let link = |to: &str| json!({"type": "relationship", "relationTo": to});
+    let with = |mut f: Value, name: &str| {
+        f["name"] = name.into();
+        f
+    };
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "authors", "access": published, "fields": [
+            {"name": "name", "type": "text"}, stage,
+            with(link("authors"), "mentor")
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "posts", "access": {"read": true}, "fields": [
+            {"name": "title", "type": "text"},
+            with(link("authors"), "author"),
+            {"name": "writers", "type": "relationship", "relationTo": "authors", "hasMany": true},
+            {"name": "credits", "type": "array", "fields": [with(link("authors"), "who")]}
+        ]}),
+    )
+    .await;
+    let author = |name: &str, stage: &str, mentor: Option<&str>| json!({"name": name, "stage": stage, "mentor": mentor});
+    let ann = id(&create(&admin, "/api/authors", author("Ann", "published", None)).await);
+    let hid = id(&create(&admin, "/api/authors", author("Hid", "draft", None)).await);
+    let mia = id(&create(
+        &admin,
+        "/api/authors",
+        author("Mia", "published", Some(&hid)),
+    )
+    .await);
+    let bo = id(&create(
+        &admin,
+        "/api/authors",
+        author("Bo", "published", Some(&ann)),
+    )
+    .await);
+    let posts = [
+        ("p1", Some(&ann), vec![&ann], vec![]),
+        ("p2", Some(&hid), vec![&hid], vec![]),
+        ("p3", Some(&ann), vec![&ann, &hid], vec![&hid]),
+        ("p4", None, vec![], vec![]),
+        ("p5", Some(&mia), vec![&mia], vec![&hid]),
+        ("p6", Some(&bo), vec![&bo], vec![&ann]),
+        ("p7", Some(&hid), vec![], vec![&hid, &ann]),
+    ];
+    let body =
+        |title: &str, a: Option<&String>, writers: &[&String], credits: &[&String], skip: &str| {
+            let keep = |x: &&&String| x.as_str() != skip;
+            let credits: Vec<Value> = credits
+                .iter()
+                .filter(keep)
+                .map(|w| json!({"who": w}))
+                .collect();
+            let writers: Vec<&&String> = writers.iter().filter(keep).collect();
+            let a = a.filter(|a| a.as_str() != skip);
+            json!({"title": title, "author": a, "writers": writers, "credits": credits})
+        };
+    let mut made = Vec::new();
+    for (title, a, writers, credits) in &posts {
+        let doc = create(&admin, "/api/posts", body(title, *a, writers, credits, "")).await;
+        made.push(id(&doc));
+    }
+    let anon = visitor(&pool).await;
+
+    // `(query, does an admin see something different from a visitor)`: the first of each
+    // pair is a filter that only a hidden author could satisfy or fail.
+    let queries: &[(&str, bool)] = &[
+        // Single link, has-many, a link inside a list row, and two hops.
+        ("where[author.name][equals]=Hid", true),
+        ("where[author.id][equals]={hid}", true),
+        ("where[author.stage][equals]=draft", true),
+        ("where[writers.name][equals]=Hid", true),
+        ("where[writers.id][in]={hid}", true),
+        ("where[credits.who.name][equals]=Hid", true),
+        ("where[author.mentor.name][equals]=Hid", true),
+        ("where[author.mentor.stage][equals]=draft", true),
+        // Inside `or` and `and`.
+        (
+            "where[or][0][author.name][equals]=Hid&where[or][1][title][equals]=p1",
+            true,
+        ),
+        (
+            "where[or][0][writers.name][equals]=Hid&where[or][1][title][equals]=p4",
+            true,
+        ),
+        (
+            "where[and][0][title][like]=p&where[and][1][author.name][equals]=Hid",
+            true,
+        ),
+        // The negative operators count a hidden author as missing.
+        ("where[author.name][not_equals]=Ann", false),
+        ("where[author.name][not_equals]=Hid", true),
+        ("where[author.id][not_in]={hid}", true),
+        ("where[author.name][not_in]=Hid,Ann", true),
+        ("where[writers.name][not_equals]=Hid", true),
+        ("where[credits.who.name][not_equals]=Hid", true),
+        ("where[author.mentor.name][not_equals]=Hid", true),
+        ("where[author.name][exists]=false", true),
+        ("where[writers.name][exists]=false", true),
+        ("where[author.mentor.name][exists]=false", true),
+        // Nothing hidden is involved, so a visitor sees what anyone would.
+        ("where[author.name][equals]=Ann", false),
+        ("where[writers.name][equals]=Ann", false),
+    ];
+
+    // Each answer for a visitor, whole pages and total included.
+    let ask = |app: Router, hid: String| async move {
+        let mut seen = Vec::new();
+        for (q, _) in queries {
+            let q = q.replace("{hid}", &hid);
+            let all = get(&app, &format!("/api/posts?{q}&sort=title")).await;
+            seen.push((titles(&all), pages(&app, &format!("{q}&sort=title")).await));
+        }
+        seen
+    };
+    let before = ask(anon.clone(), hid.clone()).await;
+    let admin_before = ask(admin.clone(), hid.clone()).await;
+    for (i, (q, differs)) in queries.iter().enumerate() {
+        assert_eq!(before[i].0 != admin_before[i].0, *differs, "{q}");
+    }
+
+    // The same questions with Hid truly gone must answer the same, page by page.
+    // (A link to nothing reads the same as no link, and a document can't be deleted while
+    // linked, so Hid's links come out first.)
+    for ((title, a, writers, credits), doc) in posts.iter().zip(&made) {
+        let res = patch(
+            &admin,
+            &format!("/api/posts/{doc}"),
+            body(title, *a, writers, credits, &hid),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+    }
+    let res = patch(
+        &admin,
+        &format!("/api/authors/{mia}"),
+        json!({"mentor": null}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = send(&admin, "DELETE", &format!("/api/authors/{hid}"), None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    let after = ask(anon.clone(), hid.clone()).await;
+    for (i, (q, _)) in queries.iter().enumerate() {
+        assert_eq!(before[i], after[i], "{q}");
+    }
+
+    // A few answers worth reading outright.
+    let url = "/api/posts?where[author.name][equals]=Hid";
+    assert!(titles(&get(&anon, url).await).is_empty());
+    let url = "/api/posts?where[author.name][not_equals]=Ann";
+    assert_eq!(
+        titles(&get(&anon, url).await),
+        ["p2", "p4", "p5", "p6", "p7"]
+    );
+
+    // Sort doesn't cross a link, so there's no order to read a hidden document from.
+    let sorted = get(&anon, "/api/posts?sort=author.name").await;
+    assert_problem(&sorted, 400);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn polymorphic_links_use_each_collections_rule(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let stage = json!({"name": "stage", "type": "select", "options": ["draft", "published"]});
+    let fields = json!([{"name": "title", "type": "text"}, stage]);
+    // Notes anyone reads, memos nobody, pages only when published.
+    for (slug, read) in [
+        ("notes", json!(true)),
+        ("memos", json!(false)),
+        ("pages", json!({"stage": "published"})),
+    ] {
+        create(
+            &admin,
+            "/api/admin/collections",
+            json!({"slug": slug, "access": {"read": read}, "fields": fields}),
+        )
+        .await;
+    }
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "items", "access": {"read": true}, "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "ref", "type": "relationship", "relationTo": ["notes", "memos"]},
+            {"name": "mix", "type": "relationship", "relationTo": ["notes", "pages"], "hasMany": true}
+        ]}),
+    )
+    .await;
+    let doc = |slug: &str, title: &str, stage: &str| {
+        let admin = admin.clone();
+        let (slug, body) = (slug.to_owned(), json!({"title": title, "stage": stage}));
+        async move { id(&create(&admin, &format!("/api/{slug}"), body).await) }
+    };
+    let note = doc("notes", "T", "draft").await;
+    let memo = doc("memos", "T", "published").await;
+    let live = doc("pages", "T", "published").await;
+    let draft = doc("pages", "T", "draft").await;
+    let to = |slug: &str, id: &str| json!({"relationTo": slug, "value": id});
+    let items = [
+        ("i-note", Some(to("notes", &note)), vec![to("notes", &note)]),
+        ("i-memo", Some(to("memos", &memo)), vec![to("notes", &note)]),
+        ("i-live", None, vec![to("pages", &live)]),
+        ("i-draft", None, vec![to("pages", &draft)]),
+        (
+            "i-both",
+            None,
+            vec![to("pages", &draft), to("notes", &note)],
+        ),
+    ];
+    for (name, r, mix) in items {
+        create(
+            &admin,
+            "/api/items",
+            json!({"name": name, "ref": r, "mix": mix}),
+        )
+        .await;
+    }
+    let anon = visitor(&pool).await;
+    let names = |res: &Res| {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut v: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["name"].as_str().unwrap().to_owned())
+            .collect();
+        v.sort();
+        v
+    };
+    let ask = |app: &Router, q: &str| {
+        let (app, url) = (app.clone(), format!("/api/items?{q}"));
+        async move { get(&app, &url).await }
+    };
+
+    // Memos deny everything, and that leaves notes alone in the same link.
+    let q = "where[ref.title][equals]=T";
+    assert_eq!(names(&ask(&anon, q).await), ["i-note"]);
+    assert_eq!(names(&ask(&admin, q).await), ["i-memo", "i-note"]);
+    let q = "where[ref.id][equals]=";
+    assert!(names(&ask(&anon, &format!("{q}{memo}")).await).is_empty());
+    assert_eq!(names(&ask(&admin, &format!("{q}{memo}")).await), ["i-memo"]);
+    // A hidden memo counts as no link at all for the negative operators.
+    let q = "where[ref.title][not_equals]=T";
+    assert_eq!(
+        names(&ask(&anon, q).await),
+        ["i-both", "i-draft", "i-live", "i-memo"]
+    );
+
+    // Notes are open and pages are published-only: each link keeps its own collection's rule.
+    let q = "where[mix.title][equals]=T";
+    assert_eq!(
+        names(&ask(&anon, q).await),
+        ["i-both", "i-live", "i-memo", "i-note"]
+    );
+    assert_eq!(
+        names(&ask(&admin, q).await),
+        ["i-both", "i-draft", "i-live", "i-memo", "i-note"]
+    );
+    let q = "where[mix.stage][equals]=draft";
+    // The note is a draft too, and open; only the draft page stays out of reach.
+    assert_eq!(names(&ask(&anon, q).await), ["i-both", "i-memo", "i-note"]);
+    assert_eq!(
+        names(&ask(&admin, q).await),
+        ["i-both", "i-draft", "i-memo", "i-note"]
+    );
+    let q = format!("where[mix.id][equals]={draft}");
+    assert!(names(&ask(&anon, &q).await).is_empty());
+    let q = format!("where[mix.id][equals]={note}");
+    assert_eq!(names(&ask(&anon, &q).await), ["i-both", "i-memo", "i-note"]);
+}
