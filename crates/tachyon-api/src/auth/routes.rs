@@ -23,7 +23,7 @@ use uuid::Uuid;
 use super::password::Breach;
 use super::principal::{Principal, SESSION_COOKIE};
 use super::{new_session_token, token_hash};
-use crate::access::caller_of;
+use crate::access::{caller_of, signed_in_as};
 use crate::documents::json_body;
 use crate::populate::to_value;
 use crate::{ApiError, AppState};
@@ -169,15 +169,9 @@ async fn setup(
         Err(DbError::Conflict(_)) => return Err(setup_done()),
         Err(e) => return Err(e.into()),
     };
-    let admin = Caller {
-        signed_in: true,
-        admin: true,
-        role: Some("admin"),
-        user: None,
-    };
     Ok((
         StatusCode::CREATED,
-        Json(user_json(&state, id, &admin).await?),
+        Json(user_json(&state, id, &signed_in_as("admin")).await?),
     ))
 }
 
@@ -243,13 +237,7 @@ async fn login(
     .await?;
     let expires = OffsetDateTime::now_utc() + limits.absolute;
     let mut body = json!({
-        "user": user_json(&state, account.user_id, &Caller {
-            signed_in: true,
-            admin: account.role == "admin",
-            role: Some(&account.role),
-            user: None,
-        })
-        .await?,
+        "user": user_json(&state, account.user_id, &signed_in_as(&account.role)).await?,
         "exp": expires.format(&Rfc3339).map_err(|e| ApiError::Internal(e.to_string()))?,
     });
     if req.bearer {

@@ -4,10 +4,10 @@
 use std::borrow::Cow;
 
 use serde::{Deserialize, Serialize};
-
-use crate::auth::Action;
 use serde_json::{Map, Value, json};
 
+use crate::FieldError;
+use crate::auth::Action;
 use crate::query::{Filter, Lookup, check_target, parse_filter_with};
 use crate::schema::{CollectionKind, CollectionSchema, Field, FieldKind, SchemaError, data_fields};
 
@@ -570,21 +570,29 @@ pub fn readable_schema(schema: &CollectionSchema, caller: &Caller) -> Collection
 /// Removes every field the caller can't read from `doc` of `fields` (data fields), at any
 /// depth: inside groups and in each list row.
 pub fn strip_unreadable(fields: &[Field], doc: &mut Map<String, Value>, caller: &Caller) {
-    if caller.admin {
-        return;
+    if let Cow::Owned(visible) = readable_fields(fields, caller) {
+        strip_to(fields, &visible, doc);
     }
+}
+
+/// Removes from `doc` of `fields` what `visible` (`fields` as `readable_fields` pruned them)
+/// leaves out, at any depth, without compiling a rule: worked out once, used per document.
+pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value>) {
     for f in fields {
-        if !field_allows(f, Action::Read, caller) {
+        let Some(v) = visible.iter().find(|v| v.name == f.name) else {
             doc.remove(&f.name);
             continue;
+        };
+        let (all, kept) = (children(f), children(v));
+        // Pruning only removes, so the same count means nothing inside is hidden.
+        if all.len() == kept.len() {
+            continue;
         }
-        match (&f.kind, doc.get_mut(&f.name)) {
-            (FieldKind::Group { fields }, Some(Value::Object(inner))) => {
-                strip_unreadable(fields, inner, caller)
-            }
-            (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+        match doc.get_mut(&f.name) {
+            Some(Value::Object(inner)) => strip_to(all, kept, inner),
+            Some(Value::Array(rows)) => {
                 for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-                    strip_unreadable(fields, row, caller);
+                    strip_to(all, kept, row);
                 }
             }
             _ => {}
@@ -592,20 +600,63 @@ pub fn strip_unreadable(fields: &[Field], doc: &mut Map<String, Value>, caller: 
     }
 }
 
-/// Whether the caller can read every field along `path`, a dotted path in `fields` (data
-/// fields) whose list indices, if any, are skipped.
-pub fn path_readable(fields: &[Field], path: &str, caller: &Caller) -> bool {
+/// Walks `path` (dotted, as validation and references name fields) in `fields` (data
+/// fields): `Some(false)` at the first field the caller can't read, `Some(true)` when every
+/// field along it is readable, `None` when it names no field. A list's row index is
+/// skipped, and what follows a field that holds no fields (a link's `value`, a list
+/// item's index, a key inside `json`) is inside its value.
+fn walk_path(fields: &[Field], path: &str, caller: &Caller) -> Option<bool> {
     let mut current = fields;
-    for segment in path.split('.') {
-        let Some(f) = current.iter().find(|f| f.name == segment) else {
-            continue;
-        };
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let f = current.iter().find(|f| f.name == segment)?;
         if !field_allows(f, Action::Read, caller) {
-            return false;
+            return Some(false);
         }
-        current = children(f);
+        match &f.kind {
+            FieldKind::Group { fields } => current = fields,
+            FieldKind::Array { fields, .. } => {
+                segments.next_if(|s| s.parse::<usize>().is_ok());
+                current = fields;
+            }
+            _ => return Some(true),
+        }
     }
-    true
+    Some(true)
+}
+
+/// Whether `path` names a field the caller can read through every field along it.
+pub fn path_readable(fields: &[Field], path: &str, caller: &Caller) -> bool {
+    walk_path(fields, path, caller) == Some(true)
+}
+
+/// Whether `path` names a field in `fields`, readable or not.
+pub fn path_exists(fields: &[Field], path: &str) -> bool {
+    let anyone = Caller {
+        admin: true,
+        ..Caller::default()
+    };
+    walk_path(fields, path, &anyone) == Some(true)
+}
+
+/// What validation tells the caller, `errors` about `fields`, without naming or describing
+/// a field they can't read: those become one entry with no path. Errors about the document
+/// as a whole, or a field that doesn't exist, are theirs to see.
+pub fn visible_errors(
+    fields: &[Field],
+    errors: Vec<FieldError>,
+    caller: &Caller,
+) -> Vec<FieldError> {
+    let (hidden, mut out): (Vec<_>, Vec<_>) = errors
+        .into_iter()
+        .partition(|e| walk_path(fields, &e.path, caller) == Some(false));
+    if !hidden.is_empty() {
+        out.push(FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        });
+    }
+    out
 }
 
 /// The fields in `input` the caller may not write with `action` (create or update), by
@@ -822,10 +873,55 @@ mod tests {
             ("links.1.url", false),
             ("meta.code", false),
             ("inRow", false),
+            // Unknown names aren't readable; what's inside a value or past a row index is.
+            ("nope", false),
+            ("seo.nope", false),
+            ("links.x.url", false),
+            ("links.0", true),
+            ("title.0", true),
+            ("", false),
         ] {
             assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
-            assert!(path_readable(s.data(), path, &admin), "{path}");
+            assert_eq!(
+                path_readable(s.data(), path, &admin),
+                path_exists(s.data(), path)
+            );
         }
+        assert!(!path_exists(s.data(), "nope"));
+        assert!(path_exists(s.data(), "links.1.url"));
+
+        // Stripping by a shape worked out once matches compiling the rules each time.
+        let visible = readable_fields(s.data(), &viewer);
+        let mut d = doc.as_object().unwrap().clone();
+        strip_to(s.data(), &visible, &mut d);
+        assert_eq!(Value::Object(d), stripped(&viewer));
+
+        // Validation errors: what the caller can't read folds into one unnamed entry.
+        let e = |path: &str, message: &str| FieldError {
+            path: path.into(),
+            message: message.into(),
+        };
+        let errors = vec![
+            e("", "expected a JSON object"),
+            e("title", "expected text"),
+            e("seo.note", "must be at most 3 characters"),
+            e("links.1.url", "is required"),
+            e("nope", "unknown field"),
+        ];
+        let generic = e(
+            "",
+            "a field you can't see needs fixing; ask someone who can see it",
+        );
+        assert_eq!(
+            visible_errors(s.data(), errors.clone(), &viewer),
+            [
+                errors[0].clone(),
+                errors[1].clone(),
+                errors[4].clone(),
+                generic
+            ]
+        );
+        assert_eq!(visible_errors(s.data(), errors.clone(), &editor), errors);
 
         // Writes: by name, at any depth.
         let refused = |input: Value, action: Action, caller: &Caller| {

@@ -3,18 +3,18 @@
 //! API key's scopes. A join's schema `where` and the relationships inside rule filters are
 //! deliberately left unguarded: Admins write them, so they can't be used to probe.
 
+use std::borrow::Cow;
 use std::collections::HashMap;
-use std::sync::{Arc, OnceLock};
+use std::ops::Deref;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::extract::{FromRequestParts, MatchedPath, RawPathParams};
 use axum::http::request::Parts;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
-use std::borrow::Cow;
-
 use tachyon_core::access::{
-    Caller, Compiled, Rule, compile, path_readable, readable_fields, readable_schema,
-    strip_unreadable, unwritable,
+    Caller, Compiled, Rule, compile, path_exists, readable_fields, strip_to, unwritable,
+    visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{Filter, Target, parse_filter};
@@ -38,6 +38,30 @@ pub(crate) struct Access {
     schemas: Arc<Schemas>,
     /// `readable()`, worked out once per request.
     readable: OnceLock<HashMap<Uuid, Option<Filter>>>,
+    /// Each collection (by ID and schema version) as the caller can read it, worked out
+    /// once per request; `None` when they can read all of it.
+    visible: Mutex<HashMap<(Uuid, i32), Pruned>>,
+}
+
+/// A collection with the fields the caller can't read removed, or `None` for all of it.
+type Pruned = Option<Arc<CollectionSchema>>;
+
+/// A collection's fields as the caller can read them: all of them, or a pruned copy
+/// shared for the request.
+pub(crate) enum Visible<'c> {
+    All(&'c [Field]),
+    Some(Arc<CollectionSchema>),
+}
+
+impl Deref for Visible<'_> {
+    type Target = [Field];
+
+    fn deref(&self) -> &[Field] {
+        match self {
+            Visible::All(fields) => fields,
+            Visible::Some(schema) => schema.data(),
+        }
+    }
 }
 
 /// Which collections' rules a request can reach, to decide whether it needs the profile.
@@ -91,14 +115,31 @@ pub(crate) fn both(a: Option<Filter>, b: Option<Filter>) -> Option<Filter> {
     }
 }
 
-/// Who `principal` is, for static rules: field rules never read `$user`.
-pub(crate) fn caller_of(principal: &Principal) -> Caller<'_> {
-    let identity = principal.identity();
+/// Someone signed in with `role`, for static rules: field rules never read `$user`.
+pub(crate) fn signed_in_as(role: &str) -> Caller<'_> {
     Caller {
-        signed_in: identity.is_some(),
-        admin: identity.is_some_and(|i| i.role == "admin"),
-        role: identity.map(|i| i.role.as_str()),
+        signed_in: true,
+        admin: role == "admin",
+        role: Some(role),
         user: None,
+    }
+}
+
+/// Who `principal` is, for static rules.
+pub(crate) fn caller_of(principal: &Principal) -> Caller<'_> {
+    principal
+        .identity()
+        .map_or_else(Caller::default, |i| signed_in_as(&i.role))
+}
+
+/// `e`, with validation errors about fields `caller` can't read folded into one that
+/// names none of them.
+pub(crate) fn hide_errors(c: &Collection, e: ApiError, caller: &Caller) -> ApiError {
+    match e {
+        ApiError::Validation(errors) => {
+            ApiError::Validation(visible_errors(c.schema.data(), errors, caller))
+        }
+        e => e,
     }
 }
 
@@ -232,6 +273,7 @@ impl Access {
             user,
             schemas: state.schemas.clone(),
             readable: OnceLock::new(),
+            visible: Mutex::new(HashMap::new()),
         })
     }
 
@@ -246,28 +288,55 @@ impl Access {
         }
     }
 
+    /// `c` as the caller can read it, when some of it is hidden from them.
+    fn pruned(&self, c: &Collection) -> Pruned {
+        let mut visible = self.visible.lock().expect("never held across a panic");
+        visible
+            .entry((c.id, c.schema_version))
+            .or_insert_with(|| match readable_fields(c.schema.data(), &self.caller()) {
+                Cow::Borrowed(_) => None,
+                Cow::Owned(fields) => Some(Arc::new(c.schema.with_fields(fields))),
+            })
+            .clone()
+    }
+
     /// `doc` of `c` without the fields the caller can't read.
     pub(crate) fn strip(&self, c: &Collection, doc: &mut Value) {
-        if let Value::Object(doc) = doc {
-            strip_unreadable(c.schema.data(), doc, &self.caller());
+        if let (Some(visible), Value::Object(doc)) = (self.pruned(c), doc) {
+            strip_to(c.schema.data(), visible.data(), doc);
         }
     }
 
-    /// Whether the caller can read every field along `path` in `c`.
+    /// Whether the caller can read every field along `path` in `c`: whether it's still
+    /// there once what they can't read is pruned.
     pub(crate) fn reads(&self, c: &Collection, path: &str) -> bool {
-        path_readable(c.schema.data(), path, &self.caller())
+        path_exists(&self.readable_fields(c), path)
     }
 
     /// The fields of `c` the caller can read: all a filter or sort may name.
-    pub(crate) fn readable_fields<'c>(&self, c: &'c Collection) -> Cow<'c, [Field]> {
-        readable_fields(c.schema.data(), &self.caller())
+    pub(crate) fn readable_fields<'c>(&self, c: &'c Collection) -> Visible<'c> {
+        match self.pruned(c) {
+            Some(schema) => Visible::Some(schema),
+            None => Visible::All(c.schema.data()),
+        }
     }
 
     /// Another collection's schema as the caller can read it, for filters through links.
     pub(crate) fn lookup(&self, slug: &str) -> Option<CollectionSchema> {
-        self.schemas
-            .lookup(slug)
-            .map(|s| readable_schema(&s, &self.caller()))
+        let c = self
+            .schemas
+            .get(slug)
+            .filter(|c| c.schema.kind == CollectionKind::Collection)?;
+        Some(match self.pruned(&c) {
+            Some(schema) => (*schema).clone(),
+            None => c.schema.0.clone(),
+        })
+    }
+
+    /// `e`, with validation errors about fields of `c` the caller can't read folded into
+    /// one that names none of them.
+    pub(crate) fn hide(&self, c: &Collection, e: ApiError) -> ApiError {
+        hide_errors(c, e, &self.caller())
     }
 
     /// A 403 naming each field in `input` the caller may not write with `action`.

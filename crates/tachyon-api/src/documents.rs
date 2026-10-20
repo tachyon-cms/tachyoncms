@@ -214,7 +214,8 @@ pub async fn create(
     }
     let body = json_body(body)?;
     access.writes(&c, &body, Action::Create)?;
-    let data = validate_document(c.schema.data(), &body, None).map_err(ApiError::Validation)?;
+    let data = validate_document(c.schema.data(), &body, None)
+        .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
     let targets = link_targets(&state, &c).await?;
     let prepared = prepare(&targets, &c, data)?;
     check_links(&state, &access, &prepared, &[]).await?;
@@ -227,7 +228,7 @@ pub async fn create(
         access.actor(Action::Create, &c).map(|a| a.id),
     )
     .await
-    .map_err(|e| unique_error(&c, e.into()))?;
+    .map_err(|e| access.hide(&c, unique_error(&c, e.into())))?;
     Ok((
         StatusCode::CREATED,
         respond(&state, &access, c, &doc, 1).await?,
@@ -289,7 +290,7 @@ pub async fn update(
     let targets = link_targets(&state, &c).await?;
     let apply = |current: &Map<String, Value>| {
         let data = validate_document(c.schema.data(), &patch, Some(current))
-            .map_err(ApiError::Validation)?;
+            .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
         prepare(&targets, &c, data)
     };
     // Links the patch adds are checked against the stored document, then again against the
@@ -310,7 +311,7 @@ pub async fn update(
         },
     )
     .await
-    .map_err(|e| unique_error(&c, e))?;
+    .map_err(|e| access.hide(&c, unique_error(&c, e)))?;
     respond(&state, &access, c, &doc, 1).await
 }
 

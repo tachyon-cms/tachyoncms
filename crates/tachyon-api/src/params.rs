@@ -214,11 +214,10 @@ fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
         // The joined collection's fields, for its sort and filter. A join whose collection
         // has gone comes back empty, so its options only need to be well formed.
         let target = schemas.get(&j.collection);
-        let fields = |visible: bool| match &target {
-            Some(t) if visible => access.readable_fields(t).into_owned(),
-            Some(t) => t.schema.data().to_vec(),
-            None => Vec::new(),
-        };
+        let all: &[Field] = target.as_deref().map_or(&[], |t| t.schema.data());
+        let visible = target.as_deref().map(|t| access.readable_fields(t));
+        let seen: &[Field] = visible.as_deref().unwrap_or_default();
+        let fields = |visible: bool| if visible { seen } else { all };
         let mut req = JoinRequest::default();
         for (option, value) in options {
             let param = format!("{here}[{option}]");
@@ -257,7 +256,7 @@ fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
                 "sort" => {
                     let text = text()?;
                     req.sort = Some(
-                        readable(|visible| parse_sort(&fields(visible), text)).map_err(
+                        readable(|visible| parse_sort(fields(visible), text)).map_err(
                             |e| match e {
                                 Unparsed::Hidden(_) => hidden(&param),
                                 Unparsed::Bad(e) => bad(format!("{param}: {}", e.message)),
@@ -270,8 +269,8 @@ fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
                     let lookup = |slug: &str| schemas.lookup(slug);
                     let visible_lookup = |slug: &str| access.lookup(slug);
                     let filter = readable(|visible| match visible {
-                        true => parse_filter_with(&fields(true), value, &visible_lookup),
-                        false => parse_filter_with(&fields(false), value, &lookup),
+                        true => parse_filter_with(fields(true), value, &visible_lookup),
+                        false => parse_filter_with(fields(false), value, &lookup),
                     })
                     .map_err(|e| {
                         let named = |e: &FilterError| {

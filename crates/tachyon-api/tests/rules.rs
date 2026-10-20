@@ -1394,7 +1394,18 @@ async fn staff(pool: &PgPool) -> Staff {
         "/api/admin/collections",
         json!({"slug": "site", "kind": "global", "fields": [
             {"name": "name", "type": "text"},
-            {"name": "apiKey", "type": "text", "access": {"read": {"role": "editor"}, "update": {"role": "admin"}}}
+            {"name": "apiKey", "type": "text", "access": {"read": {"role": "editor"}, "update": {"role": "admin"}}},
+            {"name": "token", "type": "number", "access": {"read": {"role": "admin"}}}
+        ]}),
+    )
+    .await;
+    // Never saved, so reads show its defaults.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "prefs", "kind": "global", "fields": [
+            {"name": "title", "type": "text", "default": "p"},
+            {"name": "hint", "type": "text", "default": "h", "access": ed}
         ]}),
     )
     .await;
@@ -1631,6 +1642,10 @@ async fn unreadable_fields_are_removed_everywhere(pool: PgPool) {
         get(&s.editor, "/api/globals/site").await.json["apiKey"],
         "k"
     );
+    let prefs = get(&s.viewer, "/api/globals/prefs").await;
+    assert_eq!(prefs.json, json!({"title": "p"}));
+    let prefs = get(&s.editor, "/api/globals/prefs").await;
+    assert_eq!(prefs.json, json!({"title": "p", "hint": "h"}));
 
     // What a write sends back: `secret` gets its default, which the Author can't see.
     let made = create(&s.author, "/api/posts", json!({"title": "Mine"})).await;
@@ -1653,6 +1668,17 @@ async fn unreadable_fields_are_removed_everywhere(pool: PgPool) {
         assert!(res.json.get("pay").is_none(), "{}", res.json);
     }
     assert_eq!(get(&s.admin, &me).await.json["pay"], 9);
+    let login = json!({"email": "vic@example.com", "password": common::PASSWORD});
+    let res = send(
+        &visitor(&pool).await,
+        "POST",
+        "/api/auth/login",
+        Some(&login.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["user"]["name"], "viewer");
+    assert!(res.json["user"].get("pay").is_none(), "{}", res.json);
     let listed = get(&s.admin, "/api/users").await;
     assert!(
         listed.json["docs"]
@@ -1729,6 +1755,10 @@ async fn unreadable_fields_cant_be_filtered_or_sorted(pool: PgPool) {
             "joins[posts][where][secret][equals]",
         ),
         ("/api/people?joins[posts][sort]=rank", "joins[posts][sort]"),
+        (
+            "/api/people?joins[posts][where][author.salary][gt]=0",
+            "joins[posts][where][author.salary][gt]",
+        ),
     ];
     for (url, param) in probes {
         let res = get(&s.viewer, url).await;
@@ -1952,4 +1982,94 @@ async fn virtual_fields_dont_read_hidden_fields(pool: PgPool) {
     assert_eq!(picked.status, 200, "{}", picked.json);
     assert!(picked.json.get("authorSalary").is_none(), "{}", picked.json);
     assert!(picked.json.get("hiddenName").is_none(), "{}", picked.json);
+}
+
+/// Stores `value` at `key` in document `id` behind the API's back, as bad data would be.
+async fn corrupt(pool: &PgPool, id: &str, key: &str, value: Value) {
+    sqlx::query("UPDATE documents SET published = published || $1 WHERE id = $2")
+        .bind(json!({ key: value }))
+        .bind(uuid::Uuid::parse_str(id).unwrap())
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_fields_stay_out_of_validation_errors(pool: PgPool) {
+    let s = staff(&pool).await;
+    let generic = json!({"path": "", "message": "a field you can't see needs fixing; ask someone who can see it"});
+    // Only the generic entry, and nothing that names or describes the field.
+    let hidden = |res: &Res, field: &str| {
+        assert_problem(res, 422);
+        assert_eq!(res.json["errors"], json!([generic]), "{}", res.json);
+        let body = res.json.to_string();
+        assert!(!body.contains(field) && !body.contains("number"), "{body}");
+    };
+    let named = |res: &Res, field: &str| {
+        assert_problem(res, 422);
+        assert_eq!(res.json["errors"][0]["path"], field, "{}", res.json);
+    };
+
+    // Update: a bad stored value in a field the Author can't read.
+    let mine = id(&create(&s.author, "/api/posts", json!({"title": "Mine"})).await);
+    corrupt(&pool, &mine, "rank", json!("oops")).await;
+    let url = format!("/api/posts/{mine}");
+    hidden(
+        &patch(&s.author, &url, json!({"title": "M2"})).await,
+        "rank",
+    );
+    named(
+        &patch(&s.editor, &url, json!({"title": "M2"})).await,
+        "rank",
+    );
+    // What the caller can see is still named, beside the generic entry.
+    let res = patch(&s.author, &url, json!({"title": 5})).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([{"path": "title", "message": "expected text"}, generic])
+    );
+
+    // Create: a required field the Author can't read, with no default.
+    create(
+        &s.admin,
+        "/api/admin/collections",
+        json!({"slug": "tickets", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "code", "type": "text", "required": true, "access": {"read": {"role": "editor"}}}
+        ]}),
+    )
+    .await;
+    let author = signed_in(visitor(&pool).await, "al@example.com").await;
+    let editor = signed_in(visitor(&pool).await, "eve@example.com").await;
+    let body = json!({"title": "T"}).to_string();
+    hidden(
+        &send(&author, "POST", "/api/tickets", Some(&body)).await,
+        "code",
+    );
+    named(
+        &send(&editor, "POST", "/api/tickets", Some(&body)).await,
+        "code",
+    );
+
+    // Globals: only Admins can read `token`.
+    let site: String = sqlx::query_scalar("SELECT id::text FROM collections WHERE slug = 'site'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    corrupt(&pool, &site, "token", json!("bad")).await;
+    hidden(
+        &patch(&s.editor, "/api/globals/site", json!({"name": "S"})).await,
+        "token",
+    );
+    named(
+        &patch(&s.admin, "/api/globals/site", json!({"name": "S"})).await,
+        "token",
+    );
+
+    // Profiles: the Viewer's own pay, which only Editors can read.
+    corrupt(&pool, &s.viewer_id, "pay", json!("lots")).await;
+    let me = format!("/api/users/{}", s.viewer_id);
+    hidden(&patch(&s.viewer, &me, json!({"name": "Vic"})).await, "pay");
+    named(&patch(&s.admin, &me, json!({"name": "Vic"})).await, "pay");
 }

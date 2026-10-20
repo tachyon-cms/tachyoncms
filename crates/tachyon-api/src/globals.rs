@@ -115,8 +115,8 @@ pub async fn update(
     access.writes(&c, &patch, Action::UpdateGlobal)?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: Option<&Map<String, Value>>| {
-        let data =
-            validate_document(c.schema.data(), &patch, current).map_err(ApiError::Validation)?;
+        let data = validate_document(c.schema.data(), &patch, current)
+            .map_err(|e| access.hide(&c, ApiError::Validation(e)))?;
         prepare(&targets, &c, data)
     };
     let before = |current: Option<&Map<String, Value>>| {
@@ -156,7 +156,7 @@ pub async fn update(
             Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
             Err(ApiError::NotFound) if guard.is_some() => return Err(DbError::Forbidden.into()),
             Err(ApiError::NotFound) => {}
-            Err(e) => return Err(unique_error(&c, e)),
+            Err(e) => return Err(access.hide(&c, unique_error(&c, e))),
         }
         let next = apply(None)?;
         vouched_links(&next, &[], &vouched)?;
@@ -172,7 +172,7 @@ pub async fn update(
         {
             Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
             Err(DbError::UniqueViolation(ref name)) if name == "documents_pkey" => continue,
-            Err(e) => return Err(unique_error(&c, e.into())),
+            Err(e) => return Err(access.hide(&c, unique_error(&c, e.into()))),
         }
     }
     Err(ApiError::Internal(

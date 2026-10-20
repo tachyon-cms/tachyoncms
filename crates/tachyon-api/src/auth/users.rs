@@ -17,7 +17,7 @@ use uuid::Uuid;
 use super::principal::Principal;
 use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
-use crate::access::{Access, Reach, caller_of, refuse_fields};
+use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
 use crate::populate::{check_links, link_ids, link_targets, prepare, vouched_links};
 use crate::{ApiError, AppState};
@@ -160,14 +160,15 @@ pub(crate) async fn create(
         errors.push(field("password", m));
     }
     let users = any_collection(&state, auth::USERS)?;
+    let caller = caller_of(&principal);
     let profile = Value::Object(profile);
-    refuse_fields(&users, &profile, Action::Create, &caller_of(&principal))?;
+    refuse_fields(&users, &profile, Action::Create, &caller)?;
     let data = validate_document(users.schema.data(), &profile, None);
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
     }
     if !errors.is_empty() {
-        return Err(ApiError::Validation(errors));
+        return Err(hide_errors(&users, ApiError::Validation(errors), &caller));
     }
     known_role(&state, &role).await?;
     check_new_password(&state, "password", &password).await?;
@@ -194,7 +195,7 @@ pub(crate) async fn create(
         actor(&principal, decision).map(|a| a.id),
     )
     .await
-    .map_err(|e| unique_error(&users, e.into()))?;
+    .map_err(|e| hide_errors(&users, unique_error(&users, e.into()), &caller))?;
     Ok((
         StatusCode::CREATED,
         Json(user_json(&state, id, &caller_of(&principal)).await?),
@@ -213,7 +214,8 @@ pub(crate) async fn update(
     let (account, profile) = split(json_body(body)?)?;
     let users = any_collection(&state, auth::USERS)?;
     let profile = Value::Object(profile);
-    refuse_fields(&users, &profile, Action::Update, &caller_of(&principal))?;
+    let caller = caller_of(&principal);
+    refuse_fields(&users, &profile, Action::Update, &caller)?;
     let current = auth::account(&state.pool, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -272,7 +274,7 @@ pub(crate) async fn update(
     let patch = profile;
     let apply = |current: &Map<String, Value>| {
         let data = validate_document(users.schema.data(), &patch, Some(current))
-            .map_err(ApiError::Validation)?;
+            .map_err(|e| hide_errors(&users, ApiError::Validation(e), &caller))?;
         prepare(&targets, &users, data)
     };
     let vouched = if patch.as_object().is_some_and(|p| !p.is_empty()) {
@@ -311,7 +313,7 @@ pub(crate) async fn update(
             },
         )
         .await
-        .map_err(|e| unique_error(&users, e))?;
+        .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller))?;
     }
     if let Some(role) = role {
         auth::set_role(&mut tx, id, role).await?;
