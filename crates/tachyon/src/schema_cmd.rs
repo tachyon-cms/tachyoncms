@@ -6,8 +6,10 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
+use tachyon_db::auth::{USERS, check_users_schema};
 use tachyon_db::schema_change::{self, ChangeError, Preview};
 use tachyon_db::{collections, indexes};
 
@@ -142,38 +144,42 @@ pub async fn run(
         }
     }
 
-    for s in &wanted {
-        let lookup = |slug: &str| {
-            wanted.iter().find(|o| o.slug == slug).or_else(|| {
+    // Every collection must work with the file's schemas in place of the database's, those
+    // left out of the file included: virtual and join fields read other collections, and
+    // access rules filter through them or read `$user` fields from `users`.
+    let lookup = |slug: &str| {
+        wanted
+            .iter()
+            .find(|o| o.slug == slug)
+            .or_else(|| {
                 existing
                     .iter()
                     .map(|c| &c.schema.0)
                     .find(|o| o.slug == slug)
             })
-        };
+            .cloned()
+    };
+    let roles = tachyon_db::auth::roles_list(pool).await?;
+    let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
+    let users = lookup(USERS).map(|u| u.fields).unwrap_or_default();
+    let works = |s: &CollectionSchema| {
         s.check_virtual_targets(lookup)
             .and_then(|()| s.check_join_targets(lookup))
+            .and_then(|()| check_rules(s, &users, &roles, &lookup))
+    };
+    for s in &wanted {
+        // `check_users_schema` here too for a `users` the file creates, which skips the
+        // change's own check.
+        check_users_schema(s)
+            .and_then(|()| works(s))
             .with_context(|| s.slug.clone())?;
     }
-
-    // Collections left out of the file must still work with the ones it changes.
     for c in &existing {
         let other = &c.schema.0;
-        if wanted.iter().any(|s| s.slug == other.slug) {
-            continue;
+        if !wanted.iter().any(|s| s.slug == other.slug) {
+            works(other)
+                .with_context(|| format!("{} (not in the file) would break", other.slug))?;
         }
-        let lookup = |slug: &str| {
-            wanted.iter().find(|o| o.slug == slug).or_else(|| {
-                existing
-                    .iter()
-                    .map(|c| &c.schema.0)
-                    .find(|o| o.slug == slug)
-            })
-        };
-        other
-            .check_virtual_targets(lookup)
-            .and_then(|()| other.check_join_targets(lookup))
-            .with_context(|| format!("{} (not in the file) would break", other.slug))?;
     }
 
     let none = Renames::new();
@@ -394,6 +400,18 @@ mod tests {
         );
     }
 
+    #[test]
+    fn the_access_slug_is_reserved() {
+        for kind in ["collection", "global"] {
+            let file = json!({"collections": [{"slug": "access", "kind": kind, "fields": []}]});
+            let err = parse_bundle(&file.to_string()).unwrap_err();
+            assert_eq!(
+                format!("{err:#}"),
+                "access: collection slug `access` is reserved"
+            );
+        }
+    }
+
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn duplicate_slugs_and_renames_on_new_collections_are_refused(pool: PgPool) {
         let twice = json!({"collections": [
@@ -505,5 +523,105 @@ mod tests {
         .await
         .unwrap();
         assert!(plan.contains("remove posts (it stored nothing)"), "{plan}");
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn rules_round_trip_through_export_and_apply(pool: PgPool) {
+        let abilities =
+            serde_json::from_value(json!({"content": "read", "schemas": false, "users": false}))
+                .unwrap();
+        tachyon_db::auth::role_upsert(&pool, "reviewer", "Reviewer", &abilities)
+            .await
+            .unwrap();
+        let posts = |read: Value| {
+            json!({"slug": "posts",
+            "access": {"read": read, "create": {"signedIn": true}, "update": {"author": "$user.id"}},
+            "fields": [
+                {"name": "title", "type": "text", "access": {"update": {"role": ["editor", "reviewer"]}}},
+                {"name": "author", "type": "relationship", "relationTo": "users"},
+                {"name": "notes", "type": "group", "fields": [
+                    {"name": "body", "type": "text", "access": {"read": {"or": [{"signedIn": true}, false]}}}
+                ]}
+            ]})
+        };
+        let users = json!({"slug": "users", "fields": [
+            {"name": "name", "type": "text", "required": true},
+            {"name": "team", "type": "text"}
+        ]});
+        let read = json!({"or": [{"author.team": "$user.team"}, {"title": {"like": "public"}}]});
+        let file = json!({"collections": [users, posts(read)]});
+        run(&pool, &file.to_string(), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+
+        let exported: Value = serde_json::from_str(&export(&pool).await.unwrap()).unwrap();
+        let saved = exported["collections"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|c| c["slug"] == "posts")
+            .unwrap();
+        assert_eq!(saved["access"], file["collections"][1]["access"]);
+        assert_eq!(
+            saved["fields"][0]["access"],
+            json!({"update": {"role": ["editor", "reviewer"]}})
+        );
+        assert_eq!(
+            saved["fields"][2]["fields"][0]["access"],
+            json!({"read": {"or": [{"signedIn": true}, false]}})
+        );
+        let out = run(&pool, &exported.to_string(), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(out.contains("= posts unchanged"), "{out}");
+
+        for (read, message) in [
+            (
+                json!(1),
+                "posts: access.read: a rule is true, false, {\"role\": …}, {\"signedIn\": …}, {\"and\": […]}, {\"or\": […]} or a where filter",
+            ),
+            (
+                json!({"role": "ghost"}),
+                "posts: access.read: there's no role `ghost`",
+            ),
+            (
+                json!({"title": "$user.nope"}),
+                "posts: access.read: `$user.nope` isn't id, role or a users field",
+            ),
+        ] {
+            let file = json!({"collections": [posts(read)]}).to_string();
+            let err = run(&pool, &file, &BTreeMap::new(), Some(false))
+                .await
+                .unwrap_err();
+            assert_eq!(format!("{err:#}"), message);
+        }
+
+        // A change that would break a rule in a collection left out of the file.
+        let no_team = json!({"collections": [{"slug": "users", "fields": [
+            {"name": "name", "type": "text", "required": true}
+        ]}]});
+        let err = run(&pool, &no_team.to_string(), &BTreeMap::new(), Some(true))
+            .await
+            .unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("posts (not in the file) would break: access.read: "),
+            "{err:#}"
+        );
+
+        // Rules on users itself aren't enforced, so they're refused.
+        let mut ruled = file["collections"][0].clone();
+        ruled["access"] = json!({"read": true});
+        let err = run(
+            &pool,
+            &json!({"collections": [ruled]}).to_string(),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("users: access: rules on users aren't enforced yet"),
+            "{err:#}"
+        );
     }
 }

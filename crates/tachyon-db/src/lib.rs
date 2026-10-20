@@ -36,6 +36,9 @@ pub enum DbError {
     /// The caller may only change documents they created, and this isn't one.
     #[error("not the owner")]
     NotOwner,
+    /// The stored document doesn't match the caller's update or delete rule.
+    #[error("refused by an access rule")]
+    Forbidden,
     /// A change the rules don't allow, explained in a sentence for the person making it.
     #[error("{0}")]
     Refused(String),

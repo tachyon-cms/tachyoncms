@@ -90,6 +90,8 @@ fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Val
                                 }
                             }
                         }
+                        // Including fields the caller may not update: a group that wasn't
+                        // stored never held them, so its defaults overwrite nothing.
                         (FieldKind::Group { fields }, Value::Object(group)) => {
                             apply_defaults(fields, group)
                         }

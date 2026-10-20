@@ -5,6 +5,8 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use tachyon_core::CollectionKind;
+use tachyon_core::access::Compiled;
+use tachyon_core::auth::Action;
 use tachyon_core::joins::{JoinField, on_pattern};
 use tachyon_core::query::{Filter, parse_filter_with, parse_sort};
 use tachyon_core::select::{Select, project};
@@ -12,6 +14,7 @@ use tachyon_db::collections::Collection;
 use tachyon_db::query::{self, JoinQuery};
 use uuid::Uuid;
 
+use crate::access::{Access, both};
 use crate::params::{JoinRequest, Joins};
 use crate::populate::{Shapes, child_shape, fill_virtuals_each, populate, to_value};
 use crate::{ApiError, AppState};
@@ -46,7 +49,8 @@ fn empty(count: bool) -> Value {
 }
 
 /// What a join reads from, or `None` when its collection or linking field has gone since the
-/// schema was saved: then it comes back empty rather than failing the read.
+/// schema was saved, or the caller can't read that collection: then it comes back empty
+/// rather than failing the read.
 struct Plan {
     target: Arc<Collection>,
     pattern: String,
@@ -56,11 +60,20 @@ struct Plan {
 
 // ponytail: the schema's `where` and `defaultSort` are parsed on every read; cache them on
 // the collection if that shows up in a profile.
-fn plan(state: &AppState, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> {
+fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> {
     let target = state
         .schemas
         .get(&j.collection)
         .filter(|t| t.schema.kind == CollectionKind::Collection)?;
+    let read = match access.allows(Action::Read, &target) {
+        Compiled::Deny => return None,
+        Compiled::Allow => None,
+        Compiled::Filter(f) => Some(f),
+    };
+    // Which documents link here through a field the caller can't read is hidden too.
+    if !access.reads(&target, &j.on) {
+        return None;
+    }
     let pattern = on_pattern(target.schema.data(), &j.on)?;
     let schema_filter = match &j.r#where {
         Some(w) => {
@@ -69,15 +82,15 @@ fn plan(state: &AppState, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> 
         }
         None => None,
     };
-    // The schema's filter always applies; a request can only narrow it.
-    let filter = match (schema_filter, req.filter.take()) {
-        (Some(a), Some(b)) => Some(Filter::All(vec![a, b])),
-        (a, b) => a.or(b),
-    };
+    // The schema's filter and the caller's read rule always apply; a request can only
+    // narrow them.
+    let filter = both(both(schema_filter, read), req.filter.take());
+    // A default sort on a field the caller can't read would rank what they can't see, so
+    // they get the usual order instead.
     let sort = req.sort.take().or_else(|| {
         j.sort
             .as_deref()
-            .and_then(|s| parse_sort(target.schema.data(), s).ok())
+            .and_then(|s| parse_sort(&access.readable_fields(&target), s).ok())
     });
     Some(Plan {
         target,
@@ -93,6 +106,7 @@ fn plan(state: &AppState, j: &JoinField, req: &mut JoinRequest) -> Option<Plan> 
 /// they're IDs.
 pub(crate) async fn fill_joins(
     state: &AppState,
+    access: &Access,
     items: &mut [(Value, Arc<Collection>)],
     select: Option<&Select>,
     joins: &Joins,
@@ -110,7 +124,7 @@ pub(crate) async fn fill_joins(
     }
     for c in collections {
         for j in c.schema.join_fields() {
-            if select.is_some_and(|s| !s.keeps(&j.path)) {
+            if select.is_some_and(|s| !s.keeps(&j.path)) || !access.reads(&c, &j.path) {
                 continue;
             }
             let mut req = requests.get(&j.path).cloned().unwrap_or_default();
@@ -122,7 +136,7 @@ pub(crate) async fn fill_joins(
                 .filter_map(|(i, (v, _))| Some((i, Uuid::try_parse(v.get("id")?.as_str()?).ok()?)))
                 .collect();
             let count = req.count;
-            let Some(plan) = plan(state, &j, &mut req) else {
+            let Some(plan) = plan(state, access, &j, &mut req) else {
                 for (i, _) in &parents {
                     if let Some(doc) = items[*i].0.as_object_mut() {
                         set_at(doc, &j.path, empty(count));
@@ -163,7 +177,9 @@ pub(crate) async fn fill_joins(
                     joined.push(if depth == 0 {
                         Value::String(doc.id.to_string())
                     } else {
-                        to_value(doc)?
+                        let mut value = to_value(doc)?;
+                        access.strip(&plan.target, &mut value);
+                        value
                     });
                 }
             }
@@ -176,13 +192,13 @@ pub(crate) async fn fill_joins(
                     .map(|v| (v, plan.target.clone()))
                     .collect();
                 let selects = vec![shape.as_ref(); pairs.len()];
-                fill_virtuals_each(state, &mut pairs, &selects).await?;
+                fill_virtuals_each(state, access, &mut pairs, &selects).await?;
                 for (v, _) in &mut pairs {
                     if let (Some(s), Value::Object(doc)) = (&shape, v) {
                         project(s, doc);
                     }
                 }
-                populate(state, pairs, depth - 1, shapes).await?
+                populate(state, access, pairs, depth - 1, shapes).await?
             };
             let mut by_owner: HashMap<usize, Vec<Value>> = HashMap::new();
             for (owner, v) in owners.into_iter().zip(values) {

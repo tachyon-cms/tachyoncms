@@ -19,6 +19,7 @@ pub struct Collection {
 
 pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collection, DbError> {
     let mut tx = pool.begin().await?;
+    crate::auth::check_rule_roles(&mut tx, schema).await?;
     let created = sqlx::query_as!(
         Collection,
         r#"INSERT INTO collections (id, tenant_id, slug, kind, schema)

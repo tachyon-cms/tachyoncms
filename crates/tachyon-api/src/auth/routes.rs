@@ -10,6 +10,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use tachyon_core::access::{Caller, strip_unreadable};
 use tachyon_core::auth::check_password;
 use tachyon_core::{FieldError, is_email};
 use tachyon_db::DbError;
@@ -22,6 +23,7 @@ use uuid::Uuid;
 use super::password::Breach;
 use super::principal::{Principal, SESSION_COOKIE};
 use super::{new_session_token, token_hash};
+use crate::access::{caller_of, signed_in_as};
 use crate::documents::json_body;
 use crate::populate::to_value;
 use crate::{ApiError, AppState};
@@ -92,14 +94,22 @@ pub(crate) async fn check_new_password(
     Ok(())
 }
 
-/// A user as the API shows them: their profile document plus email and role, never the hash.
-pub(crate) async fn user_json(state: &AppState, user_id: Uuid) -> Result<Value, ApiError> {
+/// A user as the API shows `caller` them: their profile document, without the fields the
+/// caller can't read, plus email and role, never the hash.
+pub(crate) async fn user_json(
+    state: &AppState,
+    user_id: Uuid,
+    caller: &Caller<'_>,
+) -> Result<Value, ApiError> {
     let account = auth::account(&state.pool, user_id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let users = auth::ensure_users_collection(&state.pool).await?;
     let doc = documents::get(&state.pool, users.id, user_id).await?;
     let mut value = to_value(&doc)?;
+    if let Value::Object(profile) = &mut value {
+        strip_unreadable(users.schema.data(), profile, caller);
+    }
     value["email"] = account.email.into();
     value["role"] = account.role.into();
     Ok(value)
@@ -159,7 +169,10 @@ async fn setup(
         Err(DbError::Conflict(_)) => return Err(setup_done()),
         Err(e) => return Err(e.into()),
     };
-    Ok((StatusCode::CREATED, Json(user_json(&state, id).await?)))
+    Ok((
+        StatusCode::CREATED,
+        Json(user_json(&state, id, &signed_in_as("admin")).await?),
+    ))
 }
 
 fn setup_done() -> ApiError {
@@ -224,7 +237,7 @@ async fn login(
     .await?;
     let expires = OffsetDateTime::now_utc() + limits.absolute;
     let mut body = json!({
-        "user": user_json(&state, account.user_id).await?,
+        "user": user_json(&state, account.user_id, &signed_in_as(&account.role)).await?,
         "exp": expires.format(&Rfc3339).map_err(|e| ApiError::Internal(e.to_string()))?,
     });
     if req.bearer {
@@ -255,7 +268,9 @@ async fn logout(State(state): State<AppState>, principal: Principal) -> Result<R
 
 async fn me(State(state): State<AppState>, principal: Principal) -> Result<Json<Value>, ApiError> {
     let identity = principal.require()?;
-    Ok(Json(user_json(&state, identity.user_id).await?))
+    Ok(Json(
+        user_json(&state, identity.user_id, &caller_of(&principal)).await?,
+    ))
 }
 
 async fn sessions(

@@ -10,7 +10,7 @@ pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "sta
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
-    "admin", "auth", "globals", "media", "search", "graphql", "plugins", "setup",
+    "access", "admin", "auth", "globals", "media", "search", "graphql", "plugins", "setup",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -22,6 +22,9 @@ pub struct CollectionSchema {
     /// What other collections get when they populate a link to this one, as a `select`.
     #[serde(default, rename = "defaultPopulate")]
     pub default_populate: Option<Map<String, Value>>,
+    /// Who may read, create, update and delete its documents; see `access`.
+    #[serde(default)]
+    pub access: Option<crate::access::CollectionAccess>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -30,13 +33,19 @@ pub struct CollectionSchema {
 
 impl PartialEq for CollectionSchema {
     fn eq(&self, other: &Self) -> bool {
-        (&self.slug, self.kind, &self.fields, &self.default_populate)
-            == (
-                &other.slug,
-                other.kind,
-                &other.fields,
-                &other.default_populate,
-            )
+        (
+            &self.slug,
+            self.kind,
+            &self.fields,
+            &self.default_populate,
+            &self.access,
+        ) == (
+            &other.slug,
+            other.kind,
+            &other.fields,
+            &other.default_populate,
+            &other.access,
+        )
     }
 }
 
@@ -78,6 +87,9 @@ pub struct Field {
     /// Read through a relationship instead of stored, such as `author.name`.
     #[serde(default, rename = "virtual")]
     pub virtual_path: Option<String>,
+    /// Who may read and write this field; see `access`.
+    #[serde(default)]
+    pub access: Option<crate::access::FieldAccess>,
     #[serde(flatten)]
     pub kind: FieldKind,
 }
@@ -376,6 +388,7 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             virtual_path: None,
+                            access: None,
                             kind: FieldKind::Group {
                                 fields: flatten(&tab.fields),
                             },
@@ -764,7 +777,21 @@ pub fn explain_parse_error(raw: &Value, e: &serde_json::Error) -> String {
         }
         None
     }
-    locate(raw.get("fields"), "fields", "").unwrap_or_else(|| e.to_string())
+    /// The collection's own `access`, by the rule at fault.
+    fn locate_access(raw: &Value) -> Option<String> {
+        let access = raw.get("access")?;
+        for (action, rule) in access.as_object().into_iter().flatten() {
+            if let Err(e) = crate::access::parse_rule(rule) {
+                return Some(format!("access.{action}: {e}"));
+            }
+        }
+        crate::access::CollectionAccess::deserialize(access)
+            .err()
+            .map(|e| format!("access: {e}"))
+    }
+    locate(raw.get("fields"), "fields", "")
+        .or_else(|| locate_access(raw))
+        .unwrap_or_else(|| e.to_string())
 }
 
 #[derive(Debug, PartialEq, thiserror::Error)]
@@ -860,6 +887,18 @@ impl CollectionSchema {
     pub fn data(&self) -> &[Field] {
         self.data
             .get_or_init(|| data_fields(&self.fields).into_owned())
+    }
+
+    /// This schema with other fields, such as only those a caller may read.
+    pub fn with_fields(&self, fields: Vec<Field>) -> Self {
+        Self {
+            slug: self.slug.clone(),
+            kind: self.kind,
+            fields,
+            default_populate: self.default_populate.clone(),
+            access: self.access.clone(),
+            data: OnceLock::new(),
+        }
     }
 
     /// Every join field, with how to find its documents.
@@ -1517,6 +1556,11 @@ mod tests {
     fn rejects_reserved_slug() {
         let s = schema(json!({"slug": "admin", "fields": []}));
         assert_eq!(s.check(), Err(SchemaError::ReservedSlug("admin".into())));
+        // `/api/access` answers what the caller may do, for collections and globals alike.
+        for kind in ["collection", "global"] {
+            let s = schema(json!({"slug": "access", "kind": kind, "fields": []}));
+            assert_eq!(s.check(), Err(SchemaError::ReservedSlug("access".into())));
+        }
     }
 
     #[test]

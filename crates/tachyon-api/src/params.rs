@@ -3,13 +3,16 @@
 use std::collections::HashMap;
 
 use serde_json::{Map, Value};
-use tachyon_core::query::{Cursor, Filter, Sort, parse_filter_with, parse_query, parse_sort};
+use tachyon_core::query::{
+    Cursor, Filter, FilterError, Sort, parse_filter_with, parse_query, parse_sort,
+};
 use tachyon_core::schema::NEAR_IN_JOIN;
 use tachyon_core::select::{Select, parse_select};
 use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
 
 use crate::ApiError;
+use crate::access::Access;
 use crate::populate::Shapes;
 use crate::schemas::Schemas;
 
@@ -62,6 +65,43 @@ pub(crate) struct JoinRequest {
 
 fn bad(message: impl Into<String>) -> ApiError {
     ApiError::BadRequest(message.into())
+}
+
+/// Why a filter or sort didn't parse.
+enum Unparsed {
+    /// It names a field the caller can't read.
+    Hidden(FilterError),
+    Bad(FilterError),
+}
+
+/// Parses a filter or sort with only the fields the caller can read (`parse(true)`). When
+/// that fails but the whole schema doesn't, or fails differently, the parameter names a
+/// field they can't read: refused, whatever else is wrong with it, so nothing about its
+/// values (not even its type) can be learned.
+fn readable<T>(parse: impl Fn(bool) -> Result<T, FilterError>) -> Result<T, Unparsed> {
+    let visible = match parse(true) {
+        Ok(v) => return Ok(v),
+        Err(e) => e,
+    };
+    match parse(false) {
+        Err(full) if full == visible => Err(Unparsed::Bad(full)),
+        _ => Err(Unparsed::Hidden(visible)),
+    }
+}
+
+fn hidden(param: &str) -> ApiError {
+    ApiError::Forbidden(format!(
+        "{param}: you can't filter or sort by a field you can't read"
+    ))
+}
+
+impl From<Unparsed> for ApiError {
+    fn from(e: Unparsed) -> Self {
+        match e {
+            Unparsed::Hidden(e) => hidden(&e.param),
+            Unparsed::Bad(e) => bad(e.to_string()),
+        }
+    }
 }
 
 fn params(raw: Option<&str>, allowed: &[&str]) -> Result<Map<String, Value>, ApiError> {
@@ -124,11 +164,8 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
     Ok(out)
 }
 
-fn joins(
-    params: &Map<String, Value>,
-    c: &Collection,
-    schemas: &Schemas,
-) -> Result<Joins, ApiError> {
+fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result<Joins, ApiError> {
+    let schemas = access.schemas();
     let by_name = match params.get("joins") {
         None => return Ok(Joins::all()),
         Some(Value::String(s)) if s == "false" => return Ok(Joins::Off),
@@ -176,8 +213,11 @@ fn joins(
         };
         // The joined collection's fields, for its sort and filter. A join whose collection
         // has gone comes back empty, so its options only need to be well formed.
-        let target = schemas.get(&j.collection).map(|t| t.schema.data().to_vec());
-        let target = target.as_deref().unwrap_or_default();
+        let target = schemas.get(&j.collection);
+        let all: &[Field] = target.as_deref().map_or(&[], |t| t.schema.data());
+        let visible = target.as_deref().map(|t| access.readable_fields(t));
+        let seen: &[Field] = visible.as_deref().unwrap_or_default();
+        let fields = |visible: bool| if visible { seen } else { all };
         let mut req = JoinRequest::default();
         for (option, value) in options {
             let param = format!("{here}[{option}]");
@@ -214,23 +254,41 @@ fn joins(
                     }
                 }
                 "sort" => {
+                    let text = text()?;
                     req.sort = Some(
-                        parse_sort(target, text()?)
-                            .map_err(|e| bad(format!("{param}: {}", e.message)))?,
+                        readable(|visible| parse_sort(fields(visible), text)).map_err(
+                            |e| match e {
+                                Unparsed::Hidden(_) => hidden(&param),
+                                Unparsed::Bad(e) => bad(format!("{param}: {}", e.message)),
+                            },
+                        )?,
                     );
                 }
                 "where" => {
                     // `where[title][equals]` from the parser becomes `joins[posts][where][title][equals]`.
                     let lookup = |slug: &str| schemas.lookup(slug);
-                    let filter = parse_filter_with(target, value, &lookup).map_err(|e| {
-                        let rest = e.param.strip_prefix("where").unwrap_or(&e.param);
-                        let hint = e.message.replace("where[", &format!("{param}["));
-                        bad(format!("{param}{rest}: {hint}"))
+                    let visible_lookup = |slug: &str| access.lookup(slug);
+                    let filter = readable(|visible| match visible {
+                        true => parse_filter_with(fields(true), value, &visible_lookup),
+                        false => parse_filter_with(fields(false), value, &lookup),
+                    })
+                    .map_err(|e| {
+                        let named = |e: &FilterError| {
+                            let rest = e.param.strip_prefix("where").unwrap_or(&e.param);
+                            format!("{param}{rest}")
+                        };
+                        match e {
+                            Unparsed::Hidden(e) => hidden(&named(&e)),
+                            Unparsed::Bad(e) => {
+                                let hint = e.message.replace("where[", &format!("{param}["));
+                                bad(format!("{}: {hint}", named(&e)))
+                            }
+                        }
                     })?;
                     if filter.near().is_some() {
                         return Err(bad(format!("{param}: {NEAR_IN_JOIN}")));
                     }
-                    req.filter = Some(filter);
+                    req.filter = Some(access.guard(filter));
                 }
                 _ => {
                     return Err(bad(format!(
@@ -255,11 +313,14 @@ fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     }
 }
 
+/// The parameters of a list. Filters that reach through relationships are guarded by the
+/// linked collections' read rules for the caller.
 pub(crate) fn list_params(
     raw: Option<&str>,
     c: &Collection,
-    schemas: &Schemas,
+    access: &Access,
 ) -> Result<ListParams, ApiError> {
+    let schemas = access.schemas();
     let params = params(
         raw,
         &[
@@ -282,15 +343,20 @@ pub(crate) fn list_params(
         Some("true") => true,
         Some(_) => return Err(bad("count must be true or false")),
     };
+    let visible = access.readable_fields(c);
     let filter = params
         .get("where")
-        .map(|w| parse_filter_with(fields, w, &|slug: &str| schemas.lookup(slug)))
-        .transpose()
-        .map_err(|e| bad(e.to_string()))?;
+        .map(|w| {
+            readable(|v| match v {
+                true => parse_filter_with(&visible, w, &|slug: &str| access.lookup(slug)),
+                false => parse_filter_with(fields, w, &|slug: &str| schemas.lookup(slug)),
+            })
+        })
+        .transpose()?
+        .map(|f| access.guard(f));
     let sort = single(&params, "sort")?
-        .map(|s| parse_sort(fields, s))
-        .transpose()
-        .map_err(|e| bad(e.to_string()))?;
+        .map(|s| readable(|v| parse_sort(if v { &visible } else { fields }, s)))
+        .transpose()?;
     let after = single(&params, "after")?
         .map(|s| Cursor::decode(s).ok_or_else(|| bad("after isn't a valid cursor")))
         .transpose()?;
@@ -314,7 +380,7 @@ pub(crate) fn list_params(
         depth: depth(&params)?,
         select: select(&params, fields)?,
         populate: populate(&params, schemas)?,
-        joins: joins(&params, c, schemas)?,
+        joins: joins(&params, c, access)?,
         filter,
         sort,
     })
@@ -323,13 +389,13 @@ pub(crate) fn list_params(
 pub(crate) fn read_params(
     raw: Option<&str>,
     c: &Collection,
-    schemas: &Schemas,
+    access: &Access,
 ) -> Result<ReadParams, ApiError> {
     let params = params(raw, &["depth", "select", "populate", "joins"])?;
     Ok(ReadParams {
         depth: depth(&params)?,
         select: select(&params, c.schema.data())?,
-        populate: populate(&params, schemas)?,
-        joins: joins(&params, c, schemas)?,
+        populate: populate(&params, access.schemas())?,
+        joins: joins(&params, c, access)?,
     })
 }

@@ -1,6 +1,6 @@
 //! Replaces relationship IDs with the documents they point at, one query per depth level.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -11,9 +11,11 @@ use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
-use tachyon_db::documents::{self, Document, Prepared, Relation};
+use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
+use tachyon_db::query::get_many_readable;
 use uuid::Uuid;
 
+use crate::access::Access;
 use crate::{ApiError, AppState};
 
 type Populated<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, ApiError>> + Send + 'a>>;
@@ -75,23 +77,98 @@ pub(crate) fn prepare(
     })
 }
 
+/// The IDs `data` of `c` links to.
+pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
+    relations(c.schema.data(), data)
+        .into_iter()
+        .map(|r| r.id)
+        .collect()
+}
+
+/// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
+pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
+
+/// Refuses the links in `next` that `before` didn't hold and that the caller can't read,
+/// exactly as a link to no document is refused, so a write can't tell a hidden document
+/// from a missing one. Links already on the document stay as they are.
+pub(crate) async fn check_links(
+    state: &AppState,
+    access: &Access,
+    next: &Prepared,
+    before: &[Uuid],
+) -> Result<Vouched, ApiError> {
+    let mut ids: Vec<Uuid> = next
+        .relations
+        .iter()
+        .map(|r| r.id)
+        .filter(|id| !before.contains(id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(Vouched::new());
+    }
+    // Any existing user may be linked (an author, an assignee): users aren't governed by
+    // rules until front-end accounts land, so only their existence is checked. Profiles
+    // read like content, so `readable()` already holds users for most callers; this keeps
+    // it true for an API key whose scopes don't cover reading users, which may still link
+    // any existing user it holds the ID of.
+    let mut linkable = access.readable().clone();
+    if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
+        linkable.insert(users.id, None);
+    }
+    let vouched = get_many_readable(&state.pool, &ids, &linkable)
+        .await?
+        .into_iter()
+        .map(|(collection_id, doc)| (doc.id, collection_id))
+        .collect();
+    vouched_links(next, before, &vouched)?;
+    Ok(vouched)
+}
+
+/// `check_links`' answer applied to the document as locked for the write: a link added
+/// since the check (relative to `before`) that it didn't vouch for is refused the same way.
+pub(crate) fn vouched_links(
+    next: &Prepared,
+    before: &[Uuid],
+    vouched: &Vouched,
+) -> Result<(), ApiError> {
+    let missing: Vec<FieldError> = next
+        .relations
+        .iter()
+        .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
+        .map(|r| FieldError {
+            path: r.path.clone(),
+            message: MISSING_LINK.into(),
+        })
+        .collect();
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(missing))
+    }
+}
+
 pub(crate) fn to_value(doc: &Document) -> Result<Value, ApiError> {
     serde_json::to_value(doc).map_err(|e| ApiError::Internal(e.to_string()))
 }
 
 /// Fills each document's virtual fields (those `select` keeps) with one query for all of them.
+/// A linked document the caller can't read gives no value.
 pub(crate) async fn fill_virtuals(
     state: &AppState,
+    access: &Access,
     items: &mut [(Value, Arc<Collection>)],
     select: Option<&Select>,
 ) -> Result<(), ApiError> {
     let selects = vec![select; items.len()];
-    fill_virtuals_each(state, items, &selects).await
+    fill_virtuals_each(state, access, items, &selects).await
 }
 
 /// `fill_virtuals` where each document has its own `select`, still in one query.
 pub(crate) async fn fill_virtuals_each(
     state: &AppState,
+    access: &Access,
     items: &mut [(Value, Arc<Collection>)],
     selects: &[Option<&Select>],
 ) -> Result<(), ApiError> {
@@ -102,7 +179,7 @@ pub(crate) async fn fill_virtuals_each(
             c.schema
                 .virtual_fields()
                 .into_iter()
-                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)))
+                .filter(|v| select.is_none_or(|s| s.keeps(&v.path)) && access.reads(c, &v.path))
                 .collect()
         })
         .collect();
@@ -117,10 +194,15 @@ pub(crate) async fn fill_virtuals_each(
     if ids.is_empty() {
         return Ok(());
     }
-    let linked: HashMap<Uuid, Value> = documents::get_many(&state.pool, &ids)
+    // Each linked document as the caller may read it, so a hidden field gives no value.
+    let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, access.readable())
         .await?
         .into_iter()
-        .map(|(_, doc)| (doc.id, Value::Object(doc.data.0)))
+        .filter_map(|(collection_id, doc)| {
+            let mut value = Value::Object(doc.data.0);
+            access.strip(&*state.schemas.get_by_id(collection_id)?, &mut value);
+            Some((doc.id, value))
+        })
         .collect();
     for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
         if let Some(doc) = value.as_object_mut() {
@@ -153,20 +235,23 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     .ok()
 }
 
+/// A link to a document the caller can't read stays an ID.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
+    access: &'a Access,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
     shapes: &'a Shapes,
 ) -> Populated<'a> {
     let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
-    populate_each(state, items, shapes)
+    populate_each(state, access, items, shapes)
 }
 
 /// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
 /// short. One query per level for every distinct link, whatever the depths.
 fn populate_each<'a>(
     state: &'a AppState,
+    access: &'a Access,
     items: Vec<(Value, Arc<Collection>, u8)>,
     shapes: &'a Shapes,
 ) -> Populated<'a> {
@@ -197,11 +282,12 @@ fn populate_each<'a>(
             return Ok(items.into_iter().map(|(v, _, _)| v).collect());
         }
 
-        let found: HashMap<Uuid, (Uuid, Document)> = documents::get_many(&state.pool, &ids)
-            .await?
-            .into_iter()
-            .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
-            .collect();
+        let found: HashMap<Uuid, (Uuid, Document)> =
+            get_many_readable(&state.pool, &ids, access.readable())
+                .await?
+                .into_iter()
+                .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
+                .collect();
         // The same document wanted at two depths is populated once for each.
         let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
         keys.sort_unstable();
@@ -213,7 +299,9 @@ fn populate_each<'a>(
                 continue;
             };
             if let Some(c) = state.schemas.get_by_id(*collection_id) {
-                fetched.push((to_value(doc)?, c, remaining));
+                let mut value = to_value(doc)?;
+                access.strip(&c, &mut value);
+                fetched.push((value, c, remaining));
                 child_keys.push(key);
             }
         }
@@ -230,7 +318,7 @@ fn populate_each<'a>(
             depths.push(remaining);
         }
         let refs: Vec<Option<&Select>> = shapes_of.iter().map(Option::as_ref).collect();
-        fill_virtuals_each(state, &mut pairs, &refs).await?;
+        fill_virtuals_each(state, access, &mut pairs, &refs).await?;
         let children: Vec<(Value, Arc<Collection>, u8)> = pairs
             .into_iter()
             .zip(shapes_of)
@@ -242,7 +330,7 @@ fn populate_each<'a>(
                 (value, c, remaining)
             })
             .collect();
-        let children = populate_each(state, children, shapes).await?;
+        let children = populate_each(state, access, children, shapes).await?;
         let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 
         Ok(items

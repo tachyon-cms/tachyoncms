@@ -4,6 +4,7 @@
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::CollectionSchema;
 use tachyon_core::auth::Abilities;
@@ -19,12 +20,22 @@ pub const USERS: &str = "users";
 /// Keys a user's account holds, which their profile can't use as field names.
 pub const ACCOUNT_KEYS: &[&str] = &["email", "role", "password", "currentPassword"];
 
-/// The users collection keeps a text `name` (setup and sign-in fill it), and no profile field
-/// may take a name its account uses.
+/// The users collection keeps a text `name` (setup and sign-in fill it), no profile field
+/// may take a name its account uses, and it has no collection rules, which its fixed read
+/// model wouldn't enforce.
 pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core::SchemaError> {
     use tachyon_core::{FieldKind, SchemaError};
     if schema.slug != USERS {
         return Ok(());
+    }
+    if schema
+        .access
+        .as_ref()
+        .is_some_and(|a| *a != tachyon_core::access::CollectionAccess::default())
+    {
+        return Err(SchemaError::InvalidOption(
+            "access: rules on users aren't enforced yet, so they can't be saved; rules on its fields are".into(),
+        ));
     }
     if let Some(f) = schema
         .data()
@@ -335,24 +346,32 @@ pub async fn reset_failures(pool: &PgPool, user_id: Uuid) -> Result<(), DbError>
     Ok(())
 }
 
-pub async fn set_password(pool: &PgPool, user_id: Uuid, hash: &str) -> Result<(), DbError> {
+pub async fn set_password(
+    db: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+    hash: &str,
+) -> Result<(), DbError> {
     sqlx::query!(
         "UPDATE accounts SET password_hash = $2, password_changed_at = now() WHERE user_id = $1",
         user_id,
         hash,
     )
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
 
-pub async fn set_email(pool: &PgPool, user_id: Uuid, email: &str) -> Result<(), DbError> {
+pub async fn set_email(
+    db: impl sqlx::PgExecutor<'_>,
+    user_id: Uuid,
+    email: &str,
+) -> Result<(), DbError> {
     sqlx::query!(
         "UPDATE accounts SET email = $2 WHERE user_id = $1",
         user_id,
         email.to_lowercase(),
     )
-    .execute(pool)
+    .execute(db)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(ref db) if db.is_unique_violation() => {
@@ -445,7 +464,7 @@ pub async fn revoke_session(pool: &PgPool, user_id: Uuid, id: Uuid) -> Result<bo
 
 /// Ends every session of a user except `keep`.
 pub async fn revoke_other_sessions(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     user_id: Uuid,
     keep: Option<Uuid>,
 ) -> Result<(), DbError> {
@@ -454,7 +473,7 @@ pub async fn revoke_other_sessions(
         user_id,
         keep,
     )
-    .execute(pool)
+    .execute(db)
     .await?;
     Ok(())
 }
@@ -527,16 +546,16 @@ pub(crate) async fn before_removing(conn: &mut PgConnection, id: Uuid) -> Result
     Ok(())
 }
 
-/// Changes a user's role, never leaving the install without an Admin.
-pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), DbError> {
-    let mut tx = pool.begin().await?;
-    guard_last_admin(&mut tx, user_id, Some(role)).await?;
+/// Changes a user's role, never leaving the install without an Admin. Run it in a
+/// transaction, so the check and the change hold together.
+pub async fn set_role(conn: &mut PgConnection, user_id: Uuid, role: &str) -> Result<(), DbError> {
+    guard_last_admin(&mut *conn, user_id, Some(role)).await?;
     let done = sqlx::query!(
         "UPDATE accounts SET role = $2 WHERE user_id = $1",
         user_id,
         role
     )
-    .execute(&mut *tx)
+    .execute(&mut *conn)
     .await
     .map_err(|e| match e {
         sqlx::Error::Database(ref db) if db.is_foreign_key_violation() => DbError::NotFound,
@@ -545,7 +564,6 @@ pub async fn set_role(pool: &PgPool, user_id: Uuid, role: &str) -> Result<(), Db
     if done.rows_affected() == 0 {
         return Err(DbError::NotFound);
     }
-    tx.commit().await?;
     Ok(())
 }
 
@@ -605,9 +623,46 @@ pub async fn role_upsert(
     Ok(())
 }
 
-/// Removes a custom role nobody has.
+/// Taken inside the transaction by a role delete, and by a schema save from its role check to
+/// its commit, so a stored rule can never name a role that's gone.
+async fn lock_rule_roles(conn: &mut PgConnection) -> Result<(), DbError> {
+    // An arbitrary constant: the one lock every role delete and rule save shares.
+    sqlx::query!("SELECT pg_advisory_xact_lock(7311002)")
+        .fetch_one(conn)
+        .await?;
+    Ok(())
+}
+
+/// Refuses `schema` if a role its rules name doesn't exist. Run it in the transaction that
+/// stores the schema: it holds the role lock until that commits. The full rule check runs
+/// before the save; this catches a role deleted in between.
+pub(crate) async fn check_rule_roles(
+    conn: &mut PgConnection,
+    schema: &CollectionSchema,
+) -> Result<(), DbError> {
+    let named = tachyon_core::access::named_roles(schema);
+    if named.is_empty() {
+        return Ok(());
+    }
+    lock_rule_roles(&mut *conn).await?;
+    let roles = sqlx::query_scalar!(
+        "SELECT slug FROM roles WHERE tenant_id = $1",
+        DEFAULT_TENANT
+    )
+    .fetch_all(&mut *conn)
+    .await?;
+    match named.into_iter().find(|r| !roles.contains(r)) {
+        Some(r) => Err(DbError::Refused(format!(
+            "access rules name the role `{r}`, which doesn't exist"
+        ))),
+        None => Ok(()),
+    }
+}
+
+/// Removes a custom role nobody has and no access rule names.
 pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
+    lock_rule_roles(&mut tx).await?;
     let builtin = sqlx::query_scalar!(
         "SELECT builtin FROM roles WHERE tenant_id = $1 AND slug = $2 FOR UPDATE",
         DEFAULT_TENANT,
@@ -631,6 +686,22 @@ pub async fn role_delete(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     if used {
         return Err(DbError::Refused(format!(
             "Some users have the role `{slug}`. Give them another role first."
+        )));
+    }
+    let schemas = sqlx::query_scalar!(
+        r#"SELECT schema AS "schema: Json<CollectionSchema>" FROM collections
+           WHERE tenant_id = $1 ORDER BY slug"#,
+        DEFAULT_TENANT,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if let Some(s) = schemas
+        .iter()
+        .find(|s| tachyon_core::access::named_roles(s).contains(slug))
+    {
+        return Err(DbError::Refused(format!(
+            "access rules in {} name the role `{slug}`; change them first",
+            s.slug
         )));
     }
     sqlx::query!(

@@ -405,3 +405,24 @@ async fn changing_default_populate_is_applied(pool: PgPool) {
     assert!(!p.diff.is_empty());
     assert_eq!(c.schema.0.default_populate, authors.default_populate.take());
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn removing_a_link_field_drops_its_links(pool: PgPool) {
+    let s = seed(&pool).await;
+    let new = posts(json!([
+        {"name": "title", "type": "text"},
+        {"name": "summary", "type": "textarea"}
+    ]));
+    apply(&pool, "posts", &new, &Renames::new(), true)
+        .await
+        .unwrap();
+    assert!(
+        documents::references(&pool, s.ann)
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Nothing is left to block deleting what it linked to.
+    let authors = collections::get_by_slug(&pool, "authors").await.unwrap();
+    documents::delete(&pool, authors.id, s.ann).await.unwrap();
+}

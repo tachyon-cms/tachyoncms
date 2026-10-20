@@ -123,6 +123,10 @@ pub enum Target {
         polymorphic: bool,
         collections: Vec<String>,
         inner: Box<Target>,
+        /// The read filter of each linked collection the caller may read (`None`: all of
+        /// it), so hidden documents never match. Empty means unguarded. Otherwise a
+        /// collection missing from the list is unreadable, and nothing in it matches.
+        guards: Vec<(String, Option<Box<Filter>>)>,
     },
     /// Some row of the list at `list` matches `inner`, whose path is relative to the row.
     Row {
@@ -354,6 +358,24 @@ pub fn parse_filter_with(
     .group(input, "where", 0)
 }
 
+/// Checks `name` can be filtered with `op`, whatever the value. Access rules check
+/// `$user` conditions this way, since their values only exist per request.
+pub(crate) fn check_target(
+    fields: &[Field],
+    name: &str,
+    op: &str,
+    lookup: Lookup<'_>,
+) -> Result<(), FilterError> {
+    let fields = data_fields(fields);
+    Parser {
+        fields: &fields,
+        count: 0,
+        lookup: Some(lookup),
+    }
+    .target(name, op, &format!("where[{name}][{op}]"))
+    .map(|_| ())
+}
+
 struct Parser<'a> {
     fields: &'a [Field],
     count: usize,
@@ -428,39 +450,8 @@ impl Parser<'_> {
                 format!("too many conditions (max {MAX_CONDITIONS})"),
             ));
         }
-        let op = Op::parse(op).ok_or_else(|| {
-            err(
-                param,
-                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
-            )
-        })?;
-        let (target, field) = resolve(
-            &Scope {
-                root: self.fields,
-                fields: self.fields,
-                collection: None,
-                in_row: false,
-            },
-            name,
-            name,
-            "filtered",
-            self.lookup,
-            Hops::default(),
-        )
-        .map_err(|m| err(param, m))?;
+        let (op, target, field) = self.target(name, op, param)?;
         let field = field.as_ref();
-        if op == Op::Near && target.is_nested() {
-            return Err(err(
-                param,
-                "near can't be used through a relationship or into a list yet",
-            ));
-        }
-        if !op.allowed(&target) {
-            return Err(err(
-                param,
-                format!("{} can't be used on this field", op.as_str()),
-            ));
-        }
         let value = match op {
             Op::Near => parse_near(operand).map_err(|()| {
                 err(
@@ -496,6 +487,48 @@ impl Parser<'_> {
             }
         };
         Ok(Filter::Cond(Cond { target, op, value }))
+    }
+
+    /// The operator and what `name` points at, checked to fit each other.
+    fn target(
+        &self,
+        name: &str,
+        op: &str,
+        param: &str,
+    ) -> Result<(Op, Target, Option<Field>), FilterError> {
+        let op = Op::parse(op).ok_or_else(|| {
+            err(
+                param,
+                "unknown operator; use equals, not_equals, in, not_in, gt, gte, lt, lte, like, contains, exists or near",
+            )
+        })?;
+        let (target, field) = resolve(
+            &Scope {
+                root: self.fields,
+                fields: self.fields,
+                collection: None,
+                in_row: false,
+            },
+            name,
+            name,
+            "filtered",
+            self.lookup,
+            Hops::default(),
+        )
+        .map_err(|m| err(param, m))?;
+        if op == Op::Near && target.is_nested() {
+            return Err(err(
+                param,
+                "near can't be used through a relationship or into a list yet",
+            ));
+        }
+        if !op.allowed(&target) {
+            return Err(err(
+                param,
+                format!("{} can't be used on this field", op.as_str()),
+            ));
+        }
+        Ok((op, target, field))
     }
 }
 
@@ -689,6 +722,7 @@ fn resolve(
                             .map(|s| (*s).to_owned())
                             .collect(),
                         inner: Box::new(inner),
+                        guards: Vec::new(),
                     },
                     field,
                 ));
@@ -1556,6 +1590,7 @@ mod tests {
                 polymorphic,
                 collections: collections.iter().map(|s| (*s).to_owned()).collect(),
                 inner: Box::new(inner),
+                guards: Vec::new(),
             }
         }
 

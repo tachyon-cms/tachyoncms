@@ -225,7 +225,7 @@ async fn revoking_other_sessions_keeps_the_current_one(pool: PgPool) {
 async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
     let first = account(&pool, "a@b.co", "admin").await;
     assert!(matches!(
-        auth::set_role(&pool, first, "editor").await,
+        auth::set_role(&mut pool.acquire().await.unwrap(), first, "editor").await,
         Err(DbError::Refused(_))
     ));
     let users = auth::ensure_users_collection(&pool).await.unwrap();
@@ -234,10 +234,12 @@ async fn the_last_admin_cant_be_demoted_or_removed(pool: PgPool) {
         Err(DbError::Refused(_))
     ));
     let second = account(&pool, "c@d.co", "admin").await;
-    auth::set_role(&pool, first, "editor").await.unwrap();
+    auth::set_role(&mut pool.acquire().await.unwrap(), first, "editor")
+        .await
+        .unwrap();
     assert_eq!(auth::count_admins(&pool).await.unwrap(), 1);
     assert!(matches!(
-        auth::set_role(&pool, second, "viewer").await,
+        auth::set_role(&mut pool.acquire().await.unwrap(), second, "viewer").await,
         Err(DbError::Refused(_))
     ));
 }
@@ -272,7 +274,9 @@ async fn roles_in_use_and_builtin_roles_cant_be_deleted(pool: PgPool) {
         auth::role_delete(&pool, "reviewer").await,
         Err(DbError::Refused(_))
     ));
-    auth::set_role(&pool, id, "viewer").await.unwrap();
+    auth::set_role(&mut pool.acquire().await.unwrap(), id, "viewer")
+        .await
+        .unwrap();
     auth::role_delete(&pool, "reviewer").await.unwrap();
     assert!(matches!(
         auth::role_delete(&pool, "reviewer").await,
@@ -332,4 +336,69 @@ async fn a_reused_key_prefix_is_a_unique_violation(pool: PgPool) {
         auth::create_api_key(&pool, id, "two", "samepfx1", b"b", &scopes, None).await,
         Err(DbError::UniqueViolation(_))
     ));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn rules_and_the_roles_they_name_stay_in_step(pool: PgPool) {
+    let abilities = Abilities {
+        content: Content::Read,
+        schemas: false,
+        users: false,
+    };
+    auth::role_upsert(&pool, "reviewer", "Reviewer", &abilities)
+        .await
+        .unwrap();
+    let schema = |slug: &str, role: &str| {
+        serde_json::from_value::<tachyon_core::CollectionSchema>(serde_json::json!({
+            "slug": slug, "fields": [{"name": "title", "type": "text", "access": {"update": {"role": role}}}]
+        }))
+        .unwrap()
+    };
+    let refused = |r: Result<(), DbError>| match r {
+        Err(DbError::Refused(why)) => why,
+        other => panic!("{other:?}"),
+    };
+
+    // Saves recheck the roles inside their own transaction.
+    let why = refused(
+        tachyon_db::collections::create(&pool, &schema("posts", "ghost"))
+            .await
+            .map(drop),
+    );
+    assert_eq!(
+        why,
+        "access rules name the role `ghost`, which doesn't exist"
+    );
+    tachyon_db::collections::create(&pool, &schema("posts", "reviewer"))
+        .await
+        .unwrap();
+    let change = tachyon_db::schema_change::apply(
+        &pool,
+        "posts",
+        &schema("posts", "ghost"),
+        &Default::default(),
+        false,
+    )
+    .await;
+    assert!(
+        matches!(&change, Err(tachyon_db::schema_change::ChangeError::Db(DbError::Refused(why)))
+            if why == "access rules name the role `ghost`, which doesn't exist"),
+        "{change:?}"
+    );
+
+    // And a role a rule names can't go.
+    assert_eq!(
+        refused(auth::role_delete(&pool, "reviewer").await),
+        "access rules in posts name the role `reviewer`; change them first"
+    );
+    tachyon_db::schema_change::apply(
+        &pool,
+        "posts",
+        &schema("posts", "editor"),
+        &Default::default(),
+        false,
+    )
+    .await
+    .unwrap();
+    auth::role_delete(&pool, "reviewer").await.unwrap();
 }
