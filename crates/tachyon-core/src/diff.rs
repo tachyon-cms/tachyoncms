@@ -141,7 +141,7 @@ pub fn diff(
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
     }
-    if old.default_populate != new.default_populate {
+    if old.default_populate != new.default_populate || old.access != new.access {
         changes.push(Change::CollectionOptionsChanged);
     }
     Ok(SchemaDiff { changes, links })

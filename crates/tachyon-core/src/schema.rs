@@ -22,6 +22,9 @@ pub struct CollectionSchema {
     /// What other collections get when they populate a link to this one, as a `select`.
     #[serde(default, rename = "defaultPopulate")]
     pub default_populate: Option<Map<String, Value>>,
+    /// Who may read, create, update and delete its documents; see `access`.
+    #[serde(default)]
+    pub access: Option<crate::access::CollectionAccess>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -30,13 +33,19 @@ pub struct CollectionSchema {
 
 impl PartialEq for CollectionSchema {
     fn eq(&self, other: &Self) -> bool {
-        (&self.slug, self.kind, &self.fields, &self.default_populate)
-            == (
-                &other.slug,
-                other.kind,
-                &other.fields,
-                &other.default_populate,
-            )
+        (
+            &self.slug,
+            self.kind,
+            &self.fields,
+            &self.default_populate,
+            &self.access,
+        ) == (
+            &other.slug,
+            other.kind,
+            &other.fields,
+            &other.default_populate,
+            &other.access,
+        )
     }
 }
 
@@ -78,6 +87,9 @@ pub struct Field {
     /// Read through a relationship instead of stored, such as `author.name`.
     #[serde(default, rename = "virtual")]
     pub virtual_path: Option<String>,
+    /// Who may read and write this field; see `access`.
+    #[serde(default)]
+    pub access: Option<crate::access::FieldAccess>,
     #[serde(flatten)]
     pub kind: FieldKind,
 }
@@ -376,6 +388,7 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             virtual_path: None,
+                            access: None,
                             kind: FieldKind::Group {
                                 fields: flatten(&tab.fields),
                             },
