@@ -367,13 +367,16 @@ pub async fn references(
                 .into_iter()
                 .map(|(_, doc)| doc.id)
                 .collect();
-        // A link held in a field the caller can't read isn't theirs to see either.
+        // A link held in a field the caller can't read isn't theirs to see either. Admins
+        // read every field, and see every link, so they can always tell what blocks a delete.
+        let admin = access.caller().admin;
         refs.retain(|r| {
             readable.contains(&r.id)
-                && state
-                    .schemas
-                    .get(&r.collection)
-                    .is_some_and(|from| access.reads(&from, &r.path))
+                && (admin
+                    || state
+                        .schemas
+                        .get(&r.collection)
+                        .is_some_and(|from| access.reads(&from, &r.path)))
         });
     }
     Ok(Json(json!({ "docs": refs })))

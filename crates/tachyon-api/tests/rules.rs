@@ -2073,3 +2073,38 @@ async fn hidden_fields_stay_out_of_validation_errors(pool: PgPool) {
     hidden(&patch(&s.viewer, &me, json!({"name": "Vic"})).await, "pay");
     named(&patch(&s.admin, &me, json!({"name": "Vic"})).await, "pay");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn admins_see_links_whatever_their_path(pool: PgPool) {
+    let s = staff(&pool).await;
+    // A link row whose path names no field. Schema changes re-sync every live document's
+    // rows, so this stands in for whatever else might leave one behind.
+    sqlx::query(
+        "UPDATE relations SET field_path = 'gone' WHERE from_doc = $1 AND field_path = 'author'",
+    )
+    .bind(uuid::Uuid::parse_str(&s.p2).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let url = format!("/api/people/{}/references", s.ann);
+    let paths = |res: Res| -> Vec<String> {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut out: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        paths(get(&s.admin, &url).await),
+        ["author", "gone", "hiddenAuthor"]
+    );
+    assert_eq!(
+        paths(get(&s.editor, &url).await),
+        ["author", "hiddenAuthor"]
+    );
+    assert_eq!(paths(get(&s.viewer, &url).await), ["author"]);
+}
