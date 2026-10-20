@@ -933,17 +933,15 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
     let admin = admin_app(pool.clone()).await;
     let published = json!({"read": {"stage": "published"}});
     let stage = json!({"name": "stage", "type": "select", "options": ["draft", "published"]});
-    let link = |to: &str| json!({"type": "relationship", "relationTo": to});
-    let with = |mut f: Value, name: &str| {
-        f["name"] = name.into();
-        f
-    };
+    let link =
+        |name: &str, to: &str| json!({"name": name, "type": "relationship", "relationTo": to});
     create(
         &admin,
         "/api/admin/collections",
         json!({"slug": "authors", "access": published, "fields": [
             {"name": "name", "type": "text"}, stage,
-            with(link("authors"), "mentor")
+            link("mentor", "authors"),
+            {"name": "age", "type": "number"}
         ]}),
     )
     .await;
@@ -952,48 +950,53 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         "/api/admin/collections",
         json!({"slug": "posts", "access": {"read": true}, "fields": [
             {"name": "title", "type": "text"},
-            with(link("authors"), "author"),
+            link("author", "authors"),
             {"name": "writers", "type": "relationship", "relationTo": "authors", "hasMany": true},
-            {"name": "credits", "type": "array", "fields": [with(link("authors"), "who")]}
+            {"name": "credits", "type": "array", "fields": [link("who", "authors")]}
         ]}),
     )
     .await;
-    let author = |name: &str, stage: &str, mentor: Option<&str>| json!({"name": name, "stage": stage, "mentor": mentor});
-    let ann = id(&create(&admin, "/api/authors", author("Ann", "published", None)).await);
-    let hid = id(&create(&admin, "/api/authors", author("Hid", "draft", None)).await);
+    let author = |name: &str, age: u32, stage: &str, mentor: Option<&str>| json!({"name": name, "age": age, "stage": stage, "mentor": mentor});
+    let ann = id(&create(&admin, "/api/authors", author("Ann", 30, "published", None)).await);
+    // Hid is a hidden author with a mentor of his own, so Mia -> Hid -> Ann has a hidden middle.
+    let hid = id(&create(
+        &admin,
+        "/api/authors",
+        author("Hid", 50, "draft", Some(&ann)),
+    )
+    .await);
     let mia = id(&create(
         &admin,
         "/api/authors",
-        author("Mia", "published", Some(&hid)),
+        author("Mia", 20, "published", Some(&hid)),
     )
     .await);
     let bo = id(&create(
         &admin,
         "/api/authors",
-        author("Bo", "published", Some(&ann)),
+        author("Bo", 40, "published", Some(&ann)),
     )
     .await);
+    let (ann, hid, mia, bo) = (ann.as_str(), hid.as_str(), mia.as_str(), bo.as_str());
     let posts = [
-        ("p1", Some(&ann), vec![&ann], vec![]),
-        ("p2", Some(&hid), vec![&hid], vec![]),
-        ("p3", Some(&ann), vec![&ann, &hid], vec![&hid]),
+        ("p1", Some(ann), vec![ann], vec![]),
+        ("p2", Some(hid), vec![hid], vec![]),
+        ("p3", Some(ann), vec![ann, hid], vec![hid]),
         ("p4", None, vec![], vec![]),
-        ("p5", Some(&mia), vec![&mia], vec![&hid]),
-        ("p6", Some(&bo), vec![&bo], vec![&ann]),
-        ("p7", Some(&hid), vec![], vec![&hid, &ann]),
+        ("p5", Some(mia), vec![mia], vec![hid]),
+        ("p6", Some(bo), vec![bo], vec![ann]),
+        ("p7", Some(hid), vec![], vec![hid, ann]),
     ];
-    let body =
-        |title: &str, a: Option<&String>, writers: &[&String], credits: &[&String], skip: &str| {
-            let keep = |x: &&&String| x.as_str() != skip;
-            let credits: Vec<Value> = credits
-                .iter()
-                .filter(keep)
-                .map(|w| json!({"who": w}))
-                .collect();
-            let writers: Vec<&&String> = writers.iter().filter(keep).collect();
-            let a = a.filter(|a| a.as_str() != skip);
-            json!({"title": title, "author": a, "writers": writers, "credits": credits})
-        };
+    // A post's JSON, leaving out every link to `skip`.
+    let body = |title: &str, a: Option<&str>, writers: &[&str], credits: &[&str], skip: &str| {
+        let credits: Vec<Value> = credits
+            .iter()
+            .filter(|w| **w != skip)
+            .map(|w| json!({"who": w}))
+            .collect();
+        let writers: Vec<&&str> = writers.iter().filter(|w| **w != skip).collect();
+        json!({"title": title, "author": a.filter(|a| *a != skip), "writers": writers, "credits": credits})
+    };
     let mut made = Vec::new();
     for (title, a, writers, credits) in &posts {
         let doc = create(&admin, "/api/posts", body(title, *a, writers, credits, "")).await;
@@ -1001,8 +1004,8 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
     }
     let anon = visitor(&pool).await;
 
-    // `(query, does an admin see something different from a visitor)`: the first of each
-    // pair is a filter that only a hidden author could satisfy or fail.
+    // `(query, differs)`: whether an admin sees something different from a visitor, which
+    // is true when a hidden author could satisfy or fail the filter.
     let queries: &[(&str, bool)] = &[
         // Single link, has-many, a link inside a list row, and two hops.
         ("where[author.name][equals]=Hid", true),
@@ -1013,6 +1016,25 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         ("where[credits.who.name][equals]=Hid", true),
         ("where[author.mentor.name][equals]=Hid", true),
         ("where[author.mentor.stage][equals]=draft", true),
+        // A hidden document in the middle of a chain (Mia -> Hid -> Ann), and a visible
+        // chain beside it (Bo -> Ann).
+        ("where[author.mentor.name][equals]=Ann", true),
+        ("where[author.mentor.stage][equals]=published", true),
+        ("where[author.mentor.mentor.name][equals]=Ann", true),
+        ("where[author.mentor.mentor.id][equals]={ann}", true),
+        ("where[author.mentor.mentor.name][not_equals]=Ann", true),
+        // Other paths to the same document, and ranges, patterns and membership.
+        ("where[credits.who.id][equals]={hid}", true),
+        ("where[credits.who.id][in]={hid},{ann}", true),
+        ("where[credits.who.age][gt]=45", true),
+        ("where[author.age][gt]=45", true),
+        ("where[author.age][gte]=50", true),
+        ("where[author.age][lt]=55", true),
+        ("where[author.age][lte]=50", true),
+        ("where[writers.age][gt]=45", true),
+        ("where[author.mentor.age][gt]=45", true),
+        ("where[author.name][like]=Hi", true),
+        ("where[author.age][not_in]=50", true),
         // Inside `or` and `and`.
         (
             "where[or][0][author.name][equals]=Hid&where[or][1][title][equals]=p1",
@@ -1043,17 +1065,17 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
     ];
 
     // Each answer for a visitor, whole pages and total included.
-    let ask = |app: Router, hid: String| async move {
+    let ask = |app: Router| async move {
         let mut seen = Vec::new();
         for (q, _) in queries {
-            let q = q.replace("{hid}", &hid);
+            let q = q.replace("{hid}", hid).replace("{ann}", ann);
             let all = get(&app, &format!("/api/posts?{q}&sort=title")).await;
             seen.push((titles(&all), pages(&app, &format!("{q}&sort=title")).await));
         }
         seen
     };
-    let before = ask(anon.clone(), hid.clone()).await;
-    let admin_before = ask(admin.clone(), hid.clone()).await;
+    let before = ask(anon.clone()).await;
+    let admin_before = ask(admin.clone()).await;
     for (i, (q, differs)) in queries.iter().enumerate() {
         assert_eq!(before[i].0 != admin_before[i].0, *differs, "{q}");
     }
@@ -1065,7 +1087,7 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
         let res = patch(
             &admin,
             &format!("/api/posts/{doc}"),
-            body(title, *a, writers, credits, &hid),
+            body(title, *a, writers, credits, hid),
         )
         .await;
         assert_eq!(res.status, 200, "{}", res.json);
@@ -1079,7 +1101,7 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     let res = send(&admin, "DELETE", &format!("/api/authors/{hid}"), None).await;
     assert_eq!(res.status, 204, "{}", res.json);
-    let after = ask(anon.clone(), hid.clone()).await;
+    let after = ask(anon.clone()).await;
     for (i, (q, _)) in queries.iter().enumerate() {
         assert_eq!(before[i], after[i], "{q}");
     }
@@ -1094,8 +1116,12 @@ async fn filters_through_links_respect_the_linked_read_rule(pool: PgPool) {
     );
 
     // Sort doesn't cross a link, so there's no order to read a hidden document from.
-    let sorted = get(&anon, "/api/posts?sort=author.name").await;
-    assert_problem(&sorted, 400);
+    for sort in ["author.name", "-author.name"] {
+        let res = get(&anon, &format!("/api/posts?sort={sort}")).await;
+        assert_eq!(res.status, 400, "sort={sort}: {}", res.json);
+    }
+    // Sorting by the link field itself orders by the stored ID, which is the post's own data.
+    assert_eq!(get(&anon, "/api/posts?sort=author").await.status, 200);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -1185,6 +1211,22 @@ async fn polymorphic_links_use_each_collections_rule(pool: PgPool) {
         names(&ask(&anon, q).await),
         ["i-both", "i-draft", "i-live", "i-memo"]
     );
+    assert_eq!(
+        names(&ask(&admin, q).await),
+        ["i-both", "i-draft", "i-live"]
+    );
+
+    // The pair's own parts are the item's data: a hidden link stays in the body as an ID,
+    // so filtering on it tells the reader nothing the body doesn't (it isn't a walk
+    // into the memo, which `ref.id` and `ref.title` above are).
+    for q in [
+        "where[ref.relationTo][equals]=memos".to_owned(),
+        format!("where[ref.value][equals]={memo}"),
+    ] {
+        let res = ask(&anon, &q).await;
+        assert_eq!(names(&res), ["i-memo"], "{q}");
+        assert_eq!(res.json["docs"][0]["ref"]["value"], memo.as_str());
+    }
 
     // Notes are open and pages are published-only: each link keeps its own collection's rule.
     let q = "where[mix.title][equals]=T";
@@ -1205,6 +1247,30 @@ async fn polymorphic_links_use_each_collections_rule(pool: PgPool) {
     );
     let q = format!("where[mix.id][equals]={draft}");
     assert!(names(&ask(&anon, &q).await).is_empty());
+    assert_eq!(names(&ask(&admin, &q).await), ["i-both", "i-draft"]);
+    let q = format!("where[mix.id][in]={draft},{live}");
+    assert_eq!(names(&ask(&anon, &q).await), ["i-live"]);
+    assert_eq!(
+        names(&ask(&admin, &q).await),
+        ["i-both", "i-draft", "i-live"]
+    );
+    // Negative operators on the has-many link: the draft page counts as no link.
+    for q in [
+        "where[mix.title][not_equals]=T",
+        "where[mix.title][exists]=false",
+    ] {
+        assert_eq!(names(&ask(&anon, q).await), ["i-draft"], "{q}");
+        assert!(names(&ask(&admin, q).await).is_empty(), "{q}");
+    }
+    let q = format!("where[mix.id][not_in]={draft}");
+    assert_eq!(
+        names(&ask(&anon, &q).await),
+        ["i-both", "i-draft", "i-live", "i-memo", "i-note"]
+    );
+    assert_eq!(
+        names(&ask(&admin, &q).await),
+        ["i-live", "i-memo", "i-note"]
+    );
     let q = format!("where[mix.id][equals]={note}");
     assert_eq!(names(&ask(&anon, &q).await), ["i-both", "i-memo", "i-note"]);
 }
