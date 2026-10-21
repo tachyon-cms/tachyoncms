@@ -49,7 +49,7 @@ pub fn validate_document(
         }
     }
     let mut errors = Vec::new();
-    check_object(fields, &doc, "", &mut errors);
+    check_object(fields, &doc, &[], "", &mut errors);
     // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500.
     for (key, value) in &doc {
         if key.contains('\0') || contains_nul(value) {
@@ -249,14 +249,16 @@ pub(crate) fn row_fields<'a>(kind: &'a FieldKind, row: &Map<String, Value>) -> &
     }
 }
 
+/// `own` are keys the object carries besides its fields, such as a block row's `id`.
 fn check_object(
     fields: &[Field],
     obj: &Map<String, Value>,
+    own: &[&str],
     prefix: &str,
     errors: &mut Vec<FieldError>,
 ) {
     for key in obj.keys() {
-        if !fields.iter().any(|f| &f.name == key) {
+        if !fields.iter().any(|f| &f.name == key) && !own.contains(&key.as_str()) {
             errors.push(error(join(prefix, key), "unknown field"));
         }
     }
@@ -337,7 +339,7 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
             }
         }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
-            check_object(fields, obj, path, errors)
+            check_object(fields, obj, &[], path, errors)
         }
         (
             FieldKind::Array {
@@ -351,7 +353,7 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
             for (i, row) in rows.iter().enumerate() {
                 let row_path = format!("{path}.{i}");
                 match row {
-                    Value::Object(obj) => check_object(fields, obj, &row_path, errors),
+                    Value::Object(obj) => check_object(fields, obj, &[], &row_path, errors),
                     _ => errors.push(error(row_path, "expected an object")),
                 }
             }
@@ -366,12 +368,24 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
         ) => {
             let limit = |n: &Option<u32>| n.map(|n| n as usize);
             check_row_count(rows.len(), limit(min_rows), limit(max_rows), path, errors);
+            let mut seen = std::collections::HashSet::new();
             for (i, row) in rows.iter().enumerate() {
                 let row_path = format!("{path}.{i}");
                 let Value::Object(obj) = row else {
                     errors.push(error(row_path, "expected an object"));
                     continue;
                 };
+                match obj.get("id").map(|id| id.as_str().map(Uuid::try_parse)) {
+                    None => {}
+                    Some(Some(Ok(id))) => {
+                        // Compared as UUIDs, so the same ID in another case still counts.
+                        if !seen.insert(id) {
+                            errors
+                                .push(error(format!("{row_path}.id"), "this row ID is used twice"));
+                        }
+                    }
+                    Some(_) => errors.push(error(format!("{row_path}.id"), "expected a row ID")),
+                }
                 let block = match obj.get("blockType") {
                     None | Some(Value::Null) => {
                         errors.push(error(format!("{row_path}.blockType"), "is required"));
@@ -389,17 +403,7 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
                         }
                     },
                 };
-                if obj
-                    .get("id")
-                    .is_some_and(|id| !id.as_str().is_some_and(is_uuid))
-                {
-                    errors.push(error(format!("{row_path}.id"), "expected a row ID"));
-                }
-                let mut data = obj.clone();
-                for key in BLOCK_ROW_KEYS {
-                    data.remove(*key);
-                }
-                check_object(&block.fields, &data, &row_path, errors);
+                check_object(&block.fields, obj, BLOCK_ROW_KEYS, &row_path, errors);
             }
         }
         _ => {
@@ -1595,6 +1599,20 @@ mod tests {
             ),
             vec![e("layout.0.id", "expected a row ID")]
         );
+        let lower = "0199d5c4-0000-7000-8000-0000000000bb";
+        for twin in [lower, &lower.to_uppercase()] {
+            assert_eq!(
+                errs(
+                    &f,
+                    json!({"layout": [
+                        {"blockType": "hero", "heading": "a", "id": lower},
+                        {"blockType": "quote", "id": twin}
+                    ]})
+                ),
+                vec![e("layout.1.id", "this row ID is used twice")],
+                "{twin}"
+            );
+        }
 
         // An update replaces the list whole: rows sent with their id keep it.
         let existing = Value::Object(doc.clone());
@@ -1642,6 +1660,67 @@ mod tests {
             Some(json!({"id": id, "name": "Bee"}))
         });
         assert_eq!(doc["layout"][1]["author"]["name"], "Bee");
+    }
+
+    #[test]
+    fn nested_blocks_follow_their_own_types() {
+        let f = fields(json!([{"name": "layout", "type": "blocks", "blocks": [
+            {"slug": "section", "fields": [{"name": "items", "type": "blocks", "blocks": [
+                {"slug": "card", "fields": [
+                    {"name": "title", "type": "text", "required": true},
+                    {"name": "author", "type": "relationship", "relationTo": "authors"},
+                    {"name": "tone", "type": "text", "default": "plain"}
+                ]},
+                {"slug": "rule", "fields": []}
+            ]}]}
+        ]}]));
+        let b = "0199d5c4-0000-7000-8000-00000000000b";
+        let mut doc = ok(
+            &f,
+            json!({"layout": [{"blockType": "section", "items": [
+                {"blockType": "rule"},
+                {"blockType": "card", "title": "T", "author": b}
+            ]}]}),
+        );
+        let card = doc["layout"][0]["items"][1].clone();
+        assert_eq!(
+            card["tone"], "plain",
+            "inner defaults follow the inner type"
+        );
+        assert!(card["id"].is_string() && doc["layout"][0]["id"].is_string());
+        assert!(doc["layout"][0]["items"][0].get("tone").is_none());
+
+        assert_eq!(
+            errs(
+                &f,
+                json!({"layout": [{"blockType": "section", "items": [
+                    {"blockType": "card"}, {"blockType": "rule", "title": "x"}, {"blockType": "section"}
+                ]}]})
+            ),
+            vec![
+                e("layout.0.items.0.title", "is required"),
+                e("layout.0.items.1.title", "unknown field"),
+                e("layout.0.items.2.blockType", "expected one of: card, rule"),
+            ]
+        );
+
+        let found: Vec<String> = relations(&f, &doc).into_iter().map(|r| r.path).collect();
+        assert_eq!(found, ["layout.0.items.1.author"]);
+        map_relations(&f, &mut doc, &mut |_, id| {
+            Some(json!({"id": id, "name": "Bee"}))
+        });
+        assert_eq!(doc["layout"][0]["items"][1]["author"]["name"], "Bee");
+
+        let params = crate::query::parse_query("select[layout][items][title]=true").unwrap();
+        let select = crate::select::parse_select(&f, &params["select"], "select").unwrap();
+        let mut shaped = doc.clone();
+        crate::select::project(&select, &mut shaped);
+        let rows = &shaped["layout"][0];
+        assert_eq!(rows["blockType"], "section");
+        assert_eq!(
+            rows["items"][1],
+            json!({"id": card["id"], "blockType": "card", "title": "T"})
+        );
     }
 
     #[test]

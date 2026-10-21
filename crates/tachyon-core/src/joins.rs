@@ -67,7 +67,10 @@ mod tests {
                 {"name": "target", "type": "relationship", "relationTo": "categories"},
                 {"name": "many", "type": "relationship", "relationTo": "categories", "hasMany": true}
             ]},
-            {"name": "author", "type": "relationship", "relationTo": "authors"}
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]}
+            ]}
         ]}))
     }
 
@@ -143,6 +146,10 @@ mod tests {
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "missing"}),
                 "field `j`: posts has no field `missing`",
+            ),
+            (
+                json!({"name": "j", "type": "join", "collection": "posts", "on": "layout.who"}),
+                "field `j`: posts.layout.who is inside blocks, which joins can't follow yet",
             ),
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "author"}),

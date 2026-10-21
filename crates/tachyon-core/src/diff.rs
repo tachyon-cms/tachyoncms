@@ -1226,6 +1226,94 @@ mod tests {
     }
 
     #[test]
+    fn block_changes_touch_one_block_type() {
+        let both = pages(json!([
+            {"slug": "hero", "fields": [{"name": "heading", "type": "text"}, {"name": "note", "type": "text"}]},
+            {"slug": "quote", "fields": [{"name": "note", "type": "text"}]}
+        ]));
+        // `note` goes from hero only; quote rows keep theirs.
+        let fewer = pages(json!([
+            {"slug": "hero", "fields": [{"name": "heading", "type": "text"}]},
+            {"slug": "quote", "fields": [{"name": "note", "type": "text"}]}
+        ]));
+        assert_eq!(
+            diff(&both, &fewer, &Renames::new()).unwrap().changes,
+            vec![Change::Removed {
+                path: "layout.hero.note".into(),
+                kind: "text"
+            }]
+        );
+        let doc = json!({"layout": [
+            {"id": "0199d5c4-0000-7000-8000-000000000001", "blockType": "hero", "heading": "h", "note": "n1"},
+            {"id": "0199d5c4-0000-7000-8000-000000000002", "blockType": "quote", "note": "n2"}
+        ]});
+        assert_eq!(
+            Value::Object(migrate_document(
+                &fewer.fields,
+                &Renames::new(),
+                doc.as_object().unwrap()
+            )),
+            json!({"layout": [
+                {"id": "0199d5c4-0000-7000-8000-000000000001", "blockType": "hero", "heading": "h"},
+                {"id": "0199d5c4-0000-7000-8000-000000000002", "blockType": "quote", "note": "n2"}
+            ]})
+        );
+
+        // A block type is matched by slug, so it can't be renamed.
+        let banner = pages(json!([
+            {"slug": "banner", "fields": [{"name": "heading", "type": "text"}, {"name": "note", "type": "text"}]},
+            {"slug": "quote", "fields": [{"name": "note", "type": "text"}]}
+        ]));
+        assert_eq!(
+            diff(&both, &banner, &renames(&[("layout.hero", "banner")]))
+                .unwrap_err()
+                .to_string(),
+            "can't rename `layout.hero`: there's no such field"
+        );
+
+        // Blocks inside a block row: renames, prunes and kept rows follow each level's type.
+        let nested = |inner: Value| {
+            pages(json!([{"slug": "section", "fields": [
+                {"name": "items", "type": "blocks", "blocks": inner}
+            ]}]))
+        };
+        let old = nested(json!([
+            {"slug": "a", "fields": [{"name": "x", "type": "text"}, {"name": "gone", "type": "text"}]},
+            {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+        ]));
+        let new = nested(json!([
+            {"slug": "a", "fields": [{"name": "y", "type": "text"}]},
+            {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+        ]));
+        let r = renames(&[("layout.section.items.a.x", "y")]);
+        let d = diff(&old, &new, &r).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Renamed {
+                    from: "layout.section.items.a.x".into(),
+                    to: "layout.section.items.a.y".into()
+                },
+                Change::Removed {
+                    path: "layout.section.items.a.gone".into(),
+                    kind: "text"
+                },
+            ]
+        );
+        let doc = json!({"layout": [{"id": "0199d5c4-0000-7000-8000-000000000001", "blockType": "section", "items": [
+            {"id": "0199d5c4-0000-7000-8000-000000000002", "blockType": "a", "x": "1", "gone": "g"},
+            {"id": "0199d5c4-0000-7000-8000-000000000003", "blockType": "b", "x": "2"}
+        ]}]});
+        assert_eq!(
+            Value::Object(migrate_document(&new.fields, &r, doc.as_object().unwrap())),
+            json!({"layout": [{"id": "0199d5c4-0000-7000-8000-000000000001", "blockType": "section", "items": [
+                {"id": "0199d5c4-0000-7000-8000-000000000002", "blockType": "a", "y": "1"},
+                {"id": "0199d5c4-0000-7000-8000-000000000003", "blockType": "b", "x": "2"}
+            ]}]})
+        );
+    }
+
+    #[test]
     fn links_inside_blocks_relink_by_block_type() {
         let id = "0199d5c4-0000-7000-8000-00000000000a";
         let page = |to: Value| {

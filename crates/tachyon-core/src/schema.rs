@@ -507,30 +507,28 @@ fn compact_fields(fields: &mut Value) {
 }
 
 /// Admin options any field can carry, data or layout. `root` is the data shape; `inside`
-/// holds the data paths the field itself covers, which its condition can't depend on.
+/// holds the data paths the field itself covers, which its condition can't depend on;
+/// `within` the block types it sits in (see `field_steps`).
 fn check_admin(
     admin: &Admin,
     root: &[Field],
     inside: &[String],
     layout: bool,
+    within: Within,
 ) -> Result<(), String> {
     if let Some(condition) = &admin.condition {
         let target = &condition.field;
-        let Some(f) = find_field(root, target) else {
+        let Some(steps) = field_steps(root, target, "", within) else {
             return Err(format!(
                 "admin.condition refers to `{target}`, which isn't a field"
             ));
         };
+        let f = *steps.last().expect("a path has at least one step");
         // A field inside a list exists once per row, so only fields in that same row can
         // depend on it.
         let mut reach = String::new();
-        let mut current = root;
-        let segments: Vec<&str> = target.split('.').collect();
-        for (i, segment) in segments.iter().enumerate() {
+        for (step, segment) in steps.iter().zip(target.split('.')) {
             reach = join(&reach, segment);
-            let Some(step) = current.iter().find(|f| f.name == *segment) else {
-                break;
-            };
             if matches!(
                 step.kind,
                 FieldKind::Array { .. } | FieldKind::Blocks { .. }
@@ -541,9 +539,6 @@ fn check_admin(
                     "admin.condition can't reach into the list `{reach}` from outside it"
                 ));
             }
-            current = segments
-                .get(i + 1)
-                .map_or(&[][..], |next| children(&step.kind, next));
         }
         if inside
             .iter()
@@ -710,6 +705,7 @@ fn check_layout(
     root: &[Field],
     loc: &str,
     prefix: &str,
+    within: Within,
 ) -> Result<(), SchemaError> {
     for (i, f) in fields.iter().enumerate() {
         let here = format!("{loc}.{i}");
@@ -722,7 +718,7 @@ fn check_layout(
                 .iter()
                 .map(|d| join(prefix, &d.name))
                 .collect();
-            check_admin(&f.admin, root, &inside, true).map_err(invalid)?;
+            check_admin(&f.admin, root, &inside, true, within).map_err(invalid)?;
             let kind = f.kind.name();
             if !f.name.is_empty() {
                 return Err(invalid(format!("{kind} fields don't take a name")));
@@ -752,21 +748,24 @@ fn check_layout(
         }
         match &f.kind {
             FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
-                check_layout(fields, root, &format!("{here}.fields"), prefix)?
+                check_layout(fields, root, &format!("{here}.fields"), prefix, within)?
             }
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => check_layout(
                 fields,
                 root,
                 &format!("{here}.fields"),
                 &join(prefix, &f.name),
+                within,
             )?,
             FieldKind::Blocks { blocks, .. } => {
+                let path = join(prefix, &f.name);
                 for (b, block) in blocks.iter().enumerate() {
                     check_layout(
                         &block.fields,
                         root,
                         &format!("{here}.blocks.{b}.fields"),
-                        &join(prefix, &f.name),
+                        &path,
+                        &enter(within, &path, &block.slug),
                     )?;
                 }
             }
@@ -781,6 +780,7 @@ fn check_layout(
                         root,
                         &format!("{here}.tabs.{t}.fields"),
                         &prefix,
+                        within,
                     )?;
                 }
             }
@@ -1052,6 +1052,14 @@ impl CollectionSchema {
             let Some(on) = find_field(target.data(), &j.on) else {
                 return Err(invalid(format!("{slug} has no field `{}`", j.on)));
             };
+            // ponytail: `on_pattern` can't match link paths inside block rows yet, so such a
+            // join would always come back empty; lift this once it can.
+            if through_blocks(target.data(), &j.on) {
+                return Err(invalid(format!(
+                    "{slug}.{} is inside blocks, which joins can't follow yet",
+                    j.on
+                )));
+            }
             let FieldKind::Relationship { relation_to, .. } = &on.kind else {
                 return Err(invalid(format!(
                     "{slug}.{} isn't a relationship field",
@@ -1241,8 +1249,8 @@ impl CollectionSchema {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
         let data = self.data();
-        check_layout(&self.fields, data, "fields", "")?;
-        check_fields(data, Level::Top, data, "", false)?;
+        check_layout(&self.fields, data, "fields", "", &[])?;
+        check_fields(data, Level::Top, data, "", false, &[])?;
         if self.kind == CollectionKind::Global
             && let Some(j) = self.join_fields().first()
         {
@@ -1398,34 +1406,65 @@ fn unknown_in_fields(
     Ok(())
 }
 
-/// The field at a dotted path, looking through groups, arrays and blocks. A path into
-/// blocks doesn't name the block type (`layout.heading`), so it finds the first block
-/// type with that field.
-pub(crate) fn find_field<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
-    let mut current = fields;
-    let mut found = None;
-    let segments: Vec<&str> = path.split('.').collect();
-    for (i, segment) in segments.iter().enumerate() {
-        let f = current.iter().find(|f| f.name == *segment)?;
-        current = segments
-            .get(i + 1)
-            .map_or(&[][..], |next| children(&f.kind, next));
-        found = Some(f);
-    }
-    found
+/// The block types a field sits in: each enclosing `blocks` field's data path, with the
+/// slug of the block type around it.
+type Within<'a> = &'a [(String, String)];
+
+/// `within` one level deeper: inside block type `slug` of the blocks field at `path`.
+fn enter(within: Within, path: &str, slug: &str) -> Vec<(String, String)> {
+    let mut out = within.to_vec();
+    out.push((path.to_owned(), slug.to_owned()));
+    out
 }
 
-/// The fields one level inside `kind` that a path continuing with `next` looks in: a group's
-/// or array's fields, or those of the first block type that has a field named `next`.
-fn children<'a>(kind: &'a FieldKind, next: &str) -> &'a [Field] {
-    match kind {
-        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-        FieldKind::Blocks { blocks, .. } => blocks
+/// The field at a dotted path, looking through groups, arrays and blocks. A path into
+/// blocks doesn't name the block type (`layout.heading`), so it finds the first block
+/// type, in schema order, that has the whole rest of the path.
+pub(crate) fn find_field<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
+    field_steps(fields, path, "", &[]).and_then(|steps| steps.last().copied())
+}
+
+/// Every field along `path` (under `prefix`), outermost first. Inside a blocks field listed
+/// in `within` only that block type is searched, so a field inside a block sees its own
+/// block type and what's above it; elsewhere every block type is.
+fn field_steps<'a>(
+    fields: &'a [Field],
+    path: &str,
+    prefix: &str,
+    within: Within,
+) -> Option<Vec<&'a Field>> {
+    let (head, rest) = path
+        .split_once('.')
+        .map_or((path, None), |(h, r)| (h, Some(r)));
+    let f = fields.iter().find(|f| f.name == head)?;
+    let Some(rest) = rest else {
+        return Some(vec![f]);
+    };
+    let here = join(prefix, head);
+    let mut steps = match &f.kind {
+        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+            field_steps(fields, rest, &here, within)?
+        }
+        FieldKind::Blocks { blocks, .. } => {
+            let only = within.iter().find(|(p, _)| *p == here).map(|(_, s)| s);
+            blocks
+                .iter()
+                .filter(|b| only.is_none_or(|slug| *slug == b.slug))
+                .find_map(|b| field_steps(&b.fields, rest, &here, within))?
+        }
+        _ => return None,
+    };
+    steps.insert(0, f);
+    Some(steps)
+}
+
+/// Whether `path` passes through a `blocks` field on its way to the field it names.
+fn through_blocks(fields: &[Field], path: &str) -> bool {
+    field_steps(fields, path, "", &[]).is_some_and(|steps| {
+        steps[..steps.len() - 1]
             .iter()
-            .find(|b| b.fields.iter().any(|f| f.name == next))
-            .map_or(&[][..], |b| &b.fields),
-        _ => &[],
-    }
+            .any(|f| matches!(f.kind, FieldKind::Blocks { .. }))
+    })
 }
 
 fn is_identifier(s: &str, allow_upper: bool) -> bool {
@@ -1450,6 +1489,7 @@ fn check_fields(
     root: &[Field],
     prefix: &str,
     in_list: bool,
+    within: Within,
 ) -> Result<(), SchemaError> {
     let top_level = level == Level::Top;
     let mut seen = HashSet::new();
@@ -1604,12 +1644,22 @@ fn check_fields(
                     }
                 }
             }
-            FieldKind::Group { fields } => {
-                check_fields(fields, Level::Nested, root, &join(prefix, &f.name), in_list)?
-            }
-            FieldKind::Array { fields, .. } => {
-                check_fields(fields, Level::Nested, root, &join(prefix, &f.name), true)?
-            }
+            FieldKind::Group { fields } => check_fields(
+                fields,
+                Level::Nested,
+                root,
+                &join(prefix, &f.name),
+                in_list,
+                within,
+            )?,
+            FieldKind::Array { fields, .. } => check_fields(
+                fields,
+                Level::Nested,
+                root,
+                &join(prefix, &f.name),
+                true,
+                within,
+            )?,
             FieldKind::Blocks { blocks, .. } => {
                 if blocks.is_empty() {
                     return Err(invalid("blocks needs at least one block type".into()));
@@ -1628,12 +1678,14 @@ fn check_fields(
                             block.slug
                         )));
                     }
+                    let path = join(prefix, &f.name);
                     check_fields(
                         &block.fields,
                         Level::BlockRow,
                         root,
-                        &join(prefix, &f.name),
+                        &path,
                         true,
+                        &enter(within, &path, &block.slug),
                     )?;
                 }
             }
@@ -1677,7 +1729,7 @@ fn check_fields(
         if let Some(path) = &f.virtual_path {
             check_virtual(f, path, root, in_list).map_err(invalid)?;
         }
-        check_admin(&f.admin, root, &[join(prefix, &f.name)], false).map_err(invalid)?;
+        check_admin(&f.admin, root, &[join(prefix, &f.name)], false, within).map_err(invalid)?;
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
             crate::validate::check_value(f, default, &f.name, &mut errors);
@@ -2646,6 +2698,30 @@ mod tests {
         assert_eq!(
             check_err(outside["fields"].clone()),
             "field `title`: admin.condition can't reach into the list `layout` from outside it"
+        );
+        // A condition inside a block sees its own block type and what's above it, never
+        // another block type's fields.
+        let mut other_type = blocks_schema();
+        other_type["fields"][1]["blocks"][0]["fields"][0]["admin"] =
+            json!({"condition": {"field": "layout.text", "exists": true}});
+        assert_eq!(
+            check_err(other_type["fields"].clone()),
+            "field `heading`: admin.condition refers to `layout.text`, which isn't a field"
+        );
+        let mut above = blocks_schema();
+        above["fields"][1]["blocks"][1]["fields"][0]["admin"] =
+            json!({"condition": {"field": "title", "equals": "x"}});
+        assert_eq!(check_err(above["fields"].clone()), "ok");
+        // Across block types, a path finds the first type that has all of it.
+        let shared = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "a", "fields": [{"name": "cta", "type": "text"}]},
+                {"slug": "b", "fields": [{"name": "cta", "type": "group", "fields": [{"name": "label", "type": "text"}]}]}
+            ]}]}),
+        );
+        assert_eq!(
+            find_field(shared.data(), "layout.cta.label").map(|f| f.kind.name()),
+            Some("text")
         );
 
         for (raw, field, option) in [

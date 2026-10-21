@@ -565,6 +565,8 @@ impl Checker<'_> {
                                         .into(),
                             });
                         }
+                        // With no rules left inside, this only refuses a rule on a layout
+                        // field in the block; it checks real rules once the refusal above is lifted.
                         self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
                     }
                 }
