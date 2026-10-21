@@ -6,7 +6,9 @@ use time::macros::format_description;
 
 use uuid::Uuid;
 
-use crate::schema::{BLOCK_ROW_KEYS, Field, FieldKind, RelationTo, SelectOption, data_fields};
+use crate::schema::{
+    BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, RelationTo, SelectOption, data_fields,
+};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
@@ -408,7 +410,11 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
                     Some(t) => match t.as_str().and_then(|slug| f.kind.block(slug)) {
                         Some(block) => block,
                         None => {
-                            let slugs: Vec<&str> = blocks.iter().map(|b| b.slug.as_str()).collect();
+                            let slugs: Vec<&str> = blocks
+                                .iter()
+                                .filter_map(BlockSource::def)
+                                .map(|b| b.slug.as_str())
+                                .collect();
                             errors.push(error(
                                 format!("{row_path}.blockType"),
                                 &format!("expected one of: {}", slugs.join(", ")),

@@ -61,13 +61,17 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
             schema
                 .reject_unknown_options(item)
                 .with_context(|| slug.to_owned())?;
-            schema.check().with_context(|| slug.to_owned())?;
+            // One naming shared blocks is checked once they're in place, in `run`.
+            if schema.block_refs().is_empty() {
+                schema.check().with_context(|| slug.to_owned())?;
+            }
             Ok(schema)
         })
         .collect()
 }
 
-fn describe(slug: &str, p: &Preview) -> String {
+/// A preview's changes, in words.
+fn changes(p: &Preview) -> String {
     let changes: Vec<String> = p
         .diff
         .changes
@@ -89,8 +93,22 @@ fn describe(slug: &str, p: &Preview) -> String {
             }
         })
         .collect();
-    let mut line = format!("~ change {slug}: {}", changes.join("; "));
-    if p.invalid > 0 {
+    changes.join("; ")
+}
+
+fn describe(slug: &str, p: &Preview) -> String {
+    let mut line = format!("~ change {slug}: {}", changes(p));
+    // A shared block's change, as each schema naming it sees it.
+    for (other, sub) in &p.collections {
+        line += &format!("\n  in {other}: {}", changes(sub));
+        if sub.invalid > 0 {
+            line += &format!(
+                "\n    {} of {} documents won't validate against the new fields",
+                sub.invalid, sub.documents
+            );
+        }
+    }
+    if p.invalid > 0 && p.collections.is_empty() {
         line += &format!(
             "\n  {} of {} documents won't validate against the new fields",
             p.invalid, p.documents
@@ -146,19 +164,33 @@ pub async fn run(
 
     // Every collection must work with the file's schemas in place of the database's, those
     // left out of the file included: virtual and join fields read other collections, and
-    // access rules filter through them or read `$user` fields from `users`.
-    let lookup = |slug: &str| {
-        wanted
-            .iter()
-            .find(|o| o.slug == slug)
-            .or_else(|| {
-                existing
-                    .iter()
-                    .map(|c| &c.schema.0)
-                    .find(|o| o.slug == slug)
-            })
-            .cloned()
+    // access rules filter through them or read `$user` fields from `users`. Each sees its
+    // shared blocks as the file leaves them.
+    let raw = |slug: &str| {
+        wanted.iter().find(|o| o.slug == slug).or_else(|| {
+            existing
+                .iter()
+                .map(|c| &c.schema.0)
+                .find(|o| o.slug == slug)
+        })
     };
+    let mut world = Vec::new();
+    for s in &wanted {
+        let expanded = s.expand(raw).with_context(|| s.slug.clone())?;
+        expanded.check().with_context(|| s.slug.clone())?;
+        world.push(expanded);
+    }
+    for c in &existing {
+        let other = &c.schema.0;
+        if !wanted.iter().any(|s| s.slug == other.slug) {
+            world.push(
+                other
+                    .expand(raw)
+                    .with_context(|| format!("{} (not in the file) would break", other.slug))?,
+            );
+        }
+    }
+    let lookup = |slug: &str| world.iter().find(|o| o.slug == slug).cloned();
     let roles = tachyon_db::auth::roles_list(pool).await?;
     let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
     let users = lookup(USERS).map(|u| u.fields).unwrap_or_default();
@@ -167,31 +199,31 @@ pub async fn run(
             .and_then(|()| s.check_join_targets(lookup))
             .and_then(|()| check_rules(s, &users, &roles, &lookup))
     };
-    for s in &wanted {
+    for s in &world {
         // `check_users_schema` here too for a `users` the file creates, which skips the
         // change's own check.
-        check_users_schema(s)
-            .and_then(|()| works(s))
-            .with_context(|| s.slug.clone())?;
-    }
-    for c in &existing {
-        let other = &c.schema.0;
-        if !wanted.iter().any(|s| s.slug == other.slug) {
-            works(other)
-                .with_context(|| format!("{} (not in the file) would break", other.slug))?;
+        if wanted.iter().any(|w| w.slug == s.slug) {
+            check_users_schema(s)
+                .and_then(|()| works(s))
+                .with_context(|| s.slug.clone())?;
+        } else {
+            works(s).with_context(|| format!("{} (not in the file) would break", s.slug))?;
         }
     }
+    // Shared blocks first, so the schemas naming them find them.
+    let is_block = |s: &&CollectionSchema| s.kind == CollectionKind::Block;
+    let ordered: Vec<&CollectionSchema> = wanted
+        .iter()
+        .filter(is_block)
+        .chain(wanted.iter().filter(|s| !is_block(s)))
+        .collect();
 
     let none = Renames::new();
-    // Collections the file creates count as valid link targets for the changed ones.
-    let pending: Vec<&str> = wanted
-        .iter()
-        .filter(|s| is_new(&s.slug))
-        .map(|s| s.slug.as_str())
-        .collect();
+    // What the file creates counts for the changed ones: as link targets, and shared blocks.
+    let pending: Vec<&CollectionSchema> = wanted.iter().filter(|s| is_new(&s.slug)).collect();
     let mut report = Vec::new();
     let mut previews = Vec::new();
-    for s in &wanted {
+    for &s in &ordered {
         if is_new(&s.slug) {
             report.push(format!("+ create {}", s.slug));
             continue;
@@ -238,12 +270,12 @@ pub async fn run(
     let mut done = Vec::new();
     let result: anyhow::Result<()> = async {
         // New collections first, so changed ones can point at them.
-        for s in wanted.iter().filter(|s| is_new(&s.slug)) {
+        for s in ordered.iter().filter(|s| is_new(&s.slug)) {
             let c = collections::create(pool, s).await?;
             indexes::reconcile_indexes(pool, c.id).await?;
             done.push(format!("+ created {}", s.slug));
         }
-        for s in wanted.iter().filter(|s| !is_new(&s.slug)) {
+        for s in ordered.iter().filter(|s| !is_new(&s.slug)) {
             let r = renames.get(&s.slug).unwrap_or(&none);
             // `yes` again here: the in-transaction check decides, not the earlier preview.
             let (c, _) = schema_change::apply(pool, &s.slug, s, r, yes).await?;
@@ -622,6 +654,86 @@ mod tests {
         assert!(
             format!("{err:#}").starts_with("users: access: rules on users aren't enforced yet"),
             "{err:#}"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn shared_blocks_round_trip_through_export_and_apply(pool: PgPool) {
+        let cta = |fields: Value| json!({"slug": "cta", "kind": "block", "fields": fields});
+        let pages = json!({"slug": "pages", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]});
+        let label = json!([{"name": "label", "type": "text"}]);
+        // The block comes after the collection in the file, and is still applied first.
+        let file = json!({"collections": [pages, cta(label.clone())]}).to_string();
+        let plan = run(&pool, &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(
+            plan.contains("+ create cta") && plan.contains("+ create pages"),
+            "{plan}"
+        );
+
+        let exported: Value = serde_json::from_str(&export(&pool).await.unwrap()).unwrap();
+        let saved = |slug: &str| {
+            exported["collections"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|c| c["slug"] == slug)
+                .cloned()
+                .unwrap()
+        };
+        assert_eq!(saved("cta"), cta(label));
+        assert_eq!(
+            saved("pages")["fields"][0]["blocks"],
+            json!([{"blockRef": "cta"}])
+        );
+        let out = run(&pool, &exported.to_string(), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(
+            out.contains("= cta unchanged") && out.contains("= pages unchanged"),
+            "{out}"
+        );
+
+        // Changing the block reports the change in each collection that uses it.
+        let changed = json!({"collections": [cta(json!([
+            {"name": "label", "type": "text"}, {"name": "url", "type": "text"}
+        ]))]})
+        .to_string();
+        let plan = run(&pool, &changed, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(plan.contains("~ change cta: add url (text)"), "{plan}");
+        assert!(
+            plan.contains("in pages: add layout.cta.url (text)"),
+            "{plan}"
+        );
+
+        // A rename names the field within the block.
+        let renamed = json!({"collections": [cta(json!([
+            {"name": "text", "type": "text"}, {"name": "url", "type": "text"}
+        ]))]})
+        .to_string();
+        let r = parse_renames(&["cta:label=text".into()]).unwrap();
+        let plan = run(&pool, &renamed, &r, None).await.unwrap();
+        assert!(
+            plan.contains("in pages: rename layout.cta.label to layout.cta.text"),
+            "{plan}"
+        );
+
+        // A reference must name a block in the file or the database.
+        let missing = json!({"collections": [{"slug": "posts", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "nope"}]}
+        ]}]})
+        .to_string();
+        let err = run(&pool, &missing, &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "posts: field `layout`: blockRef `nope` doesn't match a shared block"
         );
     }
 }

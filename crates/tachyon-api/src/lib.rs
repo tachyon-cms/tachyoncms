@@ -82,7 +82,9 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         )
         .route(
             "/api/admin/collections/{slug}",
-            get(collections::get_one).put(collections::update),
+            get(collections::get_one)
+                .put(collections::update)
+                .delete(collections::delete),
         )
         .route(
             "/api/admin/collections/{slug}/preview",

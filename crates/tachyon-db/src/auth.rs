@@ -625,7 +625,7 @@ pub async fn role_upsert(
 
 /// Taken inside the transaction by a role delete, and by a schema save from its role check to
 /// its commit, so a stored rule can never name a role that's gone.
-async fn lock_rule_roles(conn: &mut PgConnection) -> Result<(), DbError> {
+pub(crate) async fn lock_rule_roles(conn: &mut PgConnection) -> Result<(), DbError> {
     // An arbitrary constant: the one lock every role delete and rule save shares.
     sqlx::query!("SELECT pg_advisory_xact_lock(7311002)")
         .fetch_one(conn)

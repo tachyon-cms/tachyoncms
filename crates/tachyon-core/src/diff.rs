@@ -7,7 +7,8 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::schema::{
-    BLOCK_ROW_KEYS, CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields,
+    BLOCK_ROW_KEYS, BlockDef, BlockSource, CollectionSchema, Field, FieldKind, RelationTo,
+    SchemaError, data_fields,
 };
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`. A path
@@ -114,9 +115,11 @@ pub fn diff(
         return Err(invalid("renaming a collection isn't supported yet".into()));
     }
     if old.kind != new.kind {
-        return Err(invalid(
-            "a collection can't become a global, or the other way round".into(),
-        ));
+        return Err(invalid(format!(
+            "a {} can't become a {}",
+            old.kind.as_str(),
+            new.kind.as_str()
+        )));
     }
     // Compare what's stored, not how the admin arranges it.
     let old_data = data_fields(&old.fields);
@@ -241,12 +244,14 @@ fn compare(
             }
             // Block types are matched by slug, and their paths name it: `layout.hero.heading`.
             (FieldKind::Blocks { blocks: a, .. }, FieldKind::Blocks { blocks: b, .. }) => {
+                let a: Vec<&BlockDef> = a.iter().filter_map(BlockSource::def).collect();
+                let b: Vec<&BlockDef> = b.iter().filter_map(BlockSource::def).collect();
                 if options(o) != options(n) {
                     out.push(Change::OptionsChanged {
                         path: new_path.clone(),
                     });
                 }
-                for old_block in a {
+                for old_block in &a {
                     let old_block_path = join(&old_path, &old_block.slug);
                     let new_block_path = join(&new_path, &old_block.slug);
                     let Some(new_block) = b.iter().find(|nb| nb.slug == old_block.slug) else {
@@ -834,7 +839,7 @@ mod tests {
             (
                 json!({"slug": "posts", "kind": "global", "fields": []}),
                 vec![],
-                "a collection can't become a global, or the other way round",
+                "a collection can't become a global",
             ),
             (
                 json!({"slug": "posts", "fields": []}),

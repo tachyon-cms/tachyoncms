@@ -11,7 +11,8 @@ use crate::FieldError;
 use crate::auth::Action;
 use crate::query::{Filter, Lookup, check_target, parse_filter_with};
 use crate::schema::{
-    BLOCK_ROW_KEYS, CollectionKind, CollectionSchema, Field, FieldKind, SchemaError, data_fields,
+    BLOCK_ROW_KEYS, BlockSource, CollectionKind, CollectionSchema, Field, FieldKind, SchemaError,
+    data_fields,
 };
 
 /// One access rule, as stored in the schema.
@@ -560,6 +561,7 @@ impl Checker<'_> {
                 // A block's fields are named like a list's, without the block type.
                 FieldKind::Blocks { blocks, .. } => {
                     for (b, block) in blocks.iter().enumerate() {
+                        let Some(block) = block.def() else { continue };
                         self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
                     }
                 }
@@ -607,7 +609,11 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
 fn inside(f: &Field) -> Vec<&[Field]> {
     match &f.kind {
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => vec![fields],
-        FieldKind::Blocks { blocks, .. } => blocks.iter().map(|b| b.fields.as_slice()).collect(),
+        FieldKind::Blocks { blocks, .. } => blocks
+            .iter()
+            .filter_map(BlockSource::def)
+            .map(|b| b.fields.as_slice())
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -730,7 +736,7 @@ pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Fie
                         *fields = prune(fields, &next, caller)
                     }
                     FieldKind::Blocks { blocks, .. } => {
-                        for b in blocks {
+                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
                             b.fields = prune(&b.fields, &next, caller);
                         }
                     }
@@ -764,7 +770,7 @@ pub fn readable_rows<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field
                         *fields = readable_rows(fields, caller).into_owned()
                     }
                     FieldKind::Blocks { blocks, .. } => {
-                        for b in blocks {
+                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
                             b.fields = readable_rows(&b.fields, caller).into_owned();
                         }
                     }
@@ -1025,7 +1031,7 @@ pub fn unwritable(
             }
             FieldKind::Blocks { blocks, .. } => {
                 let (sent, stored) = (rows(sent), stored.map(rows));
-                for b in blocks {
+                for b in blocks.iter().filter_map(BlockSource::def) {
                     let (mine, held) = (
                         of_type(&sent, &b.slug),
                         stored.as_deref().map(|s| of_type(s, &b.slug)),

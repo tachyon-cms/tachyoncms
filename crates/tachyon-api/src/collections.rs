@@ -32,15 +32,26 @@ fn schema_error(e: SchemaError) -> ApiError {
     }])
 }
 
+/// Parses a schema, refusing unknown keys. Check it with `saved`, once its shared blocks are in place.
 fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
     let schema = CollectionSchema::deserialize(value)
         .map_err(|e| ApiError::BadRequest(explain_parse_error(value, &e)))?;
-    // Unknown keys first: a typo such as `nmae` should be named, not reported as a bad name.
-    schema
-        .reject_unknown_options(value)
-        .and_then(|()| schema.check())
-        .map_err(schema_error)?;
+    schema.reject_unknown_options(value).map_err(schema_error)?;
     Ok(schema)
+}
+
+/// Every schema as it would be with `schema` saved (see `Schemas::with_saved`), after
+/// checking `schema` with its shared blocks in place, since a select or condition may
+/// reach into one. Unknown keys were refused first: a typo such as `nmae` should be named,
+/// not reported as a bad name.
+fn saved(state: &AppState, schema: &CollectionSchema) -> Result<Vec<CollectionSchema>, ApiError> {
+    // Slug and block rules first, so a bad slug isn't reported as a missing reference.
+    if schema.block_refs().is_empty() {
+        schema.check().map_err(schema_error)?;
+    }
+    let world = state.schemas.with_saved(schema).map_err(schema_error)?;
+    world[0].check().map_err(schema_error)?;
+    Ok(world)
 }
 
 /// Logged here so the cause survives even if the reload after it fails too.
@@ -76,20 +87,20 @@ pub async fn create(
             "users is built in; change its fields with PUT /api/admin/collections/users".into(),
         ));
     }
-    for target in schema.relation_targets() {
-        let ok = target == schema.slug
-            || state
-                .schemas
-                .get(target)
-                .is_some_and(|c| c.schema.kind == CollectionKind::Collection);
+    let world = saved(&state, &schema)?;
+    for target in world[0].relation_targets() {
+        let ok = (target == schema.slug && schema.kind != CollectionKind::Block)
+            || world
+                .iter()
+                .any(|c| c.slug == target && c.kind == CollectionKind::Collection);
         if !ok {
             return Err(schema_error(SchemaError::InvalidChange(format!(
                 "relationTo `{target}` doesn't match an existing collection"
             ))));
         }
     }
-    check_virtuals(&state, &schema)?;
-    check_rules(&state, &schema).await?;
+    check_virtuals(&world)?;
+    check_rules(&state, &world).await?;
     let created = collections::create(&state.pool, &schema).await?;
     // The schema is saved either way, so serve it even if its indexes failed to build.
     let indexed = reconcile_indexes(&state.pool, created.id).await;
@@ -106,8 +117,22 @@ pub async fn get_one(
 ) -> Result<Json<Value>, ApiError> {
     principal.require()?;
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
-    let c = state.schemas.get(&slug).ok_or(ApiError::NotFound)?;
+    // As stored, shared blocks included and references kept.
+    let c = collections::get_by_slug(&state.pool, &slug).await?;
     Ok(Json(to_json(&c)))
+}
+
+/// Deletes a shared block that no schema names. Collections and globals can't be deleted yet.
+pub async fn delete(
+    State(state): State<AppState>,
+    principal: Principal,
+    path: Result<Path<String>, PathRejection>,
+) -> Result<StatusCode, ApiError> {
+    authorize(&principal, Action::Schemas, "")?;
+    let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
+    collections::delete_block(&state.pool, &slug).await?;
+    state.schemas.reload(&state.pool).await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Deserialize)]
@@ -120,33 +145,29 @@ struct ChangeRequest {
     confirm: bool,
 }
 
-/// Every virtual field must read a field its targets have, and every join a field that links here.
-fn check_virtuals(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
-    let lookup = |slug: &str| state.schemas.get(slug).map(|c| c.schema.0.clone());
-    schema
-        .check_virtual_targets(lookup)
-        .and_then(|()| schema.check_join_targets(lookup))
+/// A schema in `world` (see `Schemas::with_saved`) by slug.
+fn find<'w>(world: &'w [CollectionSchema]) -> impl Fn(&str) -> Option<&'w CollectionSchema> {
+    move |slug| world.iter().find(|c| c.slug == slug)
+}
+
+/// Every virtual field of the saved schema, `world[0]`, must read a field its targets have,
+/// and every join a field that links here.
+fn check_virtuals(world: &[CollectionSchema]) -> Result<(), ApiError> {
+    let lookup = find(world);
+    world[0]
+        .check_virtual_targets(&lookup)
+        .and_then(|()| world[0].check_join_targets(&lookup))
         .map_err(schema_error)
 }
 
-/// A change to `schema` must not break the virtual or join fields other collections read
-/// from it, such as a join on a relationship this change removes.
-fn check_dependents(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
-    let lookup = |slug: &str| {
-        if slug == schema.slug {
-            Some(schema.clone())
-        } else {
-            state.schemas.get(slug).map(|c| c.schema.0.clone())
-        }
-    };
-    for other in state.schemas.all() {
-        let other = &other.schema.0;
-        if other.slug == schema.slug {
-            continue;
-        }
+/// A change must not break the virtual or join fields other collections read from it, such
+/// as a join on a relationship this change removes, or on a field of a shared block.
+fn check_dependents(world: &[CollectionSchema]) -> Result<(), ApiError> {
+    let lookup = find(world);
+    for other in &world[1..] {
         other
-            .check_virtual_targets(lookup)
-            .and_then(|()| other.check_join_targets(lookup))
+            .check_virtual_targets(&lookup)
+            .and_then(|()| other.check_join_targets(&lookup))
             .map_err(|e| {
                 schema_error(SchemaError::InvalidChange(format!(
                     "this change would break {}: {e}",
@@ -164,25 +185,15 @@ fn check_dependents(state: &AppState, schema: &CollectionSchema) -> Result<(), A
 // ponytail: a rule stored before these checks existed, which they'd now refuse, blocks
 // saving every other collection until it's fixed. Fine before the first release, since no
 // deployment holds rules yet; add a migration that reports them if that changes.
-async fn check_rules(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+async fn check_rules(state: &AppState, world: &[CollectionSchema]) -> Result<(), ApiError> {
     let roles = tachyon_db::auth::roles_list(&state.pool).await?;
     let roles: Vec<&str> = roles.iter().map(|r| r.slug.as_str()).collect();
-    let lookup = |slug: &str| {
-        if slug == schema.slug {
-            Some(schema.clone())
-        } else {
-            state.schemas.get(slug).map(|c| c.schema.0.clone())
-        }
-    };
+    let lookup = |slug: &str| find(world)(slug).cloned();
     let users = lookup(tachyon_db::auth::USERS)
         .map(|u| u.fields)
         .unwrap_or_default();
-    access::check_rules(schema, &users, &roles, &lookup).map_err(schema_error)?;
-    for other in state.schemas.all() {
-        let other = &other.schema.0;
-        if other.slug == schema.slug {
-            continue;
-        }
+    access::check_rules(&world[0], &users, &roles, &lookup).map_err(schema_error)?;
+    for other in &world[1..] {
         access::check_rules(other, &users, &roles, &lookup).map_err(|e| {
             schema_error(SchemaError::InvalidChange(format!(
                 "this change would break {}: {e}",
@@ -230,9 +241,10 @@ pub async fn preview(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
-    check_virtuals(&state, &schema)?;
-    check_dependents(&state, &schema)?;
-    check_rules(&state, &schema).await?;
+    let world = saved(&state, &schema)?;
+    check_virtuals(&world)?;
+    check_dependents(&world)?;
+    check_rules(&state, &world).await?;
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
         .await
         .map_err(change_error)?;
@@ -247,9 +259,10 @@ pub async fn update(
 ) -> Result<Json<Value>, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
-    check_virtuals(&state, &schema)?;
-    check_dependents(&state, &schema)?;
-    check_rules(&state, &schema).await?;
+    let world = saved(&state, &schema)?;
+    check_virtuals(&world)?;
+    check_dependents(&world)?;
+    check_rules(&state, &world).await?;
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;

@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::query::FilterError;
-use crate::schema::{BLOCK_ROW_KEYS, Field, FieldKind, data_fields};
+use crate::schema::{BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, data_fields};
 
 /// Keys every document carries besides its fields. `id` always comes back.
 const BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "status"];
@@ -94,9 +94,11 @@ fn parse_tree(
                         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                             vec![fields.as_slice()]
                         }
-                        FieldKind::Blocks { blocks, .. } => {
-                            blocks.iter().map(|b| b.fields.as_slice()).collect()
-                        }
+                        FieldKind::Blocks { blocks, .. } => blocks
+                            .iter()
+                            .filter_map(BlockSource::def)
+                            .map(|b| b.fields.as_slice())
+                            .collect(),
                         _ => vec![],
                     })
                     .collect();

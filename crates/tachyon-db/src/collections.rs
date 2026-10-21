@@ -2,7 +2,7 @@
 
 use sqlx::PgPool;
 use sqlx::types::Json;
-use tachyon_core::CollectionSchema;
+use tachyon_core::{CollectionKind, CollectionSchema};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -19,7 +19,23 @@ pub struct Collection {
 
 pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collection, DbError> {
     let mut tx = pool.begin().await?;
+    // R42's lock, held to commit like every schema save, so a shared block this one names
+    // can't change or go before it's stored.
+    crate::auth::lock_rule_roles(&mut tx).await?;
     crate::auth::check_rule_roles(&mut tx, schema).await?;
+    let refs: Vec<String> = schema.block_refs().into_iter().map(str::to_owned).collect();
+    let found = sqlx::query_scalar!(
+        "SELECT slug FROM collections WHERE tenant_id = $1 AND kind = 'block' AND slug = ANY($2)",
+        DEFAULT_TENANT,
+        &refs,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if let Some(missing) = refs.iter().find(|r| !found.contains(r)) {
+        return Err(DbError::Refused(format!(
+            "blockRef `{missing}` doesn't match a shared block"
+        )));
+    }
     let created = sqlx::query_as!(
         Collection,
         r#"INSERT INTO collections (id, tenant_id, slug, kind, schema)
@@ -69,4 +85,45 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Collection>, DbError> {
     )
     .fetch_all(pool)
     .await?)
+}
+
+/// Removes the shared block `slug`, refused while any schema names it.
+pub async fn delete_block(pool: &PgPool, slug: &str) -> Result<(), DbError> {
+    let mut tx = pool.begin().await?;
+    // Under R42's lock, no schema naming it can be saved in between.
+    crate::auth::lock_rule_roles(&mut tx).await?;
+    let all = sqlx::query_scalar!(
+        r#"SELECT schema AS "schema: Json<CollectionSchema>" FROM collections
+           WHERE tenant_id = $1 ORDER BY slug"#,
+        DEFAULT_TENANT,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let block = all
+        .iter()
+        .find(|s| s.slug == slug)
+        .ok_or(DbError::NotFound)?;
+    if block.kind != CollectionKind::Block {
+        return Err(DbError::Refused(format!(
+            "`{slug}` isn't a shared block; collections and globals can't be deleted yet"
+        )));
+    }
+    if let Some(user) = all.iter().find(|s| s.block_refs().contains(&slug)) {
+        return Err(DbError::Refused(format!(
+            "{} uses the shared block `{slug}`; remove it there first",
+            user.slug
+        )));
+    }
+    sqlx::query!(
+        "DELETE FROM collections WHERE tenant_id = $1 AND slug = $2",
+        DEFAULT_TENANT,
+        slug
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", slug)
+        .execute(&mut *tx)
+        .await?;
+    tx.commit().await?;
+    Ok(())
 }

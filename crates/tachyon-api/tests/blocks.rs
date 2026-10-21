@@ -940,3 +940,382 @@ async fn profile_block_rows_answer_to_their_own_type(pool: PgPool) {
     );
     assert_eq!(seen["bio"][1]["note"], "hi");
 }
+
+async fn put(app: &Router, url: &str, body: Value) -> Res {
+    send(app, "PUT", url, Some(&body.to_string())).await
+}
+
+/// A shared `cta` block with `fields`, as a schema.
+fn cta(fields: Value) -> Value {
+    json!({"slug": "cta", "kind": "block", "fields": fields})
+}
+
+/// A collection whose blocks field `list` offers the shared `cta` and an inline `quote`.
+fn referencing(slug: &str, list: &str) -> Value {
+    json!({"slug": slug, "access": {"read": true}, "fields": [
+        {"name": "title", "type": "text"},
+        {"name": list, "type": "blocks", "blocks": [
+            {"blockRef": "cta"},
+            {"slug": "quote", "fields": [{"name": "text", "type": "text"}]}
+        ]}
+    ]})
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn shared_blocks_expand_everywhere(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let other = visitor(&pool).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        cta(json!([{"name": "label", "type": "text", "required": true}])),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        referencing("pages", "layout"),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        referencing("posts", "sections"),
+    )
+    .await;
+
+    // The schema keeps the reference; documents see the definition.
+    let saved = get(&admin, "/api/admin/collections/pages").await.json;
+    assert_eq!(
+        saved["schema"]["fields"][1]["blocks"][0],
+        json!({"blockRef": "cta"})
+    );
+    for (url, list) in [("/api/pages", "layout"), ("/api/posts", "sections")] {
+        let doc = create(
+            &admin,
+            url,
+            json!({"title": "A", list: [{"blockType": "cta", "label": "Go"}, {"blockType": "quote", "text": "Q"}]}),
+        )
+        .await;
+        let read = get(&admin, &format!("{url}/{}", id(&doc))).await.json;
+        assert_eq!(read[list][0]["label"], "Go");
+        assert_eq!(read[list][1]["text"], "Q");
+        // The block's own rules apply in every collection.
+        let res = send(
+            &admin,
+            "POST",
+            url,
+            Some(&json!({"title": "B", list: [{"blockType": "cta"}]}).to_string()),
+        )
+        .await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], format!("{list}.0.label"));
+    }
+
+    // A schema is checked with its shared blocks in place: a select may reach into one.
+    let mut notes = referencing("notes", "layout");
+    notes["defaultPopulate"] = json!({"layout": {"label": true}});
+    create(&admin, "/api/admin/collections", notes).await;
+
+    // Changing the block changes it everywhere, on this server at once.
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": cta(json!([
+            {"name": "label", "type": "text", "required": true},
+            {"name": "url", "type": "text"}
+        ]))}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // Writes checked against the old fields must retry, so each schema naming it moves on.
+    let saved = get(&admin, "/api/admin/collections/posts").await.json;
+    assert_eq!(saved["schemaVersion"], 2);
+    for (url, list) in [("/api/pages", "layout"), ("/api/posts", "sections")] {
+        assert_eq!(
+            res.json["preview"]["collections"][&url[5..]]["diff"]["changes"],
+            json!([{"type": "added", "path": format!("{list}.cta.url"), "kind": "text"}])
+        );
+        let doc = create(
+            &admin,
+            url,
+            json!({"title": "C", list: [{"blockType": "cta", "label": "Go", "url": "/x"}]}),
+        )
+        .await;
+        assert_eq!(doc[list][0]["url"], "/x");
+    }
+
+    // ...and on another server through NOTIFY.
+    for _ in 0..50 {
+        let res = get(&other, "/api/posts?where[sections.url][equals]=/x").await;
+        if res.status == 200 {
+            assert_eq!(titles(&res), ["C"]);
+            return;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    }
+    panic!("the other server never saw the changed block");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn breaking_a_shared_block_is_refused(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let fields = json!([{"name": "label", "type": "text"}, {"name": "note", "type": "text"}]);
+    create(&admin, "/api/admin/collections", cta(fields.clone())).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        referencing("pages", "layout"),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        referencing("posts", "sections"),
+    )
+    .await;
+    let page = id(&create(
+        &admin,
+        "/api/pages",
+        json!({"title": "P", "layout": [{"blockType": "cta", "label": "Go", "note": "n1"}]}),
+    )
+    .await);
+    let post = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Q", "sections": [{"blockType": "cta", "note": "n2"}]}),
+    )
+    .await);
+
+    // Requiring `label` leaves the post invalid: the report names it, per collection.
+    let required = json!([
+        {"name": "label", "type": "text", "required": true}, {"name": "note", "type": "text"}
+    ]);
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": cta(required)}),
+    )
+    .await;
+    assert_problem(&res, 409);
+    let report = &res.json["preview"]["collections"];
+    assert_eq!(report["pages"]["invalid"], 0);
+    assert_eq!(report["posts"]["invalid"], 1);
+    assert_eq!(report["posts"]["examples"][0]["id"], post);
+    assert_eq!(
+        report["posts"]["examples"][0]["errors"][0]["path"],
+        "sections.0.label"
+    );
+
+    // Removing a field documents use needs confirmation, with the change named per collection.
+    let removed = json!([{"name": "label", "type": "text"}]);
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": cta(removed.clone())}),
+    )
+    .await;
+    assert_problem(&res, 409);
+    for (slug, list) in [("pages", "layout"), ("posts", "sections")] {
+        assert_eq!(
+            res.json["preview"]["collections"][slug]["diff"]["changes"],
+            json!([{"type": "removed", "path": format!("{list}.cta.note"), "kind": "text"}])
+        );
+        assert_eq!(res.json["preview"]["collections"][slug]["documents"], 1);
+    }
+    assert_eq!(
+        get(&admin, &format!("/api/pages/{page}")).await.json["layout"][0]["note"],
+        "n1",
+        "a refused change changes nothing"
+    );
+
+    // A rename names the field within the block, and carries data in every collection.
+    let renamed = json!([{"name": "label", "type": "text"}, {"name": "remark", "type": "text"}]);
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": cta(renamed), "renames": {"note": "remark"}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        get(&admin, &format!("/api/pages/{page}")).await.json["layout"][0]["remark"],
+        "n1"
+    );
+    assert_eq!(
+        get(&admin, &format!("/api/posts/{post}")).await.json["sections"][0]["remark"],
+        "n2"
+    );
+
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": cta(removed), "confirm": true}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let doc = get(&admin, &format!("/api/pages/{page}")).await.json;
+    assert!(doc["layout"][0].get("remark").is_none(), "{doc}");
+
+    // A referenced block can't go; an unreferenced one can.
+    let res = send(&admin, "DELETE", "/api/admin/collections/cta", None).await;
+    assert_problem(&res, 409);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("pages"),
+        "{}",
+        res.json
+    );
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "spare", "kind": "block", "fields": [{"name": "x", "type": "text"}]}),
+    )
+    .await;
+    let res = send(&admin, "DELETE", "/api/admin/collections/spare", None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    // Collections and globals aren't deleted this way.
+    assert_problem(
+        &send(&admin, "DELETE", "/api/admin/collections/pages", None).await,
+        409,
+    );
+
+    // A change that breaks a join elsewhere, through a block's field, is refused.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+    )
+    .await;
+    let byline = |fields: Value| json!({"slug": "byline", "kind": "block", "fields": fields});
+    let who = json!([{"name": "who", "type": "relationship", "relationTo": "authors"}]);
+    create(&admin, "/api/admin/collections", byline(who)).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "stories", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "byline"}]}
+        ]}),
+    )
+    .await;
+    let res = put(
+        &admin,
+        "/api/admin/collections/authors",
+        json!({"schema": {"slug": "authors", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "stories", "type": "join", "collection": "stories", "on": "layout.who"}
+        ]}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = put(
+        &admin,
+        "/api/admin/collections/byline",
+        json!({"schema": byline(json!([{"name": "name", "type": "text"}])), "confirm": true}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert!(
+        res.json["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("this change would break authors"),
+        "{}",
+        res.json
+    );
+
+    // A reference must name a shared block.
+    let mut bad = referencing("notes", "layout");
+    bad["fields"][1]["blocks"][0] = json!({"blockRef": "spare"});
+    let res = send(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(&bad.to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert!(
+        res.json["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("spare"),
+        "{}",
+        res.json
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn blocks_have_no_document_routes(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let reviewer = json!({"slug": "reviewer", "name": "Reviewer",
+                          "abilities": {"content": "read", "schemas": false, "users": false}});
+    let res = send(
+        &admin,
+        "POST",
+        "/api/admin/roles",
+        Some(&reviewer.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    create(
+        &admin,
+        "/api/admin/collections",
+        cta(json!([{"name": "label", "type": "text", "access": {"read": {"role": ["reviewer"]}}}])),
+    )
+    .await;
+    for (method, url) in [
+        ("GET", "/api/cta"),
+        ("POST", "/api/cta"),
+        ("GET", "/api/globals/cta"),
+        ("PATCH", "/api/globals/cta"),
+    ] {
+        let res = send(&admin, method, url, Some("{}")).await;
+        assert_problem(&res, 404);
+    }
+    let access = get(&admin, "/api/access").await;
+    assert_eq!(access.status, 200);
+    assert!(
+        !access.json.to_string().contains("\"cta\""),
+        "{}",
+        access.json
+    );
+    // Nothing links to or joins a block.
+    let link = json!({"slug": "posts", "fields": [
+        {"name": "c", "type": "relationship", "relationTo": "cta"}
+    ]});
+    assert_problem(
+        &send(
+            &admin,
+            "POST",
+            "/api/admin/collections",
+            Some(&link.to_string()),
+        )
+        .await,
+        422,
+    );
+    // A block takes no access rules or other blocks' references.
+    for bad in [
+        json!({"slug": "b1", "kind": "block", "access": {"read": true}, "fields": []}),
+        json!({"slug": "b2", "kind": "block", "fields": [
+            {"name": "inner", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]}),
+        json!({"slug": "blocks", "kind": "block", "fields": []}),
+    ] {
+        let res = send(
+            &admin,
+            "POST",
+            "/api/admin/collections",
+            Some(&bad.to_string()),
+        )
+        .await;
+        assert_problem(&res, 422);
+    }
+    // A role a shared block's field rules name can't be deleted.
+    let res = send(&admin, "DELETE", "/api/admin/roles/reviewer", None).await;
+    assert_problem(&res, 409);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("cta"),
+        "{}",
+        res.json
+    );
+}

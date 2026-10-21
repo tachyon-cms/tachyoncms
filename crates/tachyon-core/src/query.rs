@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, SelectOption, data_fields};
+use crate::schema::{BlockSource, Field, FieldKind, SelectOption, data_fields};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -638,7 +638,13 @@ fn resolve(
                     lists: hops.lists + 1,
                     ..hops
                 };
-                let slugs = || blocks.iter().map(|b| b.slug.clone()).collect::<Vec<_>>();
+                let slugs = || {
+                    blocks
+                        .iter()
+                        .filter_map(BlockSource::def)
+                        .map(|b| b.slug.clone())
+                        .collect::<Vec<_>>()
+                };
                 if rest == "blockType" {
                     let options = slugs().into_iter().map(SelectOption::Value).collect();
                     let block_type = Field {
@@ -796,7 +802,7 @@ fn resolve(
 /// options.
 fn in_blocks(
     scope: &Scope<'_>,
-    blocks: &[crate::schema::BlockDef],
+    blocks: &[BlockSource],
     rest: &str,
     full: &str,
     verb: &str,
@@ -806,7 +812,7 @@ fn in_blocks(
     let mut found: Option<(Target, Option<Field>)> = None;
     let mut types = Vec::new();
     let mut first_error = None;
-    for b in blocks {
+    for b in blocks.iter().filter_map(BlockSource::def) {
         let row = Scope {
             root: scope.root,
             fields: &b.fields,

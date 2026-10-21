@@ -1,7 +1,7 @@
 //! Join fields: the documents of another collection that link to this one, found through
 //! the `relations` table on read and never stored.
 
-use crate::schema::{Field, FieldKind};
+use crate::schema::{BlockSource, Field, FieldKind};
 
 pub use crate::schema::JoinField;
 
@@ -33,7 +33,11 @@ fn pattern(fields: &[Field], path: &str) -> Option<String> {
         }
         (FieldKind::Blocks { blocks, .. }, Some(rest)) => {
             let mut shapes: Vec<String> = Vec::new();
-            for shape in blocks.iter().filter_map(|b| pattern(&b.fields, rest)) {
+            for shape in blocks
+                .iter()
+                .filter_map(BlockSource::def)
+                .filter_map(|b| pattern(&b.fields, rest))
+            {
                 if !shapes.contains(&shape) {
                     shapes.push(shape);
                 }

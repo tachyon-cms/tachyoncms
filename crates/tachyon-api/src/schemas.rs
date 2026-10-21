@@ -8,6 +8,7 @@ use std::time::Duration;
 use arc_swap::ArcSwap;
 use sqlx::PgPool;
 use sqlx::postgres::{PgListener, PgPoolOptions};
+use tachyon_core::{CollectionKind, CollectionSchema, SchemaError};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use uuid::Uuid;
@@ -20,10 +21,36 @@ pub struct Schemas {
     reloading: tokio::sync::Mutex<()>,
 }
 
+/// Collections and globals with their shared blocks expanded, so code past the cache never
+/// sees a reference. Shared blocks have no documents, so only `raw` holds them.
 #[derive(Default)]
 struct Snapshot {
     by_slug: HashMap<String, Arc<Collection>>,
     by_id: HashMap<Uuid, Arc<Collection>>,
+    /// Every schema as stored, shared blocks included.
+    raw: HashMap<String, Arc<Collection>>,
+}
+
+/// `c` with its references swapped for the definitions in `raw`, or `c` itself when it has
+/// none. A reference that finds nothing (saving refuses that) stays, and its rows are
+/// treated as a type the schema doesn't know.
+fn expand_in(raw: &HashMap<String, Arc<Collection>>, c: &Arc<Collection>) -> Arc<Collection> {
+    if c.schema.block_refs().is_empty() {
+        return c.clone();
+    }
+    match c
+        .schema
+        .expand(|slug: &str| raw.get(slug).map(|b| &b.schema.0))
+    {
+        Ok(schema) => Arc::new(Collection {
+            schema: sqlx::types::Json(schema),
+            ..(**c).clone()
+        }),
+        Err(error) => {
+            tracing::warn!(%error, collection = %c.schema.slug, "couldn't expand shared blocks");
+            c.clone()
+        }
+    }
 }
 
 impl Schemas {
@@ -50,7 +77,13 @@ impl Schemas {
         let _one_at_a_time = self.reloading.lock().await;
         let mut next = Snapshot::default();
         for c in collections::list(pool).await? {
-            let c = Arc::new(c);
+            next.raw.insert(c.schema.slug.clone(), Arc::new(c));
+        }
+        for c in next.raw.values() {
+            if c.schema.kind == CollectionKind::Block {
+                continue;
+            }
+            let c = expand_in(&next.raw, c);
             next.by_id.insert(c.id, c.clone());
             next.by_slug.insert(c.schema.slug.clone(), c);
         }
@@ -59,21 +92,54 @@ impl Schemas {
         Ok(())
     }
 
+    /// A collection or global by slug, expanded. Shared blocks aren't found here.
     pub fn get(&self, slug: &str) -> Option<Arc<Collection>> {
         self.current.load().by_slug.get(slug).cloned()
+    }
+
+    /// Every collection and global, expanded, as it would be with `changed` saved: one of
+    /// the same slug is replaced, and a shared block's new definition reaches every schema
+    /// naming it. `changed` itself is in the list, expanded unless it's a shared block.
+    /// Refuses when `changed` names a shared block that doesn't exist.
+    // ponytail: expands every schema per schema save; fine for admin-rate saves, keep the
+    // expanded snapshot and redo only the schemas naming `changed` if that ever shows.
+    pub fn with_saved(
+        &self,
+        changed: &CollectionSchema,
+    ) -> Result<Vec<CollectionSchema>, SchemaError> {
+        let snapshot = self.current.load();
+        let raw = |slug: &str| {
+            if slug == changed.slug {
+                Some(changed)
+            } else {
+                snapshot.raw.get(slug).map(|c| &c.schema.0)
+            }
+        };
+        let mut out = vec![if changed.kind == CollectionKind::Block {
+            changed.clone()
+        } else {
+            changed.expand(raw)?
+        }];
+        for c in snapshot.raw.values() {
+            if c.schema.slug != changed.slug && c.schema.kind != CollectionKind::Block {
+                // Stored references were checked when stored, and blocks naming one can't go.
+                out.push(c.schema.expand(raw).unwrap_or_else(|_| c.schema.0.clone()));
+            }
+        }
+        Ok(out)
     }
 
     /// A collection's schema by slug, for filters that reach through relationships. Globals
     /// aren't linkable, so they're left out.
     // ponytail: clones the schema per relationship a filter crosses; borrow from the
     // snapshot if that shows up in a profile.
-    pub fn lookup(&self, slug: &str) -> Option<tachyon_core::CollectionSchema> {
+    pub fn lookup(&self, slug: &str) -> Option<CollectionSchema> {
         self.get(slug)
-            .filter(|c| c.schema.kind == tachyon_core::CollectionKind::Collection)
+            .filter(|c| c.schema.kind == CollectionKind::Collection)
             .map(|c| c.schema.0.clone())
     }
 
-    /// Every collection and global, in no particular order.
+    /// Every collection and global, in no particular order. Shared blocks aren't listed.
     pub fn all(&self) -> Vec<Arc<Collection>> {
         self.current.load().by_id.values().cloned().collect()
     }
@@ -127,7 +193,6 @@ async fn listen(pool: &PgPool, own: &PgPool, schemas: &Schemas) -> Result<(), Db
 mod tests {
     use super::*;
     use serde_json::json;
-    use tachyon_core::CollectionSchema;
 
     async fn posts(pool: &PgPool) -> Collection {
         let schema: CollectionSchema =
