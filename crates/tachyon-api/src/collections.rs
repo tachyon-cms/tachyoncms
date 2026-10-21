@@ -101,7 +101,9 @@ pub async fn create(
     }
     check_virtuals(&world)?;
     check_rules(&state, &world).await?;
-    let created = collections::create(&state.pool, &schema).await?;
+    let created = schema_change::create(&state.pool, &schema)
+        .await
+        .map_err(change_error)?;
     // The schema is saved either way, so serve it even if its indexes failed to build.
     let indexed = reconcile_indexes(&state.pool, created.id).await;
     log_index_failure(&indexed, &schema.slug);

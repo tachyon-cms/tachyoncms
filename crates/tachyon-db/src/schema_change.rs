@@ -142,6 +142,19 @@ pub async fn preview_all(pool: &PgPool, saves: &[Save<'_>]) -> Result<Vec<Outcom
     run(pool, saves, None).await
 }
 
+/// Creates one schema, with every check a change gets, under the lock: its shared blocks
+/// expanded (loops and depth refused) and every join, virtual and rule rechecked against
+/// what's stored, not what a server's cache last heard.
+pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collection, ChangeError> {
+    let save = Save {
+        slug: &schema.slug,
+        schema,
+        renames: &Renames::new(),
+        new: true,
+    };
+    Ok(run(pool, &[save], Some(true)).await?.remove(0).collection)
+}
+
 /// `preview_all`, applied in one transaction: all of it goes in, or none of it.
 pub async fn apply_all(
     pool: &PgPool,
@@ -213,8 +226,9 @@ struct Part {
     /// Its own renames, and a shared block's: those name fields within the block (`note`),
     /// so here they become paths into this schema (`layout.cta.note`).
     renames: Renames,
-    /// The save it's reported under: its own, or the first saved shared block reaching it.
-    owner: usize,
+    /// The saves it's reported under: its own, or every saved shared block reaching it. A
+    /// schema reached by several shows their combined change under each.
+    owners: Vec<usize>,
     /// Saved itself, rather than only reached.
     saved: bool,
 }
@@ -427,13 +441,17 @@ async fn run(
             .schema
             .expand_placed(before)
             .map_err(|e| breaks(&schema.slug, e))?;
-        let owner = match saved(&schema.slug) {
-            Some(i) => i,
-            None => match reaches(placed).or_else(|| reaches(&old_placed)) {
-                Some(b) => saved(b).expect("a reaching block is saved"),
-                None => continue,
-            },
+        let owners: Vec<usize> = match saved(&schema.slug) {
+            Some(i) => vec![i],
+            None => blocks
+                .iter()
+                .filter(|b| placed.iter().chain(&old_placed).any(|(_, s)| s == *b))
+                .map(|b| saved(b).expect("a reaching block is saved"))
+                .collect(),
         };
+        if owners.is_empty() {
+            continue;
+        }
         let mut renames = match saved(&schema.slug) {
             Some(i) => saves[i].renames.clone(),
             None => Renames::new(),
@@ -451,7 +469,7 @@ async fn run(
             old,
             new: schema.clone(),
             renames,
-            owner,
+            owners,
             saved: saved(&schema.slug).is_some(),
         });
     }
@@ -497,7 +515,7 @@ async fn run(
             None => {
                 let k = parts
                     .iter()
-                    .position(|p| p.saved && p.owner == i)
+                    .position(|p| p.saved && p.owners.contains(&i))
                     .expect("a saved collection or global is a part");
                 previews[k].clone()
             }
@@ -506,7 +524,7 @@ async fn run(
                 parts
                     .iter()
                     .zip(previews)
-                    .filter(|(p, _)| !p.saved && p.owner == i)
+                    .filter(|(p, _)| !p.saved && p.owners.contains(&i))
                     .map(|(p, preview)| (p.slug.clone(), preview.clone()))
                     .collect(),
             ),
@@ -562,7 +580,8 @@ async fn run(
         if let Some(field) = rewrite(&mut tx, part, &targets, &previews[k].diff.links).await? {
             previews[k].duplicates = vec![field];
             return Err(ChangeError::Duplicates(Box::new(entry(
-                part.owner, &previews,
+                part.owners[0],
+                &previews,
             ))));
         }
         if !part.saved {

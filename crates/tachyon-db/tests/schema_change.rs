@@ -467,3 +467,121 @@ async fn a_change_rechecks_every_schema_under_the_lock(pool: PgPool) {
         "this change would break authors: field `stories`: stories has no field `layout.who`"
     );
 }
+
+fn block(slug: &str, next: Option<&str>) -> CollectionSchema {
+    let fields = match next {
+        Some(n) => json!([{"name": "l", "type": "blocks", "blocks": [{"blockRef": n}]}]),
+        None => json!([{"name": "t", "type": "text"}]),
+    };
+    serde_json::from_value(json!({"slug": slug, "kind": "block", "fields": fields})).unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn creates_get_every_check_under_the_lock(pool: PgPool) {
+    use tachyon_db::schema_change::create;
+    // b7 … b0, each through a save: b0's chain is eight deep, as deep as one goes.
+    for i in (0..8).rev() {
+        let next = (i < 7).then(|| format!("b{}", i + 1));
+        create(&pool, &block(&format!("b{i}"), next.as_deref()))
+            .await
+            .unwrap();
+    }
+    // A ninth on top is refused, though every name it uses exists: whatever a cache said.
+    let Err(ChangeError::Invalid(e)) = create(&pool, &block("x", Some("b0"))).await else {
+        panic!("x went in");
+    };
+    assert!(
+        e.to_string()
+            .contains("shared blocks can nest at most 8 deep: x → b0"),
+        "{e}"
+    );
+    // Nothing was stored, so other saves still work.
+    let mut b7 = block("b7", None);
+    b7.fields
+        .extend(block("b7", None).fields.into_iter().map(|mut f| {
+            f.name = "u".into();
+            f
+        }));
+    apply(&pool, "b7", &b7, &Renames::new(), false)
+        .await
+        .unwrap();
+
+    // A rule reading a block field that a save just dropped: refused on create too.
+    let schema = |v: Value| -> CollectionSchema { serde_json::from_value(v).unwrap() };
+    let byline =
+        |fields: Value| schema(json!({"slug": "byline", "kind": "block", "fields": fields}));
+    create(&pool, &byline(json!([{"name": "heading", "type": "text"}])))
+        .await
+        .unwrap();
+    create(
+        &pool,
+        &schema(json!({"slug": "stories", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "byline"}]}
+        ]})),
+    )
+    .await
+    .unwrap();
+    let notes = schema(json!({"slug": "notes",
+        "access": {"read": {"story.layout.heading": {"equals": "x"}}},
+        "fields": [{"name": "story", "type": "relationship", "relationTo": "stories"}]}));
+    // Checked against the block as it was, as a stale cache would: it fits.
+    let fits = |s: &CollectionSchema| {
+        let all = [byline(json!([{"name": "heading", "type": "text"}]))];
+        s.expand(|slug: &str| all.iter().find(|b| b.slug == slug))
+            .is_ok()
+    };
+    assert!(fits(&notes));
+    apply(
+        &pool,
+        "byline",
+        &byline(json!([{"name": "t", "type": "text"}])),
+        &Renames::new(),
+        true,
+    )
+    .await
+    .unwrap();
+    let Err(ChangeError::Invalid(e)) = create(&pool, &notes).await else {
+        panic!("notes went in");
+    };
+    assert!(e.to_string().starts_with("access.read: "), "{e}");
+    assert!(collections::get_by_slug(&pool, "notes").await.is_err());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_schema_reached_by_two_saved_blocks_is_listed_under_both(pool: PgPool) {
+    use tachyon_db::schema_change::{Save, create, preview_all};
+    let cta = block("cta", None);
+    let section = block("section", Some("cta"));
+    create(&pool, &cta).await.unwrap();
+    create(&pool, &section).await.unwrap();
+    let landing: CollectionSchema = serde_json::from_value(json!({"slug": "landing", "fields": [
+        {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "section"}]}
+    ]}))
+    .unwrap();
+    create(&pool, &landing).await.unwrap();
+
+    let mut cta2 = block("cta", None);
+    cta2.fields[0].name = "u".into();
+    let mut section2 = block("section", Some("cta"));
+    section2.fields.push(block("x", None).fields.remove(0));
+    let none = Renames::new();
+    let saves = [
+        Save {
+            slug: "section",
+            schema: &section2,
+            renames: &none,
+            new: false,
+        },
+        Save {
+            slug: "cta",
+            schema: &cta2,
+            renames: &none,
+            new: false,
+        },
+    ];
+    let out = preview_all(&pool, &saves).await.unwrap();
+    for o in &out {
+        let landing = &o.preview.collections["landing"];
+        assert_eq!(landing.diff.changes.len(), 3, "{:?}", landing.diff);
+    }
+}
