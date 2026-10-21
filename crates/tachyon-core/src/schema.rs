@@ -1,4 +1,4 @@
-use std::borrow::Cow;
+use std::borrow::{Borrow, Cow};
 use std::collections::HashSet;
 use std::sync::OnceLock;
 
@@ -26,6 +26,9 @@ pub struct CollectionSchema {
     /// Who may read, create, update and delete its documents; see `access`.
     #[serde(default)]
     pub access: Option<crate::access::CollectionAccess>,
+    /// What editors call one row of a shared block, and several. Shared blocks only.
+    #[serde(default)]
+    pub labels: Option<Labels>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -40,12 +43,14 @@ impl PartialEq for CollectionSchema {
             &self.fields,
             &self.default_populate,
             &self.access,
+            &self.labels,
         ) == (
             &other.slug,
             other.kind,
             &other.fields,
             &other.default_populate,
             &other.access,
+            &other.labels,
         )
     }
 }
@@ -1055,6 +1060,7 @@ impl CollectionSchema {
             fields,
             default_populate: self.default_populate.clone(),
             access: self.access.clone(),
+            labels: self.labels.clone(),
             data: OnceLock::new(),
         }
     }
@@ -1335,9 +1341,13 @@ impl CollectionSchema {
                         .into(),
                 ));
             }
-            shared_block_limits(&self.fields)?;
             check_layout(&self.fields, data, "fields", "", &[])?;
             return check_fields(data, Level::BlockRow, data, "", true, &[]);
+        }
+        if self.labels.is_some() {
+            return Err(SchemaError::InvalidOption(
+                "labels: only shared blocks take labels".into(),
+            ));
         }
         check_layout(&self.fields, data, "fields", "", &[])?;
         check_fields(data, Level::Top, data, "", false, &[])?;
@@ -1361,105 +1371,60 @@ impl CollectionSchema {
         Ok(())
     }
 
-    /// The shared blocks this schema's `blocks` fields name, each once, in schema order.
-    pub fn block_refs(&self) -> Vec<&str> {
-        fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
-            for f in fields {
-                if let FieldKind::Blocks { blocks, .. } = &f.kind {
-                    for b in blocks {
-                        match b {
-                            BlockSource::Ref(slug) if !out.contains(&slug.as_str()) => {
-                                out.push(slug)
-                            }
-                            BlockSource::Ref(_) => {}
-                            BlockSource::Inline(b) => walk(&b.fields, out),
-                        }
+    /// The shared blocks this schema's `blocks` fields name directly, each once, in schema
+    /// order. Those name others in turn; `expand_placed` follows them.
+    pub fn block_refs(&self) -> Vec<String> {
+        // ponytail: walks a copy so one walker serves reading and rewriting; schemas are
+        // small and this runs per save and per cache reload.
+        let mut fields = self.fields.clone();
+        let mut out: Vec<String> = Vec::new();
+        visit_fields(&mut fields, "", "", &mut |f, _, _| {
+            if let FieldKind::Blocks { blocks, .. } = &f.kind {
+                for b in blocks {
+                    if let BlockSource::Ref(slug) = b
+                        && !out.contains(slug)
+                    {
+                        out.push(slug.clone());
                     }
-                }
-                for inner in nested(f) {
-                    walk(inner, out);
                 }
             }
-        }
-        let mut out = Vec::new();
-        walk(&self.fields, &mut out);
-        out
-    }
-
-    /// The data path of each `blocks` field that names the shared block `slug`, as a schema
-    /// change names it (`layout`, `layout.hero.inner`): a field's rename path inside it is
-    /// `<path>.<slug>.<field>`.
-    pub fn block_ref_paths(&self, slug: &str) -> Vec<String> {
-        fn walk(fields: &[Field], prefix: &str, slug: &str, out: &mut Vec<String>) {
-            for f in fields {
-                let path = join(prefix, &f.name);
-                match &f.kind {
-                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                        walk(fields, &path, slug, out)
-                    }
-                    FieldKind::Blocks { blocks, .. } => {
-                        for b in blocks {
-                            match b {
-                                BlockSource::Ref(s) if s == slug => out.push(path.clone()),
-                                BlockSource::Ref(_) => {}
-                                BlockSource::Inline(b) => {
-                                    walk(&b.fields, &join(&path, &b.slug), slug, out)
-                                }
-                            }
-                        }
-                    }
-                    _ => {}
-                }
-            }
-        }
-        let mut out = Vec::new();
-        walk(self.data(), "", slug, &mut out);
+            Ok(())
+        })
+        .expect("this visit never fails");
         out
     }
 
     /// This schema with every shared block reference replaced by the block's definition,
-    /// which `lookup` finds. A reference to anything but a shared block is refused.
-    pub fn expand<S: std::borrow::Borrow<CollectionSchema>>(
+    /// which `lookup` finds, at any depth. See `expand_placed`.
+    pub fn expand<S: Borrow<CollectionSchema>>(
         &self,
         lookup: impl Fn(&str) -> Option<S>,
     ) -> Result<CollectionSchema, SchemaError> {
-        fn walk<S: std::borrow::Borrow<CollectionSchema>>(
-            fields: &mut [Field],
-            lookup: &impl Fn(&str) -> Option<S>,
-        ) -> Result<(), SchemaError> {
-            for f in fields {
-                let name = f.name.clone();
-                if let FieldKind::Blocks { blocks, .. } = &mut f.kind {
-                    for b in blocks.iter_mut() {
-                        match b {
-                            BlockSource::Ref(slug) => {
-                                let found = lookup(slug)
-                                    .filter(|s| s.borrow().kind == CollectionKind::Block)
-                                    .ok_or_else(|| SchemaError::InvalidField {
-                                        field: name.clone(),
-                                        message: format!(
-                                            "blockRef `{slug}` doesn't match a shared block"
-                                        ),
-                                    })?;
-                                *b = BlockSource::Inline(BlockDef {
-                                    slug: slug.clone(),
-                                    labels: None,
-                                    fields: found.borrow().fields.clone(),
-                                });
-                            }
-                            BlockSource::Inline(def) => walk(&mut def.fields, lookup)?,
-                        }
-                    }
-                }
-                for inner in nested_mut(f) {
-                    walk(inner, lookup)?;
-                }
-            }
-            Ok(())
-        }
+        self.expand_placed(lookup).map(|(schema, _)| schema)
+    }
+
+    /// `expand`, with where each shared block went: the schema-change path of the blocks
+    /// field naming it (`layout`, or `layout.section.items` through another shared block)
+    /// and its slug. Refused: a reference to anything but a shared block, shared blocks
+    /// naming each other in a loop, and nesting deeper than `MAX_BLOCK_NESTING`.
+    ///
+    /// A shared block's conditions name fields from the block's own top (`style`); placed,
+    /// they're prefixed with the data path of the blocks field (`layout.style`), the form
+    /// inline blocks use, so the expanded schema reads like an inline one.
+    pub fn expand_placed<S: Borrow<CollectionSchema>>(
+        &self,
+        lookup: impl Fn(&str) -> Option<S>,
+    ) -> Result<(CollectionSchema, Vec<(String, String)>), SchemaError> {
         let mut fields = self.fields.clone();
-        walk(&mut fields, &lookup)?;
-        Ok(self.with_fields(fields))
+        let mut placed = Vec::new();
+        // A shared block starts its own chain, so naming itself is a loop.
+        let mut chain = if self.kind == CollectionKind::Block {
+            vec![self.slug.clone()]
+        } else {
+            Vec::new()
+        };
+        expand_fields(&mut fields, "", &lookup, &mut chain, &mut placed)?;
+        Ok((self.with_fields(fields), placed))
     }
 
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
@@ -1599,64 +1564,118 @@ fn unknown_in_fields(
     Ok(())
 }
 
-/// The field lists directly inside `f`, layout ones included, but not its block types'.
-fn nested(f: &Field) -> Vec<&[Field]> {
-    match &f.kind {
-        FieldKind::Group { fields }
-        | FieldKind::Array { fields, .. }
-        | FieldKind::Row { fields }
-        | FieldKind::Collapsible { fields, .. } => vec![fields],
-        FieldKind::Tabs { tabs } => tabs.iter().map(|t| t.fields.as_slice()).collect(),
-        _ => Vec::new(),
-    }
-}
+/// How deep shared blocks may name each other: a page's `section` naming a `cta` is 2.
+pub const MAX_BLOCK_NESTING: usize = 8;
 
-fn nested_mut(f: &mut Field) -> Vec<&mut [Field]> {
-    match &mut f.kind {
-        FieldKind::Group { fields }
-        | FieldKind::Array { fields, .. }
-        | FieldKind::Row { fields }
-        | FieldKind::Collapsible { fields, .. } => vec![fields],
-        FieldKind::Tabs { tabs } => tabs.iter_mut().map(|t| t.fields.as_mut_slice()).collect(),
-        _ => Vec::new(),
-    }
-}
+/// The one walk over a raw field tree. Calls `visit` on every field at any depth (inside
+/// groups, lists, layout fields and inline block types, not references) with the data path
+/// of the list it sits in (`layout`, block types not named) and its schema-change path
+/// (`layout.hero`, see `diff::Renames`). `visit` runs before a field's insides are walked,
+/// so it may replace them.
+type Visit<'v> = dyn FnMut(&mut Field, &str, &str) -> Result<(), SchemaError> + 'v;
 
-/// What a shared block's fields can't hold, at any depth.
-// ponytail: a shared block can't name another, which keeps expansion one level deep and
-// a block save's cascade to the schemas naming it directly; nest by following references
-// (with a cycle check) if pages need it. Conditions name paths from the document's top,
-// which differ in each schema the block sits in, so they wait for row-relative paths.
-fn shared_block_limits(fields: &[Field]) -> Result<(), SchemaError> {
+fn visit_fields(
+    fields: &mut [Field],
+    data: &str,
+    change: &str,
+    visit: &mut Visit,
+) -> Result<(), SchemaError> {
     for f in fields {
-        let invalid = |message: &str| SchemaError::InvalidField {
-            field: if f.name.is_empty() {
-                f.kind.name().to_owned()
-            } else {
-                f.name.clone()
-            },
-            message: message.into(),
-        };
-        if f.admin.condition.is_some() {
-            return Err(invalid(
-                "admin.condition isn't supported inside a shared block yet",
-            ));
-        }
-        if let FieldKind::Blocks { blocks, .. } = &f.kind {
-            for b in blocks {
-                match b {
-                    BlockSource::Ref(_) => {
-                        return Err(invalid("a shared block can't name another shared block"));
-                    }
-                    BlockSource::Inline(b) => shared_block_limits(&b.fields)?,
+        visit(f, data, change)?;
+        let (inner_data, inner_change) = (join(data, &f.name), join(change, &f.name));
+        match &mut f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                visit_fields(fields, &inner_data, &inner_change, visit)?
+            }
+            FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
+                visit_fields(fields, data, change, visit)?
+            }
+            FieldKind::Tabs { tabs } => {
+                for tab in tabs {
+                    let (d, c) = match &tab.name {
+                        Some(name) => (join(data, name), join(change, name)),
+                        None => (data.to_owned(), change.to_owned()),
+                    };
+                    visit_fields(&mut tab.fields, &d, &c, visit)?;
                 }
             }
-        }
-        for inner in nested(f) {
-            shared_block_limits(inner)?;
+            FieldKind::Blocks { blocks, .. } => {
+                for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
+                    let c = join(&inner_change, &b.slug);
+                    visit_fields(&mut b.fields, &inner_data, &c, visit)?;
+                }
+            }
+            _ => {}
         }
     }
     Ok(())
+}
+
+/// Replaces each reference in `fields` (under schema-change path `change`) with its
+/// definition, expanded in turn. `chain` holds the shared blocks being expanded, outermost
+/// first.
+fn expand_fields<S: Borrow<CollectionSchema>>(
+    fields: &mut [Field],
+    change: &str,
+    lookup: &impl Fn(&str) -> Option<S>,
+    chain: &mut Vec<String>,
+    placed: &mut Vec<(String, String)>,
+) -> Result<(), SchemaError> {
+    visit_fields(fields, "", change, &mut |f, data, change| {
+        let (data, change) = (join(data, &f.name), join(change, &f.name));
+        let name = f.name.clone();
+        let FieldKind::Blocks { blocks, .. } = &mut f.kind else {
+            return Ok(());
+        };
+        for b in blocks.iter_mut() {
+            let BlockSource::Ref(slug) = b else { continue };
+            let slug = slug.clone();
+            let invalid = |message: String| SchemaError::InvalidField {
+                field: name.clone(),
+                message,
+            };
+            let path = |chain: &[String]| {
+                let mut all = chain.to_vec();
+                all.push(slug.clone());
+                all.join(" → ")
+            };
+            if let Some(start) = chain.iter().position(|c| *c == slug) {
+                return Err(invalid(format!(
+                    "shared blocks can't name each other in a loop: {}",
+                    path(&chain[start..])
+                )));
+            }
+            if chain.len() >= MAX_BLOCK_NESTING {
+                return Err(invalid(format!(
+                    "shared blocks can nest at most {MAX_BLOCK_NESTING} deep: {}",
+                    path(chain)
+                )));
+            }
+            let found = lookup(&slug)
+                .filter(|s| s.borrow().kind == CollectionKind::Block)
+                .ok_or_else(|| {
+                    invalid(format!("blockRef `{slug}` doesn't match a shared block"))
+                })?;
+            let found = found.borrow();
+            let mut inner = found.fields.clone();
+            chain.push(slug.clone());
+            expand_fields(&mut inner, &join(&change, &slug), lookup, chain, placed)?;
+            chain.pop();
+            visit_fields(&mut inner, "", "", &mut |f, _, _| {
+                if let Some(c) = &mut f.admin.condition {
+                    c.field = join(&data, &c.field);
+                }
+                Ok(())
+            })?;
+            placed.push((change.clone(), slug.clone()));
+            *b = BlockSource::Inline(BlockDef {
+                slug,
+                labels: found.labels.clone(),
+                fields: inner,
+            });
+        }
+        Ok(())
+    })
 }
 
 /// The block types a field sits in: each enclosing `blocks` field's data path, with the
@@ -2043,6 +2062,86 @@ mod tests {
     }
 
     #[test]
+    fn shared_blocks_nest_with_labels_and_conditions() {
+        let block = |slug: &str, fields: Value| {
+            schema(json!({"slug": slug, "kind": "block", "fields": fields}))
+        };
+        // Labels survive a round trip; conditions name the block's own fields.
+        let cta = schema(json!({"slug": "cta", "kind": "block",
+        "labels": {"singular": "Call", "plural": "Calls"},
+        "fields": [
+            {"name": "style", "type": "select", "options": ["link", "button"]},
+            {"name": "url", "type": "text", "admin": {"condition": {"field": "style", "equals": "link"}}}
+        ]}));
+        assert_eq!(cta.check(), Ok(()));
+        assert_eq!(
+            cta.to_compact_json()["labels"],
+            json!({"singular": "Call", "plural": "Calls"})
+        );
+        let section = block(
+            "section",
+            json!([{"name": "items", "type": "blocks", "blocks": [{"blockRef": "cta"}]}]),
+        );
+        let page = schema(json!({"slug": "pages", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "section"}]}
+        ]}));
+        let all = [cta.clone(), section.clone(), page.clone()];
+        let find = |slug: &str| all.iter().find(|s| s.slug == slug);
+        let (expanded, placed) = page.expand_placed(find).unwrap();
+        assert_eq!(
+            placed,
+            [
+                ("layout.section.items".to_owned(), "cta".to_owned()),
+                ("layout".to_owned(), "section".to_owned())
+            ]
+        );
+        let inner = expanded.data()[0].kind.block("section").unwrap().fields[0]
+            .kind
+            .block("cta")
+            .unwrap();
+        assert_eq!(inner.labels.as_ref().unwrap().singular, "Call");
+        assert_eq!(
+            inner.fields[1].admin.condition.as_ref().unwrap().field,
+            "layout.items.style"
+        );
+        assert_eq!(expanded.check(), Ok(()));
+        // The expanded block checks too, conditions and all.
+        assert_eq!(section.expand(find).unwrap().check(), Ok(()));
+
+        // A loop is refused, naming it.
+        let looped = block(
+            "cta",
+            json!([{"name": "more", "type": "blocks", "blocks": [{"blockRef": "section"}]}]),
+        );
+        let with_loop = [looped.clone(), section.clone()];
+        let find = |slug: &str| with_loop.iter().find(|s| s.slug == slug);
+        assert_eq!(
+            looped.expand(find).unwrap_err().to_string(),
+            "field `items`: shared blocks can't name each other in a loop: cta → section → cta"
+        );
+        assert_eq!(
+            page.expand(find).unwrap_err().to_string(),
+            "field `more`: shared blocks can't name each other in a loop: section → cta → section"
+        );
+        // So is nesting deeper than eight.
+        let chain: Vec<CollectionSchema> = (0..10)
+            .map(|i| {
+                block(
+                    &format!("b{i}"),
+                    json!([{"name": "l", "type": "blocks", "blocks": [{"blockRef": format!("b{}", i + 1)}]}]),
+                )
+            })
+            .chain([block("b10", json!([]))])
+            .collect();
+        let find = |slug: &str| chain.iter().find(|s| s.slug == slug);
+        assert!(chain[3].expand(find).is_ok());
+        assert_eq!(
+            chain[0].expand(find).unwrap_err().to_string(),
+            "field `l`: shared blocks can nest at most 8 deep: b0 → b1 → b2 → b3 → b4 → b5 → b6 → b7 → b8"
+        );
+    }
+
+    #[test]
     fn shared_blocks_check_and_expand() {
         let cta = schema(json!({"slug": "cta", "kind": "block", "fields": [
             {"name": "label", "type": "text", "required": true}
@@ -2057,7 +2156,6 @@ mod tests {
             ]}]}
         ]}));
         assert_eq!(pages.block_refs(), ["cta", "hero"]);
-        assert_eq!(pages.block_ref_paths("cta"), ["layout", "more"]);
         // The reference survives a round trip.
         assert_eq!(
             pages.to_compact_json()["fields"][0]["blocks"][0],
@@ -2075,7 +2173,15 @@ mod tests {
             "hero" => Some(hero.clone()),
             _ => Some(posts.clone()),
         };
-        let expanded = pages.expand(found).unwrap();
+        let (expanded, placed) = pages.expand_placed(found).unwrap();
+        let placed: Vec<(&str, &str)> = placed
+            .iter()
+            .map(|(p, s)| (p.as_str(), s.as_str()))
+            .collect();
+        assert_eq!(
+            placed,
+            [("layout", "cta"), ("more", "cta"), ("more", "hero")]
+        );
         assert!(expanded.block_refs().is_empty());
         assert_eq!(expanded.check(), Ok(()));
         let layout = &expanded.data()[0].kind;
@@ -2110,17 +2216,8 @@ mod tests {
                 "field `t`: unique, filterable and slug fields must be at the top level",
             ),
             (
-                json!({"slug": "b", "kind": "block", "fields": [{"name": "g", "type": "group", "fields": [
-                    {"name": "l", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
-                ]}]}),
-                "field `l`: a shared block can't name another shared block",
-            ),
-            (
-                json!({"slug": "b", "kind": "block", "fields": [
-                    {"name": "a", "type": "text"},
-                    {"name": "t", "type": "text", "admin": {"condition": {"field": "a", "exists": true}}}
-                ]}),
-                "field `t`: admin.condition isn't supported inside a shared block yet",
+                json!({"slug": "posts", "labels": {"singular": "Post", "plural": "Posts"}, "fields": []}),
+                "labels: only shared blocks take labels",
             ),
             (
                 json!({"slug": "blocks", "kind": "block", "fields": []}),
@@ -2208,12 +2305,12 @@ mod tests {
                 option: "maxLenght".into()
             })
         );
-        let top = json!({"slug": "posts", "labels": {}, "fields": []});
+        let top = json!({"slug": "posts", "lables": {}, "fields": []});
         assert_eq!(
             schema(top.clone()).reject_unknown_options(&top),
             Err(SchemaError::UnknownOption {
                 field: String::new(),
-                option: "labels".into()
+                option: "lables".into()
             })
         );
         let fine =

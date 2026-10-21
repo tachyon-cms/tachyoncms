@@ -245,7 +245,7 @@ pub async fn preview(
     check_virtuals(&world)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
-    let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames, &[])
+    let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames)
         .await
         .map_err(change_error)?;
     Ok(Json(json!(p)))

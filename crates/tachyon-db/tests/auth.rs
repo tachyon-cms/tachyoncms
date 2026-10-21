@@ -380,9 +380,10 @@ async fn rules_and_the_roles_they_name_stay_in_step(pool: PgPool) {
         false,
     )
     .await;
+    // The change rechecks every rule under the lock, roles included.
     assert!(
-        matches!(&change, Err(tachyon_db::schema_change::ChangeError::Db(DbError::Refused(why)))
-            if why == "access rules name the role `ghost`, which doesn't exist"),
+        matches!(&change, Err(tachyon_db::schema_change::ChangeError::Invalid(e))
+            if e.to_string() == "field `title`: access.update: there's no role `ghost`"),
         "{change:?}"
     );
 

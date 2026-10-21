@@ -90,9 +90,7 @@ async fn preview_reports_without_touching_anything(pool: PgPool) {
         {"name": "summary", "type": "textarea"},
         {"name": "rating", "type": "number", "required": true}
     ]));
-    let p = preview(&pool, "posts", &new, &renamed(), &[])
-        .await
-        .unwrap();
+    let p = preview(&pool, "posts", &new, &renamed()).await.unwrap();
     assert_eq!((p.documents, p.invalid), (1, 1));
     assert_eq!(p.examples[0].id, s.post);
     assert_eq!(p.examples[0].errors[0].path, "rating");
@@ -254,7 +252,7 @@ async fn retargeting_a_link_clears_it_after_confirmation(pool: PgPool) {
         {"name": "author", "type": "relationship", "relationTo": "tags"},
         {"name": "summary", "type": "textarea"}
     ]));
-    let p = preview(&pool, "posts", &new, &Renames::new(), &[])
+    let p = preview(&pool, "posts", &new, &Renames::new())
         .await
         .unwrap();
     assert_eq!(p.cleared, 1, "the preview must say which links go");
@@ -289,7 +287,7 @@ async fn previews_never_wait_for_writers(pool: PgPool) {
     ]));
     tokio::time::timeout(
         Duration::from_secs(3),
-        preview(&pool, "posts", &same, &Renames::new(), &[]),
+        preview(&pool, "posts", &same, &Renames::new()),
     )
     .await
     .expect("preview waited for a lock")
@@ -351,7 +349,7 @@ async fn renaming_onto_a_removed_field_moves_the_data(pool: PgPool) {
     let r: Renames = [("title".to_owned(), "summary".to_owned())]
         .into_iter()
         .collect();
-    let p = preview(&pool, "posts", &new, &r, &[]).await.unwrap();
+    let p = preview(&pool, "posts", &new, &r).await.unwrap();
     assert!(p.needs_confirmation, "the old summary's data goes");
     apply(&pool, "posts", &new, &r, true).await.unwrap();
     let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
@@ -367,7 +365,7 @@ async fn previews_list_index_changes(pool: PgPool) {
         {"name": "author", "type": "relationship", "relationTo": "authors"},
         {"name": "summary", "type": "textarea"}
     ]));
-    let p = preview(&pool, "posts", &indexed, &Renames::new(), &[])
+    let p = preview(&pool, "posts", &indexed, &Renames::new())
         .await
         .unwrap();
     assert_eq!(
@@ -387,7 +385,7 @@ async fn previews_list_index_changes(pool: PgPool) {
         {"name": "author", "type": "relationship", "relationTo": "authors"},
         {"name": "summary", "type": "textarea"}
     ]));
-    let p = preview(&pool, "posts", &plain, &Renames::new(), &[])
+    let p = preview(&pool, "posts", &plain, &Renames::new())
         .await
         .unwrap();
     assert!(p.indexes.create.is_empty());
@@ -425,4 +423,47 @@ async fn removing_a_link_field_drops_its_links(pool: PgPool) {
     // Nothing is left to block deleting what it linked to.
     let authors = collections::get_by_slug(&pool, "authors").await.unwrap();
     documents::delete(&pool, authors.id, s.ann).await.unwrap();
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_change_rechecks_every_schema_under_the_lock(pool: PgPool) {
+    // As if every check before the save read a stale cache: `apply` must still refuse a
+    // shared block change that leaves a join pointing at a field that's gone.
+    let schema = |v: serde_json::Value| -> CollectionSchema { serde_json::from_value(v).unwrap() };
+    let byline = |fields: serde_json::Value| {
+        schema(json!({"slug": "byline", "kind": "block", "fields": fields}))
+    };
+    collections::create(&pool, &schema(json!({"slug": "authors", "fields": []})))
+        .await
+        .unwrap();
+    collections::create(
+        &pool,
+        &byline(json!([{"name": "who", "type": "relationship", "relationTo": "authors"}])),
+    )
+    .await
+    .unwrap();
+    collections::create(
+        &pool,
+        &schema(json!({"slug": "stories", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "byline"}]}
+        ]})),
+    )
+    .await
+    .unwrap();
+    let authors = schema(json!({"slug": "authors", "fields": [
+        {"name": "stories", "type": "join", "collection": "stories", "on": "layout.who"}
+    ]}));
+    apply(&pool, "authors", &authors, &Renames::new(), false)
+        .await
+        .unwrap();
+
+    let gone = byline(json!([{"name": "name", "type": "text"}]));
+    let Err(ChangeError::Invalid(e)) = apply(&pool, "byline", &gone, &Renames::new(), true).await
+    else {
+        panic!("the change went in");
+    };
+    assert_eq!(
+        e.to_string(),
+        "this change would break authors: field `stories`: stories has no field `layout.who`"
+    );
 }

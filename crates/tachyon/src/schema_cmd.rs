@@ -10,7 +10,7 @@ use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
-use tachyon_db::schema_change::{self, ChangeError, Preview};
+use tachyon_db::schema_change::{self, ChangeError, Preview, Save};
 use tachyon_db::{collections, indexes};
 
 /// Every collection's schema as a pretty JSON bundle.
@@ -219,32 +219,38 @@ pub async fn run(
         .collect();
 
     let none = Renames::new();
-    // What the file creates counts for the changed ones: as link targets, and shared blocks.
-    let pending: Vec<&CollectionSchema> = wanted.iter().filter(|s| is_new(&s.slug)).collect();
-    let mut report = Vec::new();
-    let mut previews = Vec::new();
-    for &s in &ordered {
-        if is_new(&s.slug) {
-            report.push(format!("+ create {}", s.slug));
-            continue;
+    // The whole file is one change: each schema sees the file's version of the others, so
+    // a shared block's cascade reaches a schema the file also changes as the file has it.
+    let saves: Vec<Save> = ordered
+        .iter()
+        .map(|s| Save {
+            slug: &s.slug,
+            schema: s,
+            renames: renames.get(&s.slug).unwrap_or(&none),
+            new: is_new(&s.slug),
+        })
+        .collect();
+    let refused = |e: ChangeError| -> anyhow::Error {
+        match e {
+            // With several saves the error names its schema already.
+            ChangeError::Invalid(e) if saves.len() == 1 => anyhow!("{}: {e}", saves[0].slug),
+            ChangeError::Invalid(e) => anyhow!("{e}"),
+            e => e.into(),
         }
-        match schema_change::preview(
-            pool,
-            &s.slug,
-            s,
-            renames.get(&s.slug).unwrap_or(&none),
-            &pending,
-        )
+    };
+    let outcomes = schema_change::preview_all(pool, &saves)
         .await
-        {
-            Ok(p) if p.diff.is_empty() => report.push(format!("= {} unchanged", s.slug)),
-            Ok(p) => {
-                report.push(describe(&s.slug, &p));
-                previews.push(p);
-            }
-            Err(ChangeError::Invalid(e)) => bail!("{}: {e}", s.slug),
-            Err(e) => return Err(e.into()),
-        }
+        .map_err(refused)?;
+    let mut report = Vec::new();
+    for o in &outcomes {
+        let slug = &o.collection.schema.slug;
+        report.push(if o.created {
+            format!("+ create {slug}")
+        } else if o.preview.diff.is_empty() {
+            format!("= {slug} unchanged")
+        } else {
+            describe(slug, &o.preview)
+        });
     }
     for c in &existing {
         if !wanted.iter().any(|s| s.slug == c.schema.0.slug) {
@@ -257,41 +263,26 @@ pub async fn run(
     let report = report.join("\n");
 
     let Some(yes) = apply else { return Ok(report) };
-    if previews.iter().any(|p| !p.duplicates.is_empty()) {
+    if outcomes.iter().any(|o| !o.preview.duplicates.is_empty()) {
         bail!("{report}\n\nSome unique fields have duplicate values. Fix those documents first.");
     }
-    if !yes && previews.iter().any(|p| p.needs_confirmation) {
+    if !yes && outcomes.iter().any(|o| o.preview.needs_confirmation) {
         bail!(
             "{report}\n\nThese changes remove or retype fields, or leave documents that won't validate. Re-run with --yes to apply them."
         );
     }
-
-    // Each collection commits on its own. If one fails, say exactly what already went in.
-    let mut done = Vec::new();
-    let result: anyhow::Result<()> = async {
-        // New collections first, so changed ones can point at them.
-        for s in ordered.iter().filter(|s| is_new(&s.slug)) {
-            let c = collections::create(pool, s).await?;
-            indexes::reconcile_indexes(pool, c.id).await?;
-            done.push(format!("+ created {}", s.slug));
+    // One transaction: if anything fails, nothing went in. `yes` again here: the check
+    // inside it decides, not the preview above.
+    let applied = schema_change::apply_all(pool, &saves, yes)
+        .await
+        .map_err(|e| anyhow!("{report}\n\nNothing was applied: {:#}", refused(e)))?;
+    for o in &applied {
+        if let Err(e) = indexes::reconcile_indexes(pool, o.collection.id).await {
+            bail!(
+                "{report}\n\nApplied, but building indexes for {} failed: {e}. The server retries when it starts.",
+                o.collection.schema.slug
+            );
         }
-        for s in ordered.iter().filter(|s| !is_new(&s.slug)) {
-            let r = renames.get(&s.slug).unwrap_or(&none);
-            // `yes` again here: the in-transaction check decides, not the earlier preview.
-            let (c, _) = schema_change::apply(pool, &s.slug, s, r, yes).await?;
-            indexes::reconcile_indexes(pool, c.id).await?;
-            done.push(format!("~ changed {}", s.slug));
-        }
-        Ok(())
-    }
-    .await;
-    if let Err(e) = result {
-        let applied = if done.is_empty() {
-            "  nothing".to_owned()
-        } else {
-            done.join("\n")
-        };
-        bail!("{report}\n\nStopped part-way: {e}\nAlready applied:\n{applied}");
     }
     Ok(format!("{report}\n\nApplied."))
 }
@@ -735,5 +726,53 @@ mod tests {
             format!("{err:#}"),
             "posts: field `layout`: blockRef `nope` doesn't match a shared block"
         );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_file_changing_a_block_and_its_user_applies_as_one(pool: PgPool) {
+        let cta = |fields: Value| json!({"slug": "cta", "kind": "block", "fields": fields});
+        let both = json!([{"name": "label", "type": "text"}, {"name": "note", "type": "text"}]);
+        let first = json!({"collections": [cta(both.clone()), {"slug": "pages", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]}]});
+        run(&pool, &first.to_string(), &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+
+        // `cta` drops `note`, but `pages` keeps it in an inline block of its own: against
+        // the file's `pages` nothing is lost, so no --yes.
+        let second = json!({"collections": [
+            cta(json!([{"name": "label", "type": "text"}])),
+            {"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "cta", "fields": both}
+            ]}]}
+        ]})
+        .to_string();
+        let out = run(&pool, &second, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(out.contains("~ change cta: remove note"), "{out}");
+        let pages = collections::get_by_slug(&pool, "pages").await.unwrap();
+        assert_eq!(
+            pages.schema.to_compact_json()["fields"][0]["blocks"][0]["slug"],
+            "cta"
+        );
+
+        // Nothing goes in when any part fails: the new `posts` names a block that isn't there.
+        let broken = json!({"collections": [
+            cta(json!([])),
+            {"slug": "posts", "fields": [
+                {"name": "l", "type": "blocks", "blocks": [{"blockRef": "nope"}]}
+            ]}
+        ]})
+        .to_string();
+        assert!(
+            run(&pool, &broken, &BTreeMap::new(), Some(true))
+                .await
+                .is_err()
+        );
+        let cta_now = collections::get_by_slug(&pool, "cta").await.unwrap();
+        assert_eq!(cta_now.schema.fields.len(), 1);
+        assert!(collections::get_by_slug(&pool, "posts").await.is_err());
     }
 }

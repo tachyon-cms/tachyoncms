@@ -99,7 +99,7 @@ impl Schemas {
 
     /// Every collection and global, expanded, as it would be with `changed` saved: one of
     /// the same slug is replaced, and a shared block's new definition reaches every schema
-    /// naming it. `changed` itself is in the list, expanded unless it's a shared block.
+    /// naming it. `changed` itself is first in the list, expanded.
     /// Refuses when `changed` names a shared block that doesn't exist.
     // ponytail: expands every schema per schema save; fine for admin-rate saves, keep the
     // expanded snapshot and redo only the schemas naming `changed` if that ever shows.
@@ -115,11 +115,8 @@ impl Schemas {
                 snapshot.raw.get(slug).map(|c| &c.schema.0)
             }
         };
-        let mut out = vec![if changed.kind == CollectionKind::Block {
-            changed.clone()
-        } else {
-            changed.expand(raw)?
-        }];
+        // A shared block too, so one naming itself through others is refused here.
+        let mut out = vec![changed.expand(raw)?];
         for c in snapshot.raw.values() {
             if c.schema.slug != changed.slug && c.schema.kind != CollectionKind::Block {
                 // Stored references were checked when stored, and blocks naming one can't go.

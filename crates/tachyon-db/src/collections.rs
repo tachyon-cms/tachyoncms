@@ -1,7 +1,7 @@
 //! Collections repository.
 
-use sqlx::PgPool;
 use sqlx::types::Json;
+use sqlx::{PgConnection, PgPool};
 use tachyon_core::{CollectionKind, CollectionSchema};
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -23,7 +23,9 @@ pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collecti
     // can't change or go before it's stored.
     crate::auth::lock_rule_roles(&mut tx).await?;
     crate::auth::check_rule_roles(&mut tx, schema).await?;
-    let refs: Vec<String> = schema.block_refs().into_iter().map(str::to_owned).collect();
+    // Those name others in turn, but each of those was checked when it was saved, and
+    // can't go while named.
+    let refs = schema.block_refs();
     let found = sqlx::query_scalar!(
         "SELECT slug FROM collections WHERE tenant_id = $1 AND kind = 'block' AND slug = ANY($2)",
         DEFAULT_TENANT,
@@ -36,31 +38,40 @@ pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collecti
             "blockRef `{missing}` doesn't match a shared block"
         )));
     }
-    let created = sqlx::query_as!(
-        Collection,
-        r#"INSERT INTO collections (id, tenant_id, slug, kind, schema)
-           VALUES ($1, $2, $3, $4, $5)
-           RETURNING id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at"#,
-        Uuid::now_v7(),
-        DEFAULT_TENANT,
-        schema.slug,
-        schema.kind.as_str(),
-        Json(schema) as _,
-    )
-    .fetch_one(&mut *tx)
-    .await
-    .map_err(|e| match e {
-        sqlx::Error::Database(ref db) if db.is_unique_violation() => {
-            DbError::Conflict(format!("collection `{}`", schema.slug))
-        }
-        e => e.into(),
-    })?;
+    let created = insert(&mut tx, Uuid::now_v7(), schema).await?;
     // Delivered to every listening server when the transaction commits.
     sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", schema.slug)
         .execute(&mut *tx)
         .await?;
     tx.commit().await?;
     Ok(created)
+}
+
+/// Stores a new schema as `id`. Its checks are the caller's.
+pub(crate) async fn insert(
+    conn: &mut PgConnection,
+    id: Uuid,
+    schema: &CollectionSchema,
+) -> Result<Collection, DbError> {
+    sqlx::query_as!(
+        Collection,
+        r#"INSERT INTO collections (id, tenant_id, slug, kind, schema)
+           VALUES ($1, $2, $3, $4, $5)
+           RETURNING id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at"#,
+        id,
+        DEFAULT_TENANT,
+        schema.slug,
+        schema.kind.as_str(),
+        Json(schema) as _,
+    )
+    .fetch_one(conn)
+    .await
+    .map_err(|e| match e {
+        sqlx::Error::Database(ref db) if db.is_unique_violation() => {
+            DbError::Conflict(format!("collection `{}`", schema.slug))
+        }
+        e => e.into(),
+    })
 }
 
 pub async fn get_by_slug(pool: &PgPool, slug: &str) -> Result<Collection, DbError> {
@@ -87,7 +98,8 @@ pub async fn list(pool: &PgPool) -> Result<Vec<Collection>, DbError> {
     .await?)
 }
 
-/// Removes the shared block `slug`, refused while any schema names it.
+/// Removes the shared block `slug`, refused while any schema names it. Naming it through
+/// another shared block counts: that block names it directly, so it's the one reported.
 pub async fn delete_block(pool: &PgPool, slug: &str) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
     // Under R42's lock, no schema naming it can be saved in between.
@@ -108,7 +120,10 @@ pub async fn delete_block(pool: &PgPool, slug: &str) -> Result<(), DbError> {
             "`{slug}` isn't a shared block; collections and globals can't be deleted yet"
         )));
     }
-    if let Some(user) = all.iter().find(|s| s.block_refs().contains(&slug)) {
+    if let Some(user) = all
+        .iter()
+        .find(|s| s.block_refs().iter().any(|r| r == slug))
+    {
         return Err(DbError::Refused(format!(
             "{} uses the shared block `{slug}`; remove it there first",
             user.slug

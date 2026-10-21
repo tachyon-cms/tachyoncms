@@ -1138,6 +1138,12 @@ async fn breaking_a_shared_block_is_refused(pool: PgPool) {
     )
     .await;
     assert_eq!(res.status, 200, "{}", res.json);
+    for (slug, list) in [("pages", "layout"), ("posts", "sections")] {
+        assert_eq!(
+            res.json["preview"]["collections"][slug]["diff"]["changes"],
+            json!([{"type": "renamed", "from": format!("{list}.cta.note"), "to": format!("{list}.cta.remark")}])
+        );
+    }
     assert_eq!(
         get(&admin, &format!("/api/pages/{page}")).await.json["layout"][0]["remark"],
         "n1"
@@ -1293,11 +1299,11 @@ async fn blocks_have_no_document_routes(pool: PgPool) {
         .await,
         422,
     );
-    // A block takes no access rules or other blocks' references.
+    // A block takes no access rules, and can't name itself.
     for bad in [
         json!({"slug": "b1", "kind": "block", "access": {"read": true}, "fields": []}),
         json!({"slug": "b2", "kind": "block", "fields": [
-            {"name": "inner", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+            {"name": "inner", "type": "blocks", "blocks": [{"blockRef": "b2"}]}
         ]}),
         json!({"slug": "blocks", "kind": "block", "fields": []}),
     ] {
@@ -1318,4 +1324,167 @@ async fn blocks_have_no_document_routes(pool: PgPool) {
         "{}",
         res.json
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn shared_blocks_nest_and_reach_every_schema(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let cta = |extra: Value| {
+        let mut fields = json!([
+            {"name": "style", "type": "select", "options": ["link", "button"]},
+            {"name": "url", "type": "text", "admin": {"condition": {"field": "style", "equals": "link"}}}
+        ]);
+        fields
+            .as_array_mut()
+            .unwrap()
+            .extend(extra.as_array().unwrap().clone());
+        json!({"slug": "cta", "kind": "block", "labels": {"singular": "Call", "plural": "Calls"}, "fields": fields})
+    };
+    create(&admin, "/api/admin/collections", cta(json!([]))).await;
+    let saved = get(&admin, "/api/admin/collections/cta").await.json;
+    assert_eq!(
+        saved["schema"]["labels"],
+        json!({"singular": "Call", "plural": "Calls"})
+    );
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "section", "kind": "block", "fields": [
+            {"name": "heading", "type": "text"},
+            {"name": "items", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]}),
+    )
+    .await;
+    // `landing` names only `section`; the global `site` names `cta` itself.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "landing", "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "section"}]}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "site", "kind": "global", "fields": [
+            {"name": "banner", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]}),
+    )
+    .await;
+    let doc = id(&create(
+        &admin,
+        "/api/landing",
+        json!({"layout": [{"blockType": "section", "heading": "H",
+            "items": [{"blockType": "cta", "style": "link", "url": "/a"}]}]}),
+    )
+    .await);
+    let res = patch(
+        &admin,
+        "/api/globals/site",
+        json!({"banner": [{"blockType": "cta", "style": "link", "url": "/g"}]}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    // A rename in `cta` reaches `landing` through `section`, and the global's document.
+    let mut renamed = cta(json!([]));
+    renamed["fields"][1]["name"] = json!("href");
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": renamed, "renames": {"url": "href"}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    for (slug, path) in [
+        ("landing", "layout.section.items.cta"),
+        ("site", "banner.cta"),
+    ] {
+        assert_eq!(
+            res.json["preview"]["collections"][slug]["diff"]["changes"],
+            json!([{"type": "renamed", "from": format!("{path}.url"), "to": format!("{path}.href")}])
+        );
+    }
+    let read = get(&admin, &format!("/api/landing/{doc}")).await.json;
+    assert_eq!(read["layout"][0]["items"][0]["href"], "/a", "{read}");
+    let site = get(&admin, "/api/globals/site").await.json;
+    assert_eq!(site["banner"][0]["href"], "/g", "{site}");
+
+    // `cta` naming `section` would close a loop.
+    let looped =
+        cta(json!([{"name": "more", "type": "blocks", "blocks": [{"blockRef": "section"}]}]));
+    let res = put(
+        &admin,
+        "/api/admin/collections/cta",
+        json!({"schema": looped}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert!(
+        res.json["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .contains("cta → section → cta"),
+        "{}",
+        res.json
+    );
+
+    // Named through `section`: deleting is refused, naming who names it.
+    let res = send(&admin, "DELETE", "/api/admin/collections/cta", None).await;
+    assert_problem(&res, 409);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("section"),
+        "{}",
+        res.json
+    );
+
+    // Named only from a global, or only from inside an inline block: refused too.
+    let block = |slug: &str| json!({"slug": slug, "kind": "block", "fields": [{"name": "x", "type": "text"}]});
+    create(&admin, "/api/admin/collections", block("badge")).await;
+    create(&admin, "/api/admin/collections", block("quote")).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "footer", "kind": "global", "fields": [
+            {"name": "l", "type": "blocks", "blocks": [{"blockRef": "badge"}]}
+        ]}),
+    )
+    .await;
+    let wrap = |inner: Value| {
+        json!({"slug": "notes", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+            {"slug": "wrap", "fields": [{"name": "inner", "type": "blocks", "blocks": [inner]}]}
+        ]}]})
+    };
+    create(
+        &admin,
+        "/api/admin/collections",
+        wrap(json!({"blockRef": "quote"})),
+    )
+    .await;
+    for (slug, user) in [("badge", "footer"), ("quote", "notes")] {
+        let res = send(
+            &admin,
+            "DELETE",
+            &format!("/api/admin/collections/{slug}"),
+            None,
+        )
+        .await;
+        assert_problem(&res, 409);
+        assert!(
+            res.json["detail"].as_str().unwrap().contains(user),
+            "{}",
+            res.json
+        );
+    }
+    // Once the last reference goes, so can the block.
+    let res = put(
+        &admin,
+        "/api/admin/collections/notes",
+        json!({"schema": wrap(json!({"slug": "plain", "fields": []})), "confirm": true}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = send(&admin, "DELETE", "/api/admin/collections/quote", None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
 }
