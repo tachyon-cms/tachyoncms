@@ -10,7 +10,9 @@ use serde_json::{Map, Value, json};
 use crate::FieldError;
 use crate::auth::Action;
 use crate::query::{Filter, Lookup, check_target, parse_filter_with};
-use crate::schema::{CollectionKind, CollectionSchema, Field, FieldKind, SchemaError, data_fields};
+use crate::schema::{
+    BLOCK_ROW_KEYS, CollectionKind, CollectionSchema, Field, FieldKind, SchemaError, data_fields,
+};
 
 /// One access rule, as stored in the schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,7 +385,9 @@ pub fn named_roles(schema: &CollectionSchema) -> BTreeSet<String> {
                     .flatten()
                     .for_each(|r| from_rule(r, out));
             }
-            from_fields(children(f), out);
+            for inner in inside(f) {
+                from_fields(inner, out);
+            }
         }
     }
     let mut out = BTreeSet::new();
@@ -553,20 +557,9 @@ impl Checker<'_> {
                 FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
                     self.fields(fields, prefix, &format!("{here}.fields"))?
                 }
-                // ponytail: field rules inside block rows are refused until every read, write
-                // and filter walker reaches into them; lift this once they do.
+                // A block's fields are named like a list's, without the block type.
                 FieldKind::Blocks { blocks, .. } => {
                     for (b, block) in blocks.iter().enumerate() {
-                        if let Some(at) = first_rule(&data_fields(&block.fields), &path) {
-                            return Err(SchemaError::InvalidField {
-                                field: at,
-                                message:
-                                    "access rules on fields inside blocks aren't supported yet"
-                                        .into(),
-                            });
-                        }
-                        // With no rules left inside, this only refuses a rule on a layout
-                        // field in the block; it checks real rules once the refusal above is lifted.
                         self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
                     }
                 }
@@ -610,27 +603,51 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
         .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
 }
 
-/// The path of the first field under `prefix` that carries an access rule, at any depth.
-fn first_rule(fields: &[Field], prefix: &str) -> Option<String> {
-    fields.iter().find_map(|f| {
-        let path = format!("{prefix}.{}", f.name);
-        if f.access.is_some() {
-            return Some(path);
-        }
-        match &f.kind {
-            FieldKind::Blocks { blocks, .. } => {
-                blocks.iter().find_map(|b| first_rule(&b.fields, &path))
-            }
-            _ => first_rule(children(f), &path),
-        }
-    })
+/// The fields directly inside `f`: a group's or a list's, or each block type's.
+fn inside(f: &Field) -> Vec<&[Field]> {
+    match &f.kind {
+        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => vec![fields],
+        FieldKind::Blocks { blocks, .. } => blocks.iter().map(|b| b.fields.as_slice()).collect(),
+        _ => Vec::new(),
+    }
 }
 
-fn children(f: &Field) -> &[Field] {
-    match &f.kind {
-        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-        _ => &[],
+/// The fields one dotted path can reach at some depth. A path into blocks doesn't name the
+/// block type (`layout.heading`), so a level holds the fields of every block type there,
+/// and a name is answered for all the fields that share it: each must allow what's asked.
+type Level<'a> = Vec<&'a [Field]>;
+
+/// Every field named `name` in `level`: one, or one per block type that has it.
+fn named<'a>(level: &[&'a [Field]], name: &str) -> Vec<&'a Field> {
+    level
+        .iter()
+        .filter_map(|fields| fields.iter().find(|f| f.name == name))
+        .collect()
+}
+
+/// The level inside `peers`.
+fn below<'a>(peers: &[&'a Field]) -> Level<'a> {
+    peers.iter().flat_map(|f| inside(f)).collect()
+}
+
+/// The names in `level`, each once, in schema order.
+fn names<'a>(level: &[&'a [Field]]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for f in level.iter().flat_map(|fields| fields.iter()) {
+        if !out.contains(&f.name.as_str()) {
+            out.push(&f.name);
+        }
     }
+    out
+}
+
+/// Whether every field sharing a path lets the caller do `action`.
+fn all_allow(peers: &[&Field], action: Action, caller: &Caller) -> bool {
+    peers.iter().all(|f| field_allows(f, action, caller))
+}
+
+fn is_list(f: &Field) -> bool {
+    matches!(f.kind, FieldKind::Array { .. } | FieldKind::Blocks { .. })
 }
 
 /// What the caller may do with each of `fields` (data fields), at any depth, by dotted path
@@ -639,42 +656,48 @@ fn children(f: &Field) -> &[Field] {
 /// (as `unwritable` counts it), so a list and everything in it can be updated only when all
 /// of it can. Join and virtual fields are filled on read, so they're never written.
 pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3])> {
-    fn updatable(fields: &[Field], caller: &Caller) -> bool {
-        fields
+    fn updatable(level: &[&[Field]], caller: &Caller) -> bool {
+        level
             .iter()
-            .all(|f| field_allows(f, Action::Update, caller) && updatable(children(f), caller))
+            .flat_map(|fields| fields.iter())
+            .all(|f| field_allows(f, Action::Update, caller) && updatable(&inside(f), caller))
     }
     fn walk(
-        fields: &[Field],
+        level: &[&[Field]],
         prefix: &str,
         within: [bool; 3],
         caller: &Caller,
         out: &mut Vec<(String, [bool; 3])>,
     ) {
-        for f in fields {
+        for name in names(level) {
+            let peers = named(level, name);
             let path = if prefix.is_empty() {
-                f.name.clone()
+                name.to_owned()
             } else {
-                format!("{prefix}.{}", f.name)
+                format!("{prefix}.{name}")
             };
             let [read, create, update] = within;
             let mut answer = [
-                read && field_allows(f, Action::Read, caller),
-                create && field_allows(f, Action::Create, caller),
-                update && field_allows(f, Action::Update, caller),
+                read && all_allow(&peers, Action::Read, caller),
+                create && all_allow(&peers, Action::Create, caller),
+                update && all_allow(&peers, Action::Update, caller),
             ];
-            if matches!(f.kind, FieldKind::Array { .. }) {
-                answer[2] = answer[2] && updatable(children(f), caller);
+            let next = below(&peers);
+            if peers.iter().any(|f| is_list(f)) {
+                answer[2] = answer[2] && updatable(&next, caller);
             }
-            if matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some() {
+            if peers
+                .iter()
+                .any(|f| matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some())
+            {
                 (answer[1], answer[2]) = (false, false);
             }
             out.push((path.clone(), answer));
-            walk(children(f), &path, answer, caller, out);
+            walk(&next, &path, answer, caller, out);
         }
     }
     let mut out = Vec::new();
-    walk(fields, "", [true; 3], caller, &mut out);
+    walk(&[fields], "", [true; 3], caller, &mut out);
     out
 }
 
@@ -682,26 +705,41 @@ pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3
 /// filters and sorts may name. Borrows when nothing is hidden.
 pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field]> {
     fn hides(fields: &[Field], caller: &Caller) -> bool {
+        fields.iter().any(|f| {
+            !field_allows(f, Action::Read, caller) || inside(f).iter().any(|i| hides(i, caller))
+        })
+    }
+    /// `fields`, one part of `level`, without each field whose name any field sharing its
+    /// path hides.
+    fn prune(fields: &[Field], level: &[&[Field]], caller: &Caller) -> Vec<Field> {
         fields
             .iter()
-            .any(|f| !field_allows(f, Action::Read, caller) || hides(children(f), caller))
+            .filter_map(|f| {
+                let peers = named(level, &f.name);
+                if !all_allow(&peers, Action::Read, caller) {
+                    return None;
+                }
+                let next = below(&peers);
+                let mut f = f.clone();
+                match &mut f.kind {
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        *fields = prune(fields, &next, caller)
+                    }
+                    FieldKind::Blocks { blocks, .. } => {
+                        for b in blocks {
+                            b.fields = prune(&b.fields, &next, caller);
+                        }
+                    }
+                    _ => {}
+                }
+                Some(f)
+            })
+            .collect()
     }
     if !hides(fields, caller) {
         return Cow::Borrowed(fields);
     }
-    Cow::Owned(
-        fields
-            .iter()
-            .filter(|f| field_allows(f, Action::Read, caller))
-            .map(|f| {
-                let mut f = f.clone();
-                if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &mut f.kind {
-                    *fields = readable_fields(fields, caller).into_owned();
-                }
-                f
-            })
-            .collect(),
-    )
+    Cow::Owned(prune(fields, &[fields], caller))
 }
 
 /// `schema` with only the fields the caller can read.
@@ -719,25 +757,39 @@ pub fn strip_unreadable(fields: &[Field], doc: &mut Map<String, Value>, caller: 
 
 /// Removes from `doc` of `fields` what `visible` (`fields` as `readable_fields` pruned them)
 /// leaves out, at any depth, without compiling a rule: worked out once, used per document.
+/// A block row is stripped by its block type; one whose type isn't in the schema keeps
+/// only its `id` and `blockType`, since nothing says what in it is hidden.
 pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value>) {
     for f in fields {
         let Some(v) = visible.iter().find(|v| v.name == f.name) else {
             doc.remove(&f.name);
             continue;
         };
-        // Something may be hidden at any depth below, so every container is walked.
-        let (all, kept) = (children(f), children(v));
-        if all.is_empty() {
+        if inside(f).is_empty() {
             continue;
         }
-        match doc.get_mut(&f.name) {
-            Some(Value::Object(inner)) => strip_to(all, kept, inner),
-            Some(Value::Array(rows)) => {
-                for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-                    strip_to(all, kept, row);
+        // Something may be hidden at any depth below, so every container and row is walked.
+        let rows: Vec<&mut Map<String, Value>> = match doc.get_mut(&f.name) {
+            Some(Value::Object(inner)) => vec![inner],
+            Some(Value::Array(rows)) => rows.iter_mut().filter_map(Value::as_object_mut).collect(),
+            _ => Vec::new(),
+        };
+        for row in rows {
+            match (&f.kind, &v.kind) {
+                (FieldKind::Blocks { .. }, FieldKind::Blocks { .. }) => {
+                    let slug = row.get("blockType").and_then(Value::as_str);
+                    let types = slug.and_then(|s| Some((f.kind.block(s)?, v.kind.block(s)?)));
+                    match types {
+                        Some((all, kept)) => strip_to(&all.fields, &kept.fields, row),
+                        None => row.retain(|k, _| BLOCK_ROW_KEYS.contains(&k.as_str())),
+                    }
                 }
+                (
+                    FieldKind::Group { fields: all } | FieldKind::Array { fields: all, .. },
+                    FieldKind::Group { fields: kept } | FieldKind::Array { fields: kept, .. },
+                ) => strip_to(all, kept, row),
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -748,20 +800,25 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
 /// skipped, and what follows a field that holds no fields (a link's `value`, a list
 /// item's index, a key inside `json`) is inside its value.
 fn walk_path(fields: &[Field], path: &str, caller: &Caller) -> Option<bool> {
-    let mut current = fields;
+    let mut level: Level = vec![fields];
+    // Whether some field along the path holds no fields, so what follows may be in its value.
+    let mut in_value = false;
     let mut segments = path.split('.').peekable();
     while let Some(segment) = segments.next() {
-        let f = current.iter().find(|f| f.name == segment)?;
-        if !field_allows(f, Action::Read, caller) {
+        let peers = named(&level, segment);
+        if peers.is_empty() {
+            return in_value.then_some(true);
+        }
+        if !all_allow(&peers, Action::Read, caller) {
             return Some(false);
         }
-        match &f.kind {
-            FieldKind::Group { fields } => current = fields,
-            FieldKind::Array { fields, .. } => {
-                segments.next_if(|s| s.parse::<usize>().is_ok());
-                current = fields;
-            }
-            _ => return Some(true),
+        if peers.iter().any(|f| is_list(f)) {
+            segments.next_if(|s| s.parse::<usize>().is_ok());
+        }
+        in_value = peers.iter().any(|f| inside(f).is_empty());
+        level = below(&peers);
+        if level.is_empty() {
+            return Some(true);
         }
     }
     Some(true)
@@ -816,22 +873,25 @@ pub fn unwritable(
         }
     }
     fn within(
-        fields: &[Field],
+        level: &[&[Field]],
         prefix: &str,
         action: Action,
         caller: &Caller,
         out: &mut Vec<String>,
     ) {
-        for f in fields {
-            let path = format!("{prefix}.{}", f.name);
-            if field_allows(f, action, caller) {
-                within(children(f), &path, action, caller, out);
+        for name in names(level) {
+            let peers = named(level, name);
+            let path = format!("{prefix}.{name}");
+            if all_allow(&peers, action, caller) {
+                within(&below(&peers), &path, action, caller, out);
             } else {
                 push(out, path);
             }
         }
     }
+    /// `fields` is the part of `level` that `input` holds: a group's, or a row's.
     fn walk(
+        level: &[&[Field]],
         fields: &[Field],
         input: &Map<String, Value>,
         prefix: &str,
@@ -848,23 +908,30 @@ pub fn unwritable(
             } else {
                 format!("{prefix}.{}", f.name)
             };
-            if !field_allows(f, action, caller) {
+            let peers = named(level, &f.name);
+            if !all_allow(&peers, action, caller) {
                 push(out, path);
                 continue;
             }
+            let next = below(&peers);
             match (&f.kind, value) {
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    walk(fields, inner, &path, action, caller, out)
+                    walk(&next, fields, inner, &path, action, caller, out)
                 }
                 // `field_answers` reports a list as updatable only as a whole, to match.
-                (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, _)
-                    if action != Action::Create =>
-                {
-                    within(fields, &path, action, caller, out)
-                }
+                (
+                    FieldKind::Group { .. } | FieldKind::Array { .. } | FieldKind::Blocks { .. },
+                    _,
+                ) if action != Action::Create => within(&next, &path, action, caller, out),
                 (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                     for row in rows.iter().filter_map(Value::as_object) {
-                        walk(fields, row, &path, action, caller, out);
+                        walk(&next, fields, row, &path, action, caller, out);
+                    }
+                }
+                (FieldKind::Blocks { .. }, Value::Array(rows)) => {
+                    for row in rows.iter().filter_map(Value::as_object) {
+                        let fields = crate::validate::row_fields(&f.kind, row);
+                        walk(&next, fields, row, &path, action, caller, out);
                     }
                 }
                 _ => {}
@@ -873,7 +940,8 @@ pub fn unwritable(
     }
     let mut out = Vec::new();
     if !caller.admin {
-        walk(&data_fields(fields), input, "", action, caller, &mut out);
+        let fields = data_fields(fields);
+        walk(&[&fields], &fields, input, "", action, caller, &mut out);
     }
     out
 }
@@ -1029,7 +1097,9 @@ mod tests {
                 for f in fields {
                     let path = format!("{prefix}{}", f.name);
                     out.push(path.clone());
-                    walk(children(f), &format!("{path}."), out);
+                    for inner in inside(f) {
+                        walk(inner, &format!("{path}."), out);
+                    }
                 }
             }
             let mut out = Vec::new();
@@ -1149,29 +1219,190 @@ mod tests {
     }
 
     #[test]
-    fn rules_inside_blocks_are_refused_for_now() {
-        let pages = |access: Value| {
-            schema(
-                json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
-                    {"slug": "hero", "fields": [
-                        {"type": "row", "fields": [{"name": "secret", "type": "text", "access": access}]}
+    fn rules_inside_blocks_are_anded_across_block_types() {
+        let ed = json!({"read": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [
+                    {"name": "heading", "type": "text"},
+                    {"type": "row", "fields": [{"name": "secret", "type": "text", "access": ed}]},
+                    {"name": "meta", "type": "group", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"name": "inner", "type": "blocks", "blocks": [
+                        {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]},
+                        {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
                     ]}
-                ]}]}),
+                ]},
+                // `secret` with no rule here: ANDed with hero's, so hidden too. `meta` holds no
+                // fields here, so it adds nothing to `meta.x`.
+                {"slug": "quote", "fields": [
+                    {"name": "text", "type": "text"},
+                    {"name": "secret", "type": "text"},
+                    {"name": "meta", "type": "text"}
+                ]}
+            ]}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let bad = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"name": "s", "type": "text", "access": {"read": {"title": "x"}}}]}
+            ]}]}),
+        );
+        assert_eq!(
+            check(&bad),
+            Err("field `layout.s`: access.read: field rules can use only roles, signedIn, true and false".into())
+        );
+        let roles = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"type": "row", "fields": [
+                    {"name": "s", "type": "text", "access": {"read": {"role": "author"}}}
+                ]}]}
+            ]}]}),
+        );
+        assert_eq!(named_roles(&roles), BTreeSet::from(["author".to_owned()]));
+
+        let viewer = signed_in("viewer");
+        let editor = signed_in("editor");
+        let doc = json!({"layout": [
+            {"id": "1", "blockType": "hero", "heading": "h", "secret": "s",
+             "meta": {"x": "x"}, "inner": [
+                {"id": "2", "blockType": "a", "x": "x", "y": "y"},
+                {"id": "3", "blockType": "b", "x": "x"}
+             ]},
+            {"id": "4", "blockType": "quote", "text": "t", "secret": "s", "meta": "m"},
+            {"id": "5", "blockType": "gone", "secret": "s"}
+        ]});
+        let hidden = json!({"layout": [
+            {"id": "1", "blockType": "hero", "heading": "h", "meta": {}, "inner": [
+                {"id": "2", "blockType": "a", "y": "y"},
+                {"id": "3", "blockType": "b"}
+            ]},
+            {"id": "4", "blockType": "quote", "text": "t", "meta": "m"},
+            // A row whose type has gone can't say what's hidden in it, so nothing shows.
+            {"id": "5", "blockType": "gone"}
+        ]});
+        for (caller, want) in [(&viewer, &hidden), (&editor, &doc)] {
+            let mut by_rule = doc.as_object().unwrap().clone();
+            strip_unreadable(s.data(), &mut by_rule, caller);
+            assert_eq!(&Value::Object(by_rule), want);
+        }
+
+        for (path, readable) in [
+            ("layout", true),
+            ("layout.0.heading", true),
+            ("layout.1.secret", false),
+            ("layout.secret", false),
+            ("layout.0.meta", true),
+            ("layout.0.meta.x", false),
+            ("layout.0.inner.1.x", false),
+            ("layout.0.inner.0.y", true),
+            ("layout.1.text", true),
+            ("layout.1.nope", false),
+            ("layout.x.text", false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert_eq!(
+                path_readable(s.data(), path, &editor),
+                path_exists(s.data(), path),
+                "{path}"
+            );
+        }
+        let visible = readable_fields(s.data(), &viewer);
+        assert!(path_exists(&visible, "layout.0.text"));
+        assert!(!path_exists(&visible, "layout.1.secret"));
+        assert!(!path_exists(&visible, "layout.0.inner.0.x"));
+
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        assert_eq!(
+            visible_errors(
+                s.data(),
+                vec![e("layout.0.heading"), e("layout.1.secret")],
+                &viewer
+            ),
+            [
+                e("layout.0.heading"),
+                FieldError {
+                    path: String::new(),
+                    message: "a field you can't see needs fixing; ask someone who can see it"
+                        .into()
+                }
+            ]
+        );
+
+        // A list is replaced whole, so an update names what it can't change in every type.
+        let refused = |input: Value, action: Action| {
+            unwritable(&s.fields, input.as_object().unwrap(), action, &viewer)
+        };
+        assert_eq!(
+            refused(json!({"layout": []}), Action::Update),
+            ["layout.secret", "layout.meta.x", "layout.inner.x"]
+        );
+        assert!(
+            unwritable(
+                &s.fields,
+                json!({"layout": []}).as_object().unwrap(),
+                Action::Update,
+                &editor
+            )
+            .is_empty()
+        );
+        // A create writes what the rows hold, ANDed across types too.
+        let ed_create = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"name": "secret", "type": "text", "access": {"create": false}}]},
+                {"slug": "quote", "fields": [{"name": "secret", "type": "text"}, {"name": "text", "type": "text"}]}
+            ]}]}),
+        );
+        let create = |rows: Value| {
+            unwritable(
+                &ed_create.fields,
+                json!({"layout": rows}).as_object().unwrap(),
+                Action::Create,
+                &viewer,
             )
         };
-        assert_eq!(check(&pages(json!(null))), Ok(()));
+        assert!(create(json!([{"blockType": "quote", "text": "t"}])).is_empty());
         assert_eq!(
-            check(&pages(json!({"read": false}))),
-            Err(
-                "field `layout.secret`: access rules on fields inside blocks aren't supported yet"
-                    .into()
-            )
+            create(json!([{"blockType": "quote", "secret": "t"}])),
+            ["layout.secret"]
         );
-        let on_the_list = schema(
-            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks",
-            "access": {"read": false}, "blocks": [{"slug": "hero", "fields": []}]}]}),
+
+        // `/api/access` paths have no block type and no row index.
+        let answers =
+            |caller: &Caller| -> Vec<(String, [bool; 3])> { field_answers(s.data(), caller) };
+        let viewer_answers = answers(&viewer);
+        let find = |path: &str| {
+            viewer_answers
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, a)| *a)
+                .unwrap_or_else(|| panic!("{path}: {viewer_answers:?}"))
+        };
+        assert_eq!(find("layout"), [true, true, false]);
+        assert_eq!(find("layout.heading"), [true, true, false]);
+        assert_eq!(find("layout.secret"), [false, true, false]);
+        assert_eq!(find("layout.meta"), [true, true, false]);
+        assert_eq!(find("layout.meta.x"), [false, true, false]);
+        assert_eq!(find("layout.inner.x"), [false, true, false]);
+        assert_eq!(find("layout.inner.y"), [true, true, false]);
+        let paths: Vec<&str> = viewer_answers.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "layout",
+                "layout.heading",
+                "layout.secret",
+                "layout.meta",
+                "layout.meta.x",
+                "layout.inner",
+                "layout.inner.x",
+                "layout.inner.y",
+                "layout.text"
+            ]
         );
-        assert_eq!(check(&on_the_list), Ok(()));
+        assert!(answers(&editor).iter().all(|(_, a)| *a == [true; 3]));
     }
 
     /// `posts` with `access` set on the collection.

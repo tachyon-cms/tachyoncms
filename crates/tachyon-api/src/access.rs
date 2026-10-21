@@ -650,9 +650,14 @@ impl Access {
                     guards,
                 }
             }
-            Target::Row { list, inner } => Target::Row {
+            Target::Row {
+                list,
+                inner,
+                blocks,
+            } => Target::Row {
                 list,
                 inner: Box::new(self.guard_target(*inner)),
+                blocks,
             },
             other => other,
         }

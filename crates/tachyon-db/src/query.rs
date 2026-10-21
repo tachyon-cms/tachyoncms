@@ -293,13 +293,24 @@ fn push_exists(
         base.json.clone()
     };
     let inner = match target {
-        Target::Row { list, inner } => {
+        Target::Row {
+            list,
+            inner,
+            blocks,
+        } => {
             let alias = format!("r{depth}");
             qb.push(format!(
                 "EXISTS (SELECT 1 FROM jsonb_array_elements({}) AS {alias}(v) \
                  WHERE jsonb_typeof({alias}.v) = 'object' AND ",
                 array_at(&outer, list)
             ));
+            // Only rows of the block types that have the field: another type's field of the
+            // same name may hold something else entirely.
+            if let Some(types) = blocks {
+                qb.push(format!("({alias}.v ->> 'blockType') = ANY("))
+                    .push_bind(types.clone())
+                    .push(") AND ");
+            }
             let row = Base {
                 json: format!("{alias}.v"),
                 columns: String::new(),

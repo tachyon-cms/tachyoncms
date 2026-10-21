@@ -1052,14 +1052,6 @@ impl CollectionSchema {
             let Some(on) = find_field(target.data(), &j.on) else {
                 return Err(invalid(format!("{slug} has no field `{}`", j.on)));
             };
-            // ponytail: `on_pattern` can't match link paths inside block rows yet, so such a
-            // join would always come back empty; lift this once it can.
-            if through_blocks(target.data(), &j.on) {
-                return Err(invalid(format!(
-                    "{slug}.{} is inside blocks, which joins can't follow yet",
-                    j.on
-                )));
-            }
             let FieldKind::Relationship { relation_to, .. } = &on.kind else {
                 return Err(invalid(format!(
                     "{slug}.{} isn't a relationship field",
@@ -1456,15 +1448,6 @@ fn field_steps<'a>(
     };
     steps.insert(0, f);
     Some(steps)
-}
-
-/// Whether `path` passes through a `blocks` field on its way to the field it names.
-fn through_blocks(fields: &[Field], path: &str) -> bool {
-    field_steps(fields, path, "", &[]).is_some_and(|steps| {
-        steps[..steps.len() - 1]
-            .iter()
-            .any(|f| matches!(f.kind, FieldKind::Blocks { .. }))
-    })
 }
 
 fn is_identifier(s: &str, allow_upper: bool) -> bool {
