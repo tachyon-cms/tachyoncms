@@ -11,8 +11,8 @@ pub mod validate;
 pub mod virtuals;
 
 pub use schema::{
-    Admin, CollectionKind, CollectionSchema, Condition, ConditionTest, Field, FieldKind, Position,
-    RelationTo, SchemaError, SelectOption, Tab, data_fields, explain_parse_error,
+    Admin, BlockDef, CollectionKind, CollectionSchema, Condition, ConditionTest, Field, FieldKind,
+    Labels, Position, RelationTo, SchemaError, SelectOption, Tab, data_fields, explain_parse_error,
 };
 pub use validate::{
     FieldError, RelationRef, defaults, is_email, map_relations, normalize_date_time, relations,

@@ -238,7 +238,7 @@ async fn run(
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
             let mut migrated = migrate_document(new.data(), renames, &row.data);
-            if relink(&mut migrated, &links) {
+            if relink(new.data(), &mut migrated, &links) {
                 p.cleared += 1;
             }
             if let Err(errors) =
@@ -283,7 +283,7 @@ async fn run(
         after = Some(last.id);
         for row in rows {
             let mut migrated = migrate_document(new.data(), renames, &row.data);
-            relink(&mut migrated, &links);
+            relink(new.data(), &mut migrated, &links);
             // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
             let stored = validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
                 .unwrap_or(migrated);

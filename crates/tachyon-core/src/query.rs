@@ -209,6 +209,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         | FieldKind::Join { .. }
         | FieldKind::Group { .. }
         | FieldKind::Array { .. }
+        | FieldKind::Blocks { .. }
         | FieldKind::Row { .. }
         | FieldKind::Collapsible { .. }
         | FieldKind::Tabs { .. } => return None,

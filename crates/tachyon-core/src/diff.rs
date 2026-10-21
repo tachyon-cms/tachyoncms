@@ -7,10 +7,11 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::schema::{
-    CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields, find_field,
+    BLOCK_ROW_KEYS, CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields,
 };
 
-/// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`.
+/// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`. A path
+/// into a `blocks` field names the block type: `{"layout.hero.heading": "title"}`.
 pub type Renames = BTreeMap<String, String>;
 
 #[derive(Debug, Clone, PartialEq, Serialize)]
@@ -121,7 +122,7 @@ pub fn diff(
     let old_data = data_fields(&old.fields);
     let new_data = data_fields(&new.fields);
     for from in renames.keys() {
-        if find_field(&old_data, from).is_none() {
+        if field_at(&old_data, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
@@ -238,6 +239,47 @@ fn compare(
                 }
                 compare(a, b, &old_path, &new_path, renames, out, links)?;
             }
+            // Block types are matched by slug, and their paths name it: `layout.hero.heading`.
+            (FieldKind::Blocks { blocks: a, .. }, FieldKind::Blocks { blocks: b, .. }) => {
+                if options(o) != options(n) {
+                    out.push(Change::OptionsChanged {
+                        path: new_path.clone(),
+                    });
+                }
+                for old_block in a {
+                    let old_block_path = join(&old_path, &old_block.slug);
+                    let new_block_path = join(&new_path, &old_block.slug);
+                    let Some(new_block) = b.iter().find(|nb| nb.slug == old_block.slug) else {
+                        // Rows of this type are kept as they are, so validation counts the
+                        // documents still using it.
+                        out.push(Change::Removed {
+                            path: old_block_path,
+                            kind: "block",
+                        });
+                        continue;
+                    };
+                    if old_block.labels != new_block.labels {
+                        out.push(Change::OptionsChanged {
+                            path: new_block_path.clone(),
+                        });
+                    }
+                    compare(
+                        &old_block.fields,
+                        &new_block.fields,
+                        &old_block_path,
+                        &new_block_path,
+                        renames,
+                        out,
+                        links,
+                    )?;
+                }
+                for new_block in b.iter().filter(|nb| !a.iter().any(|ob| ob.slug == nb.slug)) {
+                    out.push(Change::Added {
+                        path: join(&new_path, &new_block.slug),
+                        kind: "block",
+                    });
+                }
+            }
             (
                 FieldKind::Relationship {
                     relation_to: from,
@@ -317,10 +359,46 @@ fn compare(
 fn options(f: &Field) -> Field {
     let mut f = f.clone();
     f.name.clear();
-    if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &mut f.kind {
-        fields.clear();
+    match &mut f.kind {
+        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields.clear(),
+        FieldKind::Blocks { blocks, .. } => blocks.clear(),
+        _ => {}
     }
     f
+}
+
+/// The field at a rename path, where a path into blocks names the block type
+/// (`layout.hero.heading`). A block type itself isn't a field, so it can't be renamed.
+fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
+    let mut segments = path.split('.');
+    let mut current = fields;
+    let mut found = None;
+    while let Some(segment) = segments.next() {
+        let f = current.iter().find(|f| f.name == segment)?;
+        found = Some(f);
+        current = match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
+            FieldKind::Blocks { .. } => match segments.next() {
+                Some(slug) => {
+                    found = None;
+                    &f.kind.block(slug)?.fields
+                }
+                None => &[],
+            },
+            _ => &[],
+        };
+    }
+    found
+}
+
+/// The rows of a `blocks` value whose type is `slug`.
+fn rows_of<'a>(
+    rows: &'a mut [Value],
+    slug: &'a str,
+) -> impl Iterator<Item = &'a mut Map<String, Value>> {
+    rows.iter_mut()
+        .filter_map(Value::as_object_mut)
+        .filter(move |row| row.get("blockType").and_then(Value::as_str) == Some(slug))
 }
 
 /// `options`, but also blind to a relationship's targets and list setting, which `compare`
@@ -411,7 +489,7 @@ pub fn migrate_document(
         } else {
             parent.split('.').collect()
         };
-        rename_batch(&mut doc, &segments, &batch);
+        rename_batch(&mut doc, new, &segments, "", renames, &batch);
     }
     prune(new, &mut doc);
     crate::validate::apply_defaults(new, &mut doc);
@@ -426,7 +504,17 @@ fn depth(path: &str) -> usize {
     }
 }
 
-fn rename_batch(obj: &mut Map<String, Value>, segments: &[&str], batch: &[(&str, &str)]) {
+/// Applies one batch of renames in the object at `segments` (old names). `fields` are the
+/// new fields at this level, found through `renames`, so a path into blocks reaches only
+/// rows of the block type it names.
+fn rename_batch(
+    obj: &mut Map<String, Value>,
+    fields: &[Field],
+    segments: &[&str],
+    prefix: &str,
+    renames: &Renames,
+    batch: &[(&str, &str)],
+) {
     match segments {
         [] => {
             let taken: Vec<(&str, Value)> = batch
@@ -441,34 +529,58 @@ fn rename_batch(obj: &mut Map<String, Value>, segments: &[&str], batch: &[(&str,
                 obj.insert(to.to_owned(), value);
             }
         }
-        [head, rest @ ..] => match obj.get_mut(*head) {
-            Some(Value::Object(inner)) => rename_batch(inner, rest, batch),
-            Some(Value::Array(rows)) => {
-                for row in rows {
-                    if let Value::Object(inner) = row {
-                        rename_batch(inner, rest, batch);
+        [head, rest @ ..] => {
+            let old_path = join(prefix, head);
+            let name = renames.get(&old_path).map_or(*head, String::as_str);
+            let Some(f) = fields.iter().find(|f| f.name == name) else {
+                // Gone from the new schema, so pruned anyway.
+                return;
+            };
+            match (&f.kind, obj.get_mut(*head)) {
+                (FieldKind::Group { fields }, Some(Value::Object(inner))) => {
+                    rename_batch(inner, fields, rest, &old_path, renames, batch)
+                }
+                (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+                    for inner in rows.iter_mut().filter_map(Value::as_object_mut) {
+                        rename_batch(inner, fields, rest, &old_path, renames, batch);
                     }
                 }
+                (kind @ FieldKind::Blocks { .. }, Some(Value::Array(rows))) => {
+                    let [slug, rest @ ..] = rest else { return };
+                    let Some(block) = kind.block(slug) else {
+                        return;
+                    };
+                    let block_path = join(&old_path, slug);
+                    for inner in rows_of(rows, slug) {
+                        rename_batch(inner, &block.fields, rest, &block_path, renames, batch);
+                    }
+                }
+                _ => {}
             }
-            _ => {}
-        },
+        }
     }
 }
 
 /// Converts stored links for relationships whose targets changed: wraps plain IDs as
 /// `{relationTo, value}` when a field gains targets, unwraps links to the one remaining
 /// target, and drops links whose collection is no longer allowed. Paths are in the new
-/// schema, so call this after `migrate_document`. Returns whether any link was dropped.
-pub fn relink(doc: &mut Map<String, Value>, links: &[LinkChange]) -> bool {
+/// schema (`fields`, as data), so call this after `migrate_document`. Returns whether any
+/// link was dropped.
+pub fn relink(fields: &[Field], doc: &mut Map<String, Value>, links: &[LinkChange]) -> bool {
     let mut dropped = false;
     for change in links {
         let segments: Vec<&str> = change.path.split('.').collect();
-        dropped |= relink_at(doc, &segments, change);
+        dropped |= relink_at(fields, doc, &segments, change);
     }
     dropped
 }
 
-fn relink_at(obj: &mut Map<String, Value>, segments: &[&str], change: &LinkChange) -> bool {
+fn relink_at(
+    fields: &[Field],
+    obj: &mut Map<String, Value>,
+    segments: &[&str],
+    change: &LinkChange,
+) -> bool {
     match segments {
         [name] => {
             let Some(value) = obj.get(*name) else {
@@ -505,14 +617,32 @@ fn relink_at(obj: &mut Map<String, Value>, segments: &[&str], change: &LinkChang
             }
             dropped
         }
-        [head, rest @ ..] => match obj.get_mut(*head) {
-            Some(Value::Object(inner)) => relink_at(inner, rest, change),
-            Some(Value::Array(rows)) => rows.iter_mut().fold(false, |any, row| match row {
-                Value::Object(inner) => relink_at(inner, rest, change) | any,
-                _ => any,
-            }),
-            _ => false,
-        },
+        [head, rest @ ..] => {
+            let kind = fields.iter().find(|f| f.name == *head).map(|f| &f.kind);
+            match (kind, obj.get_mut(*head)) {
+                (Some(FieldKind::Group { fields }), Some(Value::Object(inner))) => {
+                    relink_at(fields, inner, rest, change)
+                }
+                (Some(FieldKind::Array { fields, .. }), Some(Value::Array(rows))) => rows
+                    .iter_mut()
+                    .filter_map(Value::as_object_mut)
+                    .fold(false, |any, inner| {
+                        relink_at(fields, inner, rest, change) | any
+                    }),
+                (Some(kind @ FieldKind::Blocks { .. }), Some(Value::Array(rows))) => {
+                    let [slug, rest @ ..] = rest else {
+                        return false;
+                    };
+                    let Some(block) = kind.block(slug) else {
+                        return false;
+                    };
+                    rows_of(rows, slug).fold(false, |any, inner| {
+                        relink_at(&block.fields, inner, rest, change) | any
+                    })
+                }
+                _ => false,
+            }
+        }
         [] => false,
     }
 }
@@ -564,6 +694,24 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
                     if let Value::Object(inner) = row {
                         prune(fields, inner);
                     }
+                }
+            }
+            // A row whose block type is gone is left whole for validation to report.
+            (kind @ FieldKind::Blocks { .. }, Some(Value::Array(rows))) => {
+                for inner in rows.iter_mut().filter_map(Value::as_object_mut) {
+                    let Some(block) = inner
+                        .get("blockType")
+                        .and_then(Value::as_str)
+                        .and_then(|slug| kind.block(slug))
+                    else {
+                        continue;
+                    };
+                    let keys: Vec<(String, Value)> = BLOCK_ROW_KEYS
+                        .iter()
+                        .filter_map(|k| inner.remove(*k).map(|v| ((*k).to_owned(), v)))
+                        .collect();
+                    prune(&block.fields, inner);
+                    inner.extend(keys);
                 }
             }
             _ => {}
@@ -931,7 +1079,7 @@ mod tests {
         );
         assert!(!d.is_destructive());
         let mut doc = json!({"l": id}).as_object().unwrap().clone();
-        assert!(!relink(&mut doc, &d.links), "nothing is lost");
+        assert!(!relink(&[], &mut doc, &d.links), "nothing is lost");
         assert_eq!(doc["l"], json!({"relationTo": "posts", "value": id}));
 
         // Several → one: links to the remaining target unwrap, others are cleared.
@@ -941,13 +1089,13 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(!relink(&mut kept, &d.links));
+        assert!(!relink(&[], &mut kept, &d.links));
         assert_eq!(kept["l"], id);
         let mut dropped = json!({"l": {"relationTo": "pages", "value": id}})
             .as_object()
             .unwrap()
             .clone();
-        assert!(relink(&mut dropped, &d.links));
+        assert!(relink(&[], &mut dropped, &d.links));
         assert!(dropped.get("l").is_none());
 
         // Several → fewer: only links to the removed collection go.
@@ -957,7 +1105,7 @@ mod tests {
             .as_object()
             .unwrap()
             .clone();
-        assert!(relink(&mut doc, &d.links));
+        assert!(relink(&[], &mut doc, &d.links));
 
         // Several → more is an option change with nothing to convert.
         let d = diff(&pages_only, &both, &Renames::new()).unwrap();
@@ -969,8 +1117,146 @@ mod tests {
         let many_both = rel(json!(["posts", "pages"]), true);
         let d = diff(&many_both, &many_one, &Renames::new()).unwrap();
         let mut doc = json!({"l": [{"relationTo": "posts", "value": id}, {"relationTo": "pages", "value": id}]}).as_object().unwrap().clone();
-        assert!(relink(&mut doc, &d.links));
+        assert!(relink(&[], &mut doc, &d.links));
         assert_eq!(doc["l"], json!([id]));
+    }
+
+    fn pages(blocks: Value) -> CollectionSchema {
+        schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": blocks}]}),
+        )
+    }
+
+    #[test]
+    fn removing_a_block_type_in_use_is_refused() {
+        let hero = json!({"slug": "hero", "fields": [{"name": "heading", "type": "text"}]});
+        let quote = json!({"slug": "quote", "fields": [{"name": "heading", "type": "text"}]});
+        let both = pages(json!([hero, quote]));
+        let hero_only = pages(json!([hero]));
+
+        // Like any removed field: destructive, and every document still using it is counted.
+        let d = diff(&both, &hero_only, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![Change::Removed {
+                path: "layout.quote".into(),
+                kind: "block"
+            }]
+        );
+        assert!(d.is_destructive());
+        let docs = [
+            json!({"layout": [{"id": "0199d5c4-0000-7000-8000-000000000001", "blockType": "hero", "heading": "a"}]}),
+            json!({"layout": [
+                {"id": "0199d5c4-0000-7000-8000-000000000002", "blockType": "hero", "heading": "b"},
+                {"id": "0199d5c4-0000-7000-8000-000000000003", "blockType": "quote", "heading": "c"}
+            ]}),
+        ];
+        let mut invalid = Vec::new();
+        for doc in &docs {
+            let migrated =
+                migrate_document(&hero_only.fields, &Renames::new(), doc.as_object().unwrap());
+            assert_eq!(
+                Value::Object(migrated.clone()),
+                *doc,
+                "rows are never silently dropped"
+            );
+            if let Err(errors) =
+                crate::validate::validate_document(&hero_only.fields, &json!({}), Some(&migrated))
+            {
+                invalid.push(errors[0].path.clone());
+            }
+        }
+        assert_eq!(invalid, ["layout.1.blockType"]);
+
+        // Adding a block type, or a field to one, loses nothing.
+        let cta = json!({"slug": "cta", "fields": [{"name": "label", "type": "text"}]});
+        let d = diff(&hero_only, &pages(json!([hero, cta])), &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![Change::Added {
+                path: "layout.cta".into(),
+                kind: "block"
+            }]
+        );
+        assert!(!d.is_destructive());
+        let wider = pages(json!([{"slug": "hero", "fields": [
+            {"name": "heading", "type": "text"}, {"name": "sub", "type": "text", "default": "s"}
+        ]}]));
+        let d = diff(&hero_only, &wider, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![Change::Added {
+                path: "layout.hero.sub".into(),
+                kind: "text"
+            }]
+        );
+        assert!(!d.is_destructive());
+
+        // A rename inside one block type moves that type's rows only.
+        let renamed = pages(json!([
+            {"slug": "hero", "fields": [{"name": "title", "type": "text"}]},
+            quote
+        ]));
+        let r = renames(&[("layout.hero.heading", "title")]);
+        assert_eq!(
+            diff(&both, &renamed, &r).unwrap().changes,
+            vec![Change::Renamed {
+                from: "layout.hero.heading".into(),
+                to: "layout.hero.title".into()
+            }]
+        );
+        let out = migrate_document(&renamed.fields, &r, docs[1].as_object().unwrap());
+        assert_eq!(out["layout"][0]["title"], "b");
+        assert!(out["layout"][0].get("heading").is_none());
+        assert_eq!(out["layout"][1]["heading"], "c");
+        assert_eq!(
+            out["layout"][1]["id"],
+            "0199d5c4-0000-7000-8000-000000000003"
+        );
+        assert_eq!(
+            diff(
+                &both,
+                &renamed,
+                &renames(&[("layout.nope.heading", "title")])
+            )
+            .unwrap_err()
+            .to_string(),
+            "can't rename `layout.nope.heading`: there's no such field"
+        );
+    }
+
+    #[test]
+    fn links_inside_blocks_relink_by_block_type() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let page = |to: Value| {
+            pages(json!([
+                {"slug": "card", "fields": [{"name": "l", "type": "relationship", "relationTo": to}]},
+                {"slug": "other", "fields": [{"name": "l", "type": "relationship", "relationTo": "posts"}]}
+            ]))
+        };
+        let d = diff(
+            &page(json!("posts")),
+            &page(json!(["posts", "pages"])),
+            &Renames::new(),
+        )
+        .unwrap();
+        assert_eq!(d.links[0].path, "layout.card.l");
+        let new = page(json!(["posts", "pages"]));
+        let mut doc = json!({"layout": [
+            {"blockType": "card", "l": id}, {"blockType": "other", "l": id}
+        ]})
+        .as_object()
+        .unwrap()
+        .clone();
+        assert!(!relink(&new.fields, &mut doc, &d.links));
+        assert_eq!(
+            doc["layout"][0]["l"],
+            json!({"relationTo": "posts", "value": id})
+        );
+        assert_eq!(
+            doc["layout"][1]["l"], id,
+            "the other block type's field is untouched"
+        );
     }
 
     #[test]
@@ -995,7 +1281,7 @@ mod tests {
             d.changes
         );
         let mut doc = json!({"l": id}).as_object().unwrap().clone();
-        assert!(!relink(&mut doc, &d.links));
+        assert!(!relink(&[], &mut doc, &d.links));
         assert_eq!(doc["l"], json!([id]));
 
         // A list → one link: the first link is kept, the rest are cleared.
@@ -1007,7 +1293,7 @@ mod tests {
         .unwrap();
         assert!(d.is_destructive());
         let mut doc = json!({"l": [id, id2]}).as_object().unwrap().clone();
-        assert!(relink(&mut doc, &d.links));
+        assert!(relink(&[], &mut doc, &d.links));
         assert_eq!(doc["l"], id);
 
         // A target change and an option change are both reported.
@@ -1037,7 +1323,7 @@ mod tests {
         )
         .unwrap();
         let mut doc = json!({"l": {"value": id}}).as_object().unwrap().clone();
-        assert!(!relink(&mut doc, &d.links));
+        assert!(!relink(&[], &mut doc, &d.links));
         assert_eq!(doc["l"], json!({"value": id}));
         let d = diff(
             &rel(json!("posts"), false, false),
@@ -1046,6 +1332,6 @@ mod tests {
         )
         .unwrap();
         let mut doc = json!({"l": null}).as_object().unwrap().clone();
-        assert!(!relink(&mut doc, &d.links), "null isn't a link");
+        assert!(!relink(&[], &mut doc, &d.links), "null isn't a link");
     }
 }

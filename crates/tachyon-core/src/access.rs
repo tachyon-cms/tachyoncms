@@ -553,6 +553,21 @@ impl Checker<'_> {
                 FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
                     self.fields(fields, prefix, &format!("{here}.fields"))?
                 }
+                // ponytail: field rules inside block rows are refused until every read, write
+                // and filter walker reaches into them; lift this once they do.
+                FieldKind::Blocks { blocks, .. } => {
+                    for (b, block) in blocks.iter().enumerate() {
+                        if let Some(at) = first_rule(&data_fields(&block.fields), &path) {
+                            return Err(SchemaError::InvalidField {
+                                field: at,
+                                message:
+                                    "access rules on fields inside blocks aren't supported yet"
+                                        .into(),
+                            });
+                        }
+                        self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
+                    }
+                }
                 FieldKind::Tabs { tabs } => {
                     for (t, tab) in tabs.iter().enumerate() {
                         let loc = format!("{here}.tabs.{t}.fields");
@@ -591,6 +606,22 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
     };
     rule.as_ref()
         .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
+}
+
+/// The path of the first field under `prefix` that carries an access rule, at any depth.
+fn first_rule(fields: &[Field], prefix: &str) -> Option<String> {
+    fields.iter().find_map(|f| {
+        let path = format!("{prefix}.{}", f.name);
+        if f.access.is_some() {
+            return Some(path);
+        }
+        match &f.kind {
+            FieldKind::Blocks { blocks, .. } => {
+                blocks.iter().find_map(|b| first_rule(&b.fields, &path))
+            }
+            _ => first_rule(children(f), &path),
+        }
+    })
 }
 
 fn children(f: &Field) -> &[Field] {
@@ -1113,6 +1144,32 @@ mod tests {
 
     fn check(s: &CollectionSchema) -> Result<(), String> {
         check_rules(s, &users().fields, ROLES, &lookup).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn rules_inside_blocks_are_refused_for_now() {
+        let pages = |access: Value| {
+            schema(
+                json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                    {"slug": "hero", "fields": [
+                        {"type": "row", "fields": [{"name": "secret", "type": "text", "access": access}]}
+                    ]}
+                ]}]}),
+            )
+        };
+        assert_eq!(check(&pages(json!(null))), Ok(()));
+        assert_eq!(
+            check(&pages(json!({"read": false}))),
+            Err(
+                "field `layout.secret`: access rules on fields inside blocks aren't supported yet"
+                    .into()
+            )
+        );
+        let on_the_list = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks",
+            "access": {"read": false}, "blocks": [{"slug": "hero", "fields": []}]}]}),
+        );
+        assert_eq!(check(&on_the_list), Ok(()));
     }
 
     /// `posts` with `access` set on the collection.

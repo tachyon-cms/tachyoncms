@@ -6,7 +6,7 @@ use time::macros::format_description;
 
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, RelationTo, SelectOption, data_fields};
+use crate::schema::{BLOCK_ROW_KEYS, Field, FieldKind, RelationTo, SelectOption, data_fields};
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
 
@@ -83,10 +83,13 @@ fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Val
                     // What replaces the stored value whole (rows, or a group the document
                     // didn't have) is new, so it gets its defaults.
                     match (&f.kind, &mut value) {
-                        (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                        (
+                            FieldKind::Array { .. } | FieldKind::Blocks { .. },
+                            Value::Array(rows),
+                        ) => {
                             for row in rows {
                                 if let Value::Object(row) = row {
-                                    apply_defaults(fields, row);
+                                    apply_defaults(row_fields(&f.kind, row), row);
                                 }
                             }
                         }
@@ -108,10 +111,10 @@ fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Val
 fn strip_nulls(f: &Field, value: &mut Value) {
     match (&f.kind, value) {
         (FieldKind::Group { fields }, Value::Object(obj)) => strip_object(fields, obj),
-        (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+        (kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }), Value::Array(rows)) => {
             for row in rows {
                 if let Value::Object(obj) = row {
-                    strip_object(fields, obj);
+                    strip_object(row_fields(kind, obj), obj);
                 }
             }
         }
@@ -152,10 +155,13 @@ pub(crate) fn apply_defaults(fields: &[Field], obj: &mut Map<String, Value>) {
             (FieldKind::Group { fields }, Some(Value::Object(inner))) => {
                 apply_defaults(fields, inner)
             }
-            (FieldKind::Array { fields, .. }, Some(Value::Array(rows))) => {
+            (
+                kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }),
+                Some(Value::Array(rows)),
+            ) => {
                 for row in rows {
                     if let Value::Object(row) = row {
-                        apply_defaults(fields, row);
+                        apply_defaults(row_fields(kind, row), row);
                     }
                 }
             }
@@ -209,8 +215,37 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                     }
                 }
             }
+            // A block row keeps the id it was sent with, so editors can tell rows apart
+            // across saves; a new row gets one.
+            (kind @ FieldKind::Blocks { .. }, Value::Array(rows)) => {
+                for row in rows {
+                    if let Value::Object(inner) = row {
+                        normalize(row_fields(kind, inner), inner);
+                        match inner.get_mut("id") {
+                            Some(Value::String(id)) => canonical_id(id),
+                            _ => {
+                                inner.insert("id".into(), Uuid::now_v7().to_string().into());
+                            }
+                        }
+                    }
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// The fields a list row holds: an array's, or those of the block type the row names.
+/// Nothing for a row whose block type is unknown, which validation reports.
+pub(crate) fn row_fields<'a>(kind: &'a FieldKind, row: &Map<String, Value>) -> &'a [Field] {
+    match kind {
+        FieldKind::Array { fields, .. } => fields,
+        FieldKind::Blocks { .. } => row
+            .get("blockType")
+            .and_then(Value::as_str)
+            .and_then(|slug| kind.block(slug))
+            .map_or(&[], |b| &b.fields),
+        _ => &[],
     }
 }
 
@@ -268,6 +303,7 @@ fn is_list(kind: &FieldKind) -> bool {
             | FieldKind::Relationship { has_many: true, .. }
             | FieldKind::Select { multiple: true, .. }
             | FieldKind::Array { .. }
+            | FieldKind::Blocks { .. }
     )
 }
 
@@ -292,22 +328,7 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
                 errors.push(error(path.into(), "expected a list"));
                 return;
             };
-            if let Some(min) = *min_rows
-                && items.len() < min
-            {
-                errors.push(error(
-                    path.into(),
-                    &format!("must have at least {}", row_count(min)),
-                ));
-            }
-            if let Some(max) = *max_rows
-                && items.len() > max
-            {
-                errors.push(error(
-                    path.into(),
-                    &format!("must have at most {}", row_count(max)),
-                ));
-            }
+            check_row_count(items.len(), *min_rows, *max_rows, path, errors);
             // `scalar_error` ignores `has_many`, so it checks one element.
             for (i, item) in items.iter().enumerate() {
                 if let Some(message) = scalar_error(&f.kind, item) {
@@ -326,28 +347,59 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
             },
             Value::Array(rows),
         ) => {
-            if let Some(min) = *min_rows
-                && rows.len() < min
-            {
-                errors.push(error(
-                    path.into(),
-                    &format!("must have at least {}", row_count(min)),
-                ));
-            }
-            if let Some(max) = *max_rows
-                && rows.len() > max
-            {
-                errors.push(error(
-                    path.into(),
-                    &format!("must have at most {}", row_count(max)),
-                ));
-            }
+            check_row_count(rows.len(), *min_rows, *max_rows, path, errors);
             for (i, row) in rows.iter().enumerate() {
                 let row_path = format!("{path}.{i}");
                 match row {
                     Value::Object(obj) => check_object(fields, obj, &row_path, errors),
                     _ => errors.push(error(row_path, "expected an object")),
                 }
+            }
+        }
+        (
+            FieldKind::Blocks {
+                blocks,
+                min_rows,
+                max_rows,
+            },
+            Value::Array(rows),
+        ) => {
+            let limit = |n: &Option<u32>| n.map(|n| n as usize);
+            check_row_count(rows.len(), limit(min_rows), limit(max_rows), path, errors);
+            for (i, row) in rows.iter().enumerate() {
+                let row_path = format!("{path}.{i}");
+                let Value::Object(obj) = row else {
+                    errors.push(error(row_path, "expected an object"));
+                    continue;
+                };
+                let block = match obj.get("blockType") {
+                    None | Some(Value::Null) => {
+                        errors.push(error(format!("{row_path}.blockType"), "is required"));
+                        continue;
+                    }
+                    Some(t) => match t.as_str().and_then(|slug| f.kind.block(slug)) {
+                        Some(block) => block,
+                        None => {
+                            let slugs: Vec<&str> = blocks.iter().map(|b| b.slug.as_str()).collect();
+                            errors.push(error(
+                                format!("{row_path}.blockType"),
+                                &format!("expected one of: {}", slugs.join(", ")),
+                            ));
+                            continue;
+                        }
+                    },
+                };
+                if obj
+                    .get("id")
+                    .is_some_and(|id| !id.as_str().is_some_and(is_uuid))
+                {
+                    errors.push(error(format!("{row_path}.id"), "expected a row ID"));
+                }
+                let mut data = obj.clone();
+                for key in BLOCK_ROW_KEYS {
+                    data.remove(*key);
+                }
+                check_object(&block.fields, &data, &row_path, errors);
             }
         }
         _ => {
@@ -472,7 +524,7 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         // Never reached: validation only sees the data shape, where layout has dissolved.
         FieldKind::Row { .. } | FieldKind::Collapsible { .. } | FieldKind::Tabs { .. } => None,
         FieldKind::Group { .. } => Some("expected an object".into()),
-        FieldKind::Array { .. } => Some("expected a list".into()),
+        FieldKind::Array { .. } | FieldKind::Blocks { .. } => Some("expected a list".into()),
     }
 }
 
@@ -571,6 +623,31 @@ fn is_web_url(s: &str) -> bool {
     url::Url::parse(s).is_ok_and(|u| matches!(u.scheme(), "http" | "https") && u.host().is_some())
 }
 
+fn check_row_count(
+    len: usize,
+    min: Option<usize>,
+    max: Option<usize>,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+) {
+    if let Some(min) = min
+        && len < min
+    {
+        errors.push(error(
+            path.into(),
+            &format!("must have at least {}", row_count(min)),
+        ));
+    }
+    if let Some(max) = max
+        && len > max
+    {
+        errors.push(error(
+            path.into(),
+            &format!("must have at most {}", row_count(max)),
+        ));
+    }
+}
+
 fn row_count(n: usize) -> String {
     format!("{n} row{}", if n == 1 { "" } else { "s" })
 }
@@ -661,10 +738,15 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
                     walk(fields, inner, &path, out)
                 }
-                (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+                (FieldKind::Array { .. } | FieldKind::Blocks { .. }, Value::Array(rows)) => {
                     for (i, row) in rows.iter().enumerate() {
                         if let Value::Object(inner) = row {
-                            walk(fields, inner, &format!("{path}.{i}"), out);
+                            walk(
+                                row_fields(&f.kind, inner),
+                                inner,
+                                &format!("{path}.{i}"),
+                                out,
+                            );
                         }
                     }
                 }
@@ -714,10 +796,10 @@ fn map_inner(
             (FieldKind::Group { fields }, Value::Object(inner)) => {
                 map_inner(fields, inner, &path, f)
             }
-            (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
+            (kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }), Value::Array(rows)) => {
                 for (i, row) in rows.iter_mut().enumerate() {
                     if let Value::Object(inner) = row {
-                        map_inner(fields, inner, &format!("{path}.{i}"), f);
+                        map_inner(row_fields(kind, inner), inner, &format!("{path}.{i}"), f);
                     }
                 }
             }
@@ -1439,6 +1521,127 @@ mod tests {
             normalize_date_time("2026-10-12T11:30:00.123999+02:00").as_deref(),
             Some(stored.as_str())
         );
+    }
+
+    fn block_fields() -> Vec<Field> {
+        fields(json!([
+            {"name": "layout", "type": "blocks", "minRows": 1, "maxRows": 3, "blocks": [
+                {"slug": "hero", "fields": [
+                    {"name": "heading", "type": "text", "required": true},
+                    {"type": "row", "fields": [{"name": "dark", "type": "boolean", "default": false}]}
+                ]},
+                {"slug": "quote", "fields": [
+                    {"name": "text", "type": "textarea", "default": "…"},
+                    {"name": "author", "type": "relationship", "relationTo": "authors"}
+                ]}
+            ]}
+        ]))
+    }
+
+    #[test]
+    fn block_rows_validate_against_their_type() {
+        let f = block_fields();
+        let id = "0199D5C4-0000-7000-8000-0000000000AA";
+        let doc = ok(
+            &f,
+            json!({"layout": [
+                {"blockType": "hero", "heading": "Hi", "id": id},
+                {"blockType": "quote", "author": null}
+            ]}),
+        );
+        let rows = doc["layout"].as_array().unwrap();
+        assert_eq!(
+            rows[0],
+            json!({"id": id.to_lowercase(), "blockType": "hero", "heading": "Hi", "dark": false}),
+            "an existing id is kept; defaults follow the block type"
+        );
+        let new_id = rows[1]["id"].as_str().expect("new rows get an id");
+        assert!(Uuid::try_parse(new_id).is_ok());
+        assert_eq!(rows[1]["text"], "…");
+        assert!(rows[1].get("dark").is_none() && rows[1].get("author").is_none());
+
+        assert_eq!(
+            errs(
+                &f,
+                json!({"layout": [
+                    {"blockType": "hero"},
+                    {"blockType": "quote", "heading": "x"},
+                    {"blockType": "nope"},
+                    {"heading": "x"},
+                    "row"
+                ]})
+            ),
+            vec![
+                e("layout", "must have at most 3 rows"),
+                e("layout.0.heading", "is required"),
+                e("layout.1.heading", "unknown field"),
+                e("layout.2.blockType", "expected one of: hero, quote"),
+                e("layout.3.blockType", "is required"),
+                e("layout.4", "expected an object"),
+            ]
+        );
+        assert_eq!(
+            errs(&f, json!({"layout": []})),
+            vec![e("layout", "must have at least 1 row")]
+        );
+        assert_eq!(
+            errs(&f, json!({"layout": {"blockType": "hero"}})),
+            vec![e("layout", "expected a list")]
+        );
+        assert_eq!(
+            errs(
+                &f,
+                json!({"layout": [{"blockType": "hero", "heading": "x", "id": "nope"}]})
+            ),
+            vec![e("layout.0.id", "expected a row ID")]
+        );
+
+        // An update replaces the list whole: rows sent with their id keep it.
+        let existing = Value::Object(doc.clone());
+        let updated = update(
+            &f,
+            existing,
+            json!({"layout": [rows[1].clone(), {"blockType": "hero", "heading": "New"}]}),
+        );
+        assert_eq!(updated["layout"][0]["id"], new_id);
+        assert_eq!(updated["layout"][1]["dark"], false);
+        assert_ne!(updated["layout"][1]["id"], new_id);
+        assert!(updated["layout"][1]["id"].is_string());
+
+        let required = fields(
+            json!([{"name": "layout", "type": "blocks", "required": true,
+            "blocks": [{"slug": "hero", "fields": []}]}]),
+        );
+        assert_eq!(
+            errs(&required, json!({"layout": []})),
+            vec![e("layout", "is required")]
+        );
+    }
+
+    #[test]
+    fn relationships_inside_blocks_are_relations() {
+        let f = block_fields();
+        let b = "0199d5c4-0000-7000-8000-00000000000b";
+        let mut doc = ok(
+            &f,
+            json!({"layout": [
+                {"blockType": "hero", "heading": "Hi"},
+                {"blockType": "quote", "author": b}
+            ]}),
+        );
+        let found: Vec<(String, String, String)> = relations(&f, &doc)
+            .into_iter()
+            .map(|r| (r.path, r.relation_to, r.id.to_string()))
+            .collect();
+        assert_eq!(
+            found,
+            [("layout.1.author".into(), "authors".into(), b.into())]
+        );
+        map_relations(&f, &mut doc, &mut |path, id| {
+            assert_eq!(path, "layout.1.author");
+            Some(json!({"id": id, "name": "Bee"}))
+        });
+        assert_eq!(doc["layout"][1]["author"]["name"], "Bee");
     }
 
     #[test]
