@@ -30,6 +30,8 @@ pub fn index_name(collection_id: Uuid, field: &str, kind: IndexKind, value: Valu
         ValueKind::List => b'l',
         ValueKind::LinkList => b'k',
         ValueKind::Point => b'p',
+        // Never indexed (`is_indexable`), but named like any other kind.
+        ValueKind::RichText => b'r',
     };
     // FNV-1a: tiny, stable across releases, and good enough to avoid collisions here.
     // Ascending names predate the descending ones, so only descending adds a byte.

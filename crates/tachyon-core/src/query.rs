@@ -181,6 +181,8 @@ pub enum ValueKind {
     LinkList,
     /// A `[longitude, latitude]` location.
     Point,
+    /// A rich text document: it has a value or it doesn't.
+    RichText,
 }
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
@@ -199,6 +201,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
         FieldKind::Point => ValueKind::Point,
+        FieldKind::RichText { .. } => ValueKind::RichText,
         FieldKind::Text { .. }
         | FieldKind::Textarea { .. }
         | FieldKind::Email
@@ -283,6 +286,7 @@ impl Op {
             ValueKind::Point => matches!(self, Near | Exists),
             ValueKind::Boolean => matches!(self, Equals | NotEquals | Exists),
             ValueKind::List | ValueKind::LinkList => matches!(self, Contains | Exists),
+            ValueKind::RichText => self == Exists,
         }
     }
 }
@@ -678,6 +682,13 @@ fn resolve(
                 ));
             }
             FieldKind::Group { fields } if !last => current = fields,
+            // ponytail: nothing inside rich text (nodes, links, block node fields) can be
+            // filtered or sorted in W1; a path into it is refused, not guessed at.
+            FieldKind::RichText { .. } if !last => {
+                return Err(format!(
+                    "`{full}` is inside rich text, which can't be {verb} yet"
+                ));
+            }
             // A polymorphic link is an object: its `relationTo`, or its `value` (the default).
             FieldKind::Relationship {
                 relation_to,
@@ -1039,6 +1050,12 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         return Err(err(
             "sort",
             format!("`{name}` holds a location and can't be sorted"),
+        ));
+    }
+    if target.kind() == ValueKind::RichText {
+        return Err(err(
+            "sort",
+            format!("`{name}` holds rich text and can't be sorted"),
         ));
     }
     Ok(Sort { target, descending })
@@ -1633,6 +1650,59 @@ mod tests {
         for f in &schema.fields {
             assert_eq!(value_kind(&f.kind), None, "{}", f.kind.name());
         }
+    }
+
+    #[test]
+    fn rich_text_can_only_be_tested_for_a_value() {
+        let fields: Vec<Field> = serde_json::from_value(json!([
+            {"name": "body", "type": "richText", "relationTo": ["posts"], "blocks": [
+                {"slug": "cta", "fields": [{"name": "label", "type": "text"}]}
+            ]}
+        ]))
+        .unwrap();
+        let filter = |qs: &str| {
+            let params = parse_query(qs).unwrap();
+            parse_filter(&fields, &params["where"]).map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            filter("where[body][exists]=true"),
+            Ok(cond(
+                field("body", ValueKind::RichText),
+                Op::Exists,
+                Operand::One(Scalar::Bool(true))
+            ))
+        );
+        for op in ["equals", "not_equals", "like", "contains", "in", "gt"] {
+            assert_eq!(
+                filter(&format!("where[body][{op}]=x")),
+                Err(format!(
+                    "where[body][{op}]: {op} can't be used on this field"
+                )),
+            );
+        }
+        // Nothing inside the text can be filtered on: not its nodes, links or block fields.
+        for path in [
+            "body.label",
+            "body.content",
+            "body.0.label",
+            "body.cta.label",
+            "body.type",
+        ] {
+            assert_eq!(
+                filter(&format!("where[{path}][exists]=true")),
+                Err(format!(
+                    "where[{path}][exists]: `{path}` is inside rich text, which can't be filtered yet"
+                )),
+            );
+        }
+        assert_eq!(
+            parse_sort(&fields, "body").unwrap_err().to_string(),
+            "sort: `body` holds rich text and can't be sorted"
+        );
+        assert_eq!(
+            parse_sort(&fields, "body.label").unwrap_err().to_string(),
+            "sort: `body.label` is inside rich text, which can't be sorted yet"
+        );
     }
 
     #[test]

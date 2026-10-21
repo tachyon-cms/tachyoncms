@@ -246,7 +246,11 @@ fn compare(
                 compare(a, b, &old_path, &new_path, renames, out, links)?;
             }
             // Block types are matched by slug, and their paths name it: `layout.hero.heading`.
-            (FieldKind::Blocks { blocks: a, .. }, FieldKind::Blocks { blocks: b, .. }) => {
+            // A rich text field's block types are matched the same way.
+            (
+                FieldKind::Blocks { blocks: a, .. } | FieldKind::RichText { blocks: a, .. },
+                FieldKind::Blocks { blocks: b, .. } | FieldKind::RichText { blocks: b, .. },
+            ) if o.kind.name() == n.kind.name() => {
                 let a: Vec<&BlockDef> = a.iter().filter_map(BlockSource::def).collect();
                 let b: Vec<&BlockDef> = b.iter().filter_map(BlockSource::def).collect();
                 if options(o) != options(n) {
@@ -369,7 +373,7 @@ fn options(f: &Field) -> Field {
     f.name.clear();
     match &mut f.kind {
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields.clear(),
-        FieldKind::Blocks { blocks, .. } => blocks.clear(),
+        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks.clear(),
         _ => {}
     }
     f
@@ -386,7 +390,7 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
         found = Some(f);
         current = match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-            FieldKind::Blocks { .. } => match segments.next() {
+            FieldKind::Blocks { .. } | FieldKind::RichText { .. } => match segments.next() {
                 Some(slug) => {
                     found = None;
                     &f.kind.block(slug)?.fields
@@ -397,6 +401,17 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
         };
     }
     found
+}
+
+/// Calls `f` on the fields of each block node of type `slug` in rich text `text`.
+fn for_nodes_of(text: &mut Value, slug: &str, f: &mut impl FnMut(&mut Map<String, Value>)) {
+    crate::richtext::blocks_mut(text, &mut |attrs| {
+        if attrs.get("blockType").and_then(Value::as_str) == Some(slug)
+            && let Some(Value::Object(fields)) = attrs.get_mut("fields")
+        {
+            f(fields);
+        }
+    });
 }
 
 /// The rows of a `blocks` value whose type is `slug`.
@@ -563,6 +578,16 @@ fn rename_batch(
                         rename_batch(inner, &block.fields, rest, &block_path, renames, batch);
                     }
                 }
+                (kind @ FieldKind::RichText { .. }, Some(text)) => {
+                    let [slug, rest @ ..] = rest else { return };
+                    let Some(block) = kind.block(slug) else {
+                        return;
+                    };
+                    let block_path = join(&old_path, slug);
+                    for_nodes_of(text, slug, &mut |inner| {
+                        rename_batch(inner, &block.fields, rest, &block_path, renames, batch)
+                    });
+                }
                 _ => {}
             }
         }
@@ -648,6 +673,19 @@ fn relink_at(
                         relink_at(&block.fields, inner, rest, change) | any
                     })
                 }
+                (Some(kind @ FieldKind::RichText { .. }), Some(text)) => {
+                    let [slug, rest @ ..] = rest else {
+                        return false;
+                    };
+                    let Some(block) = kind.block(slug) else {
+                        return false;
+                    };
+                    let mut dropped = false;
+                    for_nodes_of(text, slug, &mut |inner| {
+                        dropped |= relink_at(&block.fields, inner, rest, change)
+                    });
+                    dropped
+                }
                 _ => false,
             }
         }
@@ -721,6 +759,18 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
                     prune(&block.fields, inner);
                     inner.extend(keys);
                 }
+            }
+            // So is a block node; its fields are pruned like a row's.
+            (kind @ FieldKind::RichText { .. }, Some(text)) => {
+                crate::richtext::blocks_mut(text, &mut |attrs| {
+                    let slug = attrs.get("blockType").and_then(Value::as_str);
+                    let Some(block) = slug.and_then(|s| kind.block(s)) else {
+                        return;
+                    };
+                    if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
+                        prune(&block.fields, inner);
+                    }
+                })
             }
             _ => {}
         }
@@ -1133,6 +1183,215 @@ mod tests {
         schema(
             json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": blocks}]}),
         )
+    }
+
+    #[test]
+    fn narrowing_features_in_use_is_refused() {
+        const ID: &str = "0199d5c4-0000-7000-8000-000000000001";
+        let cta = json!({"slug": "cta", "fields": [
+            {"name": "label", "type": "text"},
+            {"name": "gone", "type": "text"},
+            {"name": "who", "type": "relationship", "relationTo": "authors"}
+        ]});
+        let quote = json!({"slug": "quote", "fields": [{"name": "label", "type": "text"}]});
+        let body = |options: Value| {
+            let mut f = json!({"name": "body", "type": "richText"});
+            f.as_object_mut()
+                .unwrap()
+                .extend(options.as_object().unwrap().clone());
+            schema(json!({"slug": "pages", "fields": [f]}))
+        };
+        let text = |content: Value| json!({"body": {"type": "doc", "content": content}});
+        let table = json!({"type": "table", "content": [{"type": "tableRow", "content": [
+            {"type": "tableCell", "content": [{"type": "paragraph"}]}
+        ]}]});
+        let rule = json!({"type": "horizontalRule"});
+        // Every document still using what's dropped, by the path validation names.
+        let invalid = |new: &CollectionSchema, renames: &Renames, docs: &[Value]| {
+            let mut out = Vec::new();
+            for doc in docs {
+                let migrated = migrate_document(&new.fields, renames, doc.as_object().unwrap());
+                if let Err(errors) =
+                    crate::validate::validate_document(&new.fields, &json!({}), Some(&migrated))
+                {
+                    out.push((errors[0].path.clone(), errors[0].message.clone()));
+                }
+            }
+            out
+        };
+
+        // Like dropping a select option: an option change, refused while documents use it.
+        let all = body(json!({}));
+        let no_table = body(json!({"features": ["horizontalRule", "heading"]}));
+        let d = diff(&all, &no_table, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            [Change::OptionsChanged {
+                path: "body".into()
+            }]
+        );
+        let docs = [
+            text(json!([rule.clone()])),
+            text(json!([rule.clone(), table.clone()])),
+        ];
+        for doc in &docs {
+            let migrated =
+                migrate_document(&no_table.fields, &Renames::new(), doc.as_object().unwrap());
+            assert_eq!(
+                Value::Object(migrated),
+                *doc,
+                "text is never silently changed"
+            );
+        }
+        assert_eq!(
+            invalid(&no_table, &Renames::new(), &docs),
+            [(
+                "body.content.1".to_owned(),
+                "the `table` feature isn't turned on for this field".to_owned()
+            )]
+        );
+        // So is narrowing what links may point at.
+        let links = |to: Value| body(json!({ "relationTo": to }));
+        let link =
+            text(json!([{"type": "relationship", "attrs": {"relationTo": "posts", "value": ID}}]));
+        let d = diff(
+            &links(json!(["posts", "pages"])),
+            &links(json!(["pages"])),
+            &Renames::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            d.changes,
+            [Change::OptionsChanged {
+                path: "body".into()
+            }]
+        );
+        assert_eq!(
+            invalid(
+                &links(json!(["pages"])),
+                &Renames::new(),
+                &[link.clone(), text(json!([]))]
+            ),
+            [(
+                "body.content.0.attrs.relationTo".to_owned(),
+                "can't link to `posts`; expected one of: pages".to_owned()
+            )]
+        );
+
+        // Block types are matched by slug, as in a blocks field.
+        let blocks = |types: Value| body(json!({ "blocks": types }));
+        let node = |t: &str, fields: Value| {
+            let id = if t == "cta" {
+                ID
+            } else {
+                "0199d5c4-0000-7000-8000-000000000002"
+            };
+            json!({"type": "block", "attrs": {"blockType": t, "id": id, "fields": fields}})
+        };
+        let both = blocks(json!([cta, quote]));
+        let d = diff(&both, &blocks(json!([cta])), &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            [Change::Removed {
+                path: "body.quote".into(),
+                kind: "block"
+            }]
+        );
+        assert!(d.is_destructive());
+        assert_eq!(
+            invalid(
+                &blocks(json!([cta])),
+                &Renames::new(),
+                &[text(json!([node("quote", json!({"label": "q"}))]))]
+            ),
+            [(
+                "body.content.0.attrs.blockType".to_owned(),
+                "expected one of: cta".to_owned()
+            )]
+        );
+        // A rename inside one type moves that type's nodes only; a removed field goes, a
+        // new default arrives, and a widened link is reshaped.
+        let changed = blocks(json!([
+            {"slug": "cta", "fields": [
+                {"name": "title", "type": "text"},
+                {"name": "who", "type": "relationship", "relationTo": ["authors", "posts"]},
+                {"name": "tone", "type": "text", "default": "calm"}
+            ]},
+            quote
+        ]));
+        let r = renames(&[("body.cta.label", "title")]);
+        let d = diff(&both, &changed, &r).unwrap();
+        assert_eq!(
+            d.changes,
+            [
+                Change::Renamed {
+                    from: "body.cta.label".into(),
+                    to: "body.cta.title".into()
+                },
+                Change::Removed {
+                    path: "body.cta.gone".into(),
+                    kind: "text"
+                },
+                Change::Relinked {
+                    path: "body.cta.who".into(),
+                    from: "authors".into(),
+                    to: "authors, posts".into()
+                },
+                Change::Added {
+                    path: "body.cta.tone".into(),
+                    kind: "text"
+                },
+            ]
+        );
+        let stored = text(json!([
+            {"type": "blockquote", "content": [node("cta", json!({"label": "c", "gone": "g", "who": ID}))]},
+            node("quote", json!({"label": "q"}))
+        ]));
+        let mut migrated = migrate_document(&changed.fields, &r, stored.as_object().unwrap());
+        assert!(!relink(changed.data(), &mut migrated, &d.links));
+        assert_eq!(
+            Value::Object(migrated.clone()),
+            text(json!([
+                {"type": "blockquote", "content": [node("cta", json!({
+                    "title": "c", "tone": "calm", "who": {"relationTo": "authors", "value": ID}
+                }))]},
+                node("quote", json!({"label": "q"}))
+            ]))
+        );
+        assert_eq!(
+            crate::validate::validate_document(&changed.fields, &json!({}), Some(&migrated)).err(),
+            None
+        );
+
+        // Rich text and other kinds don't turn into each other.
+        let d = diff(
+            &all,
+            &schema(json!({"slug": "pages", "fields": [{"name": "body", "type": "json"}]})),
+            &Renames::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            d.changes,
+            [Change::TypeChanged {
+                path: "body".into(),
+                from: "richText",
+                to: "json"
+            }]
+        );
+        let d = diff(
+            &schema(json!({"slug": "pages", "fields": [{"name": "body", "type": "blocks", "blocks": [cta]}]})),
+            &blocks(json!([cta])),
+            &Renames::new(),
+        )
+        .unwrap();
+        assert_eq!(
+            d.changes,
+            [Change::TypeChanged {
+                path: "body".into(),
+                from: "blocks",
+                to: "richText"
+            }]
+        );
     }
 
     #[test]

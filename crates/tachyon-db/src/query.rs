@@ -65,7 +65,7 @@ fn field_expr_on(base: &str, path: &[String], kind: ValueKind) -> String {
         ValueKind::Boolean => format!(
             "(CASE WHEN jsonb_typeof({base} #> '{{{path}}}') = 'boolean' THEN ({base} #>> '{{{path}}}')::boolean END)"
         ),
-        ValueKind::List | ValueKind::LinkList | ValueKind::Point => {
+        ValueKind::List | ValueKind::LinkList | ValueKind::Point | ValueKind::RichText => {
             format!("({base} #> '{{{path}}}')")
         }
     }

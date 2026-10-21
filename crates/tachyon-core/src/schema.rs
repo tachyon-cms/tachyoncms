@@ -280,6 +280,19 @@ pub enum FieldKind {
         #[serde(default)]
         max_rows: Option<u32>,
     },
+    /// Formatted text, stored as a tree of nodes (`{"type": "doc", "content": [...]}`); see
+    /// `richtext`.
+    RichText {
+        /// What editors may use; `None` is everything.
+        #[serde(default)]
+        features: Option<Vec<crate::richtext::Feature>>,
+        /// Collections that links and relationship nodes may point at.
+        #[serde(default)]
+        relation_to: Vec<String>,
+        /// Block types the text may hold as block nodes, inline or shared, like `blocks`.
+        #[serde(default)]
+        blocks: Vec<BlockSource>,
+    },
     /// Puts its fields side by side in the admin. No effect on data.
     Row {
         fields: Vec<Field>,
@@ -456,7 +469,7 @@ pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
     fn has_layout(fields: &[Field]) -> bool {
         fields.iter().any(|f| match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => has_layout(fields),
-            FieldKind::Blocks { blocks, .. } => blocks
+            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks
                 .iter()
                 .filter_map(BlockSource::def)
                 .any(|b| has_layout(&b.fields)),
@@ -516,27 +529,17 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                 },
                 ..f.clone()
             }),
-            FieldKind::Blocks {
-                blocks,
-                min_rows,
-                max_rows,
-            } => out.push(Field {
-                kind: FieldKind::Blocks {
-                    blocks: blocks
-                        .iter()
-                        .map(|b| match b {
-                            BlockSource::Inline(b) => BlockSource::Inline(BlockDef {
-                                fields: flatten(&b.fields),
-                                ..b.clone()
-                            }),
-                            r => r.clone(),
-                        })
-                        .collect(),
-                    min_rows: *min_rows,
-                    max_rows: *max_rows,
-                },
-                ..f.clone()
-            }),
+            FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
+                let mut f = f.clone();
+                if let FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } =
+                    &mut f.kind
+                {
+                    for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
+                        b.fields = flatten(&b.fields);
+                    }
+                }
+                out.push(f)
+            }
             _ => out.push(f.clone()),
         }
     }
@@ -552,6 +555,8 @@ fn compact_fields(fields: &mut Value) {
         let Value::Object(f) = field else { continue };
         f.retain(|key, v| match key.as_str() {
             "default" | "options" => !v.is_null(),
+            // A rich text field's: nothing to link to, no block types.
+            "relationTo" | "blocks" => v.as_array().is_none_or(|a| !a.is_empty()),
             "name" => v.as_str().is_some_and(|n| !n.is_empty()),
             _ => !v.is_null() && *v != Value::Bool(false),
         });
@@ -606,7 +611,7 @@ fn check_admin(
             reach = join(&reach, segment);
             if matches!(
                 step.kind,
-                FieldKind::Array { .. } | FieldKind::Blocks { .. }
+                FieldKind::Array { .. } | FieldKind::Blocks { .. } | FieldKind::RichText { .. }
             ) && reach != *target
                 && !inside.iter().any(|p| p.starts_with(&format!("{reach}.")))
             {
@@ -631,8 +636,14 @@ fn check_admin(
                     "admin.condition must point at a field with a value, not the group `{target}`"
                 ));
             }
-            (FieldKind::Array { .. } | FieldKind::Blocks { .. }, ConditionTest::Exists(_)) => {}
-            (FieldKind::Array { .. } | FieldKind::Blocks { .. }, _) => {
+            (
+                FieldKind::Array { .. } | FieldKind::Blocks { .. } | FieldKind::RichText { .. },
+                ConditionTest::Exists(_),
+            ) => {}
+            (
+                FieldKind::Array { .. } | FieldKind::Blocks { .. } | FieldKind::RichText { .. },
+                _,
+            ) => {
                 return Err(format!(
                     "admin.condition on the {} `{target}` can only test exists",
                     f.kind.name()
@@ -677,6 +688,7 @@ fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result
         FieldKind::Group { .. }
             | FieldKind::Array { .. }
             | FieldKind::Blocks { .. }
+            | FieldKind::RichText { .. }
             | FieldKind::Relationship { .. }
             | FieldKind::Join { .. }
     ) || f.kind.is_layout()
@@ -734,7 +746,9 @@ fn read_field<'a>(fields: &'a [Field], path: &str) -> Result<&'a Field, ReadErro
         }
         current = match &f.kind {
             FieldKind::Group { fields } => fields,
-            FieldKind::Array { .. } | FieldKind::Blocks { .. } => return Err(ReadError::InList),
+            FieldKind::Array { .. } | FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
+                return Err(ReadError::InList);
+            }
             _ => return Err(ReadError::Missing),
         };
     }
@@ -832,7 +846,7 @@ fn check_layout(
                 &join(prefix, &f.name),
                 within,
             )?,
-            FieldKind::Blocks { blocks, .. } => {
+            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
                 let path = join(prefix, &f.name);
                 for (b, block) in blocks.iter().enumerate() {
                     let Some(block) = block.def() else { continue };
@@ -991,20 +1005,27 @@ impl FieldKind {
             Self::Group { .. } => "group",
             Self::Array { .. } => "array",
             Self::Blocks { .. } => "blocks",
+            Self::RichText { .. } => "richText",
             Self::Row { .. } => "row",
             Self::Collapsible { .. } => "collapsible",
             Self::Tabs { .. } => "tabs",
         }
     }
 
-    /// The block type a `blocks` field's row names in its `blockType`.
+    /// The block type a `blocks` field's row, or a rich text block node, names in its
+    /// `blockType`.
     pub fn block(&self, slug: &str) -> Option<&BlockDef> {
+        self.block_sources()
+            .iter()
+            .filter_map(BlockSource::def)
+            .find(|b| b.slug == slug)
+    }
+
+    /// The block types a `blocks` or `richText` field offers; none for other kinds.
+    pub fn block_sources(&self) -> &[BlockSource] {
         match self {
-            Self::Blocks { blocks, .. } => blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .find(|b| b.slug == slug),
-            _ => None,
+            Self::Blocks { blocks, .. } | Self::RichText { blocks, .. } => blocks,
+            _ => &[],
         }
     }
 
@@ -1030,6 +1051,7 @@ impl FieldKind {
             | Self::Group { .. }
             | Self::Array { .. }
             | Self::Blocks { .. }
+            | Self::RichText { .. }
             | Self::Row { .. }
             | Self::Collapsible { .. }
             | Self::Tabs { .. }
@@ -1309,6 +1331,16 @@ impl CollectionSchema {
                             walk(&block.fields, out);
                         }
                     }
+                    FieldKind::RichText {
+                        relation_to,
+                        blocks,
+                        ..
+                    } => {
+                        out.extend(relation_to.iter().map(String::as_str));
+                        for block in blocks.iter().filter_map(BlockSource::def) {
+                            walk(&block.fields, out);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -1379,7 +1411,7 @@ impl CollectionSchema {
         let mut fields = self.fields.clone();
         let mut out: Vec<String> = Vec::new();
         visit_fields(&mut fields, "", "", &mut |f, _, _| {
-            if let FieldKind::Blocks { blocks, .. } = &f.kind {
+            if let FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } = &f.kind {
                 for b in blocks {
                     if let BlockSource::Ref(slug) = b
                         && !out.contains(slug)
@@ -1501,7 +1533,7 @@ fn unknown_in_fields(
             | FieldKind::Collapsible { fields, .. } => {
                 unknown_in_fields(fields, raw.get("fields"), &format!("{here}.fields"))?
             }
-            FieldKind::Blocks { blocks, .. } => {
+            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
                 if let (Some(Value::Array(raw_blocks)), Some(Value::Array(known_blocks))) =
                     (raw.get("blocks"), known.get("blocks"))
                 {
@@ -1599,7 +1631,7 @@ fn visit_fields(
                     visit_fields(&mut tab.fields, &d, &c, visit)?;
                 }
             }
-            FieldKind::Blocks { blocks, .. } => {
+            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
                 for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
                     let c = join(&inner_change, &b.slug);
                     visit_fields(&mut b.fields, &inner_data, &c, visit)?;
@@ -1624,7 +1656,8 @@ fn expand_fields<S: Borrow<CollectionSchema>>(
     visit_fields(fields, "", change, &mut |f, data, change| {
         let (data, change) = (join(data, &f.name), join(change, &f.name));
         let name = f.name.clone();
-        let FieldKind::Blocks { blocks, .. } = &mut f.kind else {
+        let (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }) = &mut f.kind
+        else {
             return Ok(());
         };
         for b in blocks.iter_mut() {
@@ -1710,11 +1743,13 @@ fn fields_at<'a>(fields: &'a [Field], path: &str) -> Vec<&'a Field> {
         (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, Some(rest)) => {
             fields_at(fields, rest)
         }
-        (FieldKind::Blocks { blocks, .. }, Some(rest)) => blocks
-            .iter()
-            .filter_map(BlockSource::def)
-            .flat_map(|b| fields_at(&b.fields, rest))
-            .collect(),
+        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
+            blocks
+                .iter()
+                .filter_map(BlockSource::def)
+                .flat_map(|b| fields_at(&b.fields, rest))
+                .collect()
+        }
         _ => Vec::new(),
     }
 }
@@ -1740,7 +1775,7 @@ fn field_steps<'a>(
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
             field_steps(fields, rest, &here, within)?
         }
-        FieldKind::Blocks { blocks, .. } => {
+        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
             let only = within.iter().find(|(p, _)| *p == here).map(|(_, s)| s);
             blocks
                 .iter()
@@ -1947,35 +1982,64 @@ fn check_fields(
                 true,
                 within,
             )?,
-            FieldKind::Blocks { blocks, .. } => {
-                if blocks.is_empty() {
-                    return Err(invalid("blocks needs at least one block type".into()));
-                }
-                let mut slugs = HashSet::new();
-                for block in blocks {
-                    let slug = block.slug();
-                    if !is_identifier(slug, false) {
+            FieldKind::Blocks { blocks, .. } if blocks.is_empty() => {
+                return Err(invalid("blocks needs at least one block type".into()));
+            }
+            FieldKind::RichText {
+                features,
+                relation_to,
+                ..
+            } => {
+                if let Some(features) = features {
+                    let mut seen = HashSet::new();
+                    if let Some(twice) = features.iter().find(|f| !seen.insert(**f)) {
+                        let name = serde_json::to_value(twice).expect("features serialize");
                         return Err(invalid(format!(
-                            "block slug `{slug}` must start with a lowercase letter and use only lowercase letters, digits and underscores (64 at most)"
+                            "features lists `{}` twice",
+                            name.as_str().unwrap_or_default()
                         )));
                     }
-                    if !slugs.insert(slug) {
-                        return Err(invalid(format!("block `{slug}` is defined more than once")));
+                }
+                let mut seen = HashSet::new();
+                for t in relation_to {
+                    if !is_identifier(t, false) {
+                        return Err(invalid(format!(
+                            "relationTo `{t}` isn't a valid collection slug"
+                        )));
                     }
-                    // A shared block was checked when it was saved; `expand` checks it fits.
-                    let Some(block) = block.def() else { continue };
-                    let path = join(prefix, &f.name);
-                    check_fields(
-                        &block.fields,
-                        Level::BlockRow,
-                        root,
-                        &path,
-                        true,
-                        &enter(within, &path, &block.slug),
-                    )?;
+                    if !seen.insert(t) {
+                        return Err(invalid(format!("relationTo lists `{t}` twice")));
+                    }
                 }
             }
             _ => {}
+        }
+        // A block node in rich text holds its fields as a block row does.
+        let blocks = f.kind.block_sources();
+        if !blocks.is_empty() {
+            let mut slugs = HashSet::new();
+            for block in blocks {
+                let slug = block.slug();
+                if !is_identifier(slug, false) {
+                    return Err(invalid(format!(
+                        "block slug `{slug}` must start with a lowercase letter and use only lowercase letters, digits and underscores (64 at most)"
+                    )));
+                }
+                if !slugs.insert(slug) {
+                    return Err(invalid(format!("block `{slug}` is defined more than once")));
+                }
+                // A shared block was checked when it was saved; `expand` checks it fits.
+                let Some(block) = block.def() else { continue };
+                let path = join(prefix, &f.name);
+                check_fields(
+                    &block.fields,
+                    Level::BlockRow,
+                    root,
+                    &path,
+                    true,
+                    &enter(within, &path, &block.slug),
+                )?;
+            }
         }
         if let FieldKind::Join {
             collection,
@@ -2030,6 +2094,7 @@ fn check_fields(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::richtext::Feature;
     use serde_json::{Value, json};
 
     fn schema(v: Value) -> CollectionSchema {
@@ -2138,6 +2203,183 @@ mod tests {
         assert_eq!(
             chain[0].expand(find).unwrap_err().to_string(),
             "field `l`: shared blocks can nest at most 8 deep: b0 → b1 → b2 → b3 → b4 → b5 → b6 → b7 → b8"
+        );
+    }
+
+    #[test]
+    fn rich_text_parses_and_checks() {
+        let pages = schema(json!({"slug": "pages", "fields": [
+            {"name": "body", "type": "richText",
+             "features": ["bold", "link", "relationship", "block", "table"],
+             "relationTo": ["posts"],
+             "blocks": [
+                {"blockRef": "cta"},
+                {"slug": "quote", "fields": [
+                    {"type": "row", "fields": [{"name": "text", "type": "text"}]},
+                    {"name": "by", "type": "relationship", "relationTo": "authors"},
+                    {"name": "style", "type": "select", "options": ["a", "b"]},
+                    {"name": "note", "type": "text",
+                     "admin": {"condition": {"field": "body.style", "equals": "a"}}},
+                    {"name": "tags", "type": "blocks", "blocks": [{"blockRef": "badge"}]}
+                ]}
+             ]},
+            {"name": "plain", "type": "richText"}
+        ]}));
+        assert_eq!(pages.check(), Ok(()));
+        // Round trips, compactly: an unset feature list or empty targets aren't written.
+        let compact = pages.to_compact_json();
+        assert_eq!(
+            compact["fields"][1],
+            json!({"name": "plain", "type": "richText"})
+        );
+        assert_eq!(schema(compact.clone()), pages);
+        assert_eq!(pages.reject_unknown_options(&compact), Ok(()));
+        let FieldKind::RichText { features, .. } = &pages.fields[0].kind else {
+            panic!("a rich text field");
+        };
+        assert_eq!(
+            features.as_deref(),
+            Some(
+                &[
+                    Feature::Bold,
+                    Feature::Link,
+                    Feature::Relationship,
+                    Feature::Block,
+                    Feature::Table
+                ][..]
+            )
+        );
+        // Layout inside a block type dissolves; targets include links and block fields.
+        let quote = pages.data()[0].kind.block("quote").unwrap();
+        assert_eq!(quote.fields[0].name, "text");
+        assert_eq!(pages.relation_targets(), ["authors", "posts"]);
+
+        // Shared blocks named in rich text are found, expanded and placed like any others.
+        // Including those inside an inline block type in the text.
+        assert_eq!(pages.block_refs(), ["cta", "badge"]);
+        let cta = schema(json!({"slug": "cta", "kind": "block", "fields": [
+            {"name": "label", "type": "text"},
+            {"name": "kind", "type": "select", "options": ["x"]},
+            {"name": "url", "type": "text", "admin": {"condition": {"field": "kind", "exists": true}}},
+            {"name": "more", "type": "richText", "blocks": [{"blockRef": "badge"}]}
+        ]}));
+        let badge = schema(json!({"slug": "badge", "kind": "block", "fields": [
+            {"name": "n", "type": "number"}
+        ]}));
+        assert_eq!(cta.block_refs(), ["badge"]);
+        let all = [cta.clone(), badge.clone()];
+        let find = |slug: &str| all.iter().find(|s| s.slug == slug);
+        let (expanded, placed) = pages.expand_placed(find).unwrap();
+        assert_eq!(
+            placed,
+            [
+                ("body.cta.more".to_owned(), "badge".to_owned()),
+                ("body".to_owned(), "cta".to_owned()),
+                ("body.quote.tags".to_owned(), "badge".to_owned())
+            ]
+        );
+        assert!(expanded.block_refs().is_empty());
+        assert_eq!(expanded.check(), Ok(()));
+        let placed_cta = expanded.data()[0].kind.block("cta").unwrap();
+        assert_eq!(
+            placed_cta.fields[2].admin.condition.as_ref().unwrap().field,
+            "body.kind"
+        );
+        assert!(placed_cta.fields[3].kind.block("badge").is_some());
+        // A loop through rich text is still a loop.
+        let looped = schema(json!({"slug": "badge", "kind": "block", "fields": [
+            {"name": "back", "type": "richText", "blocks": [{"blockRef": "cta"}]}
+        ]}));
+        let with_loop = [cta.clone(), looped];
+        let find = |slug: &str| with_loop.iter().find(|s| s.slug == slug);
+        assert!(
+            pages
+                .expand(find)
+                .unwrap_err()
+                .to_string()
+                .contains("in a loop: cta → badge → cta")
+        );
+
+        for (field, message) in [
+            (
+                json!({"name": "b", "type": "richText", "features": ["bold", "bold"]}),
+                "field `b`: features lists `bold` twice",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "relationTo": ["Posts"]}),
+                "field `b`: relationTo `Posts` isn't a valid collection slug",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "relationTo": ["posts", "posts"]}),
+                "field `b`: relationTo lists `posts` twice",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "blocks": [
+                    {"slug": "q", "fields": []}, {"slug": "q", "fields": []}
+                ]}),
+                "field `b`: block `q` is defined more than once",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "blocks": [
+                    {"slug": "q", "fields": [{"name": "t", "type": "text", "unique": true}]}
+                ]}),
+                "field `t`: unique, filterable and slug fields must be at the top level",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "unique": true}),
+                "field `b`: richText fields can't be unique or filterable",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "virtual": "x.y"}),
+                "field `b`: richText fields can't be virtual; a virtual field holds one value",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "default": {"type": "doc", "content": [{"type": "video"}]}}),
+                "field `b`: default: unknown node type `video`",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "admin": {"condition": {"field": "t", "equals": 1}}}),
+                "field `b`: admin.condition refers to `t`, which isn't a field",
+            ),
+        ] {
+            let s = schema(json!({"slug": "p", "fields": [field]}));
+            assert_eq!(s.check().unwrap_err().to_string(), message);
+        }
+        // A condition on rich text can only ask whether it has a value, and a field outside
+        // can't reach into its block nodes.
+        let conditioned = |test: Value, on: &str| {
+            let mut condition = json!({ "field": on });
+            condition
+                .as_object_mut()
+                .unwrap()
+                .extend(test.as_object().unwrap().clone());
+            schema(json!({"slug": "p", "fields": [
+                {"name": "b", "type": "richText", "blocks": [
+                    {"slug": "q", "fields": [{"name": "t", "type": "text"}]}
+                ]},
+                {"name": "x", "type": "text", "admin": {"condition": condition}}
+            ]}))
+            .check()
+            .map_err(|e| e.to_string())
+        };
+        assert_eq!(conditioned(json!({"exists": true}), "b"), Ok(()));
+        assert_eq!(
+            conditioned(json!({"equals": 1}), "b"),
+            Err("field `x`: admin.condition on the richText `b` can only test exists".into())
+        );
+        assert_eq!(
+            conditioned(json!({"exists": true}), "b.t"),
+            Err("field `x`: admin.condition can't reach into the list `b` from outside it".into())
+        );
+        assert!(
+            explain_parse_error(
+                &json!({"fields": [{"name": "b", "type": "richText", "features": ["blink"]}]}),
+                &serde_json::from_value::<CollectionSchema>(
+                    json!({"slug": "p", "fields": [{"name": "b", "type": "richText", "features": ["blink"]}]})
+                )
+                .unwrap_err()
+            )
+            .starts_with("field `b`: unknown variant `blink`")
         );
     }
 

@@ -5,6 +5,7 @@ pub mod auth;
 pub mod diff;
 pub mod joins;
 pub mod query;
+pub mod richtext;
 pub mod schema;
 pub mod select;
 pub mod validate;

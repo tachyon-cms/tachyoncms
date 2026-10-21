@@ -114,6 +114,7 @@ fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Val
                         (FieldKind::Group { fields }, Value::Object(group)) => {
                             apply_defaults(fields, group)
                         }
+                        (FieldKind::RichText { .. }, text) => block_defaults(&f.kind, text),
                         _ => {}
                     }
                 }
@@ -134,8 +135,42 @@ fn strip_nulls(f: &Field, value: &mut Value) {
                 }
             }
         }
+        (kind @ FieldKind::RichText { .. }, text) => {
+            crate::richtext::blocks_mut(text, &mut |attrs| {
+                let fields = node_fields(kind, attrs);
+                if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                    strip_object(fields, obj);
+                }
+            })
+        }
         _ => {}
     }
+}
+
+/// The fields of the block type a rich text block node's `attrs` name; none when unknown.
+pub(crate) fn node_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -> &'a [Field] {
+    attrs
+        .get("blockType")
+        .and_then(Value::as_str)
+        .and_then(|slug| kind.block(slug))
+        .map_or(&[], |b| &b.fields)
+}
+
+/// Fills defaults into the fields of every block node in rich text `text`.
+fn block_defaults(kind: &FieldKind, text: &mut Value) {
+    crate::richtext::blocks_mut(text, &mut |attrs| {
+        let fields = node_fields(kind, attrs);
+        match attrs.get_mut("fields") {
+            Some(Value::Object(obj)) => apply_defaults(fields, obj),
+            None => {
+                let filled = defaults(fields);
+                if !filled.is_empty() {
+                    attrs.insert("fields".into(), Value::Object(filled));
+                }
+            }
+            Some(_) => {}
+        }
+    })
 }
 
 fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
@@ -181,6 +216,7 @@ pub(crate) fn apply_defaults(fields: &[Field], obj: &mut Map<String, Value>) {
                     }
                 }
             }
+            (kind @ FieldKind::RichText { .. }, Some(text)) => block_defaults(kind, text),
             _ => {}
         }
     }
@@ -237,16 +273,34 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                 for row in rows {
                     if let Value::Object(inner) = row {
                         normalize(row_fields(kind, inner), inner);
-                        match inner.get_mut("id") {
-                            Some(Value::String(id)) => canonical_id(id),
-                            _ => {
-                                inner.insert("id".into(), Uuid::now_v7().to_string().into());
-                            }
-                        }
+                        keep_or_give_id(inner);
                     }
                 }
             }
+            // Block nodes get IDs as block rows do; links are stored in canonical form.
+            (kind @ FieldKind::RichText { .. }, text) => {
+                crate::richtext::each_item_mut(text, &mut |_, item| match item {
+                    crate::richtext::ItemMut::Link(link) => canonical_link(link),
+                    crate::richtext::ItemMut::Block(attrs) => {
+                        let fields = node_fields(kind, attrs);
+                        if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                            normalize(fields, obj);
+                        }
+                        keep_or_give_id(attrs);
+                    }
+                })
+            }
             _ => {}
+        }
+    }
+}
+
+/// Canonicalises the `id` of a block row or node, or gives it a new one.
+fn keep_or_give_id(obj: &mut Map<String, Value>) {
+    match obj.get_mut("id") {
+        Some(Value::String(id)) => canonical_id(id),
+        _ => {
+            obj.insert("id".into(), Uuid::now_v7().to_string().into());
         }
     }
 }
@@ -266,7 +320,7 @@ pub(crate) fn row_fields<'a>(kind: &'a FieldKind, row: &Map<String, Value>) -> &
 }
 
 /// `own` are keys the object carries besides its fields, such as a block row's `id`.
-fn check_object(
+pub(crate) fn check_object(
     fields: &[Field],
     obj: &Map<String, Value>,
     own: &[&str],
@@ -305,6 +359,13 @@ fn check_object(
                 errors.push(error(path, "is required"))
             }
             Some(Value::Array(items)) if f.required && items.is_empty() && is_list(&f.kind) => {
+                errors.push(error(path, "is required"))
+            }
+            Some(text @ Value::Object(_))
+                if f.required
+                    && matches!(f.kind, FieldKind::RichText { .. })
+                    && crate::richtext::is_empty(text) =>
+            {
                 errors.push(error(path, "is required"))
             }
             Some(v) => check_value(f, v, &path, errors),
@@ -426,6 +487,11 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
                 check_object(&block.fields, obj, BLOCK_ROW_KEYS, &row_path, errors);
             }
         }
+        (FieldKind::RichText { .. }, text) => {
+            if let Err(e) = crate::richtext::validate(text, &f.kind, path) {
+                errors.extend(e);
+            }
+        }
         _ => {
             if let Some(message) = scalar_error(&f.kind, v) {
                 errors.push(error(path.into(), &message));
@@ -543,6 +609,8 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
             })
         }
         FieldKind::Json => None,
+        // Never reached: `check_value` hands rich text to `richtext::validate`.
+        FieldKind::RichText { .. } => None,
         // Never reached: `check_object` refuses a join value before this.
         FieldKind::Join { .. } => None,
         // Never reached: validation only sees the data shape, where layout has dissolved.
@@ -702,6 +770,9 @@ pub struct RelationRef {
     pub max_depth: Option<u8>,
 }
 
+/// Reads a `{relationTo, value}` link to any collection; rich text checked the collection.
+const ANY: RelationTo = RelationTo::Many(Vec::new());
+
 /// Every relationship ID in a validated document, in schema order.
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
     let fields: &[Field] = &data_fields(fields);
@@ -715,28 +786,22 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 FieldKind::Relationship { max_depth, .. } => max_depth,
                 _ => None,
             };
-            let mut push = |path: String, relation_to: &RelationTo, link: &Value| {
+            // A link at `path` as stored for `relation_to`, if it is one.
+            let found = |path: String, relation_to: &RelationTo, link: &Value| {
                 let (slug, id) = match (relation_to, link) {
                     (RelationTo::One(slug), Value::String(id)) => (slug.as_str(), id.as_str()),
-                    (RelationTo::Many(_), Value::Object(o)) => {
-                        let (Some(slug), Some(id)) = (
-                            o.get("relationTo").and_then(Value::as_str),
-                            o.get("value").and_then(Value::as_str),
-                        ) else {
-                            return;
-                        };
-                        (slug, id)
-                    }
-                    _ => return,
+                    (RelationTo::Many(_), Value::Object(o)) => (
+                        o.get("relationTo").and_then(Value::as_str)?,
+                        o.get("value").and_then(Value::as_str)?,
+                    ),
+                    _ => return None,
                 };
-                if let Ok(id) = Uuid::try_parse(id) {
-                    out.push(RelationRef {
-                        path,
-                        relation_to: slug.to_owned(),
-                        id,
-                        max_depth,
-                    });
-                }
+                Some(RelationRef {
+                    path,
+                    relation_to: slug.to_owned(),
+                    id: Uuid::try_parse(id).ok()?,
+                    max_depth,
+                })
             };
             match (&f.kind, value) {
                 (
@@ -746,7 +811,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                         ..
                     },
                     id,
-                ) => push(path, relation_to, id),
+                ) => out.extend(found(path, relation_to, id)),
                 (
                     FieldKind::Relationship {
                         relation_to,
@@ -756,7 +821,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     Value::Array(ids),
                 ) => {
                     for (i, id) in ids.iter().enumerate() {
-                        push(format!("{path}.{i}"), relation_to, id);
+                        out.extend(found(format!("{path}.{i}"), relation_to, id));
                     }
                 }
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
@@ -771,6 +836,22 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                                 &format!("{path}.{i}"),
                                 out,
                             );
+                        }
+                    }
+                }
+                // The k-th link or block node in the text is `<field>.<k>`.
+                (FieldKind::RichText { .. }, text) => {
+                    for (k, item) in crate::richtext::items(text).into_iter().enumerate() {
+                        let here = format!("{path}.{k}");
+                        match item {
+                            crate::richtext::Item::Link(link) => {
+                                out.extend(found(here, &ANY, link))
+                            }
+                            crate::richtext::Item::Block(attrs) => {
+                                if let Some(Value::Object(inner)) = attrs.get("fields") {
+                                    walk(node_fields(&f.kind, attrs), inner, &here, out);
+                                }
+                            }
                         }
                     }
                 }
@@ -826,6 +907,22 @@ fn map_inner(
                         map_inner(row_fields(kind, inner), inner, &format!("{path}.{i}"), f);
                     }
                 }
+            }
+            (kind @ FieldKind::RichText { .. }, text) => {
+                crate::richtext::each_item_mut(text, &mut |k, item| {
+                    let here = format!("{path}.{k}");
+                    match item {
+                        crate::richtext::ItemMut::Link(link) => {
+                            replace_link(link, &mut |id| f(&here, id))
+                        }
+                        crate::richtext::ItemMut::Block(attrs) => {
+                            let fields = node_fields(kind, attrs);
+                            if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
+                                map_inner(fields, inner, &here, f);
+                            }
+                        }
+                    }
+                })
             }
             _ => {}
         }

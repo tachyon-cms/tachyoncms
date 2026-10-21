@@ -31,7 +31,8 @@ fn pattern(fields: &[Field], path: &str) -> Option<String> {
         (FieldKind::Array { fields, .. }, Some(rest)) => {
             Some(format!(r"{head}\.\d+\.{}", pattern(fields, rest)?))
         }
-        (FieldKind::Blocks { blocks, .. }, Some(rest)) => {
+        // A rich text block node's links are stored like a block row's: `body.<k>.<name>`.
+        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
             let mut shapes: Vec<String> = Vec::new();
             for shape in blocks
                 .iter()
@@ -81,6 +82,9 @@ mod tests {
                 {"name": "many", "type": "relationship", "relationTo": "categories", "hasMany": true}
             ]},
             {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "body", "type": "richText", "relationTo": ["categories"], "blocks": [
+                {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]}
+            ]},
             {"name": "layout", "type": "blocks", "blocks": [
                 {"slug": "tagged", "fields": [{"name": "who", "type": "relationship", "relationTo": "tags"}]},
                 {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]},
@@ -151,7 +155,7 @@ mod tests {
     fn join_targets_are_checked() {
         let lookup = |slug: &str| (slug == "posts").then(posts);
         // `layout.who` links to categories in `card` and `list`, and to tags in `tagged`.
-        for on in ["links.target", "layout.who", "layout.rows.who"] {
+        for on in ["links.target", "layout.who", "layout.rows.who", "body.who"] {
             let ok = categories(
                 json!({"name": "posts", "type": "join", "collection": "posts", "on": on}),
             );
@@ -173,6 +177,10 @@ mod tests {
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "title"}),
                 "field `j`: posts.title isn't a relationship field",
+            ),
+            (
+                json!({"name": "j", "type": "join", "collection": "posts", "on": "body"}),
+                "field `j`: posts.body isn't a relationship field",
             ),
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "missing"}),
@@ -213,6 +221,9 @@ mod tests {
             // Each block type's own shape: one link in `card`, several in `list`.
             ("layout.who", r"^layout\.\d+\.(?:who|who(\.\d+)?)$"),
             ("layout.rows.who", r"^layout\.\d+\.rows\.\d+\.who$"),
+            // A block node's link is `<field>.<k>.<name>`, `k` its place among the text's
+            // references.
+            ("body.who", r"^body\.\d+\.who$"),
         ] {
             assert_eq!(
                 super::on_pattern(p.data(), on).as_deref(),
@@ -223,6 +234,8 @@ mod tests {
         assert_eq!(super::on_pattern(p.data(), "title"), None);
         assert_eq!(super::on_pattern(p.data(), "layout.nope"), None);
         assert_eq!(super::on_pattern(p.data(), "layout"), None);
+        // The text's own links aren't a relationship field to join on.
+        assert_eq!(super::on_pattern(p.data(), "body"), None);
     }
 
     #[test]
