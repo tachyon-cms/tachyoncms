@@ -242,9 +242,15 @@ pub(crate) async fn update(
     let users = any_collection(&state, auth::USERS)?;
     let profile = Value::Object(profile);
     let caller = caller_of(&principal);
-    // ponytail: checked without the stored profile, so a blocks field in a profile counts
-    // every block type as replaced; pass the stored profile if profiles grow blocks.
-    refuse_fields(&users, &profile, Action::Update, &caller, None)?;
+    // Which fields the patch writes depends on the block rows it replaces, so it's checked
+    // against the stored profile, then again against the locked one.
+    let stored = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        refuse_fields(&users, &profile, Action::Update, &caller, Some(&stored))?;
+        Some(stored)
+    } else {
+        None
+    };
     let current = auth::account(&state.pool, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -300,10 +306,11 @@ pub(crate) async fn update(
         }
     };
     // An account-only change (role, email, password) leaves the profile alone.
-    let profile_write = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+    let profile_write = if let Some(stored) = stored {
         let targets = link_targets(&state, &users).await?;
         let (users, patch, caller) = (&users, &profile, &caller);
         let apply = move |current: &Map<String, Value>| {
+            refuse_fields(users, patch, Action::Update, caller, Some(current))?;
             validate_document(users.schema.data(), patch, Some(current))
                 .map_err(ApiError::Validation)
                 .and_then(|data| prepare(&targets, users, data))
@@ -315,7 +322,6 @@ pub(crate) async fn update(
         // Links the profile gains must point at documents the caller can read (all of
         // them, for an Admin editing someone else's).
         let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
-        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
         let next = apply(&stored)?;
         let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
         Some((apply, vouched))

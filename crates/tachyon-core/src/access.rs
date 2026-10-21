@@ -932,9 +932,9 @@ pub fn visible_errors(
 /// The fields in `input` the caller may not write with `action` (create or update), by
 /// path. Sending a field counts as writing it, whatever the value. An update replaces a
 /// list whole, and a group sent as anything but an object, so every field inside counts.
-/// A block row answers to its own type's rules: on create, the rows sent; on update, every
-/// type with a row in what's sent or in `existing` (the stored document), since the list
-/// replaces those. Without `existing`, every block type counts.
+/// A block row answers to its own type's rules, at every depth: on create, the rows sent;
+/// on update, the rows sent and the rows replaced in `existing` (the stored document).
+/// Without `existing`, every block type counts.
 pub fn unwritable(
     fields: &[Field],
     input: &Map<String, Value>,
@@ -948,31 +948,99 @@ pub fn unwritable(
             out.push(path);
         }
     }
-    fn within(
-        level: &[&[Field]],
+    /// The values at `name` in each of `values`.
+    fn at<'v>(values: &[&'v Value], name: &str) -> Vec<&'v Value> {
+        values.iter().filter_map(|v| v.get(name)).collect()
+    }
+    /// The rows of each list in `values`.
+    fn rows<'v>(values: &[&'v Value]) -> Vec<&'v Value> {
+        values
+            .iter()
+            .filter_map(|v| v.as_array())
+            .flatten()
+            .collect()
+    }
+    /// The rows of block type `slug`.
+    fn of_type<'v>(rows: &[&'v Value], slug: &str) -> Vec<&'v Value> {
+        rows.iter()
+            .copied()
+            .filter(|r| r.get("blockType").and_then(Value::as_str) == Some(slug))
+            .collect()
+    }
+    /// What replacing `fields` writes: every field inside, except in block types with no
+    /// row in what's sent (`sent`) or replaced (`stored`; `None` when not known, and then
+    /// every block type counts).
+    fn replaced(
+        fields: &[Field],
+        sent: &[&Value],
+        stored: Option<&[&Value]>,
         prefix: &str,
         action: Action,
         caller: &Caller,
         out: &mut Vec<String>,
     ) {
-        for name in names(level) {
-            let peers = named(level, name);
-            let path = format!("{prefix}.{name}");
-            if all_allow(&peers, action, caller) {
-                within(&below(&peers), &path, action, caller, out);
-            } else {
+        for f in fields {
+            let path = format!("{prefix}.{}", f.name);
+            if !field_allows(f, action, caller) {
                 push(out, path);
+                continue;
             }
+            let stored = stored.map(|s| at(s, &f.name));
+            replaced_in(
+                f,
+                &at(sent, &f.name),
+                stored.as_deref(),
+                &path,
+                action,
+                caller,
+                out,
+            );
         }
     }
-    /// The block types of the rows in `value`.
-    fn types(value: Option<&Value>) -> Vec<&str> {
-        value
-            .and_then(Value::as_array)
-            .into_iter()
-            .flatten()
-            .filter_map(|row| row.get("blockType")?.as_str())
-            .collect()
+    /// `replaced` for what's inside `f`, whose values are `sent` and `stored`.
+    fn replaced_in(
+        f: &Field,
+        sent: &[&Value],
+        stored: Option<&[&Value]>,
+        path: &str,
+        action: Action,
+        caller: &Caller,
+        out: &mut Vec<String>,
+    ) {
+        match &f.kind {
+            FieldKind::Group { fields } => {
+                replaced(fields, sent, stored, path, action, caller, out)
+            }
+            FieldKind::Array { fields, .. } => {
+                let stored = stored.map(rows);
+                replaced(
+                    fields,
+                    &rows(sent),
+                    stored.as_deref(),
+                    path,
+                    action,
+                    caller,
+                    out,
+                )
+            }
+            FieldKind::Blocks { blocks, .. } => {
+                let (sent, stored) = (rows(sent), stored.map(rows));
+                for b in blocks {
+                    let (mine, held) = (
+                        of_type(&sent, &b.slug),
+                        stored.as_deref().map(|s| of_type(s, &b.slug)),
+                    );
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.is_empty() && mine.is_empty())
+                    {
+                        continue;
+                    }
+                    replaced(&b.fields, &mine, held.as_deref(), path, action, caller, out);
+                }
+            }
+            _ => {}
+        }
     }
     fn walk(
         fields: &[Field],
@@ -996,31 +1064,23 @@ pub fn unwritable(
                 push(out, path);
                 continue;
             }
-            let stored = existing.map(|e| e.get(&f.name));
             match (&f.kind, value) {
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    let stored = stored.map(|s| s.and_then(Value::as_object).unwrap_or(&NOTHING));
+                    let stored = existing.map(|e| {
+                        e.get(&f.name)
+                            .and_then(Value::as_object)
+                            .unwrap_or(&NOTHING)
+                    });
                     walk(fields, inner, stored, &path, action, caller, out)
                 }
                 // `field_answers` reports a list as updatable only as a whole, to match.
-                (FieldKind::Blocks { blocks, .. }, _) if action != Action::Create => {
-                    let level: Level = match stored {
-                        None => inside(f),
-                        Some(stored) => {
-                            let held = [types(Some(value)), types(stored)].concat();
-                            blocks
-                                .iter()
-                                .filter(|b| held.contains(&b.slug.as_str()))
-                                .map(|b| b.fields.as_slice())
-                                .collect()
-                        }
-                    };
-                    within(&level, &path, action, caller, out)
-                }
-                (FieldKind::Group { .. } | FieldKind::Array { .. }, _)
-                    if action != Action::Create =>
-                {
-                    within(&inside(f), &path, action, caller, out)
+                (
+                    FieldKind::Group { .. } | FieldKind::Array { .. } | FieldKind::Blocks { .. },
+                    _,
+                ) if action != Action::Create => {
+                    let stored: Option<Vec<&Value>> =
+                        existing.map(|e| e.get(&f.name).into_iter().collect());
+                    replaced_in(f, &[value], stored.as_deref(), &path, action, caller, out)
                 }
                 (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                     for row in rows.iter().filter_map(Value::as_object) {
@@ -1510,6 +1570,43 @@ mod tests {
             ["layout.inner.x"]
         );
         assert!(unwritable(&s.fields, &whole, Action::Update, &editor, None).is_empty());
+
+        // At every depth: nested rows answer to their own type too, sent or replaced.
+        let nested = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "section", "fields": [{"name": "inner", "type": "blocks", "blocks": [
+                    {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+                ]}]}
+            ]}]}),
+        );
+        let section = |types: &[&str]| {
+            let inner: Vec<Value> = types
+                .iter()
+                .map(|t| json!({"blockType": t, "x": "x"}))
+                .collect();
+            json!({"layout": [{"blockType": "section", "inner": inner}]})
+        };
+        let update = |sent: Value, stored: Option<Value>| {
+            let stored = stored.as_ref().map(|v| v.as_object().unwrap());
+            unwritable(
+                &nested.fields,
+                sent.as_object().unwrap(),
+                Action::Update,
+                &viewer,
+                stored,
+            )
+        };
+        assert!(update(section(&["b"]), Some(section(&["b", "b"]))).is_empty());
+        assert!(update(section(&[]), Some(section(&["b"]))).is_empty());
+        let inner_x = ["layout.inner.x"];
+        assert_eq!(update(section(&["b"]), Some(section(&["a", "b"]))), inner_x);
+        assert_eq!(update(section(&["a"]), Some(section(&["b"]))), inner_x);
+        assert_eq!(
+            update(json!({"layout": []}), Some(section(&["a"]))),
+            inner_x
+        );
+        assert_eq!(update(section(&["b"]), None), inner_x);
 
         // `/api/access` has no row either: block paths have no type or index, and answers
         // are ANDed across types.

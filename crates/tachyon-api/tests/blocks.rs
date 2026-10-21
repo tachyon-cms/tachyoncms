@@ -203,7 +203,7 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
         &admin,
         "/api/admin/collections",
         json!({"slug": "pages",
-            "access": {"create": {"role": ["editor", "author", "viewer"]}, "update": {"role": ["editor", "author"]}},
+            "access": {"create": {"role": ["editor", "author", "viewer"]}, "update": {"role": ["editor", "author", "viewer"]}},
             "fields": [
             {"name": "title", "type": "text"},
             {"name": "layout", "type": "blocks", "blocks": [
@@ -218,7 +218,11 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
                 // The same name with no rule: a quote row's `secret` is anyone's.
                 {"slug": "quote", "fields": [
                     {"name": "text", "type": "text"},
-                    {"name": "secret", "type": "text"}
+                    {"name": "secret", "type": "text"},
+                    {"name": "inner", "type": "blocks", "blocks": [
+                        {"slug": "note", "fields": [{"name": "body", "type": "text"}, secret]},
+                        {"slug": "plain", "fields": [{"name": "body", "type": "text"}]}
+                    ]}
                 ]}
             ]}
         ]}),
@@ -341,6 +345,33 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
             .as_str()
             .unwrap()
             .contains("`layout.secret`")
+    );
+    // At every depth: nested rows answer to their own type, sent or replaced.
+    let nested = |types: &[&str]| {
+        let inner: Vec<Value> = types
+            .iter()
+            .map(|t| json!({"blockType": t, "body": "b"}))
+            .collect();
+        json!({"layout": [{"blockType": "quote", "text": "t", "inner": inner}]})
+    };
+    let n_url = format!(
+        "/api/pages/{}",
+        id(&create(&admin, "/api/pages", nested(&["plain"])).await)
+    );
+    let res = patch(&viewer, &n_url, nested(&["plain", "plain"])).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = patch(&viewer, &n_url, nested(&["plain", "note"])).await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        res.json["detail"],
+        "You don't have permission to write `layout.inner.secret`."
+    );
+    assert_eq!(patch(&admin, &n_url, nested(&["note"])).await.status, 200);
+    let res = patch(&viewer, &n_url, nested(&["plain"])).await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        res.json["detail"],
+        "You don't have permission to write `layout.inner.secret`."
     );
     // Creating: each row answers to its own type, so quote's `secret` is the viewer's to
     // write and hero's isn't.
@@ -840,4 +871,72 @@ async fn rows_of_removed_block_types_show_only_their_type(pool: PgPool) {
             assert_eq!(layout[1]["note"], "fine", "{layout}");
         }
     }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn profile_block_rows_answer_to_their_own_type(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let ed = json!({"read": {"role": "editor"}, "update": {"role": "editor"}});
+    let users = json!({"schema": {"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "bio", "type": "blocks", "blocks": [
+            {"slug": "private", "fields": [{"name": "note", "type": "text", "access": ed}]},
+            {"slug": "public", "fields": [{"name": "note", "type": "text"}]}
+        ]}
+    ]}});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&users.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let vic = common::add_user(&pool, "vic@example.com", "viewer").await;
+    let me = format!("/api/users/{vic}");
+    let viewer = common::signed_in(visitor(&pool).await, "vic@example.com").await;
+    let public = |note: &str| json!({"blockType": "public", "note": note});
+
+    // Only public rows held or sent: the Viewer's own to replace.
+    let res = patch(&viewer, &me, json!({"bio": [public("hi")]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["bio"][0]["note"], "hi");
+    let res = patch(
+        &viewer,
+        &me,
+        json!({"bio": [{"blockType": "private", "note": "x"}]}),
+    )
+    .await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        res.json["detail"],
+        "You don't have permission to write `bio.note`."
+    );
+
+    // Once a private row is stored, replacing the list replaces it too.
+    let res = patch(
+        &admin,
+        &me,
+        json!({"bio": [{"blockType": "private", "note": "x"}, public("hi")]}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = patch(&viewer, &me, json!({"bio": [public("bye")]})).await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        res.json["detail"],
+        "You don't have permission to write `bio.note`."
+    );
+    // A name alone leaves the list alone.
+    assert_eq!(
+        patch(&viewer, &me, json!({"name": "Vic"})).await.status,
+        200
+    );
+    // Reading: each row by its own type.
+    let seen = get(&viewer, &me).await.json;
+    assert_eq!(
+        seen["bio"][0],
+        json!({"id": seen["bio"][0]["id"], "blockType": "private"})
+    );
+    assert_eq!(seen["bio"][1]["note"], "hi");
 }
