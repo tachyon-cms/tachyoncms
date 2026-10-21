@@ -78,6 +78,7 @@ mod tests {
             ]},
             {"name": "author", "type": "relationship", "relationTo": "authors"},
             {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "tagged", "fields": [{"name": "who", "type": "relationship", "relationTo": "tags"}]},
                 {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]},
                 {"slug": "list", "fields": [
                     {"name": "who", "type": "relationship", "relationTo": "categories", "hasMany": true},
@@ -145,12 +146,21 @@ mod tests {
     #[test]
     fn join_targets_are_checked() {
         let lookup = |slug: &str| (slug == "posts").then(posts);
+        // `layout.who` links to categories in `card` and `list`, and to tags in `tagged`.
         for on in ["links.target", "layout.who", "layout.rows.who"] {
             let ok = categories(
                 json!({"name": "posts", "type": "join", "collection": "posts", "on": on}),
             );
             assert_eq!(ok.check_join_targets(lookup), Ok(()), "{on}");
         }
+        let join = json!({"name": "j", "type": "join", "collection": "posts", "on": "layout.who"});
+        let tags = schema(json!({"slug": "tags", "fields": [join]}));
+        assert_eq!(tags.check_join_targets(lookup), Ok(()));
+        let authors = schema(json!({"slug": "authors", "fields": [join]}));
+        assert_eq!(
+            authors.check_join_targets(lookup).unwrap_err().to_string(),
+            "field `j`: posts.layout.who links to tags, not authors"
+        );
         for (join, message) in [
             (
                 json!({"name": "j", "type": "join", "collection": "nope", "on": "category"}),

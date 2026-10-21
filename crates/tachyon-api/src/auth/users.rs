@@ -9,7 +9,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use serde_json::{Map, Value};
 use tachyon_core::auth::{Action, Decision, check_password};
-use tachyon_core::{FieldError, is_email, validate_document};
+use tachyon_core::{FieldError, is_email, merged, validate_document};
 use tachyon_db::auth::{self, NewAccount};
 use tachyon_db::documents::{self, Actor};
 use uuid::Uuid;
@@ -177,13 +177,19 @@ pub(crate) async fn create(
     let users = any_collection(&state, auth::USERS)?;
     let caller = caller_of(&principal);
     let profile = Value::Object(profile);
-    refuse_fields(&users, &profile, Action::Create, &caller)?;
+    refuse_fields(&users, &profile, Action::Create, &caller, None)?;
     let data = validate_document(users.schema.data(), &profile, None);
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
     }
     if !errors.is_empty() {
-        return Err(hide_errors(&users, ApiError::Validation(errors), &caller));
+        let doc = merged(users.schema.data(), &profile, None);
+        return Err(hide_errors(
+            &users,
+            ApiError::Validation(errors),
+            &caller,
+            Some(&doc),
+        ));
     }
     known_role(&state, &role).await?;
     check_new_password(&state, "password", &password).await?;
@@ -191,7 +197,10 @@ pub(crate) async fn create(
     let prepared = data
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &users, data))
-        .map_err(|e| hide_errors(&users, e, &caller))?;
+        .map_err(|e| {
+            let doc = merged(users.schema.data(), &profile, None);
+            hide_errors(&users, e, &caller, Some(&doc))
+        })?;
     let hash = state
         .auth
         .hasher
@@ -213,7 +222,7 @@ pub(crate) async fn create(
         actor(&principal, decision).map(|a| a.id),
     )
     .await
-    .map_err(|e| hide_errors(&users, unique_error(&users, e.into()), &caller))?;
+    .map_err(|e| hide_errors(&users, unique_error(&users, e.into()), &caller, None))?;
     Ok((
         StatusCode::CREATED,
         Json(user_json(&state, id, &caller_of(&principal)).await?),
@@ -233,7 +242,9 @@ pub(crate) async fn update(
     let users = any_collection(&state, auth::USERS)?;
     let profile = Value::Object(profile);
     let caller = caller_of(&principal);
-    refuse_fields(&users, &profile, Action::Update, &caller)?;
+    // ponytail: checked without the stored profile, so a blocks field in a profile counts
+    // every block type as replaced; pass the stored profile if profiles grow blocks.
+    refuse_fields(&users, &profile, Action::Update, &caller, None)?;
     let current = auth::account(&state.pool, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -296,7 +307,10 @@ pub(crate) async fn update(
             validate_document(users.schema.data(), patch, Some(current))
                 .map_err(ApiError::Validation)
                 .and_then(|data| prepare(&targets, users, data))
-                .map_err(|e| hide_errors(users, e, caller))
+                .map_err(|e| {
+                    let doc = merged(users.schema.data(), patch, Some(current));
+                    hide_errors(users, e, caller, Some(&doc))
+                })
         };
         // Links the profile gains must point at documents the caller can read (all of
         // them, for an Admin editing someone else's).
@@ -334,7 +348,7 @@ pub(crate) async fn update(
             },
         )
         .await
-        .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller))?;
+        .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller, None))?;
     }
     if let Some(role) = role {
         auth::set_role(&mut tx, id, role).await?;

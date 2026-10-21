@@ -291,7 +291,7 @@ pub async fn delete_as(
     }
     check_guard(&mut tx, id, guard).await?;
     let linked = sqlx::query_scalar!(
-        r#"SELECT count(*) AS "n!" FROM relations r
+        r#"SELECT count(DISTINCT r.from_doc) AS "n!" FROM relations r
            JOIN documents d ON d.id = r.from_doc
            WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL"#,
         id,

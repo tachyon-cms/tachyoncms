@@ -15,6 +15,6 @@ pub use schema::{
     Labels, Position, RelationTo, SchemaError, SelectOption, Tab, data_fields, explain_parse_error,
 };
 pub use validate::{
-    FieldError, RelationRef, defaults, is_email, map_relations, normalize_date_time, relations,
-    slugify, validate_document,
+    FieldError, RelationRef, defaults, is_email, map_relations, merged, normalize_date_time,
+    relations, slugify, validate_document,
 };

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT count(*) AS \"n!\" FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL",
+  "query": "SELECT count(DISTINCT r.from_doc) AS \"n!\" FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -19,5 +19,5 @@
       null
     ]
   },
-  "hash": "03fc040e1612ede6526932cf1a0676b1d1eca6b01178e3ba5f9ef80c53a94ae7"
+  "hash": "f6b8fbf7238d07a1ee2c4a85e6aaf57d9502c1fa980508f3dddd07d818acec38"
 }

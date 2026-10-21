@@ -63,6 +63,20 @@ pub fn validate_document(
     Ok(doc)
 }
 
+/// The document `validate_document` checks, before defaults: `existing` with `input`
+/// written over it. The row indices in its error paths count rows of this.
+pub fn merged(
+    fields: &[Field],
+    input: &Value,
+    existing: Option<&Map<String, Value>>,
+) -> Map<String, Value> {
+    let mut doc = existing.cloned().unwrap_or_default();
+    if let Value::Object(input) = input {
+        merge(&data_fields(fields), &mut doc, input);
+    }
+    doc
+}
+
 /// Writes `input` over `doc`: `null` removes a key, groups merge, anything else replaces.
 fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Value>) {
     for (key, value) in input {

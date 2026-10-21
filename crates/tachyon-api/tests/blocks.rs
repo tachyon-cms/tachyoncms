@@ -203,7 +203,7 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
         &admin,
         "/api/admin/collections",
         json!({"slug": "pages",
-            "access": {"create": {"role": ["editor", "author"]}, "update": {"role": ["editor", "author"]}},
+            "access": {"create": {"role": ["editor", "author", "viewer"]}, "update": {"role": ["editor", "author"]}},
             "fields": [
             {"name": "title", "type": "text"},
             {"name": "layout", "type": "blocks", "blocks": [
@@ -215,7 +215,7 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
                         {"slug": "note", "fields": [{"name": "body", "type": "text"}, secret]}
                     ]}
                 ]},
-                // The same name with no rule: the answers are ANDed, so it's hidden too.
+                // The same name with no rule: a quote row's `secret` is anyone's.
                 {"slug": "quote", "fields": [
                     {"name": "text", "type": "text"},
                     {"name": "secret", "type": "text"}
@@ -241,23 +241,30 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
     .await;
     let url = format!("/api/pages/{}", id(&page));
 
-    // A viewer's read strips `secret` from every row, at every depth, in lists too.
-    let fields_of = |doc: &Value| doc["layout"].to_string();
+    // A viewer's read strips hero's `secret` from its rows, at every depth, in lists too;
+    // a quote row answers to quote's rules, which hide nothing.
     for app in [&viewer, &author] {
         let seen = get(app, &url).await.json;
-        assert!(!fields_of(&seen).contains("secret"), "{seen}");
-        assert_eq!(seen["layout"][0]["cards"][1]["label"], "b");
-        assert_eq!(seen["layout"][0]["inner"][0]["body"], "n");
-        assert_eq!(seen["layout"][1]["text"], "T");
         let listed = get(app, "/api/pages").await.json;
-        assert!(!fields_of(&listed["docs"][0]).contains("secret"));
+        for doc in [&seen, &listed["docs"][0]] {
+            let hero = &doc["layout"][0];
+            assert!(!hero.to_string().contains("secret"), "{doc}");
+            assert_eq!(hero["cards"][1]["label"], "b");
+            assert_eq!(hero["inner"][0]["body"], "n");
+            assert_eq!(
+                doc["layout"][1],
+                json!({"id": doc["layout"][1]["id"],
+                "blockType": "quote", "text": "T", "secret": "s5"})
+            );
+        }
     }
     let full = get(&editor, &url).await.json;
     assert_eq!(full["layout"], get(&admin, &url).await.json["layout"]);
     assert_eq!(full["layout"][0]["inner"][0]["secret"], "s4");
     assert_eq!(full["layout"][1]["secret"], "s5");
 
-    // Filtering or sorting by it is refused as for any hidden field; unknown names stay 400.
+    // A filter has no row to say which type it means, so `layout.secret` answers for every
+    // type: refused as for any hidden field. Unknown names stay 400; the type is anyone's.
     for app in [&viewer, &author] {
         for query in [
             "where[layout.secret][equals]=s5",
@@ -270,6 +277,16 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
         assert_problem(
             &get(app, "/api/pages?where[layout.nope][equals]=1").await,
             400,
+        );
+        assert_eq!(
+            titles(&get(app, "/api/pages?where[layout.blockType][equals]=quote").await),
+            ["P"]
+        );
+        let bad = get(app, "/api/pages?where[layout.blockType][equals]=nope").await;
+        assert_problem(&bad, 400);
+        assert_eq!(
+            bad.json["detail"],
+            "where[layout.blockType][equals]: expected one of: hero, quote"
         );
     }
     assert_eq!(
@@ -295,24 +312,56 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
         patch(&author, &url, json!({"title": "P2"})).await.status,
         200
     );
-    // Creating: only a row that holds it writes it.
-    let made = send(
+    // Only the types the list holds or will hold count: with no hero row stored or sent,
+    // the Author may replace it. Adding a hero row brings hero's rules in.
+    let quotes = create(
+        &admin,
+        "/api/pages",
+        json!({"title": "Q", "layout": [{"blockType": "quote", "text": "a"}]}),
+    )
+    .await;
+    let q_url = format!("/api/pages/{}", id(&quotes));
+    let res = patch(
         &author,
+        &q_url,
+        json!({"layout": [{"blockType": "quote", "secret": "z"}]}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["layout"][0]["secret"], "z");
+    let res = patch(
+        &author,
+        &q_url,
+        json!({"layout": [{"blockType": "hero", "heading": "h"}]}),
+    )
+    .await;
+    assert_problem(&res, 403);
+    assert!(
+        res.json["detail"]
+            .as_str()
+            .unwrap()
+            .contains("`layout.secret`")
+    );
+    // Creating: each row answers to its own type, so quote's `secret` is the viewer's to
+    // write and hero's isn't.
+    let made = send(
+        &viewer,
         "POST",
         "/api/pages",
         Some(
-            &json!({"title": "Mine", "layout": [{"blockType": "quote", "text": "x"}]}).to_string(),
+            &json!({"title": "Mine", "layout": [{"blockType": "quote", "text": "x", "secret": "q"}]})
+                .to_string(),
         ),
     )
     .await;
     assert_eq!(made.status, 201, "{}", made.json);
+    assert_eq!(made.json["layout"][0]["secret"], "q");
     let refused = send(
-        &author,
+        &viewer,
         "POST",
         "/api/pages",
         Some(
-            &json!({"title": "Mine", "layout": [{"blockType": "quote", "secret": "x"}]})
-                .to_string(),
+            &json!({"title": "Mine", "layout": [{"blockType": "hero", "secret": "x"}]}).to_string(),
         ),
     )
     .await;
@@ -322,9 +371,11 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
         "You don't have permission to write `layout.secret`."
     );
 
-    // A bad stored value inside a row is named only to someone who can read it (R28).
+    // A bad stored value inside a row is named only to someone who can read it in that
+    // row (R28): hero's is hidden from the Author, quote's isn't.
     sqlx::query(
-        "UPDATE documents SET published = jsonb_set(published, '{layout,1,secret}', '5') WHERE id = $1",
+        "UPDATE documents SET published = jsonb_set(jsonb_set(published, '{layout,0,secret}', '5'), \
+         '{layout,1,secret}', '5') WHERE id = $1",
     )
     .bind(uuid::Uuid::parse_str(&id(&page)).unwrap())
     .execute(&pool)
@@ -334,11 +385,20 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(
         res.json["errors"],
-        json!([{"path": "", "message": "a field you can't see needs fixing; ask someone who can see it"}])
+        json!([
+            {"path": "layout.1.secret", "message": "expected text"},
+            {"path": "", "message": "a field you can't see needs fixing; ask someone who can see it"}
+        ])
     );
     let res = patch(&editor, &url, json!({"title": "P3"})).await;
     assert_problem(&res, 422);
-    assert_eq!(res.json["errors"][0]["path"], "layout.1.secret");
+    let paths: Vec<&str> = res.json["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert_eq!(paths, ["layout.0.secret", "layout.1.secret"]);
 
     // Rows keep their IDs through a PATCH that sends them back; a new row gets one.
     let ids = |doc: &Value| -> Vec<String> {
@@ -365,7 +425,7 @@ async fn block_rows_follow_list_rules(pool: PgPool) {
     let v = fields(get(&viewer, "/api/access").await.json);
     assert_eq!(
         v["layout.heading"],
-        json!({"read": true, "create": false, "update": false})
+        json!({"read": true, "create": true, "update": false})
     );
     assert!(v.get("layout.secret").is_none(), "{v}");
     assert!(v.get("layout.inner.secret").is_none(), "{v}");
@@ -500,6 +560,32 @@ async fn links_inside_blocks_are_guarded(pool: PgPool) {
             assert!(hidden.json.get("nextCursor").is_none());
         }
     }
+    // The negated operators mean "no row matches", so a hidden document counts as no
+    // match: the same answer as for a name nobody has.
+    for (query, admin_sees) in [
+        ("where[layout.author.name][not_equals]=Hid", &["Two"][..]),
+        ("where[layout.author.name][not_in]=Hid,Zed", &["Two"]),
+        ("where[layout.author.stage][not_in]=draft", &["Two"]),
+        ("where[layout.inner.who.name][exists]=false", &["One"]),
+        ("where[layout.inner.who.id][not_equals]={hid}", &["One"]),
+    ] {
+        let url = format!("/api/pages?{}", query.replace("{hid}", &hid));
+        assert_eq!(titles(&get(&admin, &url).await), admin_sees, "{url}");
+        for app in [&anon, &editor] {
+            assert_eq!(titles(&get(app, &url).await), ["One", "Two"], "{url}");
+        }
+    }
+    assert_eq!(
+        titles(
+            &get(
+                &anon,
+                "/api/pages?where[layout.author.name][not_equals]=Nobody"
+            )
+            .await
+        ),
+        ["One", "Two"]
+    );
+
     // What a readable document holds is found as usual.
     assert_eq!(
         titles(&get(&anon, "/api/pages?where[layout.cards.who.name][equals]=Ann").await),
@@ -657,4 +743,101 @@ async fn joins_and_references_see_block_links(pool: PgPool) {
     assert_eq!(paths(get(&editor, &refs).await), all);
     all.retain(|p| !p.ends_with("editor"));
     assert_eq!(paths(get(&viewer, &refs).await), all);
+
+    // Links inside block rows hold a document in place: the count is only an Admin's (R15).
+    let res = send(&admin, "DELETE", &format!("/api/authors/{ann}"), None).await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "2 other documents link to this one; remove those links first"
+    );
+    let res = send(&editor, "DELETE", &format!("/api/authors/{ann}"), None).await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "Other documents link to this one; remove those links first"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn rows_of_removed_block_types_show_only_their_type(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let name = json!({"name": "name", "type": "text"});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "authors", "fields": [name]}),
+    )
+    .await;
+    // No field rules anywhere: nothing is hidden from anyone.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "layout", "type": "blocks", "blocks": [{"slug": "card", "fields": [
+                {"name": "who", "type": "relationship", "relationTo": "authors"},
+                {"name": "note", "type": "text"}
+            ]}]}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "shelf", "fields": [
+            {"name": "page", "type": "relationship", "relationTo": "pages"}
+        ]}),
+    )
+    .await;
+    let change = json!({"schema": {"slug": "authors", "fields": [
+        name,
+        {"name": "pages", "type": "join", "collection": "pages", "on": "layout.who"}
+    ]}});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/authors",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let ann = id(&create(&admin, "/api/authors", json!({"name": "Ann"})).await);
+    let page = id(&create(
+        &admin,
+        "/api/pages",
+        json!({"title": "P", "layout": [
+            {"blockType": "card", "who": ann, "note": "keep out"},
+            {"blockType": "card", "who": ann, "note": "fine"}
+        ]}),
+    )
+    .await);
+    let shelf = id(&create(&admin, "/api/shelf", json!({"page": page})).await);
+    // A row left behind by a block type that's gone, as removing one with rows leaves it.
+    sqlx::query(
+        "UPDATE documents SET published = jsonb_set(published, '{layout,0,blockType}', '\"gone\"') \
+         WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(&page).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let anon = visitor(&pool).await;
+    for app in [&admin, &anon] {
+        let layouts = [
+            get(app, "/api/pages").await.json["docs"][0]["layout"].clone(),
+            get(app, &format!("/api/pages/{page}")).await.json["layout"].clone(),
+            get(app, &format!("/api/shelf/{shelf}?depth=1")).await.json["page"]["layout"].clone(),
+            get(app, &format!("/api/authors/{ann}")).await.json["pages"]["docs"][0]["layout"]
+                .clone(),
+        ];
+        for layout in layouts {
+            assert_eq!(
+                layout[0],
+                json!({"id": layout[0]["id"], "blockType": "gone"}),
+                "{layout}"
+            );
+            assert_eq!(layout[1]["note"], "fine", "{layout}");
+        }
+    }
 }

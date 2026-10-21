@@ -1049,7 +1049,15 @@ impl CollectionSchema {
                 )));
             }
             let slug = &j.collection;
-            let Some(on) = find_field(target.data(), &j.on) else {
+            // Inside blocks, several block types may have the path: any one linking here will do.
+            let found = fields_at(target.data(), &j.on);
+            let links_here = |f: &&Field| matches!(&f.kind, FieldKind::Relationship { relation_to, .. } if relation_to.allows(&self.slug));
+            let Some(on) = found
+                .iter()
+                .copied()
+                .find(links_here)
+                .or(found.first().copied())
+            else {
                 return Err(invalid(format!("{slug} has no field `{}`", j.on)));
             };
             let FieldKind::Relationship { relation_to, .. } = &on.kind else {
@@ -1414,6 +1422,28 @@ fn enter(within: Within, path: &str, slug: &str) -> Vec<(String, String)> {
 /// type, in schema order, that has the whole rest of the path.
 pub(crate) fn find_field<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     field_steps(fields, path, "", &[]).and_then(|steps| steps.last().copied())
+}
+
+/// Every field at a dotted path: one, or one per block type that has the path, in schema
+/// order.
+fn fields_at<'a>(fields: &'a [Field], path: &str) -> Vec<&'a Field> {
+    let (head, rest) = path
+        .split_once('.')
+        .map_or((path, None), |(h, r)| (h, Some(r)));
+    let Some(f) = fields.iter().find(|f| f.name == head) else {
+        return Vec::new();
+    };
+    match (&f.kind, rest) {
+        (_, None) => vec![f],
+        (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, Some(rest)) => {
+            fields_at(fields, rest)
+        }
+        (FieldKind::Blocks { blocks, .. }, Some(rest)) => blocks
+            .iter()
+            .flat_map(|b| fields_at(&b.fields, rest))
+            .collect(),
+        _ => Vec::new(),
+    }
 }
 
 /// Every field along `path` (under `prefix`), outermost first. Inside a blocks field listed
