@@ -2,11 +2,13 @@
 
 ## Supported versions
 
-TachyonCMS is pre-alpha and hasn't had a release yet. Security fixes go to `main` only. Once we tag releases, this table will list which versions get fixes.
+TachyonCMS is pre-alpha. Until 1.0, security fixes land on `main` and ship in the next 0.x release. Older 0.x releases don't get backported fixes, so upgrade to the latest.
 
 | Version | Supported |
 |---|---|
+| Latest 0.x release | Yes |
 | `main` | Yes |
+| Older 0.x releases | No |
 
 ## Reporting a vulnerability
 
