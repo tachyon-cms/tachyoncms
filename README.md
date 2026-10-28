@@ -1,5 +1,12 @@
 # TachyonCMS
 
+<p>
+  <a href="https://github.com/tachyon-cms/tachyoncms/actions/workflows/ci.yml"><img alt="CI" src="https://github.com/tachyon-cms/tachyoncms/actions/workflows/ci.yml/badge.svg"></a>
+  <a href="LICENSE"><img alt="License: MIT" src="https://img.shields.io/badge/license-MIT-13233a"></a>
+  <a href="https://scorecard.dev/viewer/?uri=github.com/tachyon-cms/tachyoncms"><img alt="OpenSSF Scorecard" src="https://api.scorecard.dev/projects/github.com/tachyon-cms/tachyoncms/badge"></a>
+  <a href="https://github.com/tachyon-cms/tachyoncms/discussions"><img alt="Discussions" src="https://img.shields.io/github/discussions/tachyon-cms/tachyoncms?color=e85d0c"></a>
+</p>
+
 A headless CMS written in Rust. One binary, one Postgres database, and an API generated from the content types you define.
 
 > [!WARNING]
