@@ -40,6 +40,34 @@ We think you can have both. Here's what we're building toward:
 
 ## Try it
 
+### With Docker
+
+Each [release](https://github.com/tachyon-cms/tachyoncms/releases) ships a signed image. This starts Postgres and TachyonCMS side by side:
+
+```bash
+docker network create tachyon
+docker run -d --name tachyon-db --network tachyon \
+  -e POSTGRES_USER=tachyon -e POSTGRES_PASSWORD=tachyon -e POSTGRES_DB=tachyon \
+  postgres:17
+docker run --rm --network tachyon -p 127.0.0.1:3000:3000 \
+  -e TACHYON_DATABASE_URL=postgres://tachyon:tachyon@tachyon-db:5432/tachyon \
+  -e TACHYON_PUBLIC_URL=http://localhost:3000 \
+  ghcr.io/tachyon-cms/tachyoncms:v0.1.0
+```
+
+### From a release
+
+Download the archive for your platform from the [latest release](https://github.com/tachyon-cms/tachyoncms/releases). There are Linux builds (x86_64 and arm64, static) and macOS builds (Intel and Apple silicon). Then point it at a Postgres database:
+
+```bash
+tar xzf tachyon_0.1.0_*.tar.gz
+TACHYON_DATABASE_URL=postgres://user:pass@localhost:5432/tachyon ./tachyon_0.1.0_*/tachyon serve
+```
+
+The release notes show how to check a download's signature with cosign.
+
+### From source
+
 You'll need Rust (stable), Docker, and [`sqlx-cli`](https://crates.io/crates/sqlx-cli) if you plan to change queries.
 
 ```bash
@@ -226,9 +254,9 @@ cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
 
 | Milestone | What it adds |
 |---|---|
-| 1 | Schemas, validation, REST CRUD |
+| 1 | Schemas, validation, REST CRUD **(done)** |
 | 2 | Filters, sorting, relationships, globals **(done)** |
-| 3 | Auth, sessions, API keys, access rules |
+| 3 | Auth, sessions, API keys, access rules **(done)** |
 | 4 | Drafts, versions, scheduled publishing, Trash |
 | 5 | Localization and full-text search |
 | 6 | Media library and image processing |
@@ -237,7 +265,7 @@ cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
 | 9 | WebAssembly plugins and webhooks |
 | 10 | Live preview |
 | 11 | WordPress importer |
-| 12 | Release builds, Docker image, Helm chart, benchmarks |
+| 12 | Helm chart and published benchmarks (signed release builds and a Docker image ship from v0.1.0) |
 
 The admin UI is built alongside, starting after milestone 3.
 
