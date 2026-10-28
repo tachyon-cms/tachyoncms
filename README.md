@@ -20,7 +20,7 @@ Pick a CMS today and you usually pick a side. Some are built for developers: typ
 We think you can have both. Here's what we're building toward:
 
 - **Fast by default.** Rust, Axum and Tokio, with published content read from a single row. We'll publish reproducible benchmarks against the popular CMSs before we claim a single number.
-- **Safe by default.** No `unsafe` code, every query either checked at compile time or built from a validated filter tree with bound parameters, and plugins that run in a WebAssembly sandbox with only the permissions you approve.
+- **Safe by default.** No `unsafe` code, fixed queries checked at compile time, filters and sorts built from a validated tree, every request value a bound parameter, and plugins that run in a WebAssembly sandbox with only the permissions you approve.
 - **Easy for editors.** An admin that someone who has only used WordPress can pick up without training, from adding a content type to scheduling a post.
 
 ## What works today
@@ -145,11 +145,11 @@ Unless an access rule says otherwise, anyone can read, and signed-in users write
 | Editor | change all content and globals |
 | Admin | everything, including content types, users and roles |
 
-Admins manage users at `/api/users` and roles at `/api/admin/roles`, and custom roles can sit alongside the four built-in ones. A user's email, role and password stay private. Their profile is different: `name` and every other profile field show wherever a document links to them, to anyone who can read that document. An API key needs one more thing: a scope that covers `users`, or the author comes back as a bare ID and `where[author.name]` is refused. Got a field that shouldn't travel, like a phone number? Give it a field rule such as `"access": {"read": {"role": "admin"}}` and only Admins will see it in a populated author or be able to filter on it. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
+Admins manage users at `/api/users` and roles at `/api/admin/roles`, and custom roles can sit alongside the four built-in ones. A user's email, role and password stay private. Their profile is different: `name` and every other profile field show wherever a document links to them, to anyone who can read that document. An API key needs one more thing: a scope that covers `users`, or the author comes back as a bare ID and `where[author.name]` matches nothing. Got a field that shouldn't travel, like a phone number? Give it a field rule such as `"access": {"read": {"role": "admin"}}` and only Admins will see it in a populated author or be able to filter on it. A role with the `users` ability can change anyone's role, its own included, and make `admin`-scoped keys, so treat it as Admin. The last Admin can't be removed. Passwords need at least 12 characters, and ones known from data breaches are refused. Five wrong passwords in 15 minutes lock an account for 15 minutes.
 
 ### Access rules
 
-Roles answer "who are you?". Most real sites also need "which documents?": visitors see what's published, authors edit their own posts and nobody else's. That's what a rule in the schema's `access` says. Rules live in the schema, so they export and apply with it like any other change.
+Roles answer "who are you?". Most real sites also need "which documents?": visitors see what's published, authors see their own drafts and nobody else's. That's what a rule in the schema's `access` says. Rules live in the schema, so they export and apply with it like any other change.
 
 You can put them in three places:
 
@@ -167,24 +167,24 @@ A rule is one of these:
 
 A filter can compare with the person asking. `$user.id`, `$user.role` and `$user.` plus a `users` profile field (`$user.team`) stand in for their values. The profile field has to store one value or a list of them; virtual and join fields are filled on read, not stored, so rules can't use them. A list works with `in` and `not_in` only. For someone who isn't signed in there's no `$user`, so a condition that uses it matches nothing.
 
-Here's a blog where everyone reads what's published, and authors read their own drafts and change only their own posts:
+Here's a blog where everyone reads what's published and authors also read their own drafts. Authors still change only the posts they created, because the Author role already limits them to that:
 
 ```json
 {
   "slug": "posts",
   "access": {
-    "read": {"or": [{"published": true}, {"author": "$user.id"}]},
-    "update": {"author": "$user.id"}
+    "read": {"or": [{"published": true}, {"author": "$user.id"}]}
   },
   "fields": [
     {"name": "title", "type": "text", "required": true},
     {"name": "published", "type": "checkbox"},
-    {"name": "author", "type": "relationship", "relationTo": "users"}
+    {"name": "author", "type": "relationship", "relationTo": "users",
+     "access": {"update": {"role": "admin"}}}
   ]
 }
 ```
 
-A rule replaces the role defaults for the action it covers, and only that action. Here `create` and `delete` have no rule, so the table above still decides them. `read` and `update` do, and they bind Editors too: they now see only published posts and their own drafts, and change only posts they wrote. To keep them working on everything, add `{"role": "editor"}` to the read rule's `or`, and make the update rule `{"or": [{"role": "editor"}, {"author": "$user.id"}]}`. Admins pass every rule, so nobody can lock themselves out.
+A rule replaces the role defaults for the action it covers, and only that action. Here only `read` has a rule, so the table above still decides `create`, `update` and `delete`: an Author changes only what they created, which the server records itself. The read rule binds Editors too, so they now see only published posts and their own drafts; add `{"role": "editor"}` to its `or` to keep them reading everything. Don't swap the creator check for an `update` rule on `author`: `author` is whatever the client sends, and a create rule can't compare it with the caller, so anyone could name someone else as a post's author. The field rule on `author` stops a byline being reassigned after the fact. Admins pass every rule, so nobody can lock themselves out.
 
 **How it's enforced.**
 
