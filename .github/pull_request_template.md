@@ -11,4 +11,5 @@
 - [ ] Tests cover the change, and I watched the new ones fail before the fix.
 - [ ] `cargo fmt --all`, `cargo clippy --workspace --all-targets -- -D warnings` and `cargo test --workspace` pass locally.
 - [ ] If I changed SQL, I ran `cargo sqlx prepare --workspace` and committed `.sqlx/`.
+- [ ] Every commit is signed off (`git commit -s`).
 - [ ] The PR title follows [Conventional Commits](https://www.conventionalcommits.org/) (it becomes the commit message).
