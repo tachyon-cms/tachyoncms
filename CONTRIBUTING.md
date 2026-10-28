@@ -38,6 +38,16 @@ All tests should pass before you change anything. If they don't, that's a bug, s
 
 5. Open a pull request and fill in the template.
 
+## Signing off
+
+Every commit needs a [Developer Certificate of Origin](https://developercertificate.org/) sign-off. Add it with `-s`:
+
+```bash
+git commit -s -m "fix: reject an empty slug"
+```
+
+The sign-off says you wrote the change, or otherwise have the right to submit it under the project's license. The `DCO` check fails without it. Forgot? `git rebase --signoff main` and a force-push fixes every commit at once. There's no CLA, and we'll never ask you to assign copyright: see [GOVERNANCE.md](GOVERNANCE.md).
+
 ## Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, with an optional scope such as `feat(api):`. Keep the subject under 72 characters and say what changed for the user, not which file you touched. Pull requests are squash-merged, so the PR title becomes the commit on `main`. Please give it the same care.
@@ -46,11 +56,21 @@ We use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `f
 
 - Nothing lands on `main` without a pull request and green CI. That applies to maintainers too.
 - We aim to give a first response within a few days. If a week passes with no reply, a polite nudge is welcome.
+- CI has to pass: `lint`, `test` on each Postgres version, and `DCO`.
 - Reviews are about the code, never the person. The [Code of Conduct](CODE_OF_CONDUCT.md) applies everywhere in the project.
+
+## When a pull request goes quiet
+
+Life happens, and nobody owes the project their evenings. A person, not a bot, keeps an eye on open pull requests. Here's what to expect:
+
+- While a PR is waiting on us, it never goes stale.
+- Once we've asked for a change or a rebase, the PR is waiting on you, and there's still no rush. After 30 days without a reply we'll check in with a comment.
+- After 60 days without a reply, we may close the PR, or finish the change ourselves if it's close. If we finish it, your commits stay in it or you're credited with a `Co-authored-by:` line, and you're thanked in the release notes either way.
+- A closed PR can always be reopened. Come back whenever you like.
 
 ## Good first issues
 
-Look for the [`good first issue`](https://github.com/tachyon-cms/tachyoncms/labels/good%20first%20issue) label. If one looks interesting, comment that you're taking it so nobody doubles up.
+Look for the [`good first issue`](https://github.com/tachyon-cms/tachyoncms/labels/good%20first%20issue) label. If one looks interesting, say so on the issue with a rough idea of when you'll open a PR, and it's yours. Need longer? Just say. If the time passes with no word, the issue opens up for someone else.
 
 ## License
 
