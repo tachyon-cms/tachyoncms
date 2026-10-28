@@ -104,7 +104,7 @@ jobs:
         if: contains(matrix.target, 'musl')
         run: |
           file target/${{ matrix.target }}/release/tachyon | tee file.txt
-          grep -Eq 'static(-pie)? linked' file.txt || { echo "not statically linked" >&2; exit 1; }
+          grep -Eq 'static(ally|-pie) linked' file.txt || { echo "not statically linked" >&2; exit 1; }
       - name: Package
         run: |
           name=tachyon_${VERSION}_${{ matrix.target }}
