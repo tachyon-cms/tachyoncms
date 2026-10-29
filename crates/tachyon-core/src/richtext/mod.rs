@@ -9,6 +9,27 @@ use uuid::Uuid;
 use crate::schema::{BlockSource, FieldKind};
 use crate::validate::{FieldError, slugify};
 
+mod html;
+mod markdown_out;
+mod text;
+
+pub use html::to_html;
+pub use markdown_out::to_markdown;
+pub use text::to_text;
+
+/// What the renderers need to know about the documents rich text links to. Each answer
+/// takes a link's collection and its `value`: the ID, or the document populated in its
+/// place. `None` means the link shows as its text only: the caller can't read the target,
+/// or it has no answer to give.
+pub struct RenderCtx<'a> {
+    /// Where an internal link goes, from its collection's `url`.
+    pub link_url: &'a dyn Fn(&str, &Value) -> Option<String>,
+    /// The text a relationship node shows in HTML.
+    pub title: &'a dyn Fn(&str, &Value) -> Option<String>,
+    /// The slug Markdown names a linked document by (`doc:posts/<slug>`).
+    pub slug: &'a dyn Fn(&str, &Value) -> Option<String>,
+}
+
 /// What a rich text field lets editors use. Paragraphs and plain text are always allowed.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -137,7 +158,7 @@ fn mark_feature(t: &str) -> Option<Feature> {
 /// on this site. Schemes match in any case, as browsers read them (W1-R20). Anything with
 /// a control character, whitespace or a backslash is refused outright: browsers strip or
 /// rewrite those, which is how `java\tscript:` and `/\host` get through looser checks.
-fn safe_href(href: &str) -> bool {
+pub(crate) fn safe_href(href: &str) -> bool {
     if href
         .chars()
         .any(|c| c.is_control() || c.is_whitespace() || c == '\\')
@@ -858,6 +879,33 @@ pub fn heading_ids(value: &Value) -> Vec<String> {
     out
 }
 
+/// A node's `type`, or "".
+fn kind(node: &Value) -> &str {
+    node.get("type").and_then(Value::as_str).unwrap_or_default()
+}
+
+/// A node's children.
+fn children(node: &Value) -> &[Value] {
+    node.get("content")
+        .and_then(Value::as_array)
+        .map_or(&[], Vec::as_slice)
+}
+
+/// A node's attribute.
+fn attr<'v>(node: &'v Value, name: &str) -> Option<&'v Value> {
+    node.get("attrs")?.get(name)
+}
+
+/// A block node field's value as one attribute: a string or other scalar as its text,
+/// anything else as compact JSON (W1-R21). `None` for a null.
+fn field_text(value: &Value) -> Option<String> {
+    match value {
+        Value::Null => None,
+        Value::String(s) => Some(s.clone()),
+        other => Some(other.to_string()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -865,11 +913,11 @@ mod tests {
     use crate::validate::{map_relations, relations, validate_document};
     use serde_json::{Map, json};
 
-    const P1: &str = "0199d5c4-0000-7000-8000-0000000000a1";
-    const P2: &str = "0199d5c4-0000-7000-8000-0000000000a2";
-    const A1: &str = "0199d5c4-0000-7000-8000-0000000000b1";
-    const A2: &str = "0199d5c4-0000-7000-8000-0000000000b2";
-    const B1: &str = "0199d5c4-0000-7000-8000-0000000000c1";
+    pub(super) const P1: &str = "0199d5c4-0000-7000-8000-0000000000a1";
+    pub(super) const P2: &str = "0199d5c4-0000-7000-8000-0000000000a2";
+    pub(super) const A1: &str = "0199d5c4-0000-7000-8000-0000000000b1";
+    pub(super) const A2: &str = "0199d5c4-0000-7000-8000-0000000000b2";
+    pub(super) const B1: &str = "0199d5c4-0000-7000-8000-0000000000c1";
 
     /// A `body` rich text field with `options` on top of its type.
     fn fields(options: Value) -> Vec<Field> {
@@ -907,19 +955,19 @@ mod tests {
         ]}]})
     }
 
-    fn doc(content: Value) -> Value {
+    pub(super) fn doc(content: Value) -> Value {
         json!({"type": "doc", "content": content})
     }
 
-    fn text(s: &str) -> Value {
+    pub(super) fn text(s: &str) -> Value {
         json!({"type": "text", "text": s})
     }
 
-    fn para(content: Value) -> Value {
+    pub(super) fn para(content: Value) -> Value {
         json!({"type": "paragraph", "content": content})
     }
 
-    fn linked(attrs: Value) -> Value {
+    pub(super) fn linked(attrs: Value) -> Value {
         json!({"type": "text", "text": "x", "marks": [{"type": "link", "attrs": attrs}]})
     }
 
@@ -937,10 +985,11 @@ mod tests {
         doc(json!([node]))
     }
 
-    #[test]
-    fn rich_text_accepts_the_full_node_set() {
+    /// One document using every node and mark: links to post `P1`, a relationship node to
+    /// author `A1`, and `cta` block nodes from `everything`.
+    pub(super) fn full() -> Value {
         let cell = |kind: &str, attrs: Value| json!({"type": kind, "attrs": attrs, "content": [para(json!([text("c")]))]});
-        let body = doc(json!([
+        doc(json!([
             {"type": "heading", "attrs": {"level": 2}, "content": [text("Title")]},
             para(json!([
                 {"type": "text", "text": "b", "marks": [{"type": "bold"}]},
@@ -992,7 +1041,12 @@ mod tests {
                 "label": "Go", "author": A2, "meta": {"editor": A1}
             }}},
             {"type": "block", "attrs": {"blockType": "cta", "fields": {"label": "New"}}}
-        ]));
+        ]))
+    }
+
+    #[test]
+    fn rich_text_accepts_the_full_node_set() {
+        let body = full();
         assert_eq!(validate(&body, &everything()[0].kind, "body"), Ok(()));
         let stored = check(&everything(), body.clone()).unwrap();
         // A new block node gets an ID; everything else is stored as sent.

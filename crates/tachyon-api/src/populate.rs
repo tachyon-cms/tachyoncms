@@ -6,9 +6,10 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::virtuals::{self, VirtualField};
-use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
+use tachyon_core::{CollectionKind, FieldError, map_relations, relations, rich_texts_mut};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
@@ -16,6 +17,7 @@ use tachyon_db::query::get_many_readable;
 use uuid::Uuid;
 
 use crate::access::Access;
+use crate::params::Format;
 use crate::{ApiError, AppState};
 
 type Populated<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, ApiError>> + Send + 'a>>;
@@ -236,27 +238,106 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     .ok()
 }
 
-/// A link to a document the caller can't read stays an ID.
+/// A link to a document the caller can't read stays an ID. Rich text in every document,
+/// populated ones included, comes back as `format` asks.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
     access: &'a Access,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
     shapes: &'a Shapes,
+    format: Format,
 ) -> Populated<'a> {
     let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
-    populate_each(state, access, items, shapes)
+    populate_each(state, access, items, shapes, format)
+}
+
+/// Renders the rich text in `items` as `format` asks, in place. What it links to is read
+/// as the caller may read it, whatever the depth, in one query for all of `items`: a link
+/// to a document they can't read, or whose collection has no `url`, is its text alone.
+// ponytail: a second query per level beside populate's own, and it also reads the targets
+// of relationship fields inside block nodes, which render as IDs. Fold it into populate's
+// query if rendered reads show up in a profile.
+async fn render(
+    state: &AppState,
+    access: &Access,
+    items: &mut [(Value, Arc<Collection>, u8)],
+    format: Format,
+) -> Result<(), ApiError> {
+    if format == Format::Json {
+        return Ok(());
+    }
+    // The links inside each rich text field, block nodes' fields included.
+    let mut ids = Vec::new();
+    for (v, c, _) in items.iter_mut() {
+        let Some(doc) = v.as_object_mut() else {
+            continue;
+        };
+        let mut texts = Vec::new();
+        rich_texts_mut(c.schema.data(), doc, &mut |path, _| {
+            texts.push(format!("{path}."))
+        });
+        ids.extend(
+            relations(c.schema.data(), doc)
+                .into_iter()
+                .filter(|r| texts.iter().any(|t| r.path.starts_with(t)))
+                .map(|r| r.id),
+        );
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = HashMap::new();
+    if !ids.is_empty() {
+        for (collection_id, doc) in get_many_readable(&state.pool, &ids, access.readable()).await? {
+            let Some(c) = state.schemas.get_by_id(collection_id) else {
+                continue;
+            };
+            let mut value = to_value(&doc)?;
+            access.strip(&c, &mut value);
+            if let Value::Object(fields) = value {
+                targets.insert(doc.id, (c, fields));
+            }
+        }
+    }
+    // A link's target, if the caller read it and it's in the collection the link names.
+    let target = |to: &str, value: &Value| {
+        let (c, doc) = targets.get(&Uuid::try_parse(value.as_str()?).ok()?)?;
+        (c.schema.slug == to).then_some((c, doc))
+    };
+    let link_url = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.link_url(d));
+    let title = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.title_of(d));
+    let slug = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.slug_of(d));
+    let ctx = RenderCtx {
+        link_url: &link_url,
+        title: &title,
+        slug: &slug,
+    };
+    for (v, c, _) in items.iter_mut() {
+        if let Some(doc) = v.as_object_mut() {
+            rich_texts_mut(c.schema.data(), doc, &mut |_, text| {
+                *text = Value::String(match format {
+                    Format::Html => richtext::to_html(text, &ctx),
+                    Format::Markdown => richtext::to_markdown(text, &ctx),
+                    Format::Text | Format::Json => richtext::to_text(text),
+                })
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
-/// short. One query per level for every distinct link, whatever the depths.
+/// short. One query per level for every distinct link, whatever the depths. Rich text is
+/// rendered first, so a link inside text that's now a string isn't populated.
 fn populate_each<'a>(
     state: &'a AppState,
     access: &'a Access,
-    items: Vec<(Value, Arc<Collection>, u8)>,
+    mut items: Vec<(Value, Arc<Collection>, u8)>,
     shapes: &'a Shapes,
+    format: Format,
 ) -> Populated<'a> {
     Box::pin(async move {
+        render(state, access, &mut items, format).await?;
         // For each document: the link at each path, and how deep to populate it.
         let wanted: Vec<HashMap<String, (Uuid, u8)>> = items
             .iter()
@@ -331,7 +412,7 @@ fn populate_each<'a>(
                 (value, c, remaining)
             })
             .collect();
-        let children = populate_each(state, access, children, shapes).await?;
+        let children = populate_each(state, access, children, shapes, format).await?;
         let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 
         Ok(items

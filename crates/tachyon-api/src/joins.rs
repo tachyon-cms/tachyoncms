@@ -15,7 +15,7 @@ use tachyon_db::query::{self, JoinQuery};
 use uuid::Uuid;
 
 use crate::access::{Access, both};
-use crate::params::{JoinRequest, Joins};
+use crate::params::{Format, JoinRequest, Joins};
 use crate::populate::{Shapes, child_shape, fill_virtuals_each, populate, to_value};
 use crate::{ApiError, AppState};
 
@@ -104,6 +104,8 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
 /// query per join field for the whole batch. Joined documents are populated objects,
 /// shaped by `populate`/`defaultPopulate`, their own links filled to `depth - 1`; at depth 0
 /// they're IDs.
+// Each argument is a separate part of the read's shape, passed straight through to populate.
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn fill_joins(
     state: &AppState,
     access: &Access,
@@ -112,6 +114,7 @@ pub(crate) async fn fill_joins(
     joins: &Joins,
     depth: u8,
     shapes: &Shapes,
+    format: Format,
 ) -> Result<(), ApiError> {
     let Joins::On(requests) = joins else {
         return Ok(());
@@ -198,7 +201,7 @@ pub(crate) async fn fill_joins(
                         project(s, doc);
                     }
                 }
-                populate(state, access, pairs, depth - 1, shapes).await?
+                populate(state, access, pairs, depth - 1, shapes, format).await?
             };
             let mut by_owner: HashMap<usize, Vec<Value>> = HashMap::new();
             for (owner, v) in owners.into_iter().zip(values) {

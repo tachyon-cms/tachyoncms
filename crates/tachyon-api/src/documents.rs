@@ -21,7 +21,7 @@ use uuid::Uuid;
 
 use crate::access::{Access, both};
 use crate::joins::fill_joins;
-use crate::params::{Joins, list_params, read_params};
+use crate::params::{Format, Joins, list_params, read_params};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
     vouched_links,
@@ -137,13 +137,14 @@ pub(crate) async fn list_in(
         &p.joins,
         p.depth,
         &p.populate,
+        p.format,
     )
     .await?;
     let docs = docs
         .into_iter()
         .map(|(v, c)| (shaped(v, p.select.as_ref()), c))
         .collect();
-    let docs = populate(state, access, docs, p.depth, &p.populate).await?;
+    let docs = populate(state, access, docs, p.depth, &p.populate, p.format).await?;
     let mut body = json!({ "docs": docs, "limit": p.limit });
     if p.after.is_none() {
         body["page"] = page.into();
@@ -190,10 +191,11 @@ async fn respond(
         &Joins::all(),
         depth,
         &Shapes::new(),
+        Format::Json,
     )
     .await?;
     Ok(Json(
-        populate(state, access, items, depth, &Shapes::new())
+        populate(state, access, items, depth, &Shapes::new(), Format::Json)
             .await?
             .remove(0),
     ))
@@ -260,14 +262,22 @@ pub async fn get(
         &p.joins,
         p.depth,
         &p.populate,
+        p.format,
     )
     .await?;
     let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
-        populate(&state, &access, vec![(value, c)], p.depth, &p.populate)
-            .await?
-            .remove(0),
+        populate(
+            &state,
+            &access,
+            vec![(value, c)],
+            p.depth,
+            &p.populate,
+            p.format,
+        )
+        .await?
+        .remove(0),
     ))
 }
 

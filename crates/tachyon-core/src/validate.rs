@@ -976,6 +976,47 @@ fn map_inner(
     }
 }
 
+/// Calls `f` on every rich text value in `doc`, with its path (`body`, `layout.0.copy`), so
+/// it can be rendered in place. Rich text inside a block node belongs to the text holding
+/// it and isn't visited on its own.
+pub fn rich_texts_mut(
+    fields: &[Field],
+    doc: &mut Map<String, Value>,
+    f: &mut impl FnMut(&str, &mut Value),
+) {
+    fn walk(
+        fields: &[Field],
+        doc: &mut Map<String, Value>,
+        prefix: &str,
+        f: &mut impl FnMut(&str, &mut Value),
+    ) {
+        for field in fields {
+            let Some(value) = doc.get_mut(&field.name) else {
+                continue;
+            };
+            let path = join(prefix, &field.name);
+            match (&field.kind, value) {
+                (FieldKind::Group { fields }, Value::Object(inner)) => {
+                    walk(fields, inner, &path, f)
+                }
+                (
+                    kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }),
+                    Value::Array(rows),
+                ) => {
+                    for (i, row) in rows.iter_mut().enumerate() {
+                        if let Value::Object(inner) = row {
+                            walk(row_fields(kind, inner), inner, &format!("{path}.{i}"), f);
+                        }
+                    }
+                }
+                (FieldKind::RichText { .. }, text @ Value::Object(_)) => f(&path, text),
+                _ => {}
+            }
+        }
+    }
+    walk(&data_fields(fields), doc, "", f)
+}
+
 /// Polymorphic links keep their `relationTo`; only the `value` inside is replaced.
 fn replace_link(slot: &mut Value, f: &mut impl FnMut(&str) -> Option<Value>) {
     match slot {
@@ -1908,6 +1949,49 @@ mod tests {
             Value::Object(ok(&f, json!({}))),
             json!({"seo": {"index": true}, "card": {"a": "x", "b": "bd"}}),
             "a group's own default still gets its children's defaults"
+        );
+    }
+
+    #[test]
+    fn rich_texts_are_found_wherever_they_sit() {
+        let rt = |name: &str| {
+            json!({"name": name, "type": "richText", "blocks": [
+                {"slug": "box", "fields": [{"name": "inner", "type": "richText"}]}
+            ]})
+        };
+        let f = fields(json!([
+            rt("body"),
+            {"type": "row", "fields": [rt("aside")]},
+            {"name": "seo", "type": "group", "fields": [rt("note")]},
+            {"name": "rows", "type": "array", "fields": [rt("cell")]},
+            {"name": "layout", "type": "blocks", "blocks": [{"slug": "text", "fields": [rt("copy")]}]},
+            rt("empty")
+        ]));
+        let doc = |s: &str| json!({"type": "doc", "content": [{"type": "paragraph", "content": [{"type": "text", "text": s}]}]});
+        let boxed = json!({"type": "doc", "content": [
+            {"type": "block", "attrs": {"blockType": "box", "fields": {"inner": doc("inner")}}}
+        ]});
+        let mut d = json!({
+            "body": boxed, "aside": doc("aside"), "seo": {"note": doc("note")},
+            "rows": [{"id": "r", "cell": doc("cell")}],
+            "layout": [{"id": "l", "blockType": "text", "copy": doc("copy")}],
+            "empty": null
+        });
+        let mut seen = Vec::new();
+        rich_texts_mut(&f, d.as_object_mut().unwrap(), &mut |path, text| {
+            seen.push(path.to_owned());
+            *text = json!("done");
+        });
+        // Rich text inside a block node is part of the text that holds it.
+        assert_eq!(
+            seen,
+            ["body", "aside", "seo.note", "rows.0.cell", "layout.0.copy"]
+        );
+        assert_eq!(
+            d,
+            json!({"body": "done", "aside": "done", "seo": {"note": "done"},
+                "rows": [{"id": "r", "cell": "done"}],
+                "layout": [{"id": "l", "blockType": "text", "copy": "done"}], "empty": null})
         );
     }
 }

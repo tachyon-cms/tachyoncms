@@ -394,3 +394,256 @@ async fn shared_blocks_in_rich_text_expand_change_and_stay(pool: PgPool) {
         "the `blockquote` feature isn't turned on for this field"
     );
 }
+
+fn para(s: &str) -> Value {
+    json!({"type": "paragraph", "content": [{"type": "text", "text": s}]})
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn format_param_applies_everywhere(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    for schema in [
+        json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "bio", "type": "richText"}
+        ]}),
+        json!({"slug": "posts", "url": "/blog/{slug}", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "slug", "type": "slug"},
+            {"name": "body", "type": "richText", "relationTo": ["posts"]},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "related", "type": "relationship", "relationTo": "posts"}
+        ]}),
+        json!({"slug": "site", "kind": "global", "fields": [{"name": "footer", "type": "richText"}]}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    let joins = json!({"schema": {"slug": "authors", "fields": [
+        {"name": "name", "type": "text"},
+        {"name": "bio", "type": "richText"},
+        {"name": "posts", "type": "join", "collection": "posts", "on": "author"}
+    ]}});
+    let res = put(&admin, "/api/admin/collections/authors", joins).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let ann = id(&create(
+        &admin,
+        "/api/authors",
+        json!({"name": "Ann", "bio": text(json!([para("Writes <things>")]))}),
+    )
+    .await);
+    let first = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Hello", "slug": "hello", "author": ann, "body": text(json!([para("First")]))}),
+    )
+    .await);
+    let second = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Two", "slug": "two", "author": ann, "related": first,
+            "body": text(json!([doc_link("posts", &first)]))}),
+    )
+    .await);
+    let res = patch(
+        &admin,
+        "/api/globals/site",
+        json!({"footer": text(json!([para("Bye *now*")]))}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let ok = |res: Res| {
+        assert_eq!(res.status, 200, "{}", res.json);
+        res.json
+    };
+    // List and single reads, in each format.
+    let list = ok(get(&admin, "/api/posts?format=html&sort=title").await);
+    assert_eq!(list["docs"][0]["body"], "<p>First</p>");
+    assert_eq!(
+        list["docs"][1]["body"],
+        "<p><a href=\"/blog/hello\">see</a></p>"
+    );
+    let one = ok(get(&admin, &format!("/api/posts/{second}?format=markdown")).await);
+    assert_eq!(one["body"], "[see](doc:posts/hello)");
+    let one = ok(get(&admin, &format!("/api/posts/{second}?format=text")).await);
+    assert_eq!(one["body"], "see");
+    let one = ok(get(&admin, &format!("/api/posts/{second}?format=json")).await);
+    assert_eq!(one["body"]["type"], "doc");
+    let one = ok(get(&admin, &format!("/api/posts/{second}")).await);
+    assert_eq!(one["body"]["type"], "doc");
+
+    // Populated documents, two deep, and their own links.
+    let deep = ok(get(&admin, &format!("/api/posts/{second}?format=html&depth=2")).await);
+    assert_eq!(deep["related"]["body"], "<p>First</p>");
+    assert_eq!(
+        deep["related"]["author"]["bio"],
+        "<p>Writes &lt;things&gt;</p>"
+    );
+    assert_eq!(deep["author"]["bio"], "<p>Writes &lt;things&gt;</p>");
+    // Joined documents.
+    let joined = ok(get(&admin, &format!("/api/authors/{ann}?format=text")).await);
+    assert_eq!(joined["bio"], "Writes <things>");
+    let bodies: Vec<&Value> = joined["posts"]["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| &d["body"])
+        .collect();
+    assert_eq!(bodies.len(), 2);
+    assert!(bodies.iter().all(|b| b.is_string()), "{joined}");
+    // Select-shaped.
+    let shaped = ok(get(
+        &admin,
+        "/api/posts?format=markdown&select[body]=true&sort=title",
+    )
+    .await);
+    assert_eq!(shaped["docs"][0], json!({"id": first, "body": "First"}));
+    // Globals.
+    let site = ok(get(&admin, "/api/globals/site?format=markdown").await);
+    assert_eq!(site["footer"], "Bye \\*now\\*");
+
+    for url in [
+        "/api/posts?format=xml".to_owned(),
+        format!("/api/posts/{second}?format=xml"),
+        "/api/globals/site?format=xml".into(),
+        "/api/posts?format=html&format=text".into(),
+    ] {
+        let res = get(&admin, &url).await;
+        assert_problem(&res, 400);
+    }
+    let res = get(&admin, "/api/posts?format=xml").await;
+    assert_eq!(
+        res.json["detail"],
+        "format must be json, html, markdown or text"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn internal_links_use_the_collection_url(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let ed = json!({"read": {"role": "editor"}});
+    for schema in [
+        json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"}, {"name": "handle", "type": "slug"}
+        ]}),
+        json!({"slug": "posts", "url": "/blog/{slug}", "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug"}
+        ]}),
+        json!({"slug": "secrets", "url": "/s/{slug}", "access": {"read": {"role": "editor"}}, "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug"}
+        ]}),
+        // The URL's field is one only editors may read.
+        json!({"slug": "guides", "url": "https://docs.example/{slug}", "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug", "access": ed}
+        ]}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "body", "type": "richText", "relationTo": ["posts", "authors", "secrets", "guides"]}
+        ]}),
+    )
+    .await;
+    let ann = id(&create(
+        &admin,
+        "/api/authors",
+        json!({"name": "Ann", "handle": "ann"}),
+    )
+    .await);
+    let post = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Hello", "slug": "hello"}),
+    )
+    .await);
+    let secret = id(&create(
+        &admin,
+        "/api/secrets",
+        json!({"title": "Classified", "slug": "plans"}),
+    )
+    .await);
+    let guide = id(&create(
+        &admin,
+        "/api/guides",
+        json!({"title": "Guide", "slug": "setup"}),
+    )
+    .await);
+    let new_tab = json!({"type": "paragraph", "content": [{"type": "text", "text": "tab", "marks": [
+        {"type": "link", "attrs": {"doc": {"relationTo": "posts", "value": post}, "newTab": true}}
+    ]}]});
+    let body = text(json!([
+        doc_link("posts", &post),
+        doc_link("authors", &ann),
+        doc_link("secrets", &secret),
+        doc_link("guides", &guide),
+        new_tab,
+        {"type": "relationship", "attrs": {"relationTo": "authors", "value": ann}},
+        {"type": "relationship", "attrs": {"relationTo": "secrets", "value": secret}}
+    ]));
+    let page = id(&create(&admin, "/api/pages", json!({"body": body})).await);
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+
+    // At any depth, even 0, a link to a document the caller can read, in a collection with
+    // a URL, is a link to that URL. Anything else is its text alone.
+    for depth in 0..=2 {
+        let url = format!("/api/pages/{page}?format=html&depth={depth}");
+        let html = get(&viewer, &url).await.json["body"].clone();
+        assert_eq!(
+            html,
+            concat!(
+                "<p><a href=\"/blog/hello\">see</a></p>",
+                "<p>see</p>",
+                "<p>see</p>",
+                "<p>see</p>",
+                "<p><a href=\"/blog/hello\" target=\"_blank\" rel=\"noopener noreferrer\">tab</a></p>",
+                "<div data-relationship>Ann</div>"
+            ),
+            "depth {depth}"
+        );
+        let md = get(
+            &viewer,
+            &format!("/api/pages/{page}?format=markdown&depth={depth}"),
+        )
+        .await
+        .json["body"]
+            .clone();
+        assert_eq!(
+            md,
+            concat!(
+                "[see](doc:posts/hello)\n\n",
+                "[see](doc:authors/ann)\n\n",
+                "see\n\n",
+                "see\n\n",
+                "[tab](doc:posts/hello)\n\n",
+                "::ref{collection=\"authors\" slug=\"ann\"}"
+            ),
+            "depth {depth}"
+        );
+    }
+    // Someone who may read them all gets every link the collections have URLs for.
+    let html = get(&admin, &format!("/api/pages/{page}?format=html&depth=0"))
+        .await
+        .json["body"]
+        .clone();
+    let html = html.as_str().unwrap();
+    assert!(html.contains("<a href=\"/s/plans\">see</a>"), "{html}");
+    assert!(
+        html.contains("<a href=\"https://docs.example/setup\">see</a>"),
+        "{html}"
+    );
+    assert!(
+        html.contains("<div data-relationship>Classified</div>"),
+        "{html}"
+    );
+    // The JSON at depth 0 is untouched: links stay IDs.
+    let json = get(&viewer, &format!("/api/pages/{page}?depth=0"))
+        .await
+        .json;
+    assert_eq!(
+        json.pointer("/body/content/0/content/0/marks/0/attrs/doc/value"),
+        Some(&json!(post))
+    );
+}

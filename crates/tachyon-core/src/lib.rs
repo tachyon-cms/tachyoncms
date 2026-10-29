@@ -18,5 +18,5 @@ pub use schema::{
 };
 pub use validate::{
     FieldError, RelationRef, defaults, is_email, map_relations, merged, normalize_date_time,
-    relations, slugify, validate_document,
+    relations, rich_texts_mut, slugify, validate_document,
 };

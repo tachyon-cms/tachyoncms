@@ -29,6 +29,10 @@ pub struct CollectionSchema {
     /// What editors call one row of a shared block, and several. Shared blocks only.
     #[serde(default)]
     pub labels: Option<Labels>,
+    /// Where a document lives on the site, such as `/blog/{slug}`: what an internal link in
+    /// rendered rich text points at. `{field}` is a top-level text or slug field's value.
+    #[serde(default)]
+    pub url: Option<String>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -44,6 +48,7 @@ impl PartialEq for CollectionSchema {
             &self.default_populate,
             &self.access,
             &self.labels,
+            &self.url,
         ) == (
             &other.slug,
             other.kind,
@@ -51,6 +56,7 @@ impl PartialEq for CollectionSchema {
             &other.default_populate,
             &other.access,
             &other.labels,
+            &other.url,
         )
     }
 }
@@ -888,6 +894,34 @@ fn join(prefix: &str, name: &str) -> String {
     }
 }
 
+/// `template` with each `{name}` replaced by `value(name)`; `None` if any gives none, or a
+/// `{` is never closed.
+fn fill_url(template: &str, mut value: impl FnMut(&str) -> Option<String>) -> Option<String> {
+    let mut out = String::new();
+    let mut rest = template;
+    while let Some(open) = rest.find('{') {
+        out.push_str(&rest[..open]);
+        let close = open + rest[open..].find('}')?;
+        out.push_str(&value(&rest[open + 1..close])?);
+        rest = &rest[close + 1..];
+    }
+    out.push_str(rest);
+    Some(out)
+}
+
+/// Every byte but letters, digits and `-._~` as `%XX`, so a value stays one path segment.
+fn percent_encode(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
 /// Turns a failure to read a schema into a message naming the field at fault, such as
 /// "field `seo.kind`: each option must be text…". Falls back to serde's own message.
 pub fn explain_parse_error(raw: &Value, e: &serde_json::Error) -> String {
@@ -1083,6 +1117,7 @@ impl CollectionSchema {
             default_populate: self.default_populate.clone(),
             access: self.access.clone(),
             labels: self.labels.clone(),
+            url: self.url.clone(),
             data: OnceLock::new(),
         }
     }
@@ -1360,6 +1395,11 @@ impl CollectionSchema {
         if RESERVED_SLUGS.contains(&self.slug.as_str()) {
             return Err(SchemaError::ReservedSlug(self.slug.clone()));
         }
+        if self.url.is_some() && self.kind != CollectionKind::Collection {
+            return Err(SchemaError::InvalidOption(
+                "url: only collections have pages of their own".into(),
+            ));
+        }
         let data = self.data();
         if self.kind == CollectionKind::Block {
             if self.access.is_some() {
@@ -1400,7 +1440,74 @@ impl CollectionSchema {
             crate::select::parse_select(data, &Value::Object(dp.clone()), "defaultPopulate")
                 .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;
         }
+        if let Some(url) = &self.url {
+            self.check_url(url)?;
+        }
         Ok(())
+    }
+
+    fn check_url(&self, url: &str) -> Result<(), SchemaError> {
+        let bad = |m: String| Err(SchemaError::InvalidOption(format!("url: {m}")));
+        let mut unknown = None;
+        let filled = fill_url(url, |name| {
+            if self.url_field(name).is_none() {
+                unknown.get_or_insert_with(|| name.to_owned());
+            }
+            Some("x".into())
+        });
+        if let Some(name) = unknown {
+            return bad(format!(
+                "`{{{name}}}` must name a top-level text or slug field"
+            ));
+        }
+        let Some(filled) = filled else {
+            return bad("a `{` is never closed".into());
+        };
+        let page = ["http://", "https://", "/", "#"].iter().any(|p| {
+            filled
+                .get(..p.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(p))
+        });
+        if !page || !crate::richtext::safe_href(&filled) {
+            return bad("must start with http://, https://, / or #".into());
+        }
+        Ok(())
+    }
+
+    /// The top-level text or slug field `name`, which a `url` placeholder may name.
+    fn url_field(&self, name: &str) -> Option<&Field> {
+        self.data().iter().find(|f| {
+            f.name == name && matches!(f.kind, FieldKind::Text { .. } | FieldKind::Slug { .. })
+        })
+    }
+
+    /// Where `doc`, one of this collection's documents, lives: `url` with each placeholder
+    /// filled from it, percent-encoded. `None` when there's no `url`, or a placeholder's
+    /// field is empty or missing, as a field the caller can't read is.
+    pub fn link_url(&self, doc: &Map<String, Value>) -> Option<String> {
+        fill_url(self.url.as_deref()?, |name| {
+            self.url_field(name)?;
+            let value = doc.get(name)?.as_str().filter(|v| !v.is_empty())?;
+            Some(percent_encode(value))
+        })
+    }
+
+    /// The text that names `doc`: its first top-level text field.
+    pub fn title_of(&self, doc: &Map<String, Value>) -> Option<String> {
+        let f = self
+            .data()
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Text { .. }))?;
+        Some(doc.get(&f.name)?.as_str()?.to_owned())
+    }
+
+    /// `doc`'s slug: its first top-level slug field.
+    pub fn slug_of(&self, doc: &Map<String, Value>) -> Option<String> {
+        let f = self
+            .data()
+            .iter()
+            .find(|f| matches!(f.kind, FieldKind::Slug { .. }))?;
+        Some(doc.get(&f.name)?.as_str()?.to_owned())
     }
 
     /// The shared blocks this schema's `blocks` fields name directly, each once, in schema
@@ -3314,6 +3421,94 @@ mod tests {
         );
         let plain = schema(json!({"slug": "authors", "fields": []}));
         assert!(plain.to_compact_json().get("defaultPopulate").is_none());
+    }
+
+    #[test]
+    fn url_is_checked_and_filled_from_the_document() {
+        let input = json!({"slug": "posts", "url": "/blog/{slug}?t={title}", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "slug", "type": "slug", "from": "title"},
+            {"name": "n", "type": "number"},
+            {"name": "meta", "type": "group", "fields": [{"name": "deep", "type": "text"}]}
+        ]});
+        let posts = schema(input.clone());
+        assert_eq!(posts.check(), Ok(()));
+        assert_eq!(posts.reject_unknown_options(&input), Ok(()));
+        assert_eq!(posts.to_compact_json()["url"], "/blog/{slug}?t={title}");
+        let doc = |v: Value| v.as_object().unwrap().clone();
+        let d = doc(json!({"title": "A b/c?&\"<", "slug": "a-b", "n": 1}));
+        assert_eq!(
+            posts.link_url(&d).as_deref(),
+            Some("/blog/a-b?t=A%20b%2Fc%3F%26%22%3C")
+        );
+        assert_eq!(posts.title_of(&d).as_deref(), Some("A b/c?&\"<"));
+        assert_eq!(posts.slug_of(&d).as_deref(), Some("a-b"));
+        // A placeholder with nothing behind it, such as a field the caller can't read,
+        // gives no URL at all.
+        for missing in [json!({"slug": "a-b"}), json!({"slug": "a-b", "title": ""})] {
+            assert_eq!(posts.link_url(&doc(missing)), None);
+        }
+        assert_eq!(posts.title_of(&doc(json!({"slug": "a"}))), None);
+        let plain = schema(json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}));
+        assert_eq!(plain.link_url(&d), None);
+        assert!(plain.to_compact_json().get("url").is_none());
+
+        for (url, kind, message) in [
+            (
+                "/blog/{nope}",
+                "collection",
+                "url: `{nope}` must name a top-level text or slug field",
+            ),
+            (
+                "/blog/{n}",
+                "collection",
+                "url: `{n}` must name a top-level text or slug field",
+            ),
+            (
+                "/blog/{meta.deep}",
+                "collection",
+                "url: `{meta.deep}` must name a top-level text or slug field",
+            ),
+            ("/blog/{slug", "collection", "url: a `{` is never closed"),
+            (
+                "javascript:{slug}",
+                "collection",
+                "url: must start with http://, https://, / or #",
+            ),
+            (
+                "{slug}",
+                "collection",
+                "url: must start with http://, https://, / or #",
+            ),
+            (
+                "//evil.example/{slug}",
+                "collection",
+                "url: must start with http://, https://, / or #",
+            ),
+            (
+                "mailto:{slug}",
+                "collection",
+                "url: must start with http://, https://, / or #",
+            ),
+            (
+                "/x",
+                "global",
+                "url: only collections have pages of their own",
+            ),
+            (
+                "/x",
+                "block",
+                "url: only collections have pages of their own",
+            ),
+        ] {
+            let s = schema(
+                json!({"slug": "posts", "kind": kind, "url": url, "fields": [
+                    {"name": "slug", "type": "slug"}, {"name": "n", "type": "number"},
+                    {"name": "meta", "type": "group", "fields": [{"name": "deep", "type": "text"}]}
+                ]}),
+            );
+            assert_eq!(s.check().unwrap_err().to_string(), message, "{url}");
+        }
     }
 
     fn blocks_schema() -> Value {

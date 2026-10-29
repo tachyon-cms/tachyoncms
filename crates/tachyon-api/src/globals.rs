@@ -17,7 +17,7 @@ use tachyon_db::query::get_many_readable;
 
 use crate::access::{Access, both};
 use crate::documents::{json_body, shaped, unique_error};
-use crate::params::read_params;
+use crate::params::{Format, read_params};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
     vouched_links,
@@ -52,7 +52,7 @@ async fn respond(
     let mut items = vec![(value, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     Ok(Json(
-        populate(state, access, items, depth, &Shapes::new())
+        populate(state, access, items, depth, &Shapes::new(), Format::Json)
             .await?
             .remove(0),
     ))
@@ -90,9 +90,16 @@ pub async fn get(
     let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
-        populate(&state, &access, vec![(value, c)], p.depth, &p.populate)
-            .await?
-            .remove(0),
+        populate(
+            &state,
+            &access,
+            vec![(value, c)],
+            p.depth,
+            &p.populate,
+            p.format,
+        )
+        .await?
+        .remove(0),
     ))
 }
 
