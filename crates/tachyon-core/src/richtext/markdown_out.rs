@@ -12,6 +12,8 @@ use crate::schema::FieldKind;
 /// that fails the scheme check, is its text alone; so is a relationship node, which is
 /// then left out. `kind` is the rich text field's; it says how block attributes are
 /// written.
+/// A table cell's blocks become one paragraph, hard breaks between them (W1-R37).
+/// A text's marks read back in one order, since Markdown can't say theirs (W1-R37).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
 }
@@ -29,14 +31,17 @@ fn blocks(nodes: &[Value], k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
 fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let number = |name| attr(node, name).and_then(Value::as_u64);
     match kind(node) {
-        "paragraph" => line_start(inline(children(node), ctx)),
+        "paragraph" => line_start(inline(children(node), ctx, Where::Paragraph)),
         "heading" => {
             let level = number("level").unwrap_or(1).clamp(1, 6) as usize;
-            format!(
-                "{} {}",
-                "#".repeat(level),
-                line_start(inline(children(node), ctx))
-            )
+            let text = line_start(inline(children(node), ctx, Where::Heading));
+            // A trailing run of `#` after a space would read as the heading's closing one.
+            let bare = text.trim_end_matches('#');
+            let text = match bare.len() < text.len() && (bare.is_empty() || bare.ends_with(' ')) {
+                true => format!("{bare}\\{}", &text[bare.len()..]),
+                false => text,
+            };
+            format!("{} {text}", "#".repeat(level))
         }
         "bulletList" => list(node, k, ctx, |_, _| "- ".into()),
         "orderedList" => {
@@ -78,7 +83,7 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
             for (i, row) in children(node).iter().enumerate() {
                 let cells: Vec<String> = children(row)
                     .iter()
-                    .map(|cell| blocks(children(cell), k, ctx).replace('\n', " "))
+                    .map(|cell| line_start(inline(&cell_inline(cell), ctx, Where::Cell)))
                     .collect();
                 lines.push(format!("| {} |", cells.join(" | ")));
                 if i == 0 {
@@ -238,12 +243,9 @@ fn longest_run(s: &str, c: char) -> usize {
 fn line_start(s: String) -> String {
     // Indent is written as entities, which Markdown keeps as text, so what follows it can't
     // start structure (W1-R30).
-    let indent = s.len() - s.trim_start_matches([' ', '\t']).len();
+    let indent = s.len() - s.trim_start_matches([' ', '\t', '\u{b}', '\u{c}']).len();
     if indent > 0 {
-        let entities: String = s[..indent]
-            .chars()
-            .map(|c| if c == ' ' { "&#32;" } else { "&#9;" })
-            .collect();
+        let entities: String = s[..indent].chars().map(entity).collect();
         return format!("{entities}{}", &s[indent..]);
     }
     if s.starts_with(['#', '-', '+', '=', ':']) {
@@ -290,7 +292,8 @@ fn code_spans(s: &str) -> String {
         let span = &rest[..end];
         if !span.is_empty() {
             let fence = "`".repeat(longest_run(span, '`') + 1);
-            let spaced = span.starts_with(' ') && span.ends_with(' ') && span.trim() != "";
+            let spaced =
+                span.starts_with(' ') && span.ends_with(' ') && !span.trim_matches(' ').is_empty();
             let pad = match span.starts_with('`') || span.ends_with('`') || spaced {
                 true => " ",
                 false => "",
@@ -317,15 +320,49 @@ fn destination(s: &str) -> String {
     out
 }
 
-/// Inline nodes. Each line after a hard break is escaped as a paragraph's first line is.
-fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
+/// Where inline text sits, which decides how a hard break is written.
+#[derive(Clone, Copy, PartialEq)]
+enum Where {
+    Paragraph,
+    Heading,
+    Cell,
+}
+
+/// Inline nodes. A hard break is `\` ending the line, and the line after it is escaped as a
+/// paragraph's first line is. Where that can't be written (a heading, a table cell, the
+/// end of a paragraph) it's `<br>` (W1-R36).
+fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
     let lines: Vec<String> = nodes
         .split(|n| kind(n) == "hardBreak")
-        .map(|line| line_ends(&marked_line(line, ctx)))
+        .map(|line| line_ends(&marked_line(line, ctx, at == Where::Cell)))
         .collect();
     let mut lines = lines.into_iter();
     let first = lines.next().unwrap_or_default();
-    lines.fold(first, |out, l| format!("{out}\\\n{}", line_start(l)))
+    lines.fold(first, |out, l| {
+        match at == Where::Paragraph && !l.is_empty() {
+            true => format!("{out}\\\n{}", line_start(l)),
+            false => format!("{out}<br>{l}"),
+        }
+    })
+}
+
+/// A table cell's blocks as one line of inline nodes, hard breaks between them: a cell is
+/// one line of Markdown (W1-R37).
+fn cell_inline(cell: &Value) -> Vec<Value> {
+    let mut out = Vec::new();
+    for (i, block) in children(cell).iter().enumerate() {
+        if i > 0 {
+            out.push(serde_json::json!({"type": "hardBreak"}));
+        }
+        match kind(block) {
+            "paragraph" | "heading" => out.extend(children(block).iter().cloned()),
+            _ => {
+                let doc = serde_json::json!({"type": "doc", "content": [block]});
+                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc)}));
+            }
+        }
+    }
+    out
 }
 
 /// A piece of a line: text, or a delimiter run of `*`, `_` or `~` opening or closing the
@@ -342,7 +379,7 @@ enum Piece {
 
 /// One line of text nodes, with their marks. A mark the next node shares stays open across
 /// both, the longest-running outermost, so marks nest and read back as written (W1-R33).
-fn marked_line(nodes: &[Value], ctx: &RenderCtx) -> String {
+fn marked_line(nodes: &[Value], ctx: &RenderCtx, cell: bool) -> String {
     // Adjacent text under the same marks is one text.
     let mut texts: Vec<(String, Vec<Value>, bool)> = Vec::new();
     for node in nodes.iter().filter(|n| kind(n) == "text") {
@@ -368,20 +405,34 @@ fn marked_line(nodes: &[Value], ctx: &RenderCtx) -> String {
     let mut pieces: Vec<Piece> = Vec::new();
     let mut open: Vec<(Value, usize)> = Vec::new();
     let mut pairs = 0;
-    let close = |pieces: &mut Vec<Piece>, (mark, pair): (Value, usize)| {
-        pieces.push(match mark["type"].as_str() {
+    // Where each link opened, by its pair.
+    let mut starts: Vec<usize> = Vec::new();
+    let close = |pieces: &mut Vec<Piece>, starts: &[usize], (mark, pair): (Value, usize)| {
+        let piece = match mark["type"].as_str() {
             Some("underline") => Piece::Text("</u>".into()),
             Some("link") => {
-                let dest = link_destination(&mark, ctx).unwrap_or_default();
-                Piece::Text(format!("]({})", destination(&dest)))
+                let dest = destination(&link_destination(&mark, ctx).unwrap_or_default());
+                let dest = if cell { dest.replace('|', "\\|") } else { dest };
+                // A line starting `[` whose code holds `]:` reads as a link reference
+                // definition, unless something follows its destination on the line: an
+                // empty title does.
+                let defines = starts[pair] == 0
+                    && pieces[1..]
+                        .iter()
+                        .any(|p| matches!(p, Piece::Text(s) if s.contains("]:")));
+                match defines {
+                    true => Piece::Text(format!("]({dest} \"\")")),
+                    false => Piece::Text(format!("]({dest})")),
+                }
             }
             t => delimiter(t, false, pair),
-        })
+        };
+        pieces.push(piece);
     };
     for (i, (text, marks, code)) in texts.iter().enumerate() {
         let kept = open.iter().take_while(|(m, _)| marks.contains(m)).count();
         while open.len() > kept {
-            close(&mut pieces, open.pop().expect("counted"));
+            close(&mut pieces, &starts, open.pop().expect("counted"));
         }
         // How many texts from here on carry `m`: the longer, the further out it opens.
         let reach = |m: &Value| texts[i..].iter().take_while(|t| t.1.contains(m)).count();
@@ -391,6 +442,7 @@ fn marked_line(nodes: &[Value], ctx: &RenderCtx) -> String {
             .collect();
         new.sort_by_key(|m| std::cmp::Reverse(reach(m)));
         for m in new {
+            starts.push(pieces.len());
             pieces.push(match m["type"].as_str() {
                 Some("underline") => Piece::Text("<u>".into()),
                 Some("link") => Piece::Text("[".into()),
@@ -401,13 +453,14 @@ fn marked_line(nodes: &[Value], ctx: &RenderCtx) -> String {
         }
         let edges = !marks.is_empty();
         pieces.push(Piece::Text(match code {
+            true if cell => code_spans(text).replace('|', "\\|"),
             true => code_spans(text),
             false if edges => edged(text),
             false => escape(text),
         }));
     }
     while let Some(o) = open.pop() {
-        close(&mut pieces, o);
+        close(&mut pieces, &starts, o);
     }
     choose_delimiters(&mut pieces, pairs);
     flank(&mut pieces);
@@ -477,51 +530,62 @@ fn choose_delimiters(pieces: &mut [Piece], pairs: usize) {
 /// run couldn't open or close beside it, the letter is written as an entity, which reads
 /// as punctuation there and as itself in the text.
 fn flank(pieces: &mut [Piece]) {
-    for i in 0..pieces.len() {
-        let Piece::Run { ch, open, .. } = pieces[i] else {
-            continue;
-        };
-        let before = pieces[..i].iter().rev().find_map(|p| match p {
-            Piece::Text(s) => s.chars().next_back(),
-            Piece::Run { ch, .. } => Some(*ch),
-        });
-        let after = pieces[i + 1..].iter().find_map(|p| match p {
-            Piece::Text(s) => s.chars().next(),
-            Piece::Run { ch, .. } => Some(*ch),
-        });
-        let (inner, outer) = if open {
-            (after, before)
-        } else {
-            (before, after)
-        };
-        let punct = |c: Option<char>| c.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace());
+    // Encoding only ever turns a character into ASCII punctuation, so this ends; it runs
+    // until nothing changes, since one run's fix can change another's neighbour.
+    while (0..pieces.len()).any(|i| flank_one(pieces, i)) {}
+}
+
+/// Fixes the first neighbour of run `i` that stops it opening or closing, if any. Outside
+/// ASCII, a neighbour is always encoded, rather than classified (W1-R35).
+fn flank_one(pieces: &mut [Piece], i: usize) -> bool {
+    let Piece::Run { ch, open, .. } = pieces[i] else {
+        return false;
+    };
+    // The outer neighbour is before an opening run and after a closing one.
+    let (outer, inner) = (neighbour(pieces, i, open), neighbour(pieces, i, !open));
+    let c = |n: Option<(Option<usize>, char)>| n.map(|(_, c)| c);
+    let fix = if c(outer).is_some_and(|c| !c.is_ascii()) {
+        outer
+    } else if c(inner).is_some_and(|c| !c.is_ascii()) {
+        inner
+    } else if c(outer).is_some_and(|c| c.is_ascii_alphanumeric())
+        && (ch == '_' || c(inner).is_some_and(|c| c.is_ascii_punctuation()))
+    {
         // `_` never opens or closes inside a word; `*` and `~` don't beside punctuation.
-        let stuck = outer.is_some_and(char::is_alphanumeric) && (ch == '_' || punct(inner));
-        if !stuck {
-            continue;
+        outer
+    } else {
+        None
+    };
+    let Some((Some(j), _)) = fix else {
+        return false;
+    };
+    let Piece::Text(s) = &mut pieces[j] else {
+        return false;
+    };
+    match j < i {
+        true => {
+            let c = s.pop().expect("a neighbour");
+            s.push_str(&entity(c));
         }
-        let range: Box<dyn Iterator<Item = usize>> = match open {
-            true => Box::new((0..i).rev()),
-            false => Box::new(i + 1..pieces.len()),
-        };
-        for j in range {
-            if let Piece::Text(s) = &mut pieces[j] {
-                if s.is_empty() {
-                    continue;
-                }
-                let c = match open {
-                    true => s.pop(),
-                    false => Some(s.remove(0)),
-                }
-                .expect("not empty");
-                let e = entity(c);
-                match open {
-                    true => s.push_str(&e),
-                    false => s.insert_str(0, &e),
-                }
-            }
-            break;
+        false => {
+            let c = s.remove(0);
+            s.insert_str(0, &entity(c));
         }
+    }
+    true
+}
+
+/// The character beside run `i`, before it or after it, with the text piece it's in (none
+/// when it's another run).
+fn neighbour(pieces: &[Piece], i: usize, before: bool) -> Option<(Option<usize>, char)> {
+    let at = |j: usize| match &pieces[j] {
+        Piece::Text(s) if before => s.chars().next_back().map(|c| (Some(j), c)),
+        Piece::Text(s) => s.chars().next().map(|c| (Some(j), c)),
+        Piece::Run { ch, .. } => Some((None, *ch)),
+    };
+    match before {
+        true => (0..i).rev().find_map(at),
+        false => (i + 1..pieces.len()).find_map(at),
     }
 }
 
@@ -540,15 +604,15 @@ fn entity(c: char) -> String {
     format!("&#{};", c as u32)
 }
 
-/// `s` with the spaces and tabs before its end, and before each line break written as an
-/// entity, written as entities too: Markdown drops them there, or reads two spaces as a
-/// hard break (W1-R31).
+/// `s` with the spaces, tabs, VT and FF before its end, and before each line break written
+/// as an entity, written as entities too: Markdown drops them there, or reads two spaces
+/// as a hard break (W1-R31, W1-R35).
 fn line_ends(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     let mut run = String::new();
     let mut rest = s;
     while let Some(c) = rest.chars().next() {
-        if c == ' ' || c == '\t' {
+        if matches!(c, ' ' | '\t' | '\u{b}' | '\u{c}') {
             run.push(c);
         } else {
             let at_end = rest.starts_with("&#10;") || rest.starts_with("&#13;");
@@ -561,10 +625,10 @@ fn line_ends(s: &str) -> String {
     out
 }
 
-/// Ends a run of spaces and tabs: as entities where a line ends, as they are elsewhere.
+/// Ends a run of spaces, tabs, VT and FF: as entities where a line ends, as they are elsewhere.
 fn flush(out: &mut String, run: &mut String, at_end: bool) {
     match at_end {
-        true => out.extend(run.chars().map(|c| if c == ' ' { "&#32;" } else { "&#9;" })),
+        true => out.extend(run.chars().map(entity)),
         false => out.push_str(run),
     }
     run.clear();

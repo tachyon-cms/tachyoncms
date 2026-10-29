@@ -13,7 +13,10 @@ use crate::query::{ValueKind, value_kind};
 use crate::schema::{Field, FieldKind};
 use crate::validate::FieldError;
 
-const HTML: &str = "raw HTML isn't allowed; underline is the only tag, as <u>…</u>";
+const HTML: &str = "raw HTML isn't allowed; the only tags are <u>…</u> and <br>";
+
+/// The ways a hard break may be written as HTML, where Markdown can't write `\` (W1-R36).
+const BR: [&str; 3] = ["<br>", "<br/>", "<br />"];
 
 /// The order a text node's marks are kept in.
 const MARKS: &[&str] = &["bold", "italic", "underline", "strike", "link", "code"];
@@ -192,6 +195,8 @@ enum Open<'k> {
     },
     /// A directive's line, read from the source when it ends.
     Directive,
+    /// An HTML block, which may only be a hard break.
+    Html(String),
     /// A block directive's text, until the line that closes it. `text` is the block's one
     /// rich text field, which holds it.
     Body {
@@ -407,9 +412,20 @@ impl<'s, 'k> Reader<'s, 'k> {
             Event::InlineHtml(tag) => match &*tag {
                 "<u>" => self.mark(json!({"type": "underline"}), line),
                 "</u>" => self.unmark("underline", line),
+                t if BR.contains(&t) => {
+                    self.inline(line)?;
+                    self.push(node("hardBreak", line))
+                }
                 _ => Err((line, HTML.into())),
             },
-            Event::Html(_) => Err((line, HTML.into())),
+            // A paragraph holding only a hard break reads as an HTML block (W1-R36).
+            Event::Html(html) => match &mut self.top().open {
+                Open::Html(text) => {
+                    text.push_str(&html);
+                    Ok(())
+                }
+                _ => Err((line, HTML.into())),
+            },
             // Footnotes, math and the like, which the options leave off.
             _ => Err((line, "this Markdown isn't supported".into())),
         }
@@ -538,7 +554,7 @@ impl<'s, 'k> Reader<'s, 'k> {
                 let head = matches!(self.top().open, Open::TableRow { head: true });
                 Open::Node(node(if head { "tableHeader" } else { "tableCell" }, line))
             }
-            Tag::HtmlBlock => return Err((line, HTML.into())),
+            Tag::HtmlBlock => Open::Html(String::new()),
             _ => return Err((line, "this Markdown isn't supported".into())),
         };
         self.open(line, open)
@@ -599,6 +615,15 @@ impl<'s, 'k> Reader<'s, 'k> {
                 if !text.is_empty() {
                     n.insert("content".into(), json!([{"type": "text", "text": text}]));
                 }
+                self.finish(n);
+            }
+            Open::Html(text) => {
+                if !BR.contains(&text.trim()) {
+                    return Err((line, HTML.into()));
+                }
+                let mut n = node("paragraph", line);
+                n.insert("content".into(), json!([{"type": "hardBreak"}]));
+                self.room(line)?;
                 self.finish(n);
             }
             Open::Directive => {
@@ -1159,7 +1184,7 @@ mod tests {
 
     #[test]
     fn markdown_refuses_with_line_numbers() {
-        let html = "raw HTML isn't allowed; underline is the only tag, as <u>…</u>";
+        let html = "raw HTML isn't allowed; the only tags are <u>…</u> and <br>";
         let scheme = "links must start with http://, https://, mailto:, tel:, / or #";
         let bold_only: Field = serde_json::from_value(
             json!({"name": "body", "type": "richText", "features": ["bold"]}),
@@ -1825,6 +1850,270 @@ mod tests {
         );
     }
 
+    /// Random documents over every context and mark, from a fixed seed, read back as
+    /// written once mark order is normalised and same-marked neighbours merged (W1-R35).
+    #[test]
+    fn markdown_fuzz_round_trips() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        // xorshift64, seeded: the same cases every run.
+        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
+        let mut n = |m: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % m as u64) as usize
+        };
+        let frags = [
+            "a", "b", "1", " ", "\t", "*", "_", "~", "`", "``", "[", "]", "]:", "!", "&", "#",
+            "\\", "<", ">", "|", "é", "\u{2014}", "\u{24B6}", "e\u{301}", "\u{a0}", "中", "(", ")",
+            ":", "-", "=", "+", ".", "'", "\"", "\u{200b}", "\u{3000}", "$", "\u{20ac}", "<u>",
+            "<br>", "**", "__", "&amp;", "&#32;", "\u{ff01}", "\u{2028}", "\u{85}", "\u{c}",
+            "\u{b}", "\u{ad}",
+        ];
+        // The reader's mark order (W1-R37).
+        let order = ["bold", "italic", "underline", "strike", "link", "code"];
+        let normal = |nodes: &[Value]| {
+            let mut out: Vec<Value> = Vec::new();
+            for node in nodes {
+                let mut node = node.clone();
+                if let Some(Value::Array(marks)) = node.get_mut("marks") {
+                    marks.sort_by_key(|m| order.iter().position(|o| m["type"] == *o));
+                }
+                match out.last_mut() {
+                    Some(last)
+                        if last["type"] == "text"
+                            && node["type"] == "text"
+                            && last.get("marks") == node.get("marks") =>
+                    {
+                        let joined = format!(
+                            "{}{}",
+                            last["text"].as_str().unwrap(),
+                            node["text"].as_str().unwrap()
+                        );
+                        last["text"] = joined.into();
+                    }
+                    _ => out.push(node),
+                }
+            }
+            Value::Array(out)
+        };
+        let contexts = ["paragraph", "heading", "quote", "list", "cell"];
+        let (cases, mut failures) = (20_000, Vec::new());
+        for case in 0..cases {
+            let mut nodes = Vec::new();
+            for i in 0..1 + n(6) {
+                if i > 0 && n(5) == 0 {
+                    nodes.push(json!({"type": "hardBreak"}));
+                }
+                let text: String = (0..1 + n(3)).map(|_| frags[n(frags.len())]).collect();
+                let mut marks = Vec::new();
+                for m in order {
+                    if n(3) == 0 {
+                        marks.push(match m {
+                            "link" => {
+                                let href = ["/a", "/b"][n(2)];
+                                json!({"type": "link", "attrs": {"href": href}})
+                            }
+                            m => json!({"type": m}),
+                        });
+                    }
+                }
+                nodes.push(match marks.is_empty() {
+                    true => t(&text),
+                    false => marked(&text, Value::Array(marks)),
+                });
+            }
+            let wrap = |content: Value| match contexts[case % contexts.len()] {
+                "heading" => json!({"type": "heading", "attrs": {"level": 2}, "content": content}),
+                "quote" => json!({"type": "blockquote", "content": [para(content)]}),
+                "list" => {
+                    json!({"type": "orderedList", "content": [item("listItem", json!([para(content)]))]})
+                }
+                "cell" => json!({"type": "table", "content": [{"type": "tableRow", "content": [
+                    {"type": "tableHeader", "content": [para(content)]}
+                ]}]}),
+                _ => para(content),
+            };
+            let fixture = doc(json!([wrap(Value::Array(nodes.clone()))]));
+            let expected = doc(json!([wrap(normal(&nodes))]));
+            let markdown = to_markdown(&fixture, &kind, &ctx);
+            let back = from_markdown(&markdown, &kind);
+            if back.as_ref() != Ok(&expected) {
+                failures.push(format!(
+                    "{}\n{markdown:?}\n{back:?}",
+                    serde_json::to_string(&nodes).unwrap()
+                ));
+            }
+        }
+        assert!(
+            failures.is_empty(),
+            "{} of {cases} failed; first:\n{}",
+            failures.len(),
+            failures
+                .iter()
+                .take(5)
+                .cloned()
+                .collect::<Vec<_>>()
+                .join("\n\n")
+        );
+    }
+
+    /// The fuzz's known failures, each pinned (W1-R35, W1-R36).
+    #[test]
+    fn markdown_edge_cases_round_trip() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        let m = |types: &[&str]| -> Value {
+            Value::Array(
+                types
+                    .iter()
+                    .map(|t| match *t {
+                        "link" => json!({"type": "link", "attrs": {"href": "/a"}}),
+                        t => json!({"type": t}),
+                    })
+                    .collect(),
+            )
+        };
+        let br = json!({"type": "hardBreak"});
+        let cell = |content: Value| {
+            json!({"type": "table", "content": [
+                {"type": "tableRow", "content": [{"type": "tableHeader", "content": [para(content.clone())]}]},
+                {"type": "tableRow", "content": [{"type": "tableCell", "content": [para(content)]}]}
+            ]})
+        };
+        let fixtures = [
+            // F2: one run's fix mustn't strand another.
+            para(json!([
+                t("x"),
+                marked("a", m(&["italic"])),
+                marked("!b", m(&["italic", "strike"]))
+            ])),
+            para(json!([
+                t("a"),
+                marked("1", m(&["bold"])),
+                marked("!", m(&["bold", "italic"]))
+            ])),
+            para(json!([
+                t("x"),
+                marked("a", m(&["bold"])),
+                marked("!", m(&["bold", "italic"])),
+                t("y")
+            ])),
+            // F3: only U+0020 is padding.
+            para(json!([marked(" \u{a0} ", m(&["code"]))])),
+            para(json!([marked(" \t ", m(&["code"]))])),
+            // F4: neighbours outside ASCII.
+            para(json!([t("cafe\u{301}"), marked("(x)", m(&["bold"]))])),
+            para(json!([t("a\u{ad}"), marked("!", m(&["bold"]))])),
+            para(json!([t("x"), marked("\u{24B6}", m(&["bold"])), t("y")])),
+            para(json!([t("\u{200b}"), marked("!b", m(&["bold"]))])),
+            // F1: no link reference definition.
+            para(json!([marked("]:x", m(&["link", "code"]))])),
+            para(json!([marked("]:", m(&["link", "code"]))])),
+            json!({"type": "blockquote", "content": [para(json!([marked("]:x y", m(&["link", "code"])), t("z")]))]}),
+            // Pipes in cells, in text, code and hrefs.
+            cell(json!([
+                marked("a|b", m(&["bold"])),
+                marked("|", m(&["code"]))
+            ])),
+            cell(json!([marked("a|b", m(&["code"]))])),
+            cell(json!([marked("a\\\\|b", m(&["code"]))])),
+            cell(json!([marked(
+                "a|b",
+                json!([{"type": "link", "attrs": {"href": "/a|b"}}])
+            )])),
+            // A heading's trailing `#` run.
+            heading(2, "C #"),
+            heading(2, "C ##"),
+            json!({"type": "heading", "attrs": {"level": 2}, "content": [t("a "), marked("#", m(&["bold"]))]}),
+            // Hard breaks where `\` can't go (W1-R36).
+            json!({"type": "heading", "attrs": {"level": 2}, "content": [t("a"), br, t("b")]}),
+            cell(json!([t("a"), br, t("b")])),
+            para(json!([t("a"), br])),
+            para(json!([br, t("a")])),
+            para(json!([br])),
+            para(json!([t("a"), br, br, t("b")])),
+            // Control characters at a line's ends.
+            para(json!([t("a\u{b}")])),
+            para(json!([t("\u{c}")])),
+            para(json!([t("\u{c}# a")])),
+        ];
+        for fixture in fixtures {
+            let d = doc(json!([fixture]));
+            let markdown = to_markdown(&d, &kind, &ctx);
+            assert_eq!(from_markdown(&markdown, &kind), Ok(d), "{markdown:?}");
+        }
+        // Raw HTML other than `<u>` and `<br>` is still refused.
+        for (src, ok) in [
+            ("a<br>b", true),
+            ("a<br/>b", true),
+            ("a<br />b", true),
+            ("a<BR>b", false),
+            ("a<br class=\"x\">b", false),
+            ("a</br>b", false),
+            ("<br>", true),
+        ] {
+            assert_eq!(from_markdown(src, &kind).is_ok(), ok, "{src}");
+        }
+    }
+
+    /// What Markdown can't say, written the documented way (W1-R37).
+    #[test]
+    fn markdown_documents_what_it_cannot_say() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        // A cell's blocks become one paragraph, with hard breaks between them.
+        let table = |cell: Value| {
+            doc(json!([{"type": "table", "content": [{"type": "tableRow", "content": [cell]}]}]))
+        };
+        let two = table(
+            json!({"type": "tableHeader", "content": [para(json!([t("a")])), para(json!([t("b")]))]}),
+        );
+        let markdown = to_markdown(&two, &kind, &ctx);
+        assert_eq!(markdown, "| a<br>b |\n| --- |");
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(table(
+                json!({"type": "tableHeader", "content": [para(json!([
+                    t("a"), {"type": "hardBreak"}, t("b")
+                ]))]})
+            ))
+        );
+        // Marks are a set: they read back in one order.
+        let linked = doc(json!([para(json!([marked(
+            "a",
+            json!([
+                {"type": "link", "attrs": {"href": "/a"}}, {"type": "bold"}
+            ])
+        )]))]));
+        let markdown = to_markdown(&linked, &kind, &ctx);
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(doc(json!([para(json!([marked(
+                "a",
+                json!([
+                    {"type": "bold"}, {"type": "link", "attrs": {"href": "/a"}}
+                ])
+            )]))])))
+        );
+    }
+
     /// Text that starts a line the way structure does, after any indent, stays text
     /// wherever the line is (W1-R30).
     #[test]
@@ -1968,7 +2257,7 @@ mod tests {
             refused(json!({"layout": [{"blockType": "copy", "text": md("ok\n\n<b>no</b>")}]})),
             vec![FieldError {
                 path: "layout.0.text".into(),
-                message: "line 3: raw HTML isn't allowed; underline is the only tag, as <u>…</u>"
+                message: "line 3: raw HTML isn't allowed; the only tags are <u>…</u> and <br>"
                     .into()
             }]
         );

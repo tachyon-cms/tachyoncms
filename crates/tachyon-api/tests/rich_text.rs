@@ -868,7 +868,7 @@ async fn doc_links_resolve_through_access(pool: PgPool) {
         res.json["errors"],
         json!([
             {"path": "email", "message": "expected an email address"},
-            {"path": "bio", "message": "line 1: raw HTML isn't allowed; underline is the only tag, as <u>…</u>"}
+            {"path": "bio", "message": "line 1: raw HTML isn't allowed; the only tags are <u>…</u> and <br>"}
         ])
     );
     let user = create(
