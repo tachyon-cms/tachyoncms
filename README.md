@@ -13,6 +13,8 @@ A headless CMS written in Rust. One binary, one Postgres database, and an API ge
 > [!WARNING]
 > TachyonCMS is pre-alpha. The core content API, sign-in and access rules work today. The admin UI, media, drafts and GraphQL don't exist yet, so don't put it on a public network. Watch the repo to follow along, or jump in.
 
+The full documentation, with a step-by-step tutorial and a complete API reference, is at **[docs.tachyoncms.com](https://docs.tachyoncms.com)**.
+
 ## Why another CMS?
 
 Pick a CMS today and you usually pick a side. Some are built for developers: typed, API-first, a pleasure to code against, and baffling to the person who has to publish the Tuesday newsletter. WordPress is built for the editor, and you pay for that ease in plugins, patches and page speed.
