@@ -231,6 +231,59 @@ async fn block_nodes_follow_field_rules(pool: PgPool) {
     }
 }
 
+/// One block type makes `body` rich text (and `extra` json), another a group holding a
+/// link the viewer can't read: that link stays out of their references.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_hidden_link_beside_rich_text_of_its_name_stays_hidden(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+    )
+    .await;
+    let secret = json!({"name": "secret", "type": "relationship", "relationTo": "authors",
+        "access": {"read": {"role": "editor"}}});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+            {"slug": "a", "fields": [{"name": "body", "type": "richText"}, {"name": "extra", "type": "json"}]},
+            {"slug": "b", "fields": [
+                {"name": "body", "type": "group", "fields": [secret]},
+                {"name": "extra", "type": "group", "fields": [secret]}
+            ]}
+        ]}]}),
+    )
+    .await;
+    let ann = id(&create(&admin, "/api/authors", json!({"name": "Ann"})).await);
+    create(
+        &admin,
+        "/api/pages",
+        json!({"layout": [{"blockType": "b", "body": {"secret": ann}, "extra": {"secret": ann}}]}),
+    )
+    .await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    let url = format!("/api/authors/{ann}/references");
+    let paths = |res: Res| -> Vec<String> {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut out: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        paths(get(&editor, &url).await),
+        ["layout.0.body.secret", "layout.0.extra.secret"]
+    );
+    assert!(paths(get(&viewer, &url).await).is_empty());
+}
+
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn shared_blocks_in_rich_text_expand_change_and_stay(pool: PgPool) {
     let admin = admin_app(pool.clone()).await;

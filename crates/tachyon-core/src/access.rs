@@ -880,56 +880,100 @@ fn walk_path(
     caller: &Caller,
     doc: Option<&Map<String, Value>>,
 ) -> Option<bool> {
-    let mut level: Level = vec![fields];
-    let mut here = doc;
-    // Whether the last field matched holds no fields, so the next segment is in its value.
-    let mut in_value = false;
-    let mut segments = path.split('.').peekable();
-    while let Some(segment) = segments.next() {
+    let segments: Vec<&str> = path.split('.').collect();
+    walk(vec![fields], &segments, caller, doc, (false, false))
+}
+
+/// `walk_path` on from `level`, inside `here` when it's known. `value` says whether the
+/// field matched last holds no fields, so what follows is inside its value: (all of the
+/// fields sharing its name, any of them).
+fn walk(
+    mut level: Level,
+    mut rest: &[&str],
+    caller: &Caller,
+    mut here: Option<&Map<String, Value>>,
+    mut value: (bool, bool),
+) -> Option<bool> {
+    let number = |s: &str| s.parse::<usize>().is_ok();
+    let text = |f: &Field| matches!(f.kind, FieldKind::RichText { .. });
+    while let Some((&segment, tail)) = rest.split_first() {
         let peers = named(&level, segment);
         if peers.is_empty() {
-            return in_value.then_some(true);
+            // A name one block type's field holds could be another's hidden field; only an
+            // index can't be a name.
+            return (value.0 || value.1 && number(segment)).then_some(true);
         }
         if !all_allow(&peers, Action::Read, caller) {
             return Some(false);
         }
-        let mut value = here.and_then(|h| h.get(segment));
+        let next_is_name = tail.first().is_some_and(|s| !number(s));
+        // Block types that give the name different kinds read the rest differently: rich
+        // text by its nodes, the others by their fields. It must hold in every reading.
+        if next_is_name && peers.iter().any(|f| text(f)) && !peers.iter().all(|f| text(f)) {
+            let only = |rich: bool| -> Level {
+                level
+                    .iter()
+                    .filter(|fs| {
+                        fs.iter()
+                            .find(|f| f.name == segment)
+                            .is_some_and(|f| text(f) == rich)
+                    })
+                    .copied()
+                    .collect()
+            };
+            return match (
+                walk(only(true), rest, caller, here, value),
+                walk(only(false), rest, caller, here, value),
+            ) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+        }
+        rest = tail;
+        let mut found = here.and_then(|h| h.get(segment));
         // A path validation names through rich text's nodes: on to a block node's fields,
         // or into the text's own value.
-        if peers
-            .iter()
-            .any(|f| matches!(f.kind, FieldKind::RichText { .. }))
-            && segments.peek().is_some_and(|s| s.parse::<usize>().is_err())
-        {
-            while segments.next_if_eq(&"content").is_some() {
-                let i = segments.next()?.parse::<usize>().ok()?;
-                value = value.and_then(|v| v.get("content")?.get(i));
+        if next_is_name && peers.iter().all(|f| text(f)) {
+            while let ["content", i, tail @ ..] = rest {
+                let i = i.parse::<usize>().ok()?;
+                found = found.and_then(|v| v.get("content")?.get(i));
+                rest = tail;
             }
-            if segments.next_if_eq(&"attrs").is_none() || segments.next_if_eq(&"fields").is_none() {
+            let ["attrs", "fields", tail @ ..] = rest else {
                 return Some(true);
-            }
-            let attrs = value
+            };
+            rest = tail;
+            let attrs = found
                 .and_then(|v| v.get("attrs"))
                 .and_then(Value::as_object);
             here = attrs
                 .and_then(|a| a.get("fields"))
                 .and_then(Value::as_object);
             level = peers.iter().flat_map(|f| inside_row(f, attrs)).collect();
-            in_value = false;
-            if segments.peek().is_none() {
+            value = (false, false);
+            if rest.is_empty() {
                 return Some(true);
             }
             continue;
         }
         let mut indexed = false;
         if peers.iter().any(|f| is_list(f))
-            && let Some(i) = segments.next_if(|s| s.parse::<usize>().is_ok())
+            && let Some((i, tail)) = rest
+                .split_first()
+                .and_then(|(i, tail)| Some((i.parse::<usize>().ok()?, tail)))
         {
-            value = value.and_then(|v| v.get(i.parse::<usize>().ok()?));
+            found = found.and_then(|v| v.get(i));
+            rest = tail;
             indexed = true;
         }
-        in_value = !indexed && peers.iter().any(|f| inside(f).is_empty());
-        here = value.and_then(Value::as_object);
+        let empty = |f: &&Field| inside(f).is_empty();
+        value = if indexed {
+            (false, false)
+        } else {
+            (peers.iter().all(empty), peers.iter().any(empty))
+        };
+        here = found.and_then(Value::as_object);
         level = peers.iter().flat_map(|f| inside_row(f, here)).collect();
         if level.is_empty() {
             return Some(true);
@@ -1582,8 +1626,10 @@ mod tests {
             ("layout.0.nope.x", false),
             ("layout.x.text", false),
             // Right after a field that holds no fields is inside its value; after a row
-            // index, or a field that holds fields, an unknown name is no field.
-            ("layout.1.cards.x", true),
+            // index, or a field that holds fields, an unknown name is no field. So is one
+            // after a name that one block type gives a list and another a value.
+            ("layout.1.cards.x", false),
+            ("layout.1.cards.0", true),
             ("layout.0.cards.0.nope", false),
             ("layout.0.cards.0.label", true),
         ] {
@@ -1598,6 +1644,8 @@ mod tests {
         assert!(path_exists(&visible, "layout.0.text"));
         assert!(!path_exists(&visible, "layout.1.secret"));
         assert!(!path_exists(&visible, "layout.0.inner.0.x"));
+        // Pruned, a hidden field leaves no trace for a value of the same name to cover.
+        assert!(!path_exists(&visible, "layout.0.meta.x"));
 
         // Validation errors in a known document answer to their row's type.
         let e = |path: &str| FieldError {
@@ -2026,6 +2074,91 @@ mod tests {
             field_answers(s.data(), &editor)
                 .iter()
                 .all(|(_, a)| *a == yes)
+        );
+    }
+
+    /// `body` is rich text in block type `a` and a group in `b`, and `extra` json in `a`
+    /// and a group in `b`; each group hides `secret` from all but editors.
+    fn two_kinds() -> CollectionSchema {
+        let ed = json!({"read": {"role": "editor"}});
+        schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "a", "fields": [
+                    {"name": "body", "type": "richText", "blocks": [
+                        {"slug": "note", "fields": [{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]}
+                    ]},
+                    {"name": "extra", "type": "json"}
+                ]},
+                {"slug": "b", "fields": [
+                    {"name": "body", "type": "group", "fields": [
+                        {"name": "secret", "type": "text", "access": ed}, {"name": "open", "type": "text"}
+                    ]},
+                    {"name": "extra", "type": "group", "fields": [{"name": "secret", "type": "text", "access": ed}]}
+                ]}
+            ]}]}),
+        )
+    }
+
+    /// A path through a name of two kinds must hold in every reading, so the group's hidden
+    /// field stays hidden.
+    #[test]
+    fn a_name_of_two_kinds_answers_for_both() {
+        let s = two_kinds();
+        assert_eq!(check(&s), Ok(()));
+        let viewer = signed_in("viewer");
+        let visible = readable_fields(s.data(), &viewer);
+        for (path, readable, exists) in [
+            ("layout.0.body.secret", false, true),
+            ("layout.0.body.open", true, true),
+            ("layout.0.extra.secret", false, true),
+            // Rich text's own readings still hold.
+            ("layout.0.body.0.y", true, true),
+            ("layout.0.body.0.x", false, true),
+            // Validation's path through nodes names no field of the group.
+            ("layout.0.body.content.0.attrs.fields.x", false, false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert_eq!(path_exists(&visible, path), readable, "{path}");
+            assert_eq!(path_exists(s.data(), path), exists, "{path}");
+        }
+    }
+
+    /// Validation errors under a name of two kinds: with no document, and with one whose row
+    /// doesn't say its type, the group's hidden field isn't named.
+    #[test]
+    fn errors_under_a_name_of_two_kinds_stay_hidden() {
+        let s = two_kinds();
+        let viewer = signed_in("viewer");
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        let generic = FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        };
+        let unknown = json!({"layout": [{"id": "1"}]});
+        let row = |t: &str| json!({"layout": [{"id": "1", "blockType": t}]});
+        for doc in [None, Some(&unknown), Some(&row("b"))] {
+            let doc = doc.map(|d| d.as_object().unwrap());
+            for path in ["layout.0.body.secret", "layout.0.extra.secret"] {
+                assert_eq!(
+                    visible_errors(s.data(), vec![e(path)], &viewer, doc),
+                    std::slice::from_ref(&generic),
+                    "{path} {doc:?}"
+                );
+            }
+        }
+        // In an `a` row the same path is inside the text's value, which they can read.
+        let a = row("a");
+        assert_eq!(
+            visible_errors(
+                s.data(),
+                vec![e("layout.0.body.secret")],
+                &viewer,
+                a.as_object()
+            ),
+            [e("layout.0.body.secret")]
         );
     }
 
