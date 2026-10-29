@@ -203,9 +203,14 @@ pub(crate) async fn create(
     let caller = caller_of(&principal);
     let mut profile = Value::Object(profile);
     let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
-    from_markdown(&state, &access, &users, &mut profile, None).await?;
-    refuse_fields(&users, &profile, Action::Create, &caller, None)?;
-    let data = validate_document(users.schema.data(), &profile, None);
+    let data = match from_markdown(&state, &access, &users, &mut profile, None).await {
+        Err(ApiError::Validation(more)) => Err(more),
+        Err(e) => return Err(e),
+        Ok(()) => {
+            refuse_fields(&users, &profile, Action::Create, &caller, None)?;
+            validate_document(users.schema.data(), &profile, None)
+        }
+    };
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
     }

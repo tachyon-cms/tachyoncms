@@ -825,6 +825,23 @@ async fn doc_links_resolve_through_access(pool: PgPool) {
         }
     }
 
+    // Each write names at most 1,000 documents by slug, refused before any lookup.
+    let many: String = (0..1001).map(|i| format!("[x](doc:posts/s{i}) ")).collect();
+    let res = send(&viewer, "POST", "/api/pages", Some(&md(&many).to_string())).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([{"path": "body", "message": "names more than 1000 documents by slug"}])
+    );
+    let fine: String = (0..1000).map(|i| format!("[x](doc:posts/s{i}) ")).collect();
+    let res = send(&viewer, "POST", "/api/pages", Some(&md(&fine).to_string())).await;
+    assert_eq!(
+        res.json["errors"].as_array().map(Vec::len),
+        Some(1000),
+        "{}",
+        res.json
+    );
+
     // The users route converts too, before field rules.
     let profile = json!({"schema": {"slug": "users", "fields": [
         {"name": "name", "type": "text", "required": true},
@@ -834,6 +851,26 @@ async fn doc_links_resolve_through_access(pool: PgPool) {
     ]}});
     let res = put(&admin, "/api/admin/collections/users", profile).await;
     assert_eq!(res.status, 200, "{}", res.json);
+    // Account errors and Markdown errors come back together.
+    let res = send(
+        &admin,
+        "POST",
+        "/api/users",
+        Some(
+            &json!({"email": "nope", "password": common::PASSWORD, "name": "X",
+            "bio": {"format": "markdown", "value": "<b>x</b>"}})
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([
+            {"path": "email", "message": "expected an email address"},
+            {"path": "bio", "message": "line 1: raw HTML isn't allowed; underline is the only tag, as <u>…</u>"}
+        ])
+    );
     let user = create(
         &admin,
         "/api/users",

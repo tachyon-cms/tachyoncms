@@ -121,7 +121,12 @@ pub async fn update(
     };
     let who = access.actor(Action::UpdateGlobal, &c);
     let mut patch = json_body(body)?;
-    from_markdown(&state, &access, &c, &mut patch, None).await?;
+    let stored = match documents::get(&state.pool, c.id, c.id).await {
+        Ok(doc) => Some(doc.data.0),
+        Err(DbError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
+    from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
     let targets = link_targets(&state, &c).await?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against what's stored (nothing, before the first save) each time it's applied.
@@ -143,11 +148,6 @@ pub async fn update(
     };
     // Links the patch adds are checked against the stored document (or none), then again
     // against the one the write locks.
-    let stored = match documents::get(&state.pool, c.id, c.id).await {
-        Ok(doc) => Some(doc.data.0),
-        Err(DbError::NotFound) => None,
-        Err(e) => return Err(e.into()),
-    };
     let vouched = check_links(
         &state,
         &access,
