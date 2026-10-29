@@ -12,9 +12,6 @@ use crate::schema::FieldKind;
 /// that fails the scheme check, is its text alone; so is a relationship node, which is
 /// then left out. `kind` is the rich text field's; it says how block attributes are
 /// written.
-// ponytail: each text node wraps its own marks, so two touching nodes with different marks
-// can give delimiter runs (`**b***i*`) that read back differently. Merge mark runs across
-// nodes if Markdown input's round trip shows it matters.
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
 }
@@ -282,27 +279,23 @@ fn line_break(c: char) -> &'static str {
     if c == '\n' { "&#10;" } else { "&#13;" }
 }
 
-/// `s` in a code span. Code spans can't hold a line break, so the span ends before each
-/// one and starts again after it, the break written outside as an entity (W1-R28).
+/// `s` in code spans. A span can't hold a line break, so it ends before each one and starts
+/// again after it, the break written outside as an entity (W1-R28). Spaces stay inside: a
+/// span with a space at both ends is padded with one more, which Markdown strips.
 fn code_spans(s: &str) -> String {
     let mut out = String::new();
     let mut rest = s;
     loop {
         let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
-        // Spaces at a piece's ends go outside it, where Markdown keeps them.
-        let piece = &rest[..end];
-        let span = piece.trim_matches(' ');
-        let lead = &piece[..piece.len() - piece.trim_start_matches(' ').len()];
-        out.push_str(lead);
+        let span = &rest[..end];
         if !span.is_empty() {
             let fence = "`".repeat(longest_run(span, '`') + 1);
-            let pad = if span.starts_with('`') || span.ends_with('`') {
-                " "
-            } else {
-                ""
+            let spaced = span.starts_with(' ') && span.ends_with(' ') && span.trim() != "";
+            let pad = match span.starts_with('`') || span.ends_with('`') || spaced {
+                true => " ",
+                false => "",
             };
             out.push_str(&format!("{fence}{pad}{span}{pad}{fence}"));
-            out.push_str(&piece[lead.len() + span.len()..]);
         }
         let Some(c) = rest[end..].chars().next() else {
             return out;
@@ -326,53 +319,220 @@ fn destination(s: &str) -> String {
 
 /// Inline nodes. Each line after a hard break is escaped as a paragraph's first line is.
 fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
-    let mut lines = vec![String::new()];
-    // Whether the last text ended in a delimiter run with punctuation inside it.
-    let mut closed_on_punct = false;
-    for node in nodes {
-        match kind(node) {
-            "hardBreak" => {
-                lines.push(String::new());
-                closed_on_punct = false;
-            }
-            "text" => {
-                let mut r = String::new();
-                text(node, ctx, &mut r);
-                let line = lines.last_mut().expect("never empty");
-                // A `*` or `~` run with punctuation inside it only opens or closes with
-                // whitespace or punctuation outside it, so a letter there is an entity.
-                if delimited(&r, true)
-                    && let Some(c) = line.chars().last().filter(|c| c.is_alphanumeric())
-                {
-                    line.pop();
-                    line.push_str(&entity(c));
-                }
-                if closed_on_punct && let Some(c) = r.chars().next().filter(|c| c.is_alphanumeric())
-                {
-                    r = format!("{}{}", entity(c), &r[c.len_utf8()..]);
-                }
-                closed_on_punct = delimited(&r, false);
-                line.push_str(&r);
-            }
-            _ => {}
-        }
-    }
-    let first = line_ends(&lines.remove(0));
-    lines.into_iter().fold(first, |out, l| {
-        format!("{out}\\\n{}", line_start(line_ends(&l)))
-    })
+    let lines: Vec<String> = nodes
+        .split(|n| kind(n) == "hardBreak")
+        .map(|line| line_ends(&marked_line(line, ctx)))
+        .collect();
+    let mut lines = lines.into_iter();
+    let first = lines.next().unwrap_or_default();
+    lines.fold(first, |out, l| format!("{out}\\\n{}", line_start(l)))
 }
 
-/// Whether `s` starts (or, with `start` false, ends) with a `*` or `~` delimiter run that
-/// has punctuation or a symbol on its inner side.
-fn delimited(s: &str, start: bool) -> bool {
-    let is_run = |c: &char| *c == '*' || *c == '~';
-    let (edge, inner) = match start {
-        true => (s.chars().next(), s.chars().find(|c| !is_run(c))),
-        false => (s.chars().next_back(), s.chars().rev().find(|c| !is_run(c))),
+/// A piece of a line: text, or a delimiter run of `*`, `_` or `~` opening or closing the
+/// mark that `pair` numbers.
+enum Piece {
+    Text(String),
+    Run {
+        ch: char,
+        len: usize,
+        open: bool,
+        pair: usize,
+    },
+}
+
+/// One line of text nodes, with their marks. A mark the next node shares stays open across
+/// both, the longest-running outermost, so marks nest and read back as written (W1-R33).
+fn marked_line(nodes: &[Value], ctx: &RenderCtx) -> String {
+    // Adjacent text under the same marks is one text.
+    let mut texts: Vec<(String, Vec<Value>, bool)> = Vec::new();
+    for node in nodes.iter().filter(|n| kind(n) == "text") {
+        let raw = node.get("text").and_then(Value::as_str).unwrap_or("");
+        let all = node.get("marks").and_then(Value::as_array);
+        let is_code = all.is_some_and(|m| m.iter().any(|m| m["type"] == "code"));
+        // The marks Markdown can write, code apart: it's always innermost.
+        let marks: Vec<Value> = all
+            .into_iter()
+            .flatten()
+            .filter(|m| match m["type"].as_str() {
+                Some("bold" | "italic" | "strike" | "underline") => true,
+                Some("link") => link_destination(m, ctx).is_some(),
+                _ => false,
+            })
+            .cloned()
+            .collect();
+        match texts.last_mut() {
+            Some((text, m, code)) if *m == marks && *code == is_code => text.push_str(raw),
+            _ => texts.push((raw.to_owned(), marks, is_code)),
+        }
+    }
+    let mut pieces: Vec<Piece> = Vec::new();
+    let mut open: Vec<(Value, usize)> = Vec::new();
+    let mut pairs = 0;
+    let close = |pieces: &mut Vec<Piece>, (mark, pair): (Value, usize)| {
+        pieces.push(match mark["type"].as_str() {
+            Some("underline") => Piece::Text("</u>".into()),
+            Some("link") => {
+                let dest = link_destination(&mark, ctx).unwrap_or_default();
+                Piece::Text(format!("]({})", destination(&dest)))
+            }
+            t => delimiter(t, false, pair),
+        })
     };
-    edge.is_some_and(|c| is_run(&c))
-        && inner.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace())
+    for (i, (text, marks, code)) in texts.iter().enumerate() {
+        let kept = open.iter().take_while(|(m, _)| marks.contains(m)).count();
+        while open.len() > kept {
+            close(&mut pieces, open.pop().expect("counted"));
+        }
+        // How many texts from here on carry `m`: the longer, the further out it opens.
+        let reach = |m: &Value| texts[i..].iter().take_while(|t| t.1.contains(m)).count();
+        let mut new: Vec<&Value> = marks
+            .iter()
+            .filter(|m| !open.iter().any(|(o, _)| o == *m))
+            .collect();
+        new.sort_by_key(|m| std::cmp::Reverse(reach(m)));
+        for m in new {
+            pieces.push(match m["type"].as_str() {
+                Some("underline") => Piece::Text("<u>".into()),
+                Some("link") => Piece::Text("[".into()),
+                t => delimiter(t, true, pairs),
+            });
+            open.push((m.clone(), pairs));
+            pairs += 1;
+        }
+        let edges = !marks.is_empty();
+        pieces.push(Piece::Text(match code {
+            true => code_spans(text),
+            false if edges => edged(text),
+            false => escape(text),
+        }));
+    }
+    while let Some(o) = open.pop() {
+        close(&mut pieces, o);
+    }
+    choose_delimiters(&mut pieces, pairs);
+    flank(&mut pieces);
+    pieces
+        .into_iter()
+        .map(|p| match p {
+            Piece::Text(s) => s,
+            Piece::Run { ch, len, .. } => ch.to_string().repeat(len),
+        })
+        .collect()
+}
+
+/// The delimiter run of a bold, italic or strike mark; `*` until `choose_delimiters`.
+fn delimiter(t: Option<&str>, open: bool, pair: usize) -> Piece {
+    let (ch, len) = match t {
+        Some("bold") => ('*', 2),
+        Some("italic") => ('*', 1),
+        _ => ('~', 2),
+    };
+    Piece::Run {
+        ch,
+        len,
+        open,
+        pair,
+    }
+}
+
+/// Picks `*` or `_` for each bold and italic mark so that no run touches another of the
+/// same character, which would read as one run.
+fn choose_delimiters(pieces: &mut [Piece], pairs: usize) {
+    let at = |pieces: &[Piece], pair: usize| -> Vec<usize> {
+        let found = pieces
+            .iter()
+            .enumerate()
+            .filter(|(_, p)| matches!(p, Piece::Run { pair: q, ch: '*' | '_', .. } if *q == pair));
+        found.map(|(i, _)| i).collect()
+    };
+    for pair in 0..pairs {
+        let sites = at(pieces, pair);
+        if sites.is_empty() {
+            continue;
+        }
+        // Runs already chosen beside either end of this mark.
+        let beside: Vec<char> = sites
+            .iter()
+            .flat_map(|&i| [i.checked_sub(1), Some(i + 1)])
+            .flatten()
+            .filter_map(|j| match pieces.get(j) {
+                Some(Piece::Run { ch, pair: q, .. }) if *q < pair || *ch == '~' => Some(*ch),
+                _ => None,
+            })
+            .collect();
+        let ch = ['*', '_']
+            .into_iter()
+            .find(|c| !beside.contains(c))
+            .unwrap_or('*');
+        for i in sites {
+            if let Piece::Run { ch: c, .. } = &mut pieces[i] {
+                *c = ch;
+            }
+        }
+    }
+}
+
+/// A run opens only beside what's outside it on its left, and closes only beside what's on
+/// its right, as Markdown's flanking rules allow. Where that's a letter or digit and the
+/// run couldn't open or close beside it, the letter is written as an entity, which reads
+/// as punctuation there and as itself in the text.
+fn flank(pieces: &mut [Piece]) {
+    for i in 0..pieces.len() {
+        let Piece::Run { ch, open, .. } = pieces[i] else {
+            continue;
+        };
+        let before = pieces[..i].iter().rev().find_map(|p| match p {
+            Piece::Text(s) => s.chars().next_back(),
+            Piece::Run { ch, .. } => Some(*ch),
+        });
+        let after = pieces[i + 1..].iter().find_map(|p| match p {
+            Piece::Text(s) => s.chars().next(),
+            Piece::Run { ch, .. } => Some(*ch),
+        });
+        let (inner, outer) = if open {
+            (after, before)
+        } else {
+            (before, after)
+        };
+        let punct = |c: Option<char>| c.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace());
+        // `_` never opens or closes inside a word; `*` and `~` don't beside punctuation.
+        let stuck = outer.is_some_and(char::is_alphanumeric) && (ch == '_' || punct(inner));
+        if !stuck {
+            continue;
+        }
+        let range: Box<dyn Iterator<Item = usize>> = match open {
+            true => Box::new((0..i).rev()),
+            false => Box::new(i + 1..pieces.len()),
+        };
+        for j in range {
+            if let Piece::Text(s) = &mut pieces[j] {
+                if s.is_empty() {
+                    continue;
+                }
+                let c = match open {
+                    true => s.pop(),
+                    false => Some(s.remove(0)),
+                }
+                .expect("not empty");
+                let e = entity(c);
+                match open {
+                    true => s.push_str(&e),
+                    false => s.insert_str(0, &e),
+                }
+            }
+            break;
+        }
+    }
+}
+
+/// Marked text: spaces and tabs at its ends as entities, inside the delimiters, where
+/// Markdown keeps them (W1-R32).
+fn edged(raw: &str) -> String {
+    let core = raw.trim();
+    let lead = &raw[..raw.len() - raw.trim_start().len()];
+    let trail = &raw[lead.len() + core.len()..];
+    let edge = |s: &str| -> String { s.chars().map(entity).collect() };
+    format!("{}{}{}", edge(lead), escape(core), edge(trail))
 }
 
 /// `c` as a numeric character reference.
@@ -408,67 +568,6 @@ fn flush(out: &mut String, run: &mut String, at_end: bool) {
         false => out.push_str(run),
     }
     run.clear();
-}
-
-/// A text node inside its marks, the first outermost.
-fn text(node: &Value, ctx: &RenderCtx, out: &mut String) {
-    let raw = node.get("text").and_then(Value::as_str).unwrap_or("");
-    let marks = node
-        .get("marks")
-        .and_then(Value::as_array)
-        .map_or(&[][..], Vec::as_slice);
-    let is = |t: &str| {
-        marks
-            .iter()
-            .any(|m| m.get("type").and_then(Value::as_str) == Some(t))
-    };
-    let core = raw.trim();
-    let (lead, trail) = (
-        &raw[..raw.len() - raw.trim_start().len()],
-        &raw[raw.trim_end().len()..],
-    );
-    // Edge whitespace goes inside the marks as entities, which keep the delimiters next to
-    // text Markdown accepts them beside (W1-R32). A code span would show entities as
-    // written, so its edges go outside it instead.
-    let inside = !marks.is_empty() && !is("code");
-    let (lead, trail) = match inside {
-        true => ("", ""),
-        false => (lead, trail),
-    };
-    let mut inner = match (is("code"), inside) {
-        (true, _) if core.is_empty() => return out.push_str(&escape(raw)),
-        (true, _) => code_spans(core),
-        (false, true) => {
-            let edge = |s: &str| -> String { s.chars().map(entity).collect() };
-            let core = raw.trim();
-            let lead = &raw[..raw.len() - raw.trim_start().len()];
-            format!(
-                "{}{}{}",
-                edge(lead),
-                escape(core),
-                edge(&raw[lead.len() + core.len()..])
-            )
-        }
-        (false, false) if core.is_empty() => return out.push_str(&escape(raw)),
-        (false, false) => escape(core),
-    };
-    for mark in marks.iter().rev() {
-        let (open, close) = match mark.get("type").and_then(Value::as_str) {
-            Some("bold") => ("**", "**".into()),
-            Some("italic") => ("*", "*".into()),
-            Some("strike") => ("~~", "~~".into()),
-            Some("underline") => ("<u>", "</u>".into()),
-            Some("link") => match link_destination(mark, ctx) {
-                Some(dest) => ("[", format!("]({})", destination(&dest))),
-                None => continue,
-            },
-            _ => continue,
-        };
-        inner = format!("{open}{inner}{close}");
-    }
-    out.push_str(&escape(lead));
-    out.push_str(&inner);
-    out.push_str(&escape(trail));
 }
 
 /// A link mark's `href` if it passes the scheme check, or `doc:<collection>/<slug>`.
@@ -519,7 +618,7 @@ mod tests {
                 to_markdown(&full(), &plain(), ctx),
                 concat!(
                     "## Title\n\n",
-                    "**b***<u>~~i~~</u>*&#115;`S`\\\n",
+                    "**b**_<u>~~i~~</u>_&#115;`S`\\\n",
                     "[x](https://example.com/a?b=c#d)[x](http://example.com)[x](mailto:ann@example.com)",
                     "[x](tel:+441234567890)[x](/about)[x](#top)[x](doc:posts/hello)[x](/new)",
                     "[x](doc:posts/hello)[x](/same)\n\n",

@@ -1543,17 +1543,17 @@ mod tests {
                 code("c")
             ]))])))
         );
-        // Spaces at a split span's ends go outside it, where Markdown keeps them.
+        // Spaces at a split span's ends stay inside it, padded so Markdown keeps them.
         let spaced = doc(json!([para(json!([code("a\n b \nc")]))]));
         let markdown = to_markdown(&spaced, &kind, &ctx);
-        assert_eq!(markdown, "`a`&#10; `b`&#32;&#10;`c`");
+        assert_eq!(markdown, "`a`&#10;`  b  `&#10;`c`");
         assert_eq!(
             from_markdown(&markdown, &kind),
             Ok(doc(json!([para(json!([
                 code("a"),
-                t("\n "),
-                code("b"),
-                t(" \n"),
+                t("\n"),
+                code(" b "),
+                t("\n"),
                 code("c")
             ]))])))
         );
@@ -1652,6 +1652,92 @@ mod tests {
                 Ok(fixture),
                 "{m}\n{markdown}"
             );
+        }
+    }
+
+    /// Text nodes whose marks overlap, touch or differ read back as written (W1-R33).
+    #[test]
+    fn markdown_touching_marks_round_trip() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        let sets = [
+            json!([]),
+            json!([{"type": "bold"}]),
+            json!([{"type": "italic"}]),
+            json!([{"type": "strike"}]),
+            json!([{"type": "underline"}]),
+            json!([{"type": "code"}]),
+            json!([{"type": "link", "attrs": {"href": "/a"}}]),
+            json!([{"type": "bold"}, {"type": "italic"}]),
+        ];
+        let node = |text: &str, marks: &Value| match marks.as_array().unwrap().is_empty() {
+            true => t(text),
+            false => marked(text, marks.clone()),
+        };
+        // Adjacent text under the same marks reads back as one node.
+        let merged = |nodes: Vec<Value>| {
+            let mut out: Vec<Value> = Vec::new();
+            for n in nodes {
+                match out.last_mut() {
+                    Some(last) if last.get("marks") == n.get("marks") => {
+                        let joined = format!(
+                            "{}{}",
+                            last["text"].as_str().unwrap(),
+                            n["text"].as_str().unwrap()
+                        );
+                        last["text"] = joined.into();
+                    }
+                    _ => out.push(n),
+                }
+            }
+            para(Value::Array(out))
+        };
+        let joins = ["x", " ", "!"];
+        for a in &sets {
+            for b in &sets {
+                let (mut fixture, mut expected) = (Vec::new(), Vec::new());
+                for (ja, jb) in joins
+                    .iter()
+                    .flat_map(|ja| joins.iter().map(move |jb| (ja, jb)))
+                {
+                    let pair = vec![node(&format!("a{ja}"), a), node(&format!("{jb}b"), b)];
+                    let around = vec![t("p"), pair[0].clone(), pair[1].clone(), t("q")];
+                    fixture.push(para(Value::Array(pair.clone())));
+                    expected.push(merged(pair));
+                    fixture.push(para(Value::Array(around.clone())));
+                    expected.push(merged(around));
+                }
+                let markdown = to_markdown(&doc(Value::Array(fixture)), &kind, &ctx);
+                assert_eq!(
+                    from_markdown(&markdown, &kind),
+                    Ok(doc(Value::Array(expected))),
+                    "{a} then {b}\n{markdown}"
+                );
+            }
+        }
+        // Three in a row, so a mark kept open across nodes nests with the others.
+        for a in &sets {
+            for b in &sets {
+                let fixture: Vec<Value> = sets
+                    .iter()
+                    .map(|c| para(json!([node("a", a), node(" b!", b), node("c", c)])))
+                    .collect();
+                let expected: Vec<Value> = sets
+                    .iter()
+                    .map(|c| merged(vec![node("a", a), node(" b!", b), node("c", c)]))
+                    .collect();
+                let markdown = to_markdown(&doc(Value::Array(fixture)), &kind, &ctx);
+                assert_eq!(
+                    from_markdown(&markdown, &kind),
+                    Ok(doc(Value::Array(expected))),
+                    "{a} then {b}\n{markdown}"
+                );
+            }
         }
     }
 
