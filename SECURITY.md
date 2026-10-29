@@ -10,6 +10,8 @@ TachyonCMS is pre-alpha. Until 1.0, security fixes land on `main` and ship in th
 | `main` | Yes |
 | Older 0.x releases | No |
 
+How TachyonCMS protects your content, and what it doesn't protect yet, is written up in the [security model](https://docs.tachyoncms.com/security-model).
+
 ## Reporting a vulnerability
 
 Please don't report security issues in public issues, discussions or pull requests.

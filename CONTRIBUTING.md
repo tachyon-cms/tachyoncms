@@ -48,6 +48,10 @@ git commit -s -m "fix: reject an empty slug"
 
 The sign-off says you wrote the change, or otherwise have the right to submit it under the project's license. The `DCO` check fails without it. Forgot? `git rebase --signoff main` and a force-push fixes every commit at once. There's no CLA, and we'll never ask you to assign copyright: see [GOVERNANCE.md](GOVERNANCE.md).
 
+## Docs
+
+The docs at [docs.tachyoncms.com](https://docs.tachyoncms.com) live in [tachyon-cms/website](https://github.com/tachyon-cms/website) under `docs/`. If your change alters behaviour, open a matching docs PR there. Each release is checked against the docs before it's published, and the docs for a new feature ship with the release that has it.
+
 ## Commit messages
 
 We use [Conventional Commits](https://www.conventionalcommits.org/): `feat:`, `fix:`, `docs:`, `refactor:`, `test:`, `chore:`, with an optional scope such as `feat(api):`. Keep the subject under 72 characters and say what changed for the user, not which file you touched. Pull requests are squash-merged, so the PR title becomes the commit on `main`. Please give it the same care.
