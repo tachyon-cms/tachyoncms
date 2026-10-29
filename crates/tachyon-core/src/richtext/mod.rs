@@ -498,6 +498,9 @@ impl Check<'_, '_> {
             Some(Value::Object(f)) => f,
             Some(_) => return self.fail(at("fields"), "expected an object"),
         };
+        // Every field of this node starts one level below it, so a block node
+        // deeper inside one field must not carry its depth to the next.
+        let outer = self.budget.depth;
         self.budget.depth = depth;
         crate::validate::check_object(
             &block.fields,
@@ -507,6 +510,7 @@ impl Check<'_, '_> {
             &mut self.errors,
             Some(&mut *self.budget),
         );
+        self.budget.depth = outer;
     }
 
     fn marks(&mut self, marks: &Value, path: &str) {
@@ -1079,6 +1083,27 @@ mod tests {
             )
             .is_ok()
         );
+    }
+
+    #[test]
+    fn sibling_rich_text_in_a_block_starts_from_the_block_depth() {
+        // A deep block node in `a` must not push `b` deeper: both fields of the
+        // outer block start one level below it.
+        let fields = fields(json!({"blocks": [{"slug": "pair", "fields": [
+            {"name": "a", "type": "richText", "blocks": [{"slug": "leaf", "fields": []}]},
+            {"name": "b", "type": "richText"}
+        ]}]}));
+        let mut deep_block = json!({"type": "block", "attrs": {"blockType": "leaf"}});
+        for _ in 0..20 {
+            deep_block = json!({"type": "blockquote", "content": [deep_block]});
+        }
+        let body = doc(
+            json!([{"type": "block", "attrs": {"blockType": "pair", "fields": {
+                "a": doc(json!([deep_block])),
+                "b": nested(25)
+            }}}]),
+        );
+        assert_eq!(check(&fields, body).err(), None);
     }
 
     #[test]
