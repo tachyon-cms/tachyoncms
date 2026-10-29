@@ -253,22 +253,18 @@ cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
 
 ## Roadmap
 
-| Milestone | What it adds |
-|---|---|
-| 1 | Schemas, validation, REST CRUD **(done)** |
-| 2 | Filters, sorting, relationships, globals **(done)** |
-| 3 | Auth, sessions, API keys, access rules **(done)** |
-| 4 | Drafts, versions, scheduled publishing, Trash |
-| 5 | Localization and full-text search |
-| 6 | Media library and image processing |
-| 7 | GraphQL and OpenAPI |
-| 8 | Passkeys, two-factor auth, single sign-on |
-| 9 | WebAssembly plugins and webhooks |
-| 10 | Live preview |
-| 11 | WordPress importer |
-| 12 | Helm chart and published benchmarks (signed release builds and a Docker image ship from v0.1.0) |
+Done: content types, validation and REST CRUD; filters, sorting, relationships and globals; sign-in, sessions, API keys and access rules. v0.1.0 ships all of it as signed binaries and a Docker image.
 
-The admin UI is built alongside, starting after milestone 3.
+Next, in this order, with no dates:
+
+1. Rich text and blocks (in progress)
+2. Drafts, versions and scheduled publishing
+3. Media library and image processing
+4. Live preview
+5. Authoring tools: Markdown in and out, bulk import
+6. The admin, as easy as WordPress for the people who publish
+
+After that: localization and full-text search, GraphQL and OpenAPI, passkeys, two-factor and single sign-on, WebAssembly plugins and webhooks, a WordPress importer, a Helm chart and published benchmarks. [Discussion #35](https://github.com/tachyon-cms/tachyoncms/discussions/35) has the reasoning, and the polls in [#38](https://github.com/tachyon-cms/tachyoncms/discussions/38) and [#39](https://github.com/tachyon-cms/tachyoncms/discussions/39) can change the order.
 
 ## Project layout
 
