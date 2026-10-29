@@ -31,9 +31,7 @@ pub fn validate_document(
     existing: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, Vec<FieldError>> {
     let fields: &[Field] = &data_fields(fields);
-    let mut input = input.clone();
-    markdown_inputs(fields, &mut input)?;
-    let Value::Object(input) = &input else {
+    let Value::Object(input) = input else {
         return Err(vec![error(String::new(), "expected a JSON object")]);
     };
     let mut doc = existing.cloned().unwrap_or_default();
@@ -69,7 +67,8 @@ pub fn validate_document(
 
 /// Turns each rich text value in `input` sent as `{"format": "markdown", "value": "…"}`
 /// into its JSON form (`richtext::from_markdown`), in place, and returns where each was
-/// (`body`, `layout.0.copy`). Documents they name by slug are still named so.
+/// (`body`, `layout.0.copy`). Documents they name by slug are still named so. Callers run
+/// it before field rules; `validate_document` refuses Markdown left unconverted.
 pub fn markdown_inputs(
     fields: &[Field],
     input: &mut Value,
@@ -587,6 +586,13 @@ pub(crate) fn check_value(
                     within.as_deref_mut(),
                 );
             }
+        }
+        // Converted by the API before field rules see it, never here (W1-R26).
+        (FieldKind::RichText { .. }, text) if text.get("format").is_some() => {
+            errors.push(error(
+                path.into(),
+                "Markdown must be converted before validation",
+            ));
         }
         (FieldKind::RichText { .. }, text) => {
             let checked = match within {

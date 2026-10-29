@@ -1541,7 +1541,7 @@ mod tests {
         .unwrap();
         let md = |s: &str| json!({"format": "markdown", "value": s});
         let mut input =
-            json!({"body": md("**hi**"), "layout": [{"blockType": "copy", "text": md("x")}]});
+            json!({"body": md("**hi**"), "layout": [{"blockType": "copy", "text": md("*x*")}]});
         assert_eq!(
             markdown_inputs(&fields, &mut input),
             Ok(vec!["body".into(), "layout.0.text".into()])
@@ -1553,12 +1553,7 @@ mod tests {
                 json!([{"type": "bold"}])
             )]))]))
         );
-        let stored = validate_document(
-            &fields,
-            &json!({"layout": [{"blockType": "copy", "text": md("*x*")}]}),
-            None,
-        )
-        .unwrap();
+        let stored = validate_document(&fields, &input, None).unwrap();
         assert_eq!(
             stored["layout"][0]["text"],
             doc(json!([para(json!([marked(
@@ -1567,7 +1562,7 @@ mod tests {
             )]))]))
         );
 
-        let refused = |input: Value| validate_document(&fields, &input, None).unwrap_err();
+        let refused = |mut input: Value| markdown_inputs(&fields, &mut input).unwrap_err();
         assert_eq!(
             refused(json!({"layout": [{"blockType": "copy", "text": md("ok\n\n<b>no</b>")}]})),
             vec![FieldError {
@@ -1598,9 +1593,32 @@ mod tests {
                 }]
             );
         }
-        // Without the API to find it by, a document named by slug is refused.
+
+        // Validation never converts: Markdown that reaches it unconverted skipped the field
+        // rules that run on the converted form, so it's refused (W1-R26).
+        let unconverted = "Markdown must be converted before validation";
         assert_eq!(
-            refused(json!({"body": md("[x](doc:posts/intro)")}))[0].message,
+            validate_document(
+                &fields,
+                &json!({"body": md("hi"), "layout": [{"blockType": "copy", "text": md("x")}]}),
+                None
+            ),
+            Err(vec![
+                FieldError {
+                    path: "body".into(),
+                    message: unconverted.into()
+                },
+                FieldError {
+                    path: "layout.0.text".into(),
+                    message: unconverted.into()
+                },
+            ])
+        );
+        // Without the API to find it by, a document named by slug is refused.
+        let mut input = json!({"body": md("[x](doc:posts/intro)")});
+        markdown_inputs(&fields, &mut input).unwrap();
+        assert_eq!(
+            validate_document(&fields, &input, None).unwrap_err()[0].message,
             "names its document by slug; it must be saved with the document's ID"
         );
     }
