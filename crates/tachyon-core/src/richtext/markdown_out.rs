@@ -4,31 +4,32 @@
 use serde_json::Value;
 
 use super::{RenderCtx, attr, children, code_language, field_text, kind, safe_href};
+use crate::schema::FieldKind;
 
 /// `doc` as Markdown. Text is escaped so it reads back as text. What Markdown can't say is
 /// left out: subscript and superscript are plain text, table cells don't span, and a
 /// link's `newTab` is dropped. An internal link the context has no slug for, or an `href`
 /// that fails the scheme check, is its text alone; so is a relationship node, which is
-/// then left out.
+/// then left out. `kind` is the rich text field's; it says how block attributes are
+/// written.
 // ponytail: each text node wraps its own marks, so two touching nodes with different marks
-// can give delimiter runs (`**b***i*`) that read back differently, and only a paragraph's
-// first line is escaped against starting a heading or list. Merge mark runs across nodes
-// if Markdown input's round trip shows it matters.
-pub fn to_markdown(doc: &Value, ctx: &RenderCtx) -> String {
-    blocks(children(doc), ctx)
+// can give delimiter runs (`**b***i*`) that read back differently. Merge mark runs across
+// nodes if Markdown input's round trip shows it matters.
+pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
+    blocks(children(doc), Some(kind), ctx)
 }
 
 /// Block nodes apart by a blank line, empty ones left out.
-fn blocks(nodes: &[Value], ctx: &RenderCtx) -> String {
+fn blocks(nodes: &[Value], k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let parts: Vec<String> = nodes
         .iter()
-        .map(|n| block(n, ctx))
+        .map(|n| block(n, k, ctx))
         .filter(|b| !b.is_empty())
         .collect();
     parts.join("\n\n")
 }
 
-fn block(node: &Value, ctx: &RenderCtx) -> String {
+fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let number = |name| attr(node, name).and_then(Value::as_u64);
     match kind(node) {
         "paragraph" => line_start(inline(children(node), ctx)),
@@ -36,18 +37,18 @@ fn block(node: &Value, ctx: &RenderCtx) -> String {
             let level = number("level").unwrap_or(1).clamp(1, 6) as usize;
             format!("{} {}", "#".repeat(level), inline(children(node), ctx))
         }
-        "bulletList" => list(node, ctx, |_, _| "- ".into()),
+        "bulletList" => list(node, k, ctx, |_, _| "- ".into()),
         "orderedList" => {
             let start = number("start").unwrap_or(1);
-            list(node, ctx, |i, _| format!("{}. ", start + i as u64))
+            list(node, k, ctx, |i, _| format!("{}. ", start + i as u64))
         }
-        "taskList" => list(node, ctx, |_, item| {
+        "taskList" => list(node, k, ctx, |_, item| {
             match attr(item, "checked") == Some(&Value::Bool(true)) {
                 true => "- [x] ".into(),
                 false => "- [ ] ".into(),
             }
         }),
-        "blockquote" => blocks(children(node), ctx)
+        "blockquote" => blocks(children(node), k, ctx)
             .lines()
             .map(|l| {
                 if l.is_empty() {
@@ -76,7 +77,7 @@ fn block(node: &Value, ctx: &RenderCtx) -> String {
             for (i, row) in children(node).iter().enumerate() {
                 let cells: Vec<String> = children(row)
                     .iter()
-                    .map(|cell| blocks(children(cell), ctx).replace('\n', " "))
+                    .map(|cell| blocks(children(cell), k, ctx).replace('\n', " "))
                     .collect();
                 lines.push(format!("| {} |", cells.join(" | ")));
                 if i == 0 {
@@ -99,13 +100,18 @@ fn block(node: &Value, ctx: &RenderCtx) -> String {
                 None => String::new(),
             }
         }
-        "block" => directive(node, ctx),
+        "block" => directive(node, k, ctx),
         _ => String::new(),
     }
 }
 
 /// A list: each item's marker from `marker(index, item)`, its later lines indented to match.
-fn list(node: &Value, ctx: &RenderCtx, marker: impl Fn(usize, &Value) -> String) -> String {
+fn list(
+    node: &Value,
+    k: Option<&FieldKind>,
+    ctx: &RenderCtx,
+    marker: impl Fn(usize, &Value) -> String,
+) -> String {
     let mut out = Vec::new();
     for (i, item) in children(node).iter().enumerate() {
         let marker = marker(i, item);
@@ -114,7 +120,7 @@ fn list(node: &Value, ctx: &RenderCtx, marker: impl Fn(usize, &Value) -> String)
         // 1, which Markdown won't let interrupt a paragraph.
         let mut body = String::new();
         for child in children(item) {
-            let text = block(child, ctx);
+            let text = block(child, k, ctx);
             if text.is_empty() {
                 continue;
             }
@@ -154,26 +160,31 @@ fn list(node: &Value, ctx: &RenderCtx, marker: impl Fn(usize, &Value) -> String)
 
 /// A block node: `::type{key="value" …}`, or, when exactly one of its fields is rich text,
 /// `:::type{…}` around that text, with enough colons to hold any directive inside.
-fn directive(node: &Value, ctx: &RenderCtx) -> String {
+fn directive(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let block_type = attr(node, "blockType")
         .and_then(Value::as_str)
         .unwrap_or("");
+    let def = k.and_then(|k| k.block(block_type));
+    let field = |name: &str| def.and_then(|d| d.fields.iter().find(|f| f.name == name));
     let fields = attr(node, "fields").and_then(Value::as_object);
     let fields: Vec<(&String, &Value)> = fields.into_iter().flatten().collect();
-    let texts: Vec<&Value> = fields
-        .iter()
-        .map(|(_, v)| *v)
-        .filter(|v| kind(v) == "doc")
-        .collect();
+    let texts: Vec<&(&String, &Value)> = fields.iter().filter(|(_, v)| kind(v) == "doc").collect();
     let body = match texts[..] {
-        [text] => Some(to_markdown(text, ctx)),
+        [(name, text)] => Some(blocks(children(text), field(name).map(|f| &f.kind), ctx)),
         _ => None,
     };
     let attrs: Vec<String> = fields
         .iter()
         .filter(|(_, v)| body.is_none() || kind(v) != "doc")
         .filter(|(name, _)| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
-        .filter_map(|(name, v)| Some(format!("{name}=\"{}\"", quoted(&field_text(v)?))))
+        .filter_map(|(name, v)| {
+            // A json field's string is written as JSON too, so `"30"` doesn't read back as 30.
+            let text = match field(name).map(|f| &f.kind) {
+                Some(FieldKind::Json) => Some(v.to_string()),
+                _ => field_text(v),
+            };
+            Some(format!("{name}=\"{}\"", quoted(&text?)))
+        })
         .collect();
     let head = match attrs.is_empty() {
         true => block_type.to_owned(),
@@ -223,17 +234,52 @@ fn line_start(s: String) -> String {
     s
 }
 
-/// Text that reads back as itself, not as Markdown.
+/// Text that reads back as itself, not as Markdown. A line break is an entity, so it can't
+/// start a line that reads as structure (W1-R28).
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        // `!` too, or text ending in one would turn a link after it into an image.
-        if "\\`*_[]<>~|&!".contains(c) {
-            out.push('\\');
+        match c {
+            '\n' | '\r' => out.push_str(line_break(c)),
+            // `!` too, or text ending in one would turn a link after it into an image.
+            _ if "\\`*_[]<>~|&!".contains(c) => {
+                out.push('\\');
+                out.push(c);
+            }
+            _ => out.push(c),
         }
-        out.push(c);
     }
     out
+}
+
+/// `\n` or `\r` as an entity, which reads back as itself.
+fn line_break(c: char) -> &'static str {
+    if c == '\n' { "&#10;" } else { "&#13;" }
+}
+
+/// `s` in a code span. Code spans can't hold a line break, so the span ends before each
+/// one and starts again after it, the break written outside as an entity (W1-R28).
+fn code_spans(s: &str) -> String {
+    let mut out = String::new();
+    let mut rest = s;
+    loop {
+        let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
+        let span = &rest[..end];
+        if !span.is_empty() {
+            let fence = "`".repeat(longest_run(span, '`') + 1);
+            let pad = if span.starts_with('`') || span.ends_with('`') {
+                " "
+            } else {
+                ""
+            };
+            out.push_str(&format!("{fence}{pad}{span}{pad}{fence}"));
+        }
+        let Some(c) = rest[end..].chars().next() else {
+            return out;
+        };
+        out.push_str(line_break(c));
+        rest = &rest[end + 1..];
+    }
 }
 
 /// A link destination: brackets and backslashes escaped.
@@ -248,16 +294,20 @@ fn destination(s: &str) -> String {
     out
 }
 
+/// Inline nodes. Each line after a hard break is escaped as a paragraph's first line is.
 fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
-    let mut out = String::new();
+    let mut lines = vec![String::new()];
     for node in nodes {
         match kind(node) {
-            "hardBreak" => out.push_str("\\\n"),
-            "text" => text(node, ctx, &mut out),
+            "hardBreak" => lines.push(String::new()),
+            "text" => text(node, ctx, lines.last_mut().expect("never empty")),
             _ => {}
         }
     }
-    out
+    let first = lines.remove(0);
+    lines
+        .into_iter()
+        .fold(first, |out, l| format!("{out}\\\n{}", line_start(l)))
 }
 
 /// A text node inside its marks, the first outermost. Spaces at either end go outside the
@@ -283,15 +333,7 @@ fn text(node: &Value, ctx: &RenderCtx, out: &mut String) {
         return;
     }
     let mut inner = match is("code") {
-        true => {
-            let fence = "`".repeat(longest_run(core, '`') + 1);
-            let pad = if core.starts_with('`') || core.ends_with('`') {
-                " "
-            } else {
-                ""
-            };
-            format!("{fence}{pad}{core}{pad}{fence}")
-        }
+        true => code_spans(core),
         false => escape(core),
     };
     for mark in marks.iter().rev() {
@@ -308,9 +350,9 @@ fn text(node: &Value, ctx: &RenderCtx, out: &mut String) {
         };
         inner = format!("{open}{inner}{close}");
     }
-    out.push_str(lead);
+    out.push_str(&escape(lead));
     out.push_str(&inner);
-    out.push_str(trail);
+    out.push_str(&escape(trail));
 }
 
 /// A link mark's `href` if it passes the scheme check, or `doc:<collection>/<slug>`.
@@ -332,6 +374,13 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// A field that defines no block types, so block attributes are written by value.
+    fn plain() -> FieldKind {
+        let f: crate::schema::Field =
+            serde_json::from_value(json!({"name": "body", "type": "richText"})).unwrap();
+        f.kind
+    }
+
     /// Post `P1`'s slug is `hello` and author `A1`'s is `ann`; nothing else is readable.
     fn ctx_for(test: impl FnOnce(&RenderCtx)) {
         let none = |_: &str, _: &Value| None;
@@ -351,7 +400,7 @@ mod tests {
     fn markdown_renders_every_node() {
         ctx_for(|ctx| {
             assert_eq!(
-                to_markdown(&full(), ctx),
+                to_markdown(&full(), &plain(), ctx),
                 concat!(
                     "## Title\n\n",
                     "**b***<u>~~i~~</u>*s`S`\\\n",
@@ -405,7 +454,7 @@ mod tests {
                 callout(doc(json!([para(json!([text("inside")])), callout(doc(json!([para(json!([text("deeper")]))])))])))
             ]));
             assert_eq!(
-                to_markdown(&d, ctx),
+                to_markdown(&d, &plain(), ctx),
                 concat!(
                     "\\# not \\*a\\* \\[heading\\] \\<b\\> \\| \\& \\\\\n\n",
                     "1\\. not a list\n\n",

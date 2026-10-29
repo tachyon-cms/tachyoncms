@@ -1069,13 +1069,13 @@ fn map_inner(
 pub fn rich_texts_mut(
     fields: &[Field],
     doc: &mut Map<String, Value>,
-    f: &mut impl FnMut(&str, &mut Value),
+    f: &mut impl FnMut(&str, &FieldKind, &mut Value),
 ) {
     fn walk(
         fields: &[Field],
         doc: &mut Map<String, Value>,
         prefix: &str,
-        f: &mut impl FnMut(&str, &mut Value),
+        f: &mut impl FnMut(&str, &FieldKind, &mut Value),
     ) {
         for field in fields {
             let Some(value) = doc.get_mut(&field.name) else {
@@ -1096,7 +1096,9 @@ pub fn rich_texts_mut(
                         }
                     }
                 }
-                (FieldKind::RichText { .. }, text @ Value::Object(_)) => f(&path, text),
+                (kind @ FieldKind::RichText { .. }, text @ Value::Object(_)) => {
+                    f(&path, kind, text)
+                }
                 _ => {}
             }
         }
@@ -2065,7 +2067,7 @@ mod tests {
             "empty": null
         });
         let mut seen = Vec::new();
-        rich_texts_mut(&f, d.as_object_mut().unwrap(), &mut |path, text| {
+        rich_texts_mut(&f, d.as_object_mut().unwrap(), &mut |path, _, text| {
             seen.push(path.to_owned());
             *text = json!("done");
         });

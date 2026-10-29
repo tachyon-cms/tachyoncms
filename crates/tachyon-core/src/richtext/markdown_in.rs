@@ -40,7 +40,17 @@ pub fn from_markdown(src: &str, kind: &FieldKind) -> Result<Value, Vec<FieldErro
             message: format!("Markdown can be {MAX_BYTES} bytes at most"),
         }]);
     }
-    let mut doc = Reader::new(src, kind).read().map_err(|(line, message)| {
+    // A lone `\r` ends a line, as in CommonMark; as `\n`, lines are counted alike. One
+    // byte for another, so offsets don't move.
+    let bytes = src.as_bytes();
+    let src: String = src
+        .char_indices()
+        .map(|(i, c)| match c {
+            '\r' if bytes.get(i + 1) != Some(&b'\n') => '\n',
+            c => c,
+        })
+        .collect();
+    let mut doc = Reader::new(&src, kind).read().map_err(|(line, message)| {
         vec![FieldError {
             path: String::new(),
             message: format!("line {line}: {message}"),
@@ -663,6 +673,20 @@ impl<'s, 'k> Reader<'s, 'k> {
         for (key, value) in attrs {
             let field = block.fields.iter().find(|f| f.name == key);
             let value = match field {
+                // Written as JSON whatever it holds, so a string reads back as a string.
+                Some(f) if matches!(f.kind, FieldKind::Json) => {
+                    match serde_json::from_str(&value) {
+                        Ok(v) => v,
+                        Err(_) => {
+                            return Err((
+                                line,
+                                format!(
+                                    "`{key}` holds JSON, so its value must be JSON, like `\\\"text\\\"` or `30`"
+                                ),
+                            ));
+                        }
+                    }
+                }
                 Some(f) if !takes_text(&f.kind) => {
                     serde_json::from_str(&value).unwrap_or(Value::String(value))
                 }
@@ -922,7 +946,8 @@ mod tests {
             {"slug": "video", "fields": [
                 {"name": "url", "type": "text", "required": true},
                 {"name": "start", "type": "number"},
-                {"name": "autoplay", "type": "boolean"}
+                {"name": "autoplay", "type": "boolean"},
+                {"name": "meta", "type": "json"}
             ]}
         ]}))
         .unwrap()
@@ -1259,6 +1284,21 @@ mod tests {
             (&b, &deep_list, "", "line 1: nests more than 32 levels deep".into()),
             (&b, &huge_quote, "", "line 1: nests more than 32 levels deep".into()),
             (&b, &rules, "", "line 50001: holds more than 50000 nodes".into()),
+            // A lone `\r` ends a line, as in CommonMark.
+            (
+                &b,
+                "a\r\r[x](ftp://a)",
+                "content.1.content.0.marks.0.attrs.href",
+                format!("line 3: {scheme}"),
+            ),
+            (&b, "a\r::embed{}", "", "line 2: unknown directive `::embed`".into()),
+            (
+                &b,
+                "::video{url=\"x\" meta=\"{oops\"}",
+                "",
+                "line 1: `meta` holds JSON, so its value must be JSON, like `\\\"text\\\"` or `30`"
+                    .into(),
+            ),
             // The validator's refusals, at the node, on its line.
             (
                 &bold_only,
@@ -1461,13 +1501,53 @@ mod tests {
                 ]))]},
                 {"type": "blockquote", "content": [video]}
             ])),
+            // Line breaks inside text stay text, wherever the text is (W1-R28).
+            doc(json!([
+                para(json!([t(BROKEN)])),
+                para(json!([t("\n"), marked(BROKEN, json!([{"type": "bold"}])), t("\r")])),
+                para(json!([t("a"), {"type": "hardBreak"}, t("# b"), {"type": "hardBreak"}, t("::video{}")])),
+                heading(2, BROKEN),
+                {"type": "table", "content": [
+                    {"type": "tableRow", "content": [cell("tableHeader", json!([t(BROKEN)]))]},
+                    {"type": "tableRow", "content": [cell("tableCell", json!([t(BROKEN)]))]}
+                ]}
+            ])),
+            // A json field keeps its value's type, a string that reads as JSON included.
+            doc(json!([
+                meta(json!("30")),
+                meta(json!("true")),
+                meta(json!(30)),
+                meta(json!({"a": [1, "x"]}))
+            ])),
         ];
         let kind = body().kind;
         for fixture in fixtures {
-            let markdown = to_markdown(&fixture, &ctx);
+            let markdown = to_markdown(&fixture, &kind, &ctx);
             let back = from_markdown(&markdown, &kind).map(by_id);
             assert_eq!(back, Ok(fixture), "{markdown}");
         }
+
+        // Inline code can't hold a line break, so the code mark is split around it.
+        let split = doc(json!([para(json!([code("a\nb\r\nc")]))]));
+        let markdown = to_markdown(&split, &kind, &ctx);
+        assert_eq!(markdown, "`a`&#10;`b`&#13;&#10;`c`");
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(doc(json!([para(json!([
+                code("a"),
+                t("\n"),
+                code("b"),
+                t("\r\n"),
+                code("c")
+            ]))])))
+        );
+    }
+
+    /// Text holding line breaks that would read as structure if written as they are.
+    const BROKEN: &str = "a\n::video{}\r\n# b";
+
+    fn meta(value: Value) -> Value {
+        json!({"type": "block", "attrs": {"blockType": "video", "fields": {"url": "u", "meta": value}}})
     }
 
     #[test]

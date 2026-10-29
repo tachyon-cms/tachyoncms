@@ -13,7 +13,9 @@ use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::validate::markdown_inputs;
 use tachyon_core::virtuals::{self, VirtualField};
-use tachyon_core::{CollectionKind, FieldError, map_relations, merged, relations, rich_texts_mut};
+use tachyon_core::{
+    CollectionKind, FieldError, FieldKind, map_relations, merged, relations, rich_texts_mut,
+};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
@@ -92,6 +94,9 @@ pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
         .collect()
 }
 
+/// The most documents one write may name by slug.
+const MAX_SLUGS: usize = 1000;
+
 /// Turns the rich text `input` sends as Markdown (`{"format": "markdown", …}`) into its
 /// JSON form. Runs before field rules see `input`, since a directive's block can hold
 /// fields they guard. Each document the Markdown names by slug (`doc:posts/intro`, `::ref`)
@@ -117,13 +122,25 @@ pub(crate) async fn from_markdown(
             .unwrap_or_default()
             .to_owned()
     };
+    // Each lookup is a query per 100 slugs, so a write may name only so many.
     let mut named: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut count = 0;
     for path in &paths {
         if let Some(text) = input.pointer_mut(&text_at(path)) {
             richtext::slug_refs_mut(text, &mut |_, link| {
                 let to = get(link, "relationTo");
-                named.entry(to).or_default().insert(get(link, "slug"));
+                count += usize::from(named.entry(to).or_default().insert(get(link, "slug")));
             });
+        }
+        if count > MAX_SLUGS {
+            let message = format!("names more than {MAX_SLUGS} documents by slug");
+            return Err(hide(
+                vec![FieldError {
+                    path: path.clone(),
+                    message,
+                }],
+                input,
+            ));
         }
     }
     let mut found: HashMap<(String, String), Uuid> = HashMap::new();
@@ -382,11 +399,11 @@ async fn render(
     items: &mut [(Value, Arc<Collection>, u8)],
     format: Format,
 ) -> Result<(), ApiError> {
-    let to_string: fn(&Value, &RenderCtx) -> String = match format {
+    let to_string: fn(&Value, &FieldKind, &RenderCtx) -> String = match format {
         Format::Json => return Ok(()),
-        Format::Html => richtext::to_html,
+        Format::Html => |text, _, ctx| richtext::to_html(text, ctx),
         Format::Markdown => richtext::to_markdown,
-        Format::Text => |text, _| richtext::to_text(text),
+        Format::Text => |text, _, _| richtext::to_text(text),
     };
     // The links inside each rich text field, block nodes' fields included.
     let mut ids = Vec::new();
@@ -395,7 +412,7 @@ async fn render(
             continue;
         };
         let mut texts = Vec::new();
-        rich_texts_mut(c.schema.data(), doc, &mut |path, _| {
+        rich_texts_mut(c.schema.data(), doc, &mut |path, _, _| {
             texts.push(format!("{path}."))
         });
         ids.extend(
@@ -435,8 +452,8 @@ async fn render(
     };
     for (v, c, _) in items.iter_mut() {
         if let Some(doc) = v.as_object_mut() {
-            rich_texts_mut(c.schema.data(), doc, &mut |_, text| {
-                *text = Value::String(to_string(text, &ctx))
+            rich_texts_mut(c.schema.data(), doc, &mut |_, kind, text| {
+                *text = Value::String(to_string(text, kind, &ctx))
             });
         }
     }
