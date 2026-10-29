@@ -58,6 +58,7 @@ async fn seed(pool: &PgPool) -> Seed {
         .clone();
     let relations = vec![Relation {
         path: "author".into(),
+        at: "author".into(),
         collection_id: authors,
         id: ann,
     }];

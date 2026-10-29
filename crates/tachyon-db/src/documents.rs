@@ -30,6 +30,8 @@ pub struct Document {
 #[derive(Debug, Clone)]
 pub struct Relation {
     pub path: String,
+    /// Where validation names the link, for errors about it (`RelationRef::at`).
+    pub at: String,
     pub collection_id: Uuid,
     pub id: Uuid,
 }
@@ -383,7 +385,7 @@ pub(crate) async fn sync_relations(
         .iter()
         .filter(|r| !found.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
-            path: r.path.clone(),
+            path: r.at.clone(),
             message: MISSING_LINK.into(),
         })
         .collect();

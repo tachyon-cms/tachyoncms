@@ -788,6 +788,10 @@ fn error(path: String, message: &str) -> FieldError {
 pub struct RelationRef {
     /// Where the ID sits in the document: `author`, `related.1`, `links.0.author`.
     pub path: String,
+    /// Where validation names the ID, for errors about it: `path`, but through rich text's
+    /// nodes (`body.content.0.content.1.marks.0.attrs.doc.value`) where `path` counts
+    /// references (`body.0`).
+    pub at: String,
     pub relation_to: String,
     pub id: Uuid,
     /// The field's `maxDepth`, if it caps population.
@@ -800,18 +804,26 @@ const ANY: RelationTo = RelationTo::Many(Vec::new());
 /// Every relationship ID in a validated document, in schema order.
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
     let fields: &[Field] = &data_fields(fields);
-    fn walk(fields: &[Field], obj: &Map<String, Value>, prefix: &str, out: &mut Vec<RelationRef>) {
+    /// `at`: where validation names `obj`, which differs from `prefix` inside rich text.
+    fn walk(
+        fields: &[Field],
+        obj: &Map<String, Value>,
+        prefix: &str,
+        at: &str,
+        out: &mut Vec<RelationRef>,
+    ) {
         for f in fields {
             let Some(value) = obj.get(&f.name) else {
                 continue;
             };
             let path = join(prefix, &f.name);
+            let named = join(at, &f.name);
             let max_depth = match f.kind {
                 FieldKind::Relationship { max_depth, .. } => max_depth,
                 _ => None,
             };
             // A link at `path` as stored for `relation_to`, if it is one.
-            let found = |path: String, relation_to: &RelationTo, link: &Value| {
+            let found = |path: String, at: String, relation_to: &RelationTo, link: &Value| {
                 let (slug, id) = match (relation_to, link) {
                     (RelationTo::One(slug), Value::String(id)) => (slug.as_str(), id.as_str()),
                     (RelationTo::Many(_), Value::Object(o)) => (
@@ -822,6 +834,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 };
                 Some(RelationRef {
                     path,
+                    at,
                     relation_to: slug.to_owned(),
                     id: Uuid::try_parse(id).ok()?,
                     max_depth,
@@ -835,7 +848,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                         ..
                     },
                     id,
-                ) => out.extend(found(path, relation_to, id)),
+                ) => out.extend(found(path, named, relation_to, id)),
                 (
                     FieldKind::Relationship {
                         relation_to,
@@ -845,35 +858,45 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     Value::Array(ids),
                 ) => {
                     for (i, id) in ids.iter().enumerate() {
-                        out.extend(found(format!("{path}.{i}"), relation_to, id));
+                        out.extend(found(
+                            format!("{path}.{i}"),
+                            format!("{named}.{i}"),
+                            relation_to,
+                            id,
+                        ));
                     }
                 }
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    walk(fields, inner, &path, out)
+                    walk(fields, inner, &path, &named, out)
                 }
                 (FieldKind::Array { .. } | FieldKind::Blocks { .. }, Value::Array(rows)) => {
                     for (i, row) in rows.iter().enumerate() {
                         if let Value::Object(inner) = row {
-                            walk(
-                                row_fields(&f.kind, inner),
-                                inner,
-                                &format!("{path}.{i}"),
-                                out,
-                            );
+                            let row = format!("{path}.{i}");
+                            let row_at = format!("{named}.{i}");
+                            walk(row_fields(&f.kind, inner), inner, &row, &row_at, out);
                         }
                     }
                 }
                 // The k-th link or block node in the text is `<field>.<k>`.
                 (FieldKind::RichText { .. }, text) => {
-                    for (k, item) in crate::richtext::items(text).into_iter().enumerate() {
+                    for (k, (node, item)) in crate::richtext::items(text).into_iter().enumerate() {
                         let here = format!("{path}.{k}");
+                        let node = format!("{named}.{node}");
                         match item {
                             crate::richtext::Item::Link(link) => {
-                                out.extend(found(here, &ANY, link))
+                                out.extend(found(here, format!("{node}.value"), &ANY, link))
                             }
                             crate::richtext::Item::Block(attrs) => {
                                 if let Some(Value::Object(inner)) = attrs.get("fields") {
-                                    walk(node_fields(&f.kind, attrs), inner, &here, out);
+                                    let fields_at = format!("{node}.fields");
+                                    walk(
+                                        node_fields(&f.kind, attrs),
+                                        inner,
+                                        &here,
+                                        &fields_at,
+                                        out,
+                                    );
                                 }
                             }
                         }
@@ -884,7 +907,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
         }
     }
     let mut out = Vec::new();
-    walk(fields, doc, "", &mut out);
+    walk(fields, doc, "", "", &mut out);
     out
 }
 

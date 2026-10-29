@@ -59,12 +59,13 @@ pub(crate) fn prepare(
         match targets.get(&r.relation_to) {
             Some(&collection_id) => found.push(Relation {
                 path: r.path,
+                at: r.at,
                 collection_id,
                 id: r.id,
             }),
             None => errors.push(FieldError {
                 message: format!("links to `{}`, which isn't a collection", r.relation_to),
-                path: r.path,
+                path: r.at,
             }),
         }
     }
@@ -138,7 +139,7 @@ pub(crate) fn vouched_links(
         .iter()
         .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
-            path: r.path.clone(),
+            path: r.at.clone(),
             message: MISSING_LINK.into(),
         })
         .collect();

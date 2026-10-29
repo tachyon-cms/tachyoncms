@@ -167,7 +167,11 @@ async fn block_nodes_follow_field_rules(pool: PgPool) {
         .push(doc_link("secrets", &hidden));
     let res = patch(&viewer, &own_url, linked.clone()).await;
     assert_problem(&res, 422);
-    assert_eq!(res.json["errors"][0]["path"], "body.1");
+    // The 422 names the link's node, which the editor can point at (finding: not `body.1`).
+    assert_eq!(
+        res.json["errors"][0]["path"],
+        "body.content.1.content.0.marks.0.attrs.doc.value"
+    );
     let missing = linked
         .to_string()
         .replace(&hidden, "0199d5c4-0000-7000-8000-00000000dead");

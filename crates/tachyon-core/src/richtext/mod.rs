@@ -720,22 +720,38 @@ fn is_link_mark(mark: &Value) -> bool {
 }
 
 /// Every `Item` in `value`, in order: a text node's links, then the node itself, then
-/// the nodes inside it.
-pub(crate) fn items(value: &Value) -> Vec<Item<'_>> {
-    let mut out = Vec::new();
-    each_node(value, &mut |node| {
+/// the nodes inside it. Each comes with where it sits in `value`, as validation names it:
+/// `content.0.content.1.marks.0.attrs.doc` for a link, `content.2.attrs` for a node.
+pub(crate) fn items(value: &Value) -> Vec<(String, Item<'_>)> {
+    fn walk<'v>(node: &'v Value, path: &str, out: &mut Vec<(String, Item<'v>)>) {
+        let at = |rest: String| match path {
+            "" => rest,
+            _ => format!("{path}.{rest}"),
+        };
         let marks = node.get("marks").and_then(Value::as_array);
-        for mark in marks.into_iter().flatten().filter(|m| is_link_mark(m)) {
-            if let Some(doc) = mark.pointer("/attrs/doc") {
-                out.push(Item::Link(doc));
+        for (m, mark) in marks.into_iter().flatten().enumerate() {
+            if is_link_mark(mark)
+                && let Some(doc) = mark.pointer("/attrs/doc")
+            {
+                out.push((at(format!("marks.{m}.attrs.doc")), Item::Link(doc)));
             }
         }
         match (node.get("type").and_then(Value::as_str), node.get("attrs")) {
-            (Some("relationship"), Some(attrs)) => out.push(Item::Link(attrs)),
-            (Some("block"), Some(Value::Object(attrs))) => out.push(Item::Block(attrs)),
+            (Some("relationship"), Some(attrs)) => {
+                out.push((at("attrs".into()), Item::Link(attrs)))
+            }
+            (Some("block"), Some(Value::Object(attrs))) => {
+                out.push((at("attrs".into()), Item::Block(attrs)))
+            }
             _ => {}
         }
-    });
+        let children = node.get("content").and_then(Value::as_array);
+        for (i, child) in children.into_iter().flatten().enumerate() {
+            walk(child, &at(format!("content.{i}")), out);
+        }
+    }
+    let mut out = Vec::new();
+    walk(value, "", &mut out);
     out
 }
 
@@ -764,12 +780,9 @@ pub(crate) fn each_item_mut(value: &mut Value, f: &mut impl FnMut(usize, ItemMut
 
 /// The `attrs` of every block node in `value`, at any depth.
 pub(crate) fn blocks(value: &Value) -> Vec<&Map<String, Value>> {
-    items(value)
+    block_attrs(value)
         .into_iter()
-        .filter_map(|item| match item {
-            Item::Block(attrs) => Some(attrs),
-            Item::Link(_) => None,
-        })
+        .filter_map(Value::as_object)
         .collect()
 }
 
@@ -795,19 +808,19 @@ pub(crate) fn blocks_mut(value: &mut Value, f: &mut impl FnMut(&mut Map<String, 
     });
 }
 
-/// The documents `value` links to and the relationship nodes it holds, by their index
-/// among its references (the `<k>` of `<field>.<k>`), in document order.
+/// The documents `value` links to and the relationship nodes it holds, in document order,
+/// each by where its `{relationTo, value}` sits in `value`
+/// (`content.0.content.1.marks.0.attrs.doc`, `content.2.attrs`).
 pub fn links(value: &Value) -> Vec<(String, LinkRef)> {
     items(value)
         .into_iter()
-        .enumerate()
-        .filter_map(|(k, item)| {
+        .filter_map(|(at, item)| {
             let Item::Link(link) = item else { return None };
             let doc = LinkRef::Doc {
                 collection: link.get("relationTo")?.as_str()?.to_owned(),
                 id: Uuid::try_parse(link.get("value")?.as_str()?).ok()?,
             };
-            Some((k.to_string(), doc))
+            Some((at, doc))
         })
         .collect()
 }
@@ -1510,6 +1523,21 @@ mod tests {
             .into_iter()
             .map(|r| (r.path, r.relation_to, r.id.to_string()))
             .collect();
+        // Errors about a link name its node, as validation does.
+        let at: Vec<String> = relations(&fields, &stored)
+            .into_iter()
+            .map(|r| r.at)
+            .collect();
+        assert_eq!(
+            at,
+            [
+                "body.content.0.content.1.marks.0.attrs.doc.value",
+                "body.content.1.attrs.value",
+                "body.content.2.content.0.attrs.fields.author",
+                "body.content.2.content.0.attrs.fields.meta.editor",
+                "body.content.3.content.0.marks.0.attrs.doc.value",
+            ]
+        );
         let row = |p: &str, c: &str, id: &str| (p.to_owned(), c.to_owned(), id.to_owned());
         assert_eq!(
             found,
@@ -1528,11 +1556,29 @@ mod tests {
         assert_eq!(
             links(&stored["body"]),
             [
-                ("0".to_owned(), doc_ref("posts", P1)),
-                ("1".to_owned(), doc_ref("authors", A1)),
-                ("3".to_owned(), doc_ref("posts", P2)),
+                (
+                    "content.0.content.1.marks.0.attrs.doc".to_owned(),
+                    doc_ref("posts", P1)
+                ),
+                ("content.1.attrs".to_owned(), doc_ref("authors", A1)),
+                (
+                    "content.3.content.0.marks.0.attrs.doc".to_owned(),
+                    doc_ref("posts", P2)
+                ),
             ]
         );
+        // The two walkers count the same references in the same order, or `relations` and
+        // `map_relations` would name different things `body.<k>`.
+        let kind = |item: &Item| matches!(item, Item::Block(_));
+        let read: Vec<bool> = items(&stored["body"])
+            .iter()
+            .map(|(_, i)| kind(i))
+            .collect();
+        let mut written = Vec::new();
+        each_item_mut(&mut stored["body"].clone(), &mut |k, item| {
+            written.push((k, matches!(item, ItemMut::Block(_))))
+        });
+        assert_eq!(written, read.into_iter().enumerate().collect::<Vec<_>>());
 
         // Populating swaps each `value` for the document; a hidden one stays an ID.
         let mut populated = stored.clone();
