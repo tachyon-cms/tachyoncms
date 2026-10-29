@@ -35,7 +35,11 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
         "paragraph" => line_start(inline(children(node), ctx)),
         "heading" => {
             let level = number("level").unwrap_or(1).clamp(1, 6) as usize;
-            format!("{} {}", "#".repeat(level), inline(children(node), ctx))
+            format!(
+                "{} {}",
+                "#".repeat(level),
+                line_start(inline(children(node), ctx))
+            )
         }
         "bulletList" => list(node, k, ctx, |_, _| "- ".into()),
         "orderedList" => {
@@ -168,14 +172,25 @@ fn directive(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let field = |name: &str| def.and_then(|d| d.fields.iter().find(|f| f.name == name));
     let fields = attr(node, "fields").and_then(Value::as_object);
     let fields: Vec<(&String, &Value)> = fields.into_iter().flatten().collect();
-    let texts: Vec<&(&String, &Value)> = fields.iter().filter(|(_, v)| kind(v) == "doc").collect();
-    let body = match texts[..] {
-        [(name, text)] => Some(blocks(children(text), field(name).map(|f| &f.kind), ctx)),
-        _ => None,
+    // Rich text by its field, or by its shape where the block type isn't known; a json
+    // field holding a doc-shaped value is an attribute.
+    let texts: Vec<&(&String, &Value)> = fields
+        .iter()
+        .filter(|(name, v)| {
+            kind(v) == "doc"
+                && field(name).is_none_or(|f| matches!(f.kind, FieldKind::RichText { .. }))
+        })
+        .collect();
+    let (body_name, body) = match texts[..] {
+        [(name, text)] => (
+            Some(*name),
+            Some(blocks(children(text), field(name).map(|f| &f.kind), ctx)),
+        ),
+        _ => (None, None),
     };
     let attrs: Vec<String> = fields
         .iter()
-        .filter(|(_, v)| body.is_none() || kind(v) != "doc")
+        .filter(|(name, _)| Some(*name) != body_name)
         .filter(|(name, _)| name.chars().all(|c| c.is_ascii_alphanumeric() || c == '_'))
         .filter_map(|(name, v)| {
             // A json field's string is written as JSON too, so `"30"` doesn't read back as 30.
@@ -224,6 +239,16 @@ fn longest_run(s: &str, c: char) -> usize {
 
 /// `s` with what would make its first line a heading, list, rule or directive escaped.
 fn line_start(s: String) -> String {
+    // Indent is written as entities, which Markdown keeps as text, so what follows it can't
+    // start structure (W1-R30).
+    let indent = s.len() - s.trim_start_matches([' ', '\t']).len();
+    if indent > 0 {
+        let entities: String = s[..indent]
+            .chars()
+            .map(|c| if c == ' ' { "&#32;" } else { "&#9;" })
+            .collect();
+        return format!("{entities}{}", &s[indent..]);
+    }
     if s.starts_with(['#', '-', '+', '=', ':']) {
         return format!("\\{s}");
     }
@@ -264,7 +289,11 @@ fn code_spans(s: &str) -> String {
     let mut rest = s;
     loop {
         let end = rest.find(['\n', '\r']).unwrap_or(rest.len());
-        let span = &rest[..end];
+        // Spaces at a piece's ends go outside it, where Markdown keeps them.
+        let piece = &rest[..end];
+        let span = piece.trim_matches(' ');
+        let lead = &piece[..piece.len() - piece.trim_start_matches(' ').len()];
+        out.push_str(lead);
         if !span.is_empty() {
             let fence = "`".repeat(longest_run(span, '`') + 1);
             let pad = if span.starts_with('`') || span.ends_with('`') {
@@ -273,6 +302,7 @@ fn code_spans(s: &str) -> String {
                 ""
             };
             out.push_str(&format!("{fence}{pad}{span}{pad}{fence}"));
+            out.push_str(&piece[lead.len() + span.len()..]);
         }
         let Some(c) = rest[end..].chars().next() else {
             return out;

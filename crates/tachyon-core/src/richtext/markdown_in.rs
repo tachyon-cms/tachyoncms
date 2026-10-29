@@ -1517,7 +1517,9 @@ mod tests {
                 meta(json!("30")),
                 meta(json!("true")),
                 meta(json!(30)),
-                meta(json!({"a": [1, "x"]}))
+                meta(json!({"a": [1, "x"]})),
+                // Shaped like rich text, but a json field's, so it's an attribute.
+                meta(json!({"type": "doc", "content": []}))
             ])),
         ];
         let kind = body().kind;
@@ -1541,6 +1543,59 @@ mod tests {
                 code("c")
             ]))])))
         );
+        // Spaces at a split span's ends go outside it, where Markdown keeps them.
+        let spaced = doc(json!([para(json!([code("a\n b \nc")]))]));
+        let markdown = to_markdown(&spaced, &kind, &ctx);
+        assert_eq!(markdown, "`a`&#10; `b` &#10;`c`");
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(doc(json!([para(json!([
+                code("a"),
+                t("\n "),
+                code("b"),
+                t(" \n"),
+                code("c")
+            ]))])))
+        );
+    }
+
+    /// Text that starts a line the way structure does, after any indent, stays text
+    /// wherever the line is (W1-R30).
+    #[test]
+    fn markdown_line_starts_stay_text() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        let openers = [
+            "#", "-", "*", "+", "1.", "1)", ">", "```", "~~~", ":::x", "::x{}", "|", "---", "===",
+            "<u>", "<div>",
+        ];
+        for indent in ["", " ", "  ", "   ", "    ", "\t"] {
+            for opener in openers {
+                let line = format!("{indent}{opener} b");
+                let cell = |kind: &str| json!({"type": kind, "content": [para(json!([t(&line)]))]});
+                let fixture = doc(json!([
+                    para(json!([t(&line)])),
+                    para(json!([t("a"), {"type": "hardBreak"}, t(&line)])),
+                    para(json!([t(&format!("a\n{line}"))])),
+                    heading(2, &line),
+                    {"type": "table", "content": [
+                        {"type": "tableRow", "content": [cell("tableHeader")]},
+                        {"type": "tableRow", "content": [cell("tableCell")]}
+                    ]}
+                ]));
+                let markdown = to_markdown(&fixture, &kind, &ctx);
+                assert_eq!(
+                    from_markdown(&markdown, &kind),
+                    Ok(fixture),
+                    "{line:?}\n{markdown}"
+                );
+            }
+        }
     }
 
     /// Text holding line breaks that would read as structure if written as they are.
