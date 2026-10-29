@@ -110,19 +110,20 @@ fn list(node: &Value, ctx: &RenderCtx, marker: impl Fn(usize, &Value) -> String)
     for (i, item) in children(node).iter().enumerate() {
         let marker = marker(i, item);
         // A nested list follows its paragraph directly; anything else needs a blank line,
-        // or it would run on into the line before.
+        // or it would run on into the line before. So does a numbered list starting past
+        // 1, which Markdown won't let interrupt a paragraph.
         let mut body = String::new();
         for child in children(item) {
             let text = block(child, ctx);
             if text.is_empty() {
                 continue;
             }
+            let runs_on = kind(child).ends_with("List")
+                && attr(child, "start")
+                    .and_then(Value::as_u64)
+                    .is_none_or(|s| s == 1);
             if !body.is_empty() {
-                body.push_str(if kind(child).ends_with("List") {
-                    "\n"
-                } else {
-                    "\n\n"
-                });
+                body.push_str(if runs_on { "\n" } else { "\n\n" });
             }
             body.push_str(&text);
         }
@@ -130,7 +131,13 @@ fn list(node: &Value, ctx: &RenderCtx, marker: impl Fn(usize, &Value) -> String)
             out.push(marker.trim_end().to_owned());
             continue;
         }
-        let indent = " ".repeat(marker.len());
+        // A task item's content starts after its `- `; its box is part of the content.
+        let width = ["[ ] ", "[x] "]
+            .iter()
+            .find_map(|b| marker.strip_suffix(b))
+            .unwrap_or(&marker)
+            .len();
+        let indent = " ".repeat(width);
         let lines: Vec<String> = body
             .lines()
             .enumerate()
@@ -191,10 +198,12 @@ fn directive(node: &Value, ctx: &RenderCtx) -> String {
 
 /// `s` inside a directive's double-quoted attribute.
 fn quoted(s: &str) -> String {
-    // A newline would end the directive's line; Markdown input reads `\n` back (W1-R25).
+    // A line break would end the directive's line; Markdown input reads `\n` and `\r` back
+    // (W1-R25).
     s.replace('\\', "\\\\")
         .replace('"', "\\\"")
         .replace('\n', "\\n")
+        .replace('\r', "\\r")
 }
 
 /// The longest run of `c` in `s`.
@@ -349,7 +358,7 @@ mod tests {
                     "[x](https://example.com/a?b=c#d)[x](http://example.com)[x](mailto:ann@example.com)",
                     "[x](tel:+441234567890)[x](/about)[x](#top)[x](doc:posts/hello)[x](/new)",
                     "[x](doc:posts/hello)[x](/same)\n\n",
-                    "- one\n",
+                    "- one\n\n",
                     "  3. three\n\n",
                     "1.\n\n",
                     "- [x] done\n",

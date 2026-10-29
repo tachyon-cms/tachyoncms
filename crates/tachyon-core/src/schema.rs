@@ -1511,11 +1511,14 @@ impl CollectionSchema {
 
     /// `doc`'s slug: its first top-level slug field.
     pub fn slug_of(&self, doc: &Map<String, Value>) -> Option<String> {
-        let f = self
-            .data()
+        Some(doc.get(&self.slug_field()?.name)?.as_str()?.to_owned())
+    }
+
+    /// The field a document's slug is in: its first top-level slug field.
+    pub fn slug_field(&self) -> Option<&Field> {
+        self.data()
             .iter()
-            .find(|f| matches!(f.kind, FieldKind::Slug { .. }))?;
-        Some(doc.get(&f.name)?.as_str()?.to_owned())
+            .find(|f| matches!(f.kind, FieldKind::Slug { .. }))
     }
 
     /// The shared blocks this schema's `blocks` fields name directly, each once, in schema

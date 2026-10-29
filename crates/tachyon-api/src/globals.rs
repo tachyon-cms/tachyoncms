@@ -19,8 +19,8 @@ use crate::access::{Access, both};
 use crate::documents::{json_body, shaped, unique_error};
 use crate::params::{Format, read_params};
 use crate::populate::{
-    Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
-    vouched_links,
+    Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
+    to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -120,7 +120,8 @@ pub async fn update(
         Ok((read, write)) => both(read, write),
     };
     let who = access.actor(Action::UpdateGlobal, &c);
-    let patch = json_body(body)?;
+    let mut patch = json_body(body)?;
+    from_markdown(&state, &access, &c, &mut patch, None).await?;
     let targets = link_targets(&state, &c).await?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against what's stored (nothing, before the first save) each time it's applied.

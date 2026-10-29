@@ -5,18 +5,22 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use tachyon_core::access::Compiled;
+use tachyon_core::auth::Action;
+use tachyon_core::query::parse_filter;
 use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
+use tachyon_core::validate::markdown_inputs;
 use tachyon_core::virtuals::{self, VirtualField};
-use tachyon_core::{CollectionKind, FieldError, map_relations, relations, rich_texts_mut};
+use tachyon_core::{CollectionKind, FieldError, map_relations, merged, relations, rich_texts_mut};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
-use tachyon_db::query::get_many_readable;
+use tachyon_db::query::{self, ListQuery, get_many_readable};
 use uuid::Uuid;
 
-use crate::access::Access;
+use crate::access::{Access, both};
 use crate::params::Format;
 use crate::{ApiError, AppState};
 
@@ -86,6 +90,120 @@ pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
         .into_iter()
         .map(|r| r.id)
         .collect()
+}
+
+/// Turns the rich text `input` sends as Markdown (`{"format": "markdown", …}`) into its
+/// JSON form. Runs before field rules see `input`, since a directive's block can hold
+/// fields they guard. Each document the Markdown names by slug (`doc:posts/intro`, `::ref`)
+/// is found among those the caller may read and linked by ID; one they can't read is
+/// refused exactly as one that isn't there. `existing` is the stored document, if any.
+pub(crate) async fn from_markdown(
+    state: &AppState,
+    access: &Access,
+    c: &Collection,
+    input: &mut Value,
+    existing: Option<&Map<String, Value>>,
+) -> Result<(), ApiError> {
+    let fields = c.schema.data();
+    let hide = |e: Vec<FieldError>, input: &Value| {
+        let doc = merged(fields, input, existing);
+        access.hide(c, ApiError::Validation(e), Some(&doc))
+    };
+    let paths = markdown_inputs(fields, input).map_err(|e| hide(e, input))?;
+    let text_at = |path: &str| format!("/{}", path.replace('.', "/"));
+    let get = |link: &Map<String, Value>, k: &str| {
+        link.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    let mut named: HashMap<String, HashSet<String>> = HashMap::new();
+    for path in &paths {
+        if let Some(text) = input.pointer_mut(&text_at(path)) {
+            richtext::slug_refs_mut(text, &mut |_, link| {
+                let to = get(link, "relationTo");
+                named.entry(to).or_default().insert(get(link, "slug"));
+            });
+        }
+    }
+    let mut found: HashMap<(String, String), Uuid> = HashMap::new();
+    for (to, slugs) in named {
+        for (slug, id) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
+            found.insert((to.clone(), slug), id);
+        }
+    }
+    let mut errors = Vec::new();
+    for path in &paths {
+        if let Some(text) = input.pointer_mut(&text_at(path)) {
+            richtext::slug_refs_mut(text, &mut |at, link| {
+                let (to, slug) = (get(link, "relationTo"), get(link, "slug"));
+                let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
+                match found.get(&(to.clone(), slug.clone())) {
+                    Some(id) => {
+                        link.remove("slug");
+                        link.remove("line");
+                        link.insert("value".into(), id.to_string().into());
+                    }
+                    None => errors.push(FieldError {
+                        path: format!("{path}.{at}"),
+                        message: format!(
+                            "line {line}: no `{to}` document you can read has the slug `{slug}`"
+                        ),
+                    }),
+                }
+            });
+        }
+    }
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(hide(errors, input)),
+    }
+}
+
+/// The IDs of the documents of collection `to` the caller may read whose slug is one of
+/// `slugs`, by slug. None when they can't read the collection or its slug field.
+async fn by_slug(
+    state: &AppState,
+    access: &Access,
+    to: &str,
+    slugs: Vec<String>,
+) -> Result<HashMap<String, Uuid>, ApiError> {
+    let mut out = HashMap::new();
+    let Some(c) = state
+        .schemas
+        .get(to)
+        .filter(|c| c.schema.kind == CollectionKind::Collection)
+    else {
+        return Ok(out);
+    };
+    let Some(field) = c.schema.slug_field().filter(|f| access.reads(&c, &f.name)) else {
+        return Ok(out);
+    };
+    let read = match access.allows(Action::Read, &c) {
+        Compiled::Deny => return Ok(out),
+        Compiled::Allow => None,
+        Compiled::Filter(f) => Some(f),
+    };
+    // A filter's `in` takes 100 values at most.
+    for chunk in slugs.chunks(100) {
+        let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let filter = both(Some(named), read.clone());
+        let q = ListQuery {
+            filter: filter.as_ref(),
+            sort: None,
+            limit: chunk.len() as i64,
+            offset: 0,
+            after: None,
+            count: false,
+        };
+        for doc in query::list(&state.pool, c.id, &q).await?.docs {
+            if let Some(slug) = c.schema.slug_of(&doc.data) {
+                out.insert(slug, doc.id);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.

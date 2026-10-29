@@ -10,10 +10,12 @@ use crate::schema::{BlockSource, FieldKind};
 use crate::validate::{FieldError, slugify};
 
 mod html;
+mod markdown_in;
 mod markdown_out;
 mod text;
 
 pub use html::to_html;
+pub use markdown_in::{from_markdown, slug_refs_mut};
 pub use markdown_out::to_markdown;
 pub use text::to_text;
 

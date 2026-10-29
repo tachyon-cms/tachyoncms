@@ -23,8 +23,8 @@ use crate::access::{Access, both};
 use crate::joins::fill_joins;
 use crate::params::{Format, Joins, list_params, read_params};
 use crate::populate::{
-    Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
-    vouched_links,
+    Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
+    to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -213,7 +213,8 @@ pub async fn create(
     if !access.may_create(&c) {
         return Err(access.refuse());
     }
-    let body = json_body(body)?;
+    let mut body = json_body(body)?;
+    from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
     let targets = link_targets(&state, &c).await?;
     let prepared = validate_document(c.schema.data(), &body, None)
@@ -295,10 +296,11 @@ pub async fn update(
     let guard = access
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
-    let patch = json_body(body)?;
+    let mut patch = json_body(body)?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one.
     let stored = documents::get(&state.pool, c.id, id).await?.data.0;
+    from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: &Map<String, Value>| {

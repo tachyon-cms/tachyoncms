@@ -31,7 +31,9 @@ pub fn validate_document(
     existing: Option<&Map<String, Value>>,
 ) -> Result<Map<String, Value>, Vec<FieldError>> {
     let fields: &[Field] = &data_fields(fields);
-    let Value::Object(input) = input else {
+    let mut input = input.clone();
+    markdown_inputs(fields, &mut input)?;
+    let Value::Object(input) = &input else {
         return Err(vec![error(String::new(), "expected a JSON object")]);
     };
     let mut doc = existing.cloned().unwrap_or_default();
@@ -63,6 +65,85 @@ pub fn validate_document(
     }
     normalize(fields, &mut doc);
     Ok(doc)
+}
+
+/// Turns each rich text value in `input` sent as `{"format": "markdown", "value": "…"}`
+/// into its JSON form (`richtext::from_markdown`), in place, and returns where each was
+/// (`body`, `layout.0.copy`). Documents they name by slug are still named so.
+pub fn markdown_inputs(
+    fields: &[Field],
+    input: &mut Value,
+) -> Result<Vec<String>, Vec<FieldError>> {
+    fn walk(
+        fields: &[Field],
+        obj: &mut Map<String, Value>,
+        prefix: &str,
+        done: &mut Vec<String>,
+        errors: &mut Vec<FieldError>,
+    ) {
+        for f in fields {
+            let Some(value) = obj.get_mut(&f.name) else {
+                continue;
+            };
+            let path = join(prefix, &f.name);
+            match (&f.kind, value) {
+                (FieldKind::Group { fields }, Value::Object(inner)) => {
+                    walk(fields, inner, &path, done, errors)
+                }
+                (
+                    kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }),
+                    Value::Array(rows),
+                ) => {
+                    for (i, row) in rows.iter_mut().enumerate() {
+                        if let Value::Object(inner) = row {
+                            let fields = row_fields(kind, inner);
+                            walk(fields, inner, &format!("{path}.{i}"), done, errors);
+                        }
+                    }
+                }
+                (FieldKind::RichText { .. }, text @ Value::Object(_))
+                    if text.get("format").is_some() =>
+                {
+                    let src = match text.as_object() {
+                        Some(o) if o.len() == 2 && o["format"] == "markdown" => {
+                            o.get("value").and_then(Value::as_str)
+                        }
+                        _ => None,
+                    };
+                    let Some(src) = src else {
+                        errors.push(error(
+                            path,
+                            "expected {\"format\": \"markdown\", \"value\": \"…\"}",
+                        ));
+                        continue;
+                    };
+                    match crate::richtext::from_markdown(src, &f.kind) {
+                        Ok(doc) => {
+                            *text = doc;
+                            done.push(path);
+                        }
+                        Err(e) => errors.extend(e.into_iter().map(|e| FieldError {
+                            path: match e.path.as_str() {
+                                "" => path.clone(),
+                                at => join(&path, at),
+                            },
+                            message: e.message,
+                        })),
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    let (mut done, mut errors) = (Vec::new(), Vec::new());
+    if let Value::Object(obj) = input {
+        walk(&data_fields(fields), obj, "", &mut done, &mut errors);
+    }
+    if errors.is_empty() {
+        Ok(done)
+    } else {
+        Err(errors)
+    }
 }
 
 /// The document `validate_document` checks, before defaults: `existing` with `input`
@@ -157,7 +238,7 @@ pub(crate) fn node_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -
 }
 
 /// Fills defaults into the fields of every block node in rich text `text`.
-fn block_defaults(kind: &FieldKind, text: &mut Value) {
+pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
     crate::richtext::blocks_mut(text, &mut |attrs| {
         let fields = node_fields(kind, attrs);
         match attrs.get_mut("fields") {

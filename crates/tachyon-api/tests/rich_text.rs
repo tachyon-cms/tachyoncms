@@ -687,3 +687,180 @@ async fn a_single_user_read_takes_format(pool: PgPool) {
         assert_problem(&get(&admin, &format!("{url}?{bad}")).await, 400);
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn doc_links_resolve_through_access(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let ed = json!({"read": {"role": "editor"}});
+    for schema in [
+        json!({"slug": "authors", "fields": [
+            {"name": "name", "type": "text"}, {"name": "handle", "type": "slug"}
+        ]}),
+        // Hidden document by document: a viewer reads only published posts.
+        json!({"slug": "posts", "access": {"read": {"stage": "published"}}, "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug"},
+            {"name": "stage", "type": "text"}
+        ]}),
+        // Hidden whole.
+        json!({"slug": "secrets", "access": {"read": {"role": "editor"}}, "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug"}
+        ]}),
+        // The slug itself is hidden, so finding a guide by it would be a probe.
+        json!({"slug": "guides", "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug", "access": ed}
+        ]}),
+        json!({"slug": "settings", "kind": "global", "fields": [
+            {"name": "footer", "type": "richText", "relationTo": ["posts"]}
+        ]}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    let editors = json!({"create": {"role": "editor"}, "update": {"role": "editor"}});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages",
+            "access": {"create": {"role": ["editor", "viewer"]}, "update": {"role": ["editor", "viewer"]}},
+            "fields": [
+            {"name": "body", "type": "richText", "relationTo": ["posts", "authors", "secrets", "guides"], "blocks": [
+                {"slug": "callout", "fields": [
+                    {"name": "kind", "type": "text", "access": editors},
+                    {"name": "body", "type": "richText", "relationTo": ["posts"]}
+                ]}
+            ]}
+        ]}),
+    )
+    .await;
+    let ann = id(&create(
+        &admin,
+        "/api/authors",
+        json!({"name": "Ann", "handle": "ann"}),
+    )
+    .await);
+    let open = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Open", "slug": "open", "stage": "published"}),
+    )
+    .await);
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let md = |s: &str| json!({"body": {"format": "markdown", "value": s}});
+
+    // Each slug becomes the ID of the document it names, at the top and inside a block.
+    let page = create(
+        &viewer,
+        "/api/pages",
+        md("See [it](doc:posts/open).\n\n::ref{collection=\"authors\" slug=\"ann\"}\n\n:::callout\n[again](doc:posts/open)\n:::"),
+    )
+    .await;
+    let body = &page["body"]["content"];
+    let link = &body[0]["content"][1]["marks"][0]["attrs"]["doc"];
+    assert_eq!(
+        (link["relationTo"].as_str(), linked(link)),
+        (Some("posts"), open.as_str())
+    );
+    let rel = &body[1]["attrs"];
+    assert_eq!(
+        (rel["relationTo"].as_str(), linked(rel)),
+        (Some("authors"), ann.as_str())
+    );
+    let inner = &body[2]["attrs"]["fields"]["body"]["content"][0]["content"][0];
+    assert_eq!(linked(&inner["marks"][0]["attrs"]["doc"]), open);
+    // A stored callout node would make replacing the text count its fields.
+    let plain = create(&viewer, "/api/pages", md("plain")).await;
+    let url = format!("/api/pages/{}", id(&plain));
+    let res = patch(&viewer, &url, md("[x](doc:posts/open)")).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        linked(&res.json["body"]["content"][0]["content"][0]["marks"][0]["attrs"]["doc"]),
+        open
+    );
+    let res = patch(
+        &admin,
+        "/api/globals/settings",
+        json!({"footer": {"format": "markdown", "value": "[x](doc:posts/open)"}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        linked(&res.json["footer"]["content"][0]["content"][0]["marks"][0]["attrs"]["doc"]),
+        open
+    );
+
+    // Field rules see a directive's block fields, as they see a JSON block node's.
+    let sent = md(":::callout{kind=\"warning\"}\nx\n:::").to_string();
+    assert_problem(&send(&viewer, "POST", "/api/pages", Some(&sent)).await, 403);
+    assert_problem(
+        &patch(&viewer, &url, md(":::callout{kind=\"warning\"}\nx\n:::")).await,
+        403,
+    );
+
+    // A target the viewer can't read, by document, by collection or by its slug field, is
+    // refused exactly as one that isn't there.
+    for (collection, extra) in [
+        ("posts", json!({"stage": "draft"})),
+        ("secrets", json!({})),
+        ("guides", json!({})),
+    ] {
+        let mut doc = json!({"title": "Shut", "slug": "shut"});
+        doc.as_object_mut()
+            .unwrap()
+            .extend(extra.as_object().unwrap().clone());
+        let shut = id(&create(&admin, &format!("/api/{collection}"), doc).await);
+        let src = format!("Intro\n\n[x](doc:{collection}/shut)");
+        let hidden = send(&viewer, "POST", "/api/pages", Some(&md(&src).to_string())).await;
+        assert_problem(&hidden, 422);
+        assert_eq!(
+            hidden.json["errors"],
+            json!([{"path": "body.content.1.content.0.marks.0.attrs.doc",
+                "message": format!("line 3: no `{collection}` document you can read has the slug `shut`")}]),
+            "{collection}"
+        );
+        let res = send(&admin, "DELETE", &format!("/api/{collection}/{shut}"), None).await;
+        assert_eq!(res.status, 204, "{}", res.json);
+        let missing = send(&viewer, "POST", "/api/pages", Some(&md(&src).to_string())).await;
+        assert_eq!(missing.status, hidden.status);
+        for k in ["type", "title", "status", "detail", "errors"] {
+            assert_eq!(missing.json[k], hidden.json[k], "{collection}: {k}");
+        }
+    }
+
+    // The users route converts too, before field rules.
+    let profile = json!({"schema": {"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "bio", "type": "richText", "relationTo": ["posts"], "blocks": [
+            {"slug": "callout", "fields": [{"name": "kind", "type": "text", "access": editors}]}
+        ]}
+    ]}});
+    let res = put(&admin, "/api/admin/collections/users", profile).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let user = create(
+        &admin,
+        "/api/users",
+        json!({"email": "ed@example.com", "password": common::PASSWORD, "role": "viewer", "name": "Ed",
+            "bio": {"format": "markdown", "value": "[x](doc:posts/open)"}}),
+    )
+    .await;
+    assert_eq!(
+        linked(&user["bio"]["content"][0]["content"][0]["marks"][0]["attrs"]["doc"]),
+        open
+    );
+    let ed = common::signed_in(
+        tachyon_api::router(pool.clone()).await.unwrap(),
+        "ed@example.com",
+    )
+    .await;
+    let res = patch(
+        &ed,
+        &format!("/api/users/{}", id(&user)),
+        json!({"bio": {"format": "markdown", "value": "::callout{kind=\"x\"}"}}),
+    )
+    .await;
+    assert_problem(&res, 403);
+}
+
+/// A link's target ID, whether the response populated it or not.
+fn linked(link: &Value) -> &str {
+    let v = &link["value"];
+    v.get("id").unwrap_or(v).as_str().unwrap()
+}

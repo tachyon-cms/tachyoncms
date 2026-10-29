@@ -21,7 +21,7 @@ use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
 use crate::params::{Format, format_param};
 use crate::populate::{
-    Shapes, check_links, link_ids, link_targets, populate, prepare, vouched_links,
+    Shapes, check_links, from_markdown, link_ids, link_targets, populate, prepare, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -201,7 +201,9 @@ pub(crate) async fn create(
     }
     let users = any_collection(&state, auth::USERS)?;
     let caller = caller_of(&principal);
-    let profile = Value::Object(profile);
+    let mut profile = Value::Object(profile);
+    let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+    from_markdown(&state, &access, &users, &mut profile, None).await?;
     refuse_fields(&users, &profile, Action::Create, &caller, None)?;
     let data = validate_document(users.schema.data(), &profile, None);
     if let Err(more) = &data {
@@ -265,12 +267,14 @@ pub(crate) async fn update(
     let admin = manages_users(&principal);
     let (account, profile) = split(json_body(body)?)?;
     let users = any_collection(&state, auth::USERS)?;
-    let profile = Value::Object(profile);
+    let mut profile = Value::Object(profile);
     let caller = caller_of(&principal);
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored profile, then again against the locked one.
     let stored = if profile.as_object().is_some_and(|p| !p.is_empty()) {
         let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+        from_markdown(&state, &access, &users, &mut profile, Some(&stored)).await?;
         refuse_fields(&users, &profile, Action::Update, &caller, Some(&stored))?;
         Some(stored)
     } else {
