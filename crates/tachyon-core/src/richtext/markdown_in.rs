@@ -1741,6 +1741,90 @@ mod tests {
         }
     }
 
+    /// Links side by side, and marks around a hard break, read back as written.
+    #[test]
+    fn markdown_links_and_breaks_round_trip() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        let link = |href: &str| json!({"type": "link", "attrs": {"href": href}});
+        let with = |marks: Vec<Value>| Value::Array(marks);
+        let extras = [
+            vec![],
+            vec![json!({"type": "bold"})],
+            vec![json!({"type": "italic"})],
+            vec![json!({"type": "code"})],
+        ];
+        let joins = ["x", " ", "!"];
+        let mut fixture = Vec::new();
+        let mut expected = Vec::new();
+        for ea in &extras {
+            for eb in &extras {
+                for ja in joins {
+                    for jb in joins {
+                        // Marks in the reader's order: bold, italic, link, code.
+                        let marks = |e: &Vec<Value>, href: &str| {
+                            let mut m: Vec<Value> =
+                                e.iter().filter(|m| m["type"] != "code").cloned().collect();
+                            m.push(link(href));
+                            m.extend(e.iter().filter(|m| m["type"] == "code").cloned());
+                            with(m)
+                        };
+                        let a = marked(&format!("a{ja}"), marks(ea, "/a"));
+                        let b = marked(&format!("{jb}b"), marks(eb, "/b"));
+                        fixture.push(para(json!([t("p"), a.clone(), b.clone(), t("q")])));
+                        expected.push(para(json!([t("p"), a, b, t("q")])));
+                        // The same href twice is one link.
+                        let a = marked(&format!("a{ja}"), marks(ea, "/a"));
+                        let b = marked(&format!("{jb}b"), marks(eb, "/a"));
+                        fixture.push(para(json!([a.clone(), b.clone()])));
+                        let same = ea == eb;
+                        expected.push(match same {
+                            true => para(json!([marked(&format!("a{ja}{jb}b"), marks(ea, "/a"))])),
+                            false => para(json!([a, b])),
+                        });
+                    }
+                }
+            }
+        }
+        let br = json!({"type": "hardBreak"});
+        let bold = json!([{"type": "bold"}]);
+        let code = json!([{"type": "code"}]);
+        let linked = json!([{"type": "link", "attrs": {"href": "/a"}}]);
+        let bold_link = json!([{"type": "bold"}, {"type": "link", "attrs": {"href": "/a"}}]);
+        for p in [
+            // A mark open across the break.
+            json!([marked("a", bold.clone()), br, marked("b", bold.clone())]),
+            json!([marked("a ", bold.clone()), br, marked(" b", bold.clone())]),
+            // Ending right before it, starting right after it.
+            json!([t("x"), marked("a", bold.clone()), br, t("b")]),
+            json!([t("a"), br, marked("b", bold.clone()), t("x")]),
+            json!([
+                marked("a!", bold.clone()),
+                br,
+                marked("!b", json!([{"type": "italic"}]))
+            ]),
+            // Code and links around it.
+            json!([marked("a", code.clone()), br, marked("b", code.clone())]),
+            json!([marked("a ", code.clone()), br, marked(" b", code)]),
+            json!([marked("a", linked.clone()), br, marked("b", linked)]),
+            json!([marked("a", bold_link.clone()), br, marked("b", bold_link)]),
+        ] {
+            fixture.push(para(p.clone()));
+            expected.push(para(p));
+        }
+        let markdown = to_markdown(&doc(Value::Array(fixture)), &kind, &ctx);
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(doc(Value::Array(expected))),
+            "{markdown}"
+        );
+    }
+
     /// Text that starts a line the way structure does, after any indent, stays text
     /// wherever the line is (W1-R30).
     #[test]
