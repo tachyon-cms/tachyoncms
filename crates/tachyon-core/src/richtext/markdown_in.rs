@@ -1546,7 +1546,7 @@ mod tests {
         // Spaces at a split span's ends go outside it, where Markdown keeps them.
         let spaced = doc(json!([para(json!([code("a\n b \nc")]))]));
         let markdown = to_markdown(&spaced, &kind, &ctx);
-        assert_eq!(markdown, "`a`&#10; `b` &#10;`c`");
+        assert_eq!(markdown, "`a`&#10; `b`&#32;&#10;`c`");
         assert_eq!(
             from_markdown(&markdown, &kind),
             Ok(doc(json!([para(json!([
@@ -1557,6 +1557,39 @@ mod tests {
                 code("c")
             ]))])))
         );
+    }
+
+    /// Spaces and tabs at a line's end stay text, and never make a hard break (W1-R31).
+    #[test]
+    fn markdown_line_ends_keep_their_spaces() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        for end in [" ", "  ", "   ", "\t", " \t"] {
+            let line = format!("b{end}");
+            let cell = |kind: &str| json!({"type": kind, "content": [para(json!([t(&line)]))]});
+            let fixture = doc(json!([
+                para(json!([t(&line)])),
+                para(json!([t(&line), {"type": "hardBreak"}, t("c")])),
+                para(json!([t(&format!("{line}\nc"))])),
+                para(json!([t(&format!("{line}\r\nc"))])),
+                heading(2, &line),
+                {"type": "table", "content": [
+                    {"type": "tableRow", "content": [cell("tableHeader")]},
+                    {"type": "tableRow", "content": [cell("tableCell")]}
+                ]}
+            ]));
+            let markdown = to_markdown(&fixture, &kind, &ctx);
+            assert_eq!(
+                from_markdown(&markdown, &kind),
+                Ok(fixture),
+                "{end:?}\n{markdown}"
+            );
+        }
     }
 
     /// Text that starts a line the way structure does, after any indent, stays text

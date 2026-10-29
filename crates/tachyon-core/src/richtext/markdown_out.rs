@@ -334,10 +334,40 @@ fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
             _ => {}
         }
     }
-    let first = lines.remove(0);
-    lines
-        .into_iter()
-        .fold(first, |out, l| format!("{out}\\\n{}", line_start(l)))
+    let first = line_ends(&lines.remove(0));
+    lines.into_iter().fold(first, |out, l| {
+        format!("{out}\\\n{}", line_start(line_ends(&l)))
+    })
+}
+
+/// `s` with the spaces and tabs before its end, and before each line break written as an
+/// entity, written as entities too: Markdown drops them there, or reads two spaces as a
+/// hard break (W1-R31).
+fn line_ends(s: &str) -> String {
+    let mut out = String::with_capacity(s.len());
+    let mut run = String::new();
+    let mut rest = s;
+    while let Some(c) = rest.chars().next() {
+        if c == ' ' || c == '\t' {
+            run.push(c);
+        } else {
+            let at_end = rest.starts_with("&#10;") || rest.starts_with("&#13;");
+            flush(&mut out, &mut run, at_end);
+            out.push(c);
+        }
+        rest = &rest[c.len_utf8()..];
+    }
+    flush(&mut out, &mut run, true);
+    out
+}
+
+/// Ends a run of spaces and tabs: as entities where a line ends, as they are elsewhere.
+fn flush(out: &mut String, run: &mut String, at_end: bool) {
+    match at_end {
+        true => out.extend(run.chars().map(|c| if c == ' ' { "&#32;" } else { "&#9;" })),
+        false => out.push_str(run),
+    }
+    run.clear();
 }
 
 /// A text node inside its marks, the first outermost. Spaces at either end go outside the
