@@ -327,10 +327,33 @@ fn destination(s: &str) -> String {
 /// Inline nodes. Each line after a hard break is escaped as a paragraph's first line is.
 fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
     let mut lines = vec![String::new()];
+    // Whether the last text ended in a delimiter run with punctuation inside it.
+    let mut closed_on_punct = false;
     for node in nodes {
         match kind(node) {
-            "hardBreak" => lines.push(String::new()),
-            "text" => text(node, ctx, lines.last_mut().expect("never empty")),
+            "hardBreak" => {
+                lines.push(String::new());
+                closed_on_punct = false;
+            }
+            "text" => {
+                let mut r = String::new();
+                text(node, ctx, &mut r);
+                let line = lines.last_mut().expect("never empty");
+                // A `*` or `~` run with punctuation inside it only opens or closes with
+                // whitespace or punctuation outside it, so a letter there is an entity.
+                if delimited(&r, true)
+                    && let Some(c) = line.chars().last().filter(|c| c.is_alphanumeric())
+                {
+                    line.pop();
+                    line.push_str(&entity(c));
+                }
+                if closed_on_punct && let Some(c) = r.chars().next().filter(|c| c.is_alphanumeric())
+                {
+                    r = format!("{}{}", entity(c), &r[c.len_utf8()..]);
+                }
+                closed_on_punct = delimited(&r, false);
+                line.push_str(&r);
+            }
             _ => {}
         }
     }
@@ -338,6 +361,23 @@ fn inline(nodes: &[Value], ctx: &RenderCtx) -> String {
     lines.into_iter().fold(first, |out, l| {
         format!("{out}\\\n{}", line_start(line_ends(&l)))
     })
+}
+
+/// Whether `s` starts (or, with `start` false, ends) with a `*` or `~` delimiter run that
+/// has punctuation or a symbol on its inner side.
+fn delimited(s: &str, start: bool) -> bool {
+    let is_run = |c: &char| *c == '*' || *c == '~';
+    let (edge, inner) = match start {
+        true => (s.chars().next(), s.chars().find(|c| !is_run(c))),
+        false => (s.chars().next_back(), s.chars().rev().find(|c| !is_run(c))),
+    };
+    edge.is_some_and(|c| is_run(&c))
+        && inner.is_some_and(|c| !c.is_alphanumeric() && !c.is_whitespace())
+}
+
+/// `c` as a numeric character reference.
+fn entity(c: char) -> String {
+    format!("&#{};", c as u32)
 }
 
 /// `s` with the spaces and tabs before its end, and before each line break written as an
@@ -370,8 +410,7 @@ fn flush(out: &mut String, run: &mut String, at_end: bool) {
     run.clear();
 }
 
-/// A text node inside its marks, the first outermost. Spaces at either end go outside the
-/// marks, where Markdown needs them.
+/// A text node inside its marks, the first outermost.
 fn text(node: &Value, ctx: &RenderCtx, out: &mut String) {
     let raw = node.get("text").and_then(Value::as_str).unwrap_or("");
     let marks = node
@@ -388,13 +427,30 @@ fn text(node: &Value, ctx: &RenderCtx, out: &mut String) {
         &raw[..raw.len() - raw.trim_start().len()],
         &raw[raw.trim_end().len()..],
     );
-    if core.is_empty() {
-        out.push_str(&escape(raw));
-        return;
-    }
-    let mut inner = match is("code") {
-        true => code_spans(core),
-        false => escape(core),
+    // Edge whitespace goes inside the marks as entities, which keep the delimiters next to
+    // text Markdown accepts them beside (W1-R32). A code span would show entities as
+    // written, so its edges go outside it instead.
+    let inside = !marks.is_empty() && !is("code");
+    let (lead, trail) = match inside {
+        true => ("", ""),
+        false => (lead, trail),
+    };
+    let mut inner = match (is("code"), inside) {
+        (true, _) if core.is_empty() => return out.push_str(&escape(raw)),
+        (true, _) => code_spans(core),
+        (false, true) => {
+            let edge = |s: &str| -> String { s.chars().map(entity).collect() };
+            let core = raw.trim();
+            let lead = &raw[..raw.len() - raw.trim_start().len()];
+            format!(
+                "{}{}{}",
+                edge(lead),
+                escape(core),
+                edge(&raw[lead.len() + core.len()..])
+            )
+        }
+        (false, false) if core.is_empty() => return out.push_str(&escape(raw)),
+        (false, false) => escape(core),
     };
     for mark in marks.iter().rev() {
         let (open, close) = match mark.get("type").and_then(Value::as_str) {
@@ -463,7 +519,7 @@ mod tests {
                 to_markdown(&full(), &plain(), ctx),
                 concat!(
                     "## Title\n\n",
-                    "**b***<u>~~i~~</u>*s`S`\\\n",
+                    "**b***<u>~~i~~</u>*&#115;`S`\\\n",
                     "[x](https://example.com/a?b=c#d)[x](http://example.com)[x](mailto:ann@example.com)",
                     "[x](tel:+441234567890)[x](/about)[x](#top)[x](doc:posts/hello)[x](/new)",
                     "[x](doc:posts/hello)[x](/same)\n\n",
@@ -520,7 +576,7 @@ mod tests {
                     "1\\. not a list\n\n",
                     "\\:::not a directive\n\n",
                     "````\na\n```\nb\n````\n\n",
-                    "``a`b`` **spaced** hiddenbad[(p)](/a_\\(b\\))\n\n",
+                    "``a`b``**&#32;spaced&#32;**&#104;iddenbad[(p)](/a_\\(b\\))\n\n",
                     "Wow\\![x](/a)\n\n",
                     "::note{lines=\"one\\ntwo\\\\n\"}\n\n",
                     "::::callout{kind=\"warn \\\"x\\\"\"}\n",

@@ -1577,6 +1577,9 @@ mod tests {
                 para(json!([t(&line), {"type": "hardBreak"}, t("c")])),
                 para(json!([t(&format!("{line}\nc"))])),
                 para(json!([t(&format!("{line}\r\nc"))])),
+                // Across nodes: the run and the break written by different text nodes.
+                para(json!([marked(&line, json!([{"type": "bold"}])), t("\nc")])),
+                para(json!([t(&line), marked("\nc", json!([{"type": "italic"}]))])),
                 heading(2, &line),
                 {"type": "table", "content": [
                     {"type": "tableRow", "content": [cell("tableHeader")]},
@@ -1588,6 +1591,66 @@ mod tests {
                 from_markdown(&markdown, &kind),
                 Ok(fixture),
                 "{end:?}\n{markdown}"
+            );
+        }
+    }
+
+    /// Spaces and tabs at a marked text's edges stay inside its mark (W1-R32).
+    #[test]
+    fn markdown_mark_edges_stay_inside() {
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+        };
+        let kind = body().kind;
+        let marks = [
+            json!([{"type": "bold"}]),
+            json!([{"type": "italic"}]),
+            json!([{"type": "strike"}]),
+            json!([{"type": "underline"}]),
+            json!([{"type": "link", "attrs": {"href": "/a"}}]),
+            json!([{"type": "bold"}, {"type": "italic"}]),
+        ];
+        // The parser reads entity spaces inside delimiters as the mark's own text.
+        assert_eq!(
+            from_markdown("x **&#32;b&#9;** *&#32;*", &kind),
+            Ok(doc(json!([para(json!([
+                t("x "),
+                marked(" b\t", json!([{"type": "bold"}])),
+                t(" "),
+                marked(" ", json!([{"type": "italic"}]))
+            ]))])))
+        );
+        for m in marks {
+            // A neighbour under other marks, or the two would read back as one node.
+            let other = match m[0]["type"] == "strike" {
+                true => json!([{"type": "underline"}]),
+                false => json!([{"type": "strike"}]),
+            };
+            let fixture = doc(json!([
+                para(json!([t("x"), marked(" b ", m.clone()), t("y")])),
+                para(json!([marked("\tb\t", m.clone())])),
+                para(json!([
+                    marked("  b", m.clone()),
+                    marked("c  ", other.clone())
+                ])),
+                para(json!([t("x"), marked(" ", m.clone()), t("y")])),
+                para(json!([marked(" \t ", m.clone())])),
+                // Punctuation inside a delimiter beside letters outside it.
+                para(json!([t("x"), marked("&b!", m.clone()), t("y")])),
+                para(json!([
+                    t("1"),
+                    marked("\u{2014}b\u{2014}", m.clone()),
+                    t("2")
+                ])),
+            ]));
+            let markdown = to_markdown(&fixture, &kind, &ctx);
+            assert_eq!(
+                from_markdown(&markdown, &kind),
+                Ok(fixture),
+                "{m}\n{markdown}"
             );
         }
     }
