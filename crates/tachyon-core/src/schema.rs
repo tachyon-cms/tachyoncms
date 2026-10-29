@@ -1988,7 +1988,7 @@ fn check_fields(
             FieldKind::RichText {
                 features,
                 relation_to,
-                ..
+                blocks,
             } => {
                 if let Some(features) = features {
                     let mut seen = HashSet::new();
@@ -1998,6 +1998,23 @@ fn check_fields(
                             "features lists `{}` twice",
                             name.as_str().unwrap_or_default()
                         )));
+                    }
+                    // Settings no editor could use are refused rather than left to puzzle.
+                    use crate::richtext::Feature as F;
+                    if !blocks.is_empty() && !features.contains(&F::Block) {
+                        return Err(invalid(
+                            "blocks needs `block` in features, or no features list".into(),
+                        ));
+                    }
+                    if !relation_to.is_empty()
+                        && !features
+                            .iter()
+                            .any(|f| matches!(f, F::Link | F::Relationship))
+                    {
+                        return Err(invalid(
+                            "relationTo needs `link` or `relationship` in features, or no features list"
+                                .into(),
+                        ));
                     }
                 }
                 let mut seen = HashSet::new();
@@ -2304,6 +2321,17 @@ mod tests {
             (
                 json!({"name": "b", "type": "richText", "features": ["bold", "bold"]}),
                 "field `b`: features lists `bold` twice",
+            ),
+            // Settings the feature list leaves no way to use.
+            (
+                json!({"name": "b", "type": "richText", "features": ["bold"], "blocks": [
+                    {"slug": "q", "fields": []}
+                ]}),
+                "field `b`: blocks needs `block` in features, or no features list",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "features": ["bold"], "relationTo": ["posts"]}),
+                "field `b`: relationTo needs `link` or `relationship` in features, or no features list",
             ),
             (
                 json!({"name": "b", "type": "richText", "relationTo": ["Posts"]}),
