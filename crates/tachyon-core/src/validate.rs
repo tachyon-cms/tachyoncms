@@ -51,7 +51,7 @@ pub fn validate_document(
         }
     }
     let mut errors = Vec::new();
-    check_object(fields, &doc, &[], "", &mut errors);
+    check_object(fields, &doc, &[], "", &mut errors, None);
     // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500.
     for (key, value) in &doc {
         if key.contains('\0') || contains_nul(value) {
@@ -279,6 +279,7 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
             }
             // Block nodes get IDs as block rows do; links are stored in canonical form.
             (kind @ FieldKind::RichText { .. }, text) => {
+                crate::richtext::lower_schemes(text);
                 crate::richtext::each_item_mut(text, &mut |_, item| match item {
                     crate::richtext::ItemMut::Link(link) => canonical_link(link),
                     crate::richtext::ItemMut::Block(attrs) => {
@@ -320,12 +321,14 @@ pub(crate) fn row_fields<'a>(kind: &'a FieldKind, row: &Map<String, Value>) -> &
 }
 
 /// `own` are keys the object carries besides its fields, such as a block row's `id`.
+/// `within`: the limits used so far by the rich text whose block node this is in.
 pub(crate) fn check_object(
     fields: &[Field],
     obj: &Map<String, Value>,
     own: &[&str],
     prefix: &str,
     errors: &mut Vec<FieldError>,
+    mut within: Option<&mut crate::richtext::Budget>,
 ) {
     for key in obj.keys() {
         if !fields.iter().any(|f| &f.name == key) && !own.contains(&key.as_str()) {
@@ -355,20 +358,21 @@ pub(crate) fn check_object(
         match obj.get(&f.name) {
             None | Some(Value::Null) if f.required => errors.push(error(path, "is required")),
             None | Some(Value::Null) => {}
+            // Only a well-formed document can be told it's empty.
+            Some(text) if f.required && matches!(f.kind, FieldKind::RichText { .. }) => {
+                let before = errors.len();
+                check_value(f, text, &path, errors, within.as_deref_mut());
+                if errors.len() == before && crate::richtext::is_empty(text) {
+                    errors.push(error(path, "is required"))
+                }
+            }
             Some(Value::String(s)) if f.required && s.trim().is_empty() => {
                 errors.push(error(path, "is required"))
             }
             Some(Value::Array(items)) if f.required && items.is_empty() && is_list(&f.kind) => {
                 errors.push(error(path, "is required"))
             }
-            Some(text @ Value::Object(_))
-                if f.required
-                    && matches!(f.kind, FieldKind::RichText { .. })
-                    && crate::richtext::is_empty(text) =>
-            {
-                errors.push(error(path, "is required"))
-            }
-            Some(v) => check_value(f, v, &path, errors),
+            Some(v) => check_value(f, v, &path, errors, within.as_deref_mut()),
         }
     }
 }
@@ -386,7 +390,14 @@ fn is_list(kind: &FieldKind) -> bool {
     )
 }
 
-pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<FieldError>) {
+/// `within`: as `check_object` takes it.
+pub(crate) fn check_value(
+    f: &Field,
+    v: &Value,
+    path: &str,
+    errors: &mut Vec<FieldError>,
+    mut within: Option<&mut crate::richtext::Budget>,
+) {
     match (&f.kind, v) {
         (
             FieldKind::Text {
@@ -416,7 +427,7 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
             }
         }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
-            check_object(fields, obj, &[], path, errors)
+            check_object(fields, obj, &[], path, errors, within)
         }
         (
             FieldKind::Array {
@@ -430,7 +441,9 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
             for (i, row) in rows.iter().enumerate() {
                 let row_path = format!("{path}.{i}");
                 match row {
-                    Value::Object(obj) => check_object(fields, obj, &[], &row_path, errors),
+                    Value::Object(obj) => {
+                        check_object(fields, obj, &[], &row_path, errors, within.as_deref_mut())
+                    }
                     _ => errors.push(error(row_path, "expected an object")),
                 }
             }
@@ -484,11 +497,22 @@ pub(crate) fn check_value(f: &Field, v: &Value, path: &str, errors: &mut Vec<Fie
                         }
                     },
                 };
-                check_object(&block.fields, obj, BLOCK_ROW_KEYS, &row_path, errors);
+                check_object(
+                    &block.fields,
+                    obj,
+                    BLOCK_ROW_KEYS,
+                    &row_path,
+                    errors,
+                    within.as_deref_mut(),
+                );
             }
         }
         (FieldKind::RichText { .. }, text) => {
-            if let Err(e) = crate::richtext::validate(text, &f.kind, path) {
+            let checked = match within {
+                Some(budget) => crate::richtext::validate_within(text, &f.kind, path, budget),
+                None => crate::richtext::validate(text, &f.kind, path),
+            };
+            if let Err(e) = checked {
                 errors.extend(e);
             }
         }

@@ -45,6 +45,9 @@ pub const MAX_DEPTH: usize = 32;
 /// How many nodes one value may hold, the document itself not counted.
 pub const MAX_NODES: usize = 50_000;
 
+/// How many columns or rows one table cell may span.
+pub const MAX_SPAN: u64 = 1_000;
+
 const DOC_SHAPE: &str = "expected a rich text document like {\"type\": \"doc\", \"content\": []}";
 const SCHEMES: &str = "links must start with http://, https://, mailto:, tel:, / or #";
 
@@ -131,9 +134,9 @@ fn mark_feature(t: &str) -> Option<Feature> {
 }
 
 /// An `href` a browser can only follow to a web page, an email, a phone number or a place
-/// on this site. Anything with a control character, whitespace or a backslash is refused
-/// outright: browsers strip or rewrite those, which is how `java\tscript:` and `/\host`
-/// get through looser checks.
+/// on this site. Schemes match in any case, as browsers read them (W1-R20). Anything with
+/// a control character, whitespace or a backslash is refused outright: browsers strip or
+/// rewrite those, which is how `java\tscript:` and `/\host` get through looser checks.
 fn safe_href(href: &str) -> bool {
     if href
         .chars()
@@ -143,7 +146,10 @@ fn safe_href(href: &str) -> bool {
     }
     ["http://", "https://", "mailto:", "tel:", "#"]
         .iter()
-        .any(|p| href.starts_with(p))
+        .any(|p| {
+            href.get(..p.len())
+                .is_some_and(|h| h.eq_ignore_ascii_case(p))
+        })
         || (href.starts_with('/') && !href.starts_with("//"))
 }
 
@@ -151,6 +157,25 @@ fn safe_href(href: &str) -> bool {
 /// set, its features, where each node may go, the limits, and the fields of block nodes.
 /// Paths name the offending node, such as `body.content.3.marks.0.attrs.href`.
 pub fn validate(value: &Value, kind: &FieldKind, path: &str) -> Result<(), Vec<FieldError>> {
+    validate_within(value, kind, path, &mut Budget::default())
+}
+
+/// What one rich text value has used of its limits: the nodes counted so far, and the
+/// depth of the block node whose fields are being checked. Rich text inside a block node
+/// goes on from these rather than starting again (W1-R18).
+#[derive(Default)]
+pub(crate) struct Budget {
+    nodes: usize,
+    depth: usize,
+}
+
+/// `validate`, for rich text inside a block node of the text `budget` belongs to.
+pub(crate) fn validate_within(
+    value: &Value,
+    kind: &FieldKind,
+    path: &str,
+    budget: &mut Budget,
+) -> Result<(), Vec<FieldError>> {
     let FieldKind::RichText {
         features,
         relation_to,
@@ -163,7 +188,7 @@ pub fn validate(value: &Value, kind: &FieldKind, path: &str) -> Result<(), Vec<F
         kind,
         features: features.as_deref(),
         relation_to,
-        nodes: 0,
+        budget,
         ids: HashSet::new(),
         errors: Vec::new(),
     };
@@ -176,16 +201,16 @@ pub fn validate(value: &Value, kind: &FieldKind, path: &str) -> Result<(), Vec<F
 }
 
 /// One validation, stopping at the first node at fault.
-struct Check<'a> {
+struct Check<'a, 'b> {
     kind: &'a FieldKind,
     features: Option<&'a [Feature]>,
     relation_to: &'a [String],
-    nodes: usize,
+    budget: &'b mut Budget,
     ids: HashSet<Uuid>,
     errors: Vec<FieldError>,
 }
 
-impl Check<'_> {
+impl Check<'_, '_> {
     fn fail(&mut self, path: String, message: impl Into<String>) {
         self.errors.push(FieldError {
             path,
@@ -217,7 +242,8 @@ impl Check<'_> {
         {
             return self.fail(format!("{path}.{key}"), format!("unknown key `{key}`"));
         }
-        self.children(doc, path, "doc", Holds::Blocks, 0, false);
+        let depth = self.budget.depth;
+        self.children(doc, path, "doc", Holds::Blocks, depth, false);
     }
 
     /// The nodes in `node`'s `content`, which hold `holds`. `required`: at least one.
@@ -248,8 +274,8 @@ impl Check<'_> {
     }
 
     fn node(&mut self, v: &Value, path: &str, parent: &str, holds: Holds, depth: usize) {
-        self.nodes += 1;
-        if self.nodes > MAX_NODES {
+        self.budget.nodes += 1;
+        if self.budget.nodes > MAX_NODES {
             return self.fail(path.into(), format!("holds more than {MAX_NODES} nodes"));
         }
         if depth > MAX_DEPTH {
@@ -296,7 +322,7 @@ impl Check<'_> {
                 format!("unknown attribute `{key}`"),
             );
         }
-        self.attrs(t, given, path);
+        self.attrs(t, given, path, depth);
         if !self.errors.is_empty() {
             return;
         }
@@ -330,8 +356,8 @@ impl Check<'_> {
         }
     }
 
-    /// A node's attributes, already known to be ones it takes.
-    fn attrs(&mut self, t: &str, attrs: &Map<String, Value>, path: &str) {
+    /// A node's attributes, already known to be ones it takes. The node sits at `depth`.
+    fn attrs(&mut self, t: &str, attrs: &Map<String, Value>, path: &str, depth: usize) {
         let at = |k: &str| format!("{path}.attrs.{k}");
         // An optional attribute may be missing or `null`.
         let given = |k: &str| attrs.get(k).filter(|v| !v.is_null());
@@ -365,14 +391,20 @@ impl Check<'_> {
             }
             "tableCell" | "tableHeader" => {
                 for k in ["colspan", "rowspan"] {
-                    if !whole(k, 1) {
-                        return self.fail(at(k), "expected a whole number of 1 or more");
+                    if given(k)
+                        .is_some_and(|v| !v.as_u64().is_some_and(|n| (1..=MAX_SPAN).contains(&n)))
+                    {
+                        return self.fail(
+                            at(k),
+                            format!("expected a whole number from 1 to {MAX_SPAN}"),
+                        );
                     }
                 }
                 let span = given("colspan").and_then(Value::as_u64).unwrap_or(1);
                 if given("colwidth").is_some_and(|w| {
                     !w.as_array().is_some_and(|w| {
-                        w.len() as u64 == span && w.iter().all(|n| n.as_u64().is_some())
+                        w.len() as u64 == span
+                            && w.iter().all(|n| n.as_u64().is_some_and(|n| n >= 1))
                     })
                 }) {
                     self.fail(
@@ -382,7 +414,7 @@ impl Check<'_> {
                 }
             }
             "relationship" => self.link(attrs, &format!("{path}.attrs")),
-            "block" => self.block(attrs, path),
+            "block" => self.block(attrs, path, depth),
             _ => {}
         }
     }
@@ -425,8 +457,8 @@ impl Check<'_> {
         }
     }
 
-    /// A block node's type, ID and fields.
-    fn block(&mut self, attrs: &Map<String, Value>, path: &str) {
+    /// A block node's type, ID and fields. Rich text in its fields nests below `depth`.
+    fn block(&mut self, attrs: &Map<String, Value>, path: &str, depth: usize) {
         let at = |k: &str| format!("{path}.attrs.{k}");
         let kind = self.kind;
         let offered: Vec<&str> = kind
@@ -466,7 +498,15 @@ impl Check<'_> {
             Some(Value::Object(f)) => f,
             Some(_) => return self.fail(at("fields"), "expected an object"),
         };
-        crate::validate::check_object(&block.fields, fields, &[], &at("fields"), &mut self.errors);
+        self.budget.depth = depth;
+        crate::validate::check_object(
+            &block.fields,
+            fields,
+            &[],
+            &at("fields"),
+            &mut self.errors,
+            Some(&mut *self.budget),
+        );
     }
 
     fn marks(&mut self, marks: &Value, path: &str) {
@@ -502,12 +542,24 @@ impl Check<'_> {
                 Some(Value::Object(a)) => a,
                 Some(_) => return self.fail(at, "expected an object"),
             };
-            let takes: &[&str] = if t == "link" { &["href", "doc"] } else { &[] };
+            // A link opens in a new tab by `newTab`; raw `target`, `rel` and `class` would let
+            // the text set what the page does (W1-R20).
+            let takes: &[&str] = if t == "link" {
+                &["href", "doc", "newTab"]
+            } else {
+                &[]
+            };
             if let Some(key) = attrs.keys().find(|k| !takes.contains(&k.as_str())) {
                 return self.fail(format!("{at}.{key}"), format!("unknown attribute `{key}`"));
             }
             if t != "link" {
                 continue;
+            }
+            if attrs
+                .get("newTab")
+                .is_some_and(|v| !v.is_null() && !v.is_boolean())
+            {
+                return self.fail(format!("{at}.newTab"), "expected true or false");
             }
             match (attrs.get("href"), attrs.get("doc")) {
                 (Some(_), Some(_)) => return self.fail(at, "a link takes href or doc, not both"),
@@ -582,8 +634,37 @@ impl Check<'_> {
     }
 }
 
-/// Whether a value holds nothing an editor typed: no nodes, or only empty paragraphs.
+/// Stores each link's scheme lowercased (W1-R20): `HTTPS://` as `https://`.
+pub(crate) fn lower_schemes(value: &mut Value) {
+    each_node_mut(value, &mut |node| {
+        let Some(Value::Array(marks)) = node.get_mut("marks") else {
+            return;
+        };
+        for href in marks
+            .iter_mut()
+            .filter_map(|m| m.pointer_mut("/attrs/href"))
+        {
+            if let Value::String(h) = href
+                && let Some(i) = h.find(':')
+                && h[..i].bytes().all(|b| b.is_ascii_alphabetic())
+            {
+                h[..i].make_ascii_lowercase();
+            }
+        }
+    });
+}
+
+/// Whether a value holds nothing an editor typed: no nodes, or only paragraphs holding
+/// nothing but whitespace and line breaks.
 pub(crate) fn is_empty(value: &Value) -> bool {
+    let blank = |n: &Value| match n.get("type").and_then(Value::as_str) {
+        Some("hardBreak") => true,
+        Some("text") => n
+            .get("text")
+            .and_then(Value::as_str)
+            .is_none_or(|t| t.trim().is_empty()),
+        _ => false,
+    };
     value
         .get("content")
         .and_then(Value::as_array)
@@ -592,7 +673,7 @@ pub(crate) fn is_empty(value: &Value) -> bool {
                 n.get("type").and_then(Value::as_str) == Some("paragraph")
                     && n.get("content")
                         .and_then(Value::as_array)
-                        .is_none_or(Vec::is_empty)
+                        .is_none_or(|inline| inline.iter().all(blank))
             })
         })
 }
@@ -795,6 +876,20 @@ mod tests {
         ]}))
     }
 
+    /// A `box` block type holding rich text of its own.
+    fn boxed() -> Vec<Field> {
+        fields(
+            json!({"blocks": [{"slug": "box", "fields": [{"name": "inner", "type": "richText"}]}]}),
+        )
+    }
+
+    /// A one-cell table whose cell has `attrs`.
+    fn table_cell(attrs: Value) -> Value {
+        json!({"type": "table", "content": [{"type": "tableRow", "content": [
+            {"type": "tableCell", "attrs": attrs, "content": [{"type": "paragraph"}]}
+        ]}]})
+    }
+
     fn doc(content: Value) -> Value {
         json!({"type": "doc", "content": content})
     }
@@ -844,7 +939,10 @@ mod tests {
                 linked(json!({"href": "tel:+441234567890"})),
                 linked(json!({"href": "/about"})),
                 linked(json!({"href": "#top"})),
-                linked(json!({"doc": {"relationTo": "posts", "value": P1}}))
+                linked(json!({"doc": {"relationTo": "posts", "value": P1}})),
+                linked(json!({"href": "/new", "newTab": true})),
+                linked(json!({"doc": {"relationTo": "posts", "value": P1}, "newTab": false})),
+                linked(json!({"href": "/same", "newTab": null}))
             ])),
             {"type": "paragraph"},
             {"type": "bulletList", "content": [
@@ -890,17 +988,47 @@ mod tests {
             body["content"].as_array().unwrap()[..nodes.len() - 1]
         );
 
+        // Schemes compare in any case and are stored lowercased (W1-R20).
+        let shouting = |h: &str| doc(json!([para(json!([linked(json!({ "href": h }))]))]));
+        for (sent, kept) in [
+            ("HTTPS://Example.com/A", "https://Example.com/A"),
+            ("MailTo:Ann@example.com", "mailto:Ann@example.com"),
+            ("/Path:Colon", "/Path:Colon"),
+            ("#Top:1", "#Top:1"),
+        ] {
+            let stored = check(&everything(), shouting(sent)).unwrap();
+            assert_eq!(
+                stored["body"].pointer("/content/0/content/0/marks/0/attrs/href"),
+                Some(&json!(kept))
+            );
+        }
+
         // An empty document is fine; a required field needs something in it.
         assert!(check(&everything(), doc(json!([]))).is_ok());
         assert!(check(&everything(), json!({"type": "doc"})).is_ok());
         let required = fields(json!({"required": true}));
-        for empty in [doc(json!([])), doc(json!([{"type": "paragraph"}]))] {
+        for empty in [
+            doc(json!([])),
+            doc(json!([{"type": "paragraph"}])),
+            doc(json!([para(
+                json!([text("  "), {"type": "hardBreak"}, text("\t")])
+            )])),
+        ] {
             assert_eq!(
                 check(&required, empty).unwrap_err()[0].message,
                 "is required"
             );
         }
         assert!(check(&required, doc(json!([para(json!([text("hi")]))]))).is_ok());
+        // A value that isn't a document is told so, not that it's required.
+        for bad in [
+            json!({"type": "paragraph"}),
+            json!({}),
+            json!({"type": "bogus", "content": []}),
+            json!("  "),
+        ] {
+            assert_eq!(check(&required, bad).unwrap_err()[0].message, DOC_SHAPE);
+        }
 
         // As deep as the limit allows: the text sits 32 levels down.
         assert!(check(&everything(), nested(30)).is_ok());
@@ -959,7 +1087,6 @@ mod tests {
             "vbscript:msgbox(1)",
             "file:///etc/passwd",
             "ftp://example.com",
-            "HTTPS://example.com",
             "//evil.example",
             "/\\evil.example",
             "\\\\evil.example",
@@ -971,6 +1098,10 @@ mod tests {
         }
         let all = everything;
         let deep = format!("body{}", ".content.0".repeat(33));
+        let deep_inner = format!(
+            "body.content.0.attrs.fields.inner{}",
+            ".content.0".repeat(32)
+        );
         let one = |node: Value| doc(json!([node]));
         let disabled = |name: &str| format!("the `{name}` feature isn't turned on for this field");
         let narrow = || fields(json!({"features": ["bold", "link"], "relationTo": ["posts"]}));
@@ -1167,6 +1298,43 @@ mod tests {
                 "expected true or false".into(),
             ),
             (all(), one(para(json!([text("")]))), "body.content.0.content.0.text", "expected text that isn't empty".into()),
+            (
+                all(),
+                one(para(json!([linked(json!({"href": "/a", "newTab": "yes"}))]))),
+                "body.content.0.content.0.marks.0.attrs.newTab",
+                "expected true or false".into(),
+            ),
+            (
+                all(),
+                one(para(json!([linked(json!({"href": "/a", "rel": "opener"}))]))),
+                "body.content.0.content.0.marks.0.attrs.rel",
+                "unknown attribute `rel`".into(),
+            ),
+            (
+                all(),
+                one(para(json!([linked(json!({"href": "/a", "class": "x"}))]))),
+                "body.content.0.content.0.marks.0.attrs.class",
+                "unknown attribute `class`".into(),
+            ),
+            // Spans and widths are bounded.
+            (
+                all(),
+                one(table_cell(json!({"colspan": 1_000_000_000_000_000_000u64}))),
+                "body.content.0.content.0.content.0.attrs.colspan",
+                "expected a whole number from 1 to 1000".into(),
+            ),
+            (
+                all(),
+                one(table_cell(json!({"rowspan": 1001}))),
+                "body.content.0.content.0.content.0.attrs.rowspan",
+                "expected a whole number from 1 to 1000".into(),
+            ),
+            (
+                all(),
+                one(table_cell(json!({"colwidth": [0]}))),
+                "body.content.0.content.0.content.0.attrs.colwidth",
+                "expected a list of widths in pixels, one per column the cell spans".into(),
+            ),
             // Limits.
             (
                 all(),
@@ -1178,6 +1346,22 @@ mod tests {
                 all(),
                 doc(json!((0..50_001).map(|_| json!({"type": "horizontalRule"})).collect::<Vec<_>>())),
                 "body.content.50000",
+                "holds more than 50000 nodes".into(),
+            ),
+            // Rich text in a block node counts toward the limits of the text it's in
+            // (W1-R18): its nodes sit one level below the block node.
+            (
+                boxed(),
+                one(json!({"type": "block", "attrs": {"blockType": "box", "fields": {"inner": nested(30)}}})),
+                &deep_inner,
+                "nests more than 32 levels deep".into(),
+            ),
+            (
+                boxed(),
+                one(json!({"type": "block", "attrs": {"blockType": "box", "fields": {"inner":
+                    doc(json!((0..50_000).map(|_| json!({"type": "horizontalRule"})).collect::<Vec<_>>()))
+                }}})),
+                "body.content.0.attrs.fields.inner.content.49999",
                 "holds more than 50000 nodes".into(),
             ),
             // Links.
