@@ -1456,9 +1456,14 @@ impl CollectionSchema {
             Some("x".into())
         });
         if let Some(name) = unknown {
-            return bad(format!(
-                "`{{{name}}}` must name a top-level text or slug field"
-            ));
+            let virtual_field = self
+                .data()
+                .iter()
+                .any(|f| f.name == name && f.virtual_path.is_some());
+            return bad(match virtual_field {
+                true => format!("`{{{name}}}` is virtual; a url needs a stored text or slug field"),
+                false => format!("`{{{name}}}` must name a top-level text or slug field"),
+            });
         }
         let Some(filled) = filled else {
             return bad("a `{` is never closed".into());
@@ -1474,10 +1479,13 @@ impl CollectionSchema {
         Ok(())
     }
 
-    /// The top-level text or slug field `name`, which a `url` placeholder may name.
+    /// The stored top-level text or slug field `name`, which a `url` placeholder may name.
+    /// Virtual fields aren't stored, so a rendered link would never have their value.
     fn url_field(&self, name: &str) -> Option<&Field> {
         self.data().iter().find(|f| {
-            f.name == name && matches!(f.kind, FieldKind::Text { .. } | FieldKind::Slug { .. })
+            f.name == name
+                && f.virtual_path.is_none()
+                && matches!(f.kind, FieldKind::Text { .. } | FieldKind::Slug { .. })
         })
     }
 
@@ -1492,12 +1500,12 @@ impl CollectionSchema {
         })
     }
 
-    /// The text that names `doc`: its first top-level text field.
+    /// The text that names `doc`: its first stored top-level text field.
     pub fn title_of(&self, doc: &Map<String, Value>) -> Option<String> {
         let f = self
             .data()
             .iter()
-            .find(|f| matches!(f.kind, FieldKind::Text { .. }))?;
+            .find(|f| f.virtual_path.is_none() && matches!(f.kind, FieldKind::Text { .. }))?;
         Some(doc.get(&f.name)?.as_str()?.to_owned())
     }
 
@@ -3451,6 +3459,14 @@ mod tests {
         assert_eq!(posts.title_of(&doc(json!({"slug": "a"}))), None);
         let plain = schema(json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}));
         assert_eq!(plain.link_url(&d), None);
+        // A virtual field is never stored, so it can't fill a URL or be the title.
+        let read_through = schema(json!({"slug": "posts", "fields": [
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "authorName", "type": "text", "virtual": "author.name"},
+            {"name": "title", "type": "text"}
+        ]}));
+        let hi = doc(json!({"authorName": "Ann", "title": "Hi"}));
+        assert_eq!(read_through.title_of(&hi).as_deref(), Some("Hi"));
         assert!(plain.to_compact_json().get("url").is_none());
 
         for (url, kind, message) in [
@@ -3500,10 +3516,17 @@ mod tests {
                 "block",
                 "url: only collections have pages of their own",
             ),
+            (
+                "/a/{authorName}",
+                "collection",
+                "url: `{authorName}` is virtual; a url needs a stored text or slug field",
+            ),
         ] {
             let s = schema(
                 json!({"slug": "posts", "kind": kind, "url": url, "fields": [
                     {"name": "slug", "type": "slug"}, {"name": "n", "type": "number"},
+                    {"name": "author", "type": "relationship", "relationTo": "authors"},
+                    {"name": "authorName", "type": "text", "virtual": "author.name"},
                     {"name": "meta", "type": "group", "fields": [{"name": "deep", "type": "text"}]}
                 ]}),
             );

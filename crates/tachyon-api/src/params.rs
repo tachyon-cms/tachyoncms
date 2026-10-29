@@ -323,6 +323,11 @@ fn format(params: &Map<String, Value>) -> Result<Format, ApiError> {
     })
 }
 
+/// The parameters of a read that takes only `format`, such as a single user's.
+pub(crate) fn format_param(raw: Option<&str>) -> Result<Format, ApiError> {
+    format(&params(raw, &["format"])?)
+}
+
 fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     match single(params, "depth")? {
         None => Ok(DEFAULT_DEPTH),

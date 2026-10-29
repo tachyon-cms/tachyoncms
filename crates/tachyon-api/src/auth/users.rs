@@ -19,7 +19,10 @@ use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
 use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
-use crate::populate::{check_links, link_ids, link_targets, prepare, vouched_links};
+use crate::params::{Format, format_param};
+use crate::populate::{
+    Shapes, check_links, link_ids, link_targets, populate, prepare, vouched_links,
+};
 use crate::{ApiError, AppState};
 
 pub(crate) use tachyon_db::auth::ACCOUNT_KEYS;
@@ -128,14 +131,36 @@ pub(crate) async fn list(
     Ok(Json(body))
 }
 
+/// A user's account and profile. `format` renders the profile's rich text, as it does for
+/// any other document.
+// ponytail: only `format`; depth and select on this route are in the backlog.
 pub(crate) async fn get(
     State(state): State<AppState>,
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let id = user_id(path)?;
     self_or_admin(&principal, id)?;
-    Ok(Json(user_json(&state, id, &caller_of(&principal)).await?))
+    let format = format_param(raw.as_deref())?;
+    let value = user_json(&state, id, &caller_of(&principal)).await?;
+    if format == Format::Json {
+        return Ok(Json(value));
+    }
+    // Depth 0: nothing is populated, but rich text renders through the same path, reading
+    // its links as this caller may.
+    let users = any_collection(&state, auth::USERS)?;
+    let access = Access::new(&state, principal, Reach::From(&users)).await?;
+    let mut rendered = populate(
+        &state,
+        &access,
+        vec![(value, users)],
+        0,
+        &Shapes::new(),
+        format,
+    )
+    .await?;
+    Ok(Json(rendered.remove(0)))
 }
 
 fn user_id(path: Result<Path<String>, PathRejection>) -> Result<Uuid, ApiError> {

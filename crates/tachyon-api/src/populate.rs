@@ -264,9 +264,12 @@ async fn render(
     items: &mut [(Value, Arc<Collection>, u8)],
     format: Format,
 ) -> Result<(), ApiError> {
-    if format == Format::Json {
-        return Ok(());
-    }
+    let to_string: fn(&Value, &RenderCtx) -> String = match format {
+        Format::Json => return Ok(()),
+        Format::Html => richtext::to_html,
+        Format::Markdown => richtext::to_markdown,
+        Format::Text => |text, _| richtext::to_text(text),
+    };
     // The links inside each rich text field, block nodes' fields included.
     let mut ids = Vec::new();
     for (v, c, _) in items.iter_mut() {
@@ -315,11 +318,7 @@ async fn render(
     for (v, c, _) in items.iter_mut() {
         if let Some(doc) = v.as_object_mut() {
             rich_texts_mut(c.schema.data(), doc, &mut |_, text| {
-                *text = Value::String(match format {
-                    Format::Html => richtext::to_html(text, &ctx),
-                    Format::Markdown => richtext::to_markdown(text, &ctx),
-                    Format::Text | Format::Json => richtext::to_text(text),
-                })
+                *text = Value::String(to_string(text, &ctx))
             });
         }
     }

@@ -896,6 +896,16 @@ fn attr<'v>(node: &'v Value, name: &str) -> Option<&'v Value> {
     node.get("attrs")?.get(name)
 }
 
+/// A code block's language, if it's one validation allows today: a language stored before
+/// the rule could otherwise add classes or break a fence.
+fn code_language(node: &Value) -> Option<&str> {
+    attr(node, "language").and_then(Value::as_str).filter(|l| {
+        !l.is_empty()
+            && l.chars()
+                .all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c))
+    })
+}
+
 /// A block node field's value as one attribute: a string or other scalar as its text,
 /// anything else as compact JSON (W1-R21). `None` for a null.
 fn field_text(value: &Value) -> Option<String> {

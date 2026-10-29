@@ -3,7 +3,7 @@
 
 use serde_json::Value;
 
-use super::{RenderCtx, attr, children, field_text, kind, safe_href};
+use super::{RenderCtx, attr, children, code_language, field_text, kind, safe_href};
 
 /// `doc` as Markdown. Text is escaped so it reads back as text. What Markdown can't say is
 /// left out: subscript and superscript are plain text, table cells don't span, and a
@@ -65,14 +65,7 @@ fn block(node: &Value, ctx: &RenderCtx) -> String {
                 .filter_map(|t| t.get("text")?.as_str())
                 .collect();
             let fence = "`".repeat(longest_run(&code, '`').max(2) + 1);
-            // Validation keeps a language to these characters; anything else is dropped.
-            let lang = attr(node, "language")
-                .and_then(Value::as_str)
-                .filter(|l| {
-                    l.chars()
-                        .all(|c| c.is_ascii_alphanumeric() || "_+-".contains(c))
-                })
-                .unwrap_or("");
+            let lang = code_language(node).unwrap_or("");
             match code.is_empty() {
                 true => format!("{fence}{lang}\n{fence}"),
                 false => format!("{fence}{lang}\n{code}\n{fence}"),
@@ -198,7 +191,10 @@ fn directive(node: &Value, ctx: &RenderCtx) -> String {
 
 /// `s` inside a directive's double-quoted attribute.
 fn quoted(s: &str) -> String {
-    s.replace('\\', "\\\\").replace('"', "\\\"")
+    // A newline would end the directive's line; Markdown input reads `\n` back (W1-R25).
+    s.replace('\\', "\\\\")
+        .replace('"', "\\\"")
+        .replace('\n', "\\n")
 }
 
 /// The longest run of `c` in `s`.
@@ -222,7 +218,8 @@ fn line_start(s: String) -> String {
 fn escape(s: &str) -> String {
     let mut out = String::with_capacity(s.len());
     for c in s.chars() {
-        if "\\`*_[]<>~|&".contains(c) {
+        // `!` too, or text ending in one would turn a link after it into an image.
+        if "\\`*_[]<>~|&!".contains(c) {
             out.push('\\');
         }
         out.push(c);
@@ -390,6 +387,11 @@ mod tests {
                     {"type": "text", "text": "bad", "marks": [{"type": "link", "attrs": {"href": "javascript:alert(1)"}}]},
                     {"type": "text", "text": "(p)", "marks": [{"type": "link", "attrs": {"href": "/a_(b)"}}]}
                 ])),
+                para(json!([
+                    text("Wow!"),
+                    {"type": "text", "text": "x", "marks": [{"type": "link", "attrs": {"href": "/a"}}]}
+                ])),
+                {"type": "block", "attrs": {"blockType": "note", "fields": {"lines": "one\ntwo\\n"}}},
                 {"type": "relationship", "attrs": {"relationTo": "authors", "value": "gone"}},
                 callout(doc(json!([para(json!([text("inside")])), callout(doc(json!([para(json!([text("deeper")]))])))])))
             ]));
@@ -401,6 +403,8 @@ mod tests {
                     "\\:::not a directive\n\n",
                     "````\na\n```\nb\n````\n\n",
                     "``a`b`` **spaced** hiddenbad[(p)](/a_\\(b\\))\n\n",
+                    "Wow\\![x](/a)\n\n",
+                    "::note{lines=\"one\\ntwo\\\\n\"}\n\n",
                     "::::callout{kind=\"warn \\\"x\\\"\"}\n",
                     "inside\n\n",
                     ":::callout{kind=\"warn \\\"x\\\"\"}\n",

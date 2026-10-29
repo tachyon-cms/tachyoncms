@@ -4,7 +4,7 @@ use std::fmt::Write;
 
 use serde_json::Value;
 
-use super::{RenderCtx, attr, children, field_text, heading_ids, kind, safe_href};
+use super::{RenderCtx, attr, children, code_language, field_text, heading_ids, kind, safe_href};
 
 /// `doc` as HTML. Text and attribute values are escaped, every `href` is checked again as
 /// it's written (stored data can outlive a rule), and an internal link the context can't
@@ -104,11 +104,11 @@ fn node_html(
         "horizontalRule" => out.push_str("<hr>"),
         "hardBreak" => out.push_str("<br>"),
         "codeBlock" => {
-            match attr(node, "language").and_then(Value::as_str) {
-                Some(lang) if !lang.is_empty() => {
+            match code_language(node) {
+                Some(lang) => {
                     let _ = write!(out, "<pre><code class=\"language-{}\">", esc(lang));
                 }
-                _ => out.push_str("<pre><code>"),
+                None => out.push_str("<pre><code>"),
             }
             for child in children(node) {
                 out.push_str(&esc(child
@@ -410,11 +410,17 @@ mod tests {
             let d = doc(json!([
                 {"type": "heading", "attrs": {"level": 1}, "content": [text("Intro")]},
                 {"type": "heading", "attrs": {"level": 7}, "content": [text("Intro")]},
-                {"type": "block", "attrs": {"blockType": "cta", "fields": {"ctaLabel": "Go", "gone": null}}}
+                {"type": "block", "attrs": {"blockType": "cta", "fields": {"ctaLabel": "Go", "gone": null}}},
+                // A language stored before the rule can't pick extra classes.
+                {"type": "codeBlock", "attrs": {"language": "x y"}, "content": [text("a")]}
             ]));
             assert_eq!(
                 to_html(&d, ctx),
-                "<h1 id=\"intro\">Intro</h1><h6 id=\"intro-2\">Intro</h6><div data-block=\"cta\" data-cta-label=\"Go\"></div>"
+                concat!(
+                    "<h1 id=\"intro\">Intro</h1><h6 id=\"intro-2\">Intro</h6>",
+                    "<div data-block=\"cta\" data-cta-label=\"Go\"></div>",
+                    "<pre><code>a</code></pre>"
+                )
             );
         });
     }

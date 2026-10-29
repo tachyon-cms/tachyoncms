@@ -483,14 +483,14 @@ async fn format_param_applies_everywhere(pool: PgPool) {
     // Joined documents.
     let joined = ok(get(&admin, &format!("/api/authors/{ann}?format=text")).await);
     assert_eq!(joined["bio"], "Writes <things>");
-    let bodies: Vec<&Value> = joined["posts"]["docs"]
+    let mut bodies: Vec<&str> = joined["posts"]["docs"]
         .as_array()
         .unwrap()
         .iter()
-        .map(|d| &d["body"])
+        .map(|d| d["body"].as_str().unwrap())
         .collect();
-    assert_eq!(bodies.len(), 2);
-    assert!(bodies.iter().all(|b| b.is_string()), "{joined}");
+    bodies.sort_unstable();
+    assert_eq!(bodies, ["First", "see"], "{joined}");
     // Select-shaped.
     let shaped = ok(get(
         &admin,
@@ -646,4 +646,44 @@ async fn internal_links_use_the_collection_url(pool: PgPool) {
         json.pointer("/body/content/0/content/0/marks/0/attrs/doc/value"),
         Some(&json!(post))
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_single_user_read_takes_format(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "posts", "url": "/blog/{slug}",
+        "fields": [{"name": "title", "type": "text"}, {"name": "slug", "type": "slug"}]}),
+    )
+    .await;
+    let post = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Hello", "slug": "hello"}),
+    )
+    .await);
+    let profile = json!({"schema": {"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true},
+        {"name": "bio", "type": "richText", "relationTo": ["posts"]}
+    ]}});
+    let res = put(&admin, "/api/admin/collections/users", profile).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let user = create(
+        &admin,
+        "/api/users",
+        json!({"email": "ed@example.com", "name": "Ed", "password": common::PASSWORD,
+            "role": "editor", "bio": text(json!([doc_link("posts", &post)]))}),
+    )
+    .await;
+    let url = format!("/api/users/{}", id(&user));
+    let res = get(&admin, &format!("{url}?format=html")).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["bio"], "<p><a href=\"/blog/hello\">see</a></p>");
+    assert_eq!(res.json["email"], "ed@example.com");
+    assert_eq!(get(&admin, &url).await.json["bio"]["type"], "doc");
+    for bad in ["format=xml", "depth=1", "select[name]=true"] {
+        assert_problem(&get(&admin, &format!("{url}?{bad}")).await, 400);
+    }
 }
