@@ -61,7 +61,7 @@ pub fn from_markdown(src: &str, kind: &FieldKind) -> Result<Value, Vec<FieldErro
     })?;
     // Nodes carry their line until here, where it's moved aside for the errors below.
     let mut lines = Vec::new();
-    each_node_at(&mut doc, "", &mut |path, node| {
+    each_node_at(&mut doc, kind, "", &mut |path, node| {
         if let Some(line) = node.remove("line").and_then(|l| l.as_u64()) {
             lines.push((path.to_owned(), line));
         }
@@ -69,7 +69,7 @@ pub fn from_markdown(src: &str, kind: &FieldKind) -> Result<Value, Vec<FieldErro
     // Checked as though every slug named a document: whether one does is the caller's call.
     let mut check = doc.clone();
     let mut nul = Vec::new();
-    slug_refs_mut(&mut check, &mut |at, link| {
+    slug_refs_mut(&mut check, kind, &mut |at, link| {
         // Slugs are looked up before field rules run, and Postgres can't take U+0000
         // (W1-R43).
         if link
@@ -114,8 +114,13 @@ pub fn from_markdown(src: &str, kind: &FieldKind) -> Result<Value, Vec<FieldErro
 /// Calls `f` on each document `from_markdown`'s output names by slug, with where it sits
 /// (`content.0.content.1.marks.0.attrs.doc`, `content.2.attrs`), at any depth, block
 /// nodes' text included. `f` gets `{"relationTo", "slug", "line"}` to replace with `value`.
-pub fn slug_refs_mut(value: &mut Value, f: &mut impl FnMut(&str, &mut Map<String, Value>)) {
-    each_node_at(value, "", &mut |path, node| {
+/// `kind` is the rich text field's, which says which block fields hold text.
+pub fn slug_refs_mut(
+    value: &mut Value,
+    kind: &FieldKind,
+    f: &mut impl FnMut(&str, &mut Map<String, Value>),
+) {
+    each_node_at(value, kind, "", &mut |path, node| {
         if let Some(Value::Array(marks)) = node.get_mut("marks") {
             for (m, mark) in marks.iter_mut().enumerate() {
                 if let Some(Value::Object(doc)) = mark.pointer_mut("/attrs/doc")
@@ -142,21 +147,37 @@ fn join(path: &str, rest: &str) -> String {
 }
 
 /// Calls `f` on `node` and every node inside it, the text of block nodes included, each
-/// with its path as validation names it.
-fn each_node_at(node: &mut Value, path: &str, f: &mut impl FnMut(&str, &mut Map<String, Value>)) {
+/// with its path as validation names it. `kind` is the text's field; only block fields
+/// that are rich text are walked, since a json value shaped like it is data (W1-R44).
+fn each_node_at(
+    node: &mut Value,
+    kind: &FieldKind,
+    path: &str,
+    f: &mut impl FnMut(&str, &mut Map<String, Value>),
+) {
     let Value::Object(obj) = node else { return };
     f(path, obj);
     if let Some(Value::Array(children)) = obj.get_mut("content") {
         for (i, child) in children.iter_mut().enumerate() {
-            each_node_at(child, &join(path, &format!("content.{i}")), f);
+            each_node_at(child, kind, &join(path, &format!("content.{i}")), f);
         }
     }
     if obj.get("type").and_then(Value::as_str) == Some("block")
-        && let Some(Value::Object(fields)) = obj.get_mut("attrs").and_then(|a| a.get_mut("fields"))
+        && let Some(Value::Object(attrs)) = obj.get_mut("attrs")
     {
-        for (name, text) in fields.iter_mut() {
-            if text.get("type").and_then(Value::as_str) == Some("doc") {
-                each_node_at(text, &join(path, &format!("attrs.fields.{name}")), f);
+        let defs = crate::validate::node_fields(kind, attrs);
+        if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
+            for (name, text) in fields.iter_mut() {
+                if let Some(def) = defs.iter().find(|d| d.name == *name)
+                    && matches!(def.kind, FieldKind::RichText { .. })
+                {
+                    each_node_at(
+                        text,
+                        &def.kind,
+                        &join(path, &format!("attrs.fields.{name}")),
+                        f,
+                    );
+                }
             }
         }
     }
@@ -1444,9 +1465,27 @@ mod tests {
         }
     }
 
+    /// A json field's value is data: one shaped like rich text, slugs and `line` keys
+    /// included, is never walked, looked up or rewritten (W1-R44).
+    #[test]
+    fn markdown_json_values_are_data() {
+        let kind = body().kind;
+        let meta = r#"{"type":"doc","content":[{"type":"relationship","line":7,"attrs":{"relationTo":"posts","slug":"nope","line":3}},{"type":"paragraph","content":[{"type":"text","text":"x","marks":[{"type":"link","attrs":{"doc":{"relationTo":"posts","slug":"nope"}}}]}]}]}"#;
+        let src = format!(
+            "::video{{url=\"a\" meta=\"{}\"}}",
+            meta.replace('"', "\\\"")
+        );
+        let mut doc = from_markdown(&src, &kind).unwrap();
+        let stored = &doc["content"][0]["attrs"]["fields"]["meta"];
+        assert_eq!(*stored, serde_json::from_str::<Value>(meta).unwrap());
+        let mut seen = Vec::new();
+        slug_refs_mut(&mut doc, &kind, &mut |at, _| seen.push(at.to_owned()));
+        assert_eq!(seen, Vec::<String>::new());
+    }
+
     /// Each document named by slug, by its ID: as the API finds them.
     fn by_id(mut doc: Value) -> Value {
-        slug_refs_mut(&mut doc, &mut |_, link| {
+        slug_refs_mut(&mut doc, &body().kind, &mut |_, link| {
             let id = match link["slug"].as_str() {
                 Some("intro") => P1,
                 Some("ann") => A1,
@@ -2460,8 +2499,9 @@ mod tests {
         let mut input =
             json!({"body": md("**hi**"), "layout": [{"blockType": "copy", "text": md("*x*")}]});
         assert_eq!(
-            markdown_inputs(&fields, &mut input),
-            Ok(vec!["body".into(), "layout.0.text".into()])
+            markdown_inputs(&fields, &mut input)
+                .map(|done| done.into_iter().map(|(path, _)| path).collect::<Vec<_>>()),
+            Ok(vec!["body".to_owned(), "layout.0.text".to_owned()])
         );
         assert_eq!(
             input["body"],

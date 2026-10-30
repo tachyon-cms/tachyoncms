@@ -125,9 +125,9 @@ pub(crate) async fn from_markdown(
     // Each lookup is a query per 100 slugs, so a write may name only so many.
     let mut named: HashMap<String, HashSet<String>> = HashMap::new();
     let mut count = 0;
-    for path in &paths {
+    for (path, kind) in &paths {
         if let Some(text) = input.pointer_mut(&text_at(path)) {
-            richtext::slug_refs_mut(text, &mut |_, link| {
+            richtext::slug_refs_mut(text, kind, &mut |_, link| {
                 let to = get(link, "relationTo");
                 count += usize::from(named.entry(to).or_default().insert(get(link, "slug")));
             });
@@ -150,9 +150,9 @@ pub(crate) async fn from_markdown(
         }
     }
     let mut errors = Vec::new();
-    for path in &paths {
+    for (path, kind) in &paths {
         if let Some(text) = input.pointer_mut(&text_at(path)) {
-            richtext::slug_refs_mut(text, &mut |at, link| {
+            richtext::slug_refs_mut(text, kind, &mut |at, link| {
                 let (to, slug) = (get(link, "relationTo"), get(link, "slug"));
                 let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
                 match found.get(&(to.clone(), slug.clone())) {
@@ -164,7 +164,8 @@ pub(crate) async fn from_markdown(
                     None => errors.push(FieldError {
                         path: format!("{path}.{at}"),
                         message: format!(
-                            "line {line}: no `{to}` document you can read has the slug `{slug}`"
+                            "line {line}: no `{to}` document you can read has the slug `{}`",
+                            clipped(&slug)
                         ),
                     }),
                 }
@@ -174,6 +175,14 @@ pub(crate) async fn from_markdown(
     match errors.is_empty() {
         true => Ok(()),
         false => Err(hide(errors, input)),
+    }
+}
+
+/// `s` cut to 100 characters and `…`, so an error never echoes a whole long input (W1-R44).
+fn clipped(s: &str) -> String {
+    match s.char_indices().nth(100) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
     }
 }
 

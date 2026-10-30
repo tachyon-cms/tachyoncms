@@ -914,7 +914,8 @@ async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
             {"name": "title", "type": "text"},
             {"name": "slug", "type": "slug"},
             {"name": "body", "type": "richText", "relationTo": ["pages"], "blocks": [
-                {"slug": "callout", "fields": [{"name": "kind", "type": "text"}]}
+                {"slug": "callout", "fields": [{"name": "kind", "type": "text"}]},
+                {"slug": "embed", "fields": [{"name": "meta", "type": "json"}]}
             ]},
             {"name": "layout", "type": "blocks", "blocks": [
                 {"slug": "copy", "fields": [{"name": "copy", "type": "richText", "relationTo": ["pages"]}]}
@@ -966,4 +967,36 @@ async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
             res.json
         );
     }
+
+    // A json value shaped like rich text is data: its slug is never looked up, so a
+    // missing one isn't a 422, and it's stored exactly as sent (W1-R44).
+    let meta = r#"{"type":"doc","content":[{"type":"relationship","attrs":{"relationTo":"pages","slug":"missing","line":3}}]}"#;
+    let src = format!("::embed{{meta=\"{}\"}}", meta.replace('"', "\\\""));
+    let page = create(&admin, "/api/pages", md(&src)).await;
+    assert_eq!(
+        page["body"]["content"][0]["attrs"]["fields"]["meta"],
+        serde_json::from_str::<Value>(meta).unwrap()
+    );
+
+    // A missing slug is named clipped, however long it is.
+    let long = "s".repeat(1_000_000);
+    let res = send(
+        &admin,
+        "POST",
+        "/api/pages",
+        Some(&md(&format!("[a](doc:pages/{long})")).to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    let message = res.json["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains(&format!("`{}…`", &long[..100])),
+        "{message}"
+    );
+    assert!(message.len() < 300, "{}", message.len());
+    assert!(
+        res.json.to_string().len() < 2_000,
+        "{}",
+        res.json.to_string().len()
+    );
 }

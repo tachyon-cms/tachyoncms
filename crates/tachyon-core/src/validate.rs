@@ -71,17 +71,17 @@ pub fn validate_document(
 
 /// Turns each rich text value in `input` sent as `{"format": "markdown", "value": "…"}`
 /// into its JSON form (`richtext::from_markdown`), in place, and returns where each was
-/// (`body`, `layout.0.copy`). Documents they name by slug are still named so. Callers run
+/// (`body`, `layout.0.copy`), with its field's kind. Documents they name by slug are still named so. Callers run
 /// it before field rules; `validate_document` refuses Markdown left unconverted.
 pub fn markdown_inputs(
     fields: &[Field],
     input: &mut Value,
-) -> Result<Vec<String>, Vec<FieldError>> {
+) -> Result<Vec<(String, FieldKind)>, Vec<FieldError>> {
     fn walk(
         fields: &[Field],
         obj: &mut Map<String, Value>,
         prefix: &str,
-        done: &mut Vec<String>,
+        done: &mut Vec<(String, FieldKind)>,
         errors: &mut Vec<FieldError>,
     ) {
         for f in fields {
@@ -123,7 +123,7 @@ pub fn markdown_inputs(
                     match crate::richtext::from_markdown(src, &f.kind) {
                         Ok(doc) => {
                             *text = doc;
-                            done.push(path);
+                            done.push((path, f.kind.clone()));
                         }
                         Err(e) => errors.extend(e.into_iter().map(|e| FieldError {
                             path: match e.path.as_str() {

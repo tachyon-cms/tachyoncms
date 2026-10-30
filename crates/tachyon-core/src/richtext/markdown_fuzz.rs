@@ -612,7 +612,7 @@ fn run(seed: u64, cases: usize, make: impl Fn(&mut Rng, usize) -> Value) {
         let doc = make(&mut r, case);
         let markdown = to_markdown(&doc, &kind, &ctx);
         let back = from_markdown(&markdown, &kind).map(|mut back| {
-            slug_refs_mut(&mut back, &mut |_, link| {
+            slug_refs_mut(&mut back, &kind, &mut |_, link| {
                 let slug = link.remove("slug").unwrap();
                 link.remove("line");
                 let to = link["relationTo"].as_str().unwrap().to_owned();
