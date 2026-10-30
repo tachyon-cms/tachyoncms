@@ -21,6 +21,7 @@ use crate::schema::FieldKind;
 /// one, and a cell keeps its own as R37 says (W1-R39, W1-R41).
 /// A table's first row is its header, as GFM has no table without one (W1-R39).
 /// An ordered list's `start: 1` and a block's empty `fields` aren't written (W1-R39).
+/// A task item with no `checked` is written unchecked, and reads back so (W1-R42).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
 }
@@ -64,6 +65,15 @@ impl Lists {
     fn wrote(&mut self) {
         self.last = self.pending.take();
     }
+}
+
+/// Whether `line` is nothing but list markers: `-`, `*`, `+`, `1.` or `1)`.
+fn markers_only(line: &str) -> bool {
+    line.split(' ').filter(|m| !m.is_empty()).all(|m| {
+        matches!(m, "-" | "*" | "+")
+            || m.strip_suffix(['.', ')'])
+                .is_some_and(|n| !n.is_empty() && n.bytes().all(|b| b.is_ascii_digit()))
+    }) && !line.trim().is_empty()
 }
 
 /// Whether `s` ends in a line that is only `<br>`: Markdown reads that as an HTML block,
@@ -232,6 +242,9 @@ fn list(
             .lines()
             .enumerate()
             .map(|(n, l)| match (n, l.is_empty()) {
+                // Empty items nested on one line are markers alone, which `- - -` shows can
+                // read as a rule; an empty `<u></u>` after them keeps them items (W1-R43).
+                (0, _) if markers_only(l) => format!("{marker}{l} <u></u>"),
                 (0, _) => format!("{marker}{l}"),
                 (_, true) => String::new(),
                 _ => format!("{indent}{l}"),

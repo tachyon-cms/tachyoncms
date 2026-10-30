@@ -912,8 +912,12 @@ async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
         "/api/admin/collections",
         json!({"slug": "pages", "fields": [
             {"name": "title", "type": "text"},
-            {"name": "body", "type": "richText", "blocks": [
+            {"name": "slug", "type": "slug"},
+            {"name": "body", "type": "richText", "relationTo": ["pages"], "blocks": [
                 {"slug": "callout", "fields": [{"name": "kind", "type": "text"}]}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "copy", "fields": [{"name": "copy", "type": "richText", "relationTo": ["pages"]}]}
             ]}
         ]}),
     )
@@ -936,6 +940,20 @@ async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
             "body.content.0.attrs.fields.kind",
         ),
         (md("1000001. a"), "body.content.0.attrs.start"),
+        // A slug is refused before it's looked up, never sent to the database.
+        (
+            md("::ref{collection=\"pages\" slug=\"a\u{0}\"}"),
+            "body.content.0.attrs.slug",
+        ),
+        (
+            md("[a](<doc:pages/a\u{0}>)"),
+            "body.content.0.content.0.marks.0.attrs.doc.slug",
+        ),
+        (
+            json!({"layout": [{"blockType": "copy", "copy": {"format": "markdown",
+                "value": "::ref{collection=\"pages\" slug=\"\u{0}\"}"}}]}),
+            "layout.0.copy.content.0.attrs.slug",
+        ),
     ] {
         let res = send(&admin, "POST", "/api/pages", Some(&body.to_string())).await;
         assert_problem(&res, 422);

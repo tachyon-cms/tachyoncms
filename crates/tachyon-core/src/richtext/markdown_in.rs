@@ -68,11 +68,28 @@ pub fn from_markdown(src: &str, kind: &FieldKind) -> Result<Value, Vec<FieldErro
     });
     // Checked as though every slug named a document: whether one does is the caller's call.
     let mut check = doc.clone();
-    slug_refs_mut(&mut check, &mut |_, link| {
+    let mut nul = Vec::new();
+    slug_refs_mut(&mut check, &mut |at, link| {
+        // Slugs are looked up before field rules run, and Postgres can't take U+0000
+        // (W1-R43).
+        if link
+            .get("slug")
+            .and_then(Value::as_str)
+            .is_some_and(|s| s.contains('\0'))
+        {
+            let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
+            nul.push(FieldError {
+                path: format!("{at}.slug"),
+                message: format!("line {line}: {}", crate::validate::NUL),
+            });
+        }
         link.remove("slug");
         link.remove("line");
         link.insert("value".into(), Uuid::nil().to_string().into());
     });
+    if !nul.is_empty() {
+        return Err(nul);
+    }
     crate::validate::block_defaults(kind, &mut check);
     super::validate(&check, kind, "").map_err(|errors| {
         errors
@@ -1219,6 +1236,19 @@ mod tests {
             (&b, "Hello\n\n<div>hi</div>", "", format!("line 3: {html}")),
             (&b, "a <span>b</span>", "", format!("line 1: {html}")),
             (&b, "<u>open", "", "line 1: `<u>` is never closed".into()),
+            // A slug is never looked up with a NUL in it (W1-R43).
+            (
+                &b,
+                "a\n\n::ref{collection=\"posts\" slug=\"a\u{0}\"}",
+                "content.1.attrs.slug",
+                "line 3: must not contain the NUL character".into(),
+            ),
+            (
+                &b,
+                "[a](<doc:posts/\u{0}>)",
+                "content.0.content.0.marks.0.attrs.doc.slug",
+                "line 1: must not contain the NUL character".into(),
+            ),
             (&b, "shut</u>", "", "line 1: `</u>` closes nothing".into()),
             (&b, "<u>a <u>b</u></u>", "", "line 1: `underline` is applied twice".into()),
             (&b, "*a _b *c* d_ e*", "", "line 1: `italic` is applied twice".into()),
@@ -1883,6 +1913,18 @@ mod tests {
         json!({"type": "taskList", "content": [task(true, json!([first]))]})
     }
 
+    /// Bullet lists `depth` deep, each item's only block the next list, the innermost
+    /// item holding an empty paragraph; `after` adds items to the outermost list.
+    fn nest(depth: usize, after: Vec<Value>) -> Value {
+        let mut list = bullets(vec![json!([{"type": "paragraph"}])]);
+        for _ in 1..depth {
+            list = bullets(vec![json!([list])]);
+        }
+        let mut items = list["content"].as_array().unwrap().clone();
+        items.extend(after.into_iter().map(|c| item("listItem", c)));
+        json!({"type": "bulletList", "content": items})
+    }
+
     fn video(url: &str) -> Value {
         json!({"type": "block", "attrs": {"blockType": "video", "fields": {"url": url}}})
     }
@@ -2074,6 +2116,15 @@ mod tests {
                     {"type": "tableCell", "content": [empty]}
                 ]}
             ]}),
+            // I1: empty items nested three and four deep are a line of markers alone,
+            // which mustn't read as a rule (W1-R43).
+            nest(3, vec![]),
+            nest(4, vec![]),
+            nest(3, vec![json!([para(json!([t("a")]))])]),
+            json!({"type": "blockquote", "content": [nest(3, vec![])]}),
+            callout_of(vec![nest(3, vec![])]),
+            json!({"type": "taskList", "content": [task(false, json!([nest(3, vec![])]))]}),
+            json!({"type": "orderedList", "content": [item("listItem", json!([nest(3, vec![])]))]}),
             // Control characters at a line's ends.
             para(json!([t("a\u{b}")])),
             para(json!([t("\u{c}")])),
@@ -2137,6 +2188,24 @@ mod tests {
         );
         // A directive behind a task box is refused, not kept as text: it fails closed.
         assert!(from_markdown("- [ ] ::video{url=\"a\"}", &kind).is_err());
+        // I1: untrusted markers alone either read the same way twice or are refused.
+        for src in [
+            "- + -",
+            "--\n* - +",
+            "* + - +",
+            "> - + -",
+            "1. - +",
+            "- [ ]\n  + - *",
+        ] {
+            if let Ok(d) = from_markdown(src, &kind) {
+                let markdown = to_markdown(&d, &kind, &ctx);
+                assert_eq!(
+                    from_markdown(&markdown, &kind),
+                    Ok(d),
+                    "{src:?} -> {markdown:?}"
+                );
+            }
+        }
         // Raw HTML other than `<u>` and `<br>` is still refused.
         for (src, ok) in [
             ("a<br>b", true),

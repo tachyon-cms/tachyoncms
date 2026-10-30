@@ -296,36 +296,7 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
             0 => json!({"type": "blockquote", "content": [empty()]}),
             _ => json!({"type": "blockquote", "content": blocks(r, at, depth + 1, 3)}),
         },
-        6 | 7 => {
-            let kind = r.pick(&["bulletList", "orderedList", "taskList"]);
-            let items: Vec<Value> = (0..1 + r.n(3))
-                .map(|_| {
-                    let mut content = vec![match r.n(5) {
-                        0 => block(r, at, depth + 1),
-                        1 => empty(),
-                        _ => para(inline(r, rels, true)),
-                    }];
-                    if r.n(3) == 0 {
-                        content.push(block(r, at, depth + 1));
-                    }
-                    match kind {
-                        "taskList" => json!({"type": "taskItem", "attrs": {"checked": r.n(2) == 0}, "content": content}),
-                        _ => json!({"type": "listItem", "content": content}),
-                    }
-                })
-                .collect();
-            let mut n = json!({"type": kind, "content": items});
-            if kind == "orderedList" && r.n(3) == 0 {
-                // Up to the cap, where the last number is still nine digits (W1-R41).
-                let start = match r.n(4) {
-                    0 => MAX_START - r.n(3) as u64,
-                    1 => r.n(MAX_START as usize + 1) as u64,
-                    _ => r.n(4) as u64,
-                };
-                n["attrs"] = json!({ "start": start });
-            }
-            n
-        }
+        6 | 7 => list(r, at, depth),
         8 => {
             let cols = 1 + r.n(3);
             // Some tables have no header row, as an editor allows.
@@ -412,6 +383,42 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
             In::Aside => para(inline(r, rels, true)),
         },
     }
+}
+
+/// A bullet, ordered or task list, its items' first blocks often empty or a list.
+fn list(r: &mut Rng, at: In, depth: usize) -> Value {
+    let rels = at.rels();
+    // Bullets twice as often: only they can stack into `- - -` (W1-R43).
+    let kind = r.pick(&["bulletList", "bulletList", "orderedList", "taskList"]);
+    let items: Vec<Value> = (0..1 + r.n(3))
+        .map(|_| {
+            // Lists opening with a list nest empty items onto one line (W1-R43).
+            let mut content = vec![match r.n(4) {
+                0 if r.n(2) == 0 => block(r, at, depth + 1),
+                0 => empty(),
+                1 if depth < 4 => list(r, at, depth + 1),
+                _ => para(inline(r, rels, true)),
+            }];
+            if r.n(3) == 0 {
+                content.push(block(r, at, depth + 1));
+            }
+            match kind {
+                "taskList" => json!({"type": "taskItem", "attrs": {"checked": r.n(2) == 0}, "content": content}),
+                _ => json!({"type": "listItem", "content": content}),
+            }
+        })
+        .collect();
+    let mut n = json!({"type": kind, "content": items});
+    if kind == "orderedList" && r.n(3) == 0 {
+        // Up to the cap, where the last number is still nine digits (W1-R41).
+        let start = match r.n(4) {
+            0 => MAX_START - r.n(3) as u64,
+            1 => r.n(MAX_START as usize + 1) as u64,
+            _ => r.n(4) as u64,
+        };
+        n["attrs"] = json!({ "start": start });
+    }
+    n
 }
 
 /// The reader's mark order (W1-R37).
