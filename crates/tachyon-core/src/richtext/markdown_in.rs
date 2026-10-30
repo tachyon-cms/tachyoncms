@@ -1909,6 +1909,7 @@ mod tests {
             )
         };
         let br = json!({"type": "hardBreak"});
+        let empty = json!({"type": "paragraph"});
         let cell = |content: Value| {
             json!({"type": "table", "content": [
                 {"type": "tableRow", "content": [{"type": "tableHeader", "content": [para(content.clone())]}]},
@@ -2021,6 +2022,58 @@ mod tests {
                     item("listItem", json!([{"type": "codeBlock"}]))
                 ]}),
             ]),
+            // P1: the largest start, every number still nine digits or fewer (W1-R41).
+            json!({"type": "orderedList", "attrs": {"start": 1_000_000}, "content": [
+                item("listItem", json!([para(json!([t("a")]))])),
+                item("listItem", json!([para(json!([t("b")]))]))
+            ]}),
+            // P2, P3 and R40: a container holding one empty paragraph keeps it (W1-R41).
+            json!({"type": "blockquote", "content": [empty]}),
+            json!({"type": "blockquote", "content": [{"type": "blockquote", "content": [empty]}]}),
+            bullets(vec![json!([
+                json!({"type": "blockquote", "content": [empty]})
+            ])]),
+            callout_of(vec![json!({"type": "blockquote", "content": [empty]})]),
+            bullets(vec![json!([empty])]),
+            bullets(vec![
+                json!([empty]),
+                json!([para(json!([t("a")]))]),
+                json!([empty]),
+            ]),
+            json!({"type": "orderedList", "attrs": {"start": 3}, "content": [
+                item("listItem", json!([empty])), item("listItem", json!([empty]))
+            ]}),
+            json!({"type": "taskList", "content": [task(false, json!([empty]))]}),
+            json!({"type": "taskList", "content": [task(false, json!([empty])), task(true, json!([empty]))]}),
+            json!({"type": "taskList", "content": [
+                task(true, json!([empty])), task(false, json!([para(json!([t("a")]))]))
+            ]}),
+            // A nested list opening with an empty item, right under its paragraph.
+            bullets(vec![json!([
+                para(json!([t("a")])),
+                bullets(vec![json!([empty])])
+            ])]),
+            bullets(vec![json!([
+                para(json!([t("a")])),
+                json!({"type": "taskList", "content": [task(false, json!([empty]))]})
+            ])]),
+            bullets(vec![json!([
+                para(json!([t("a")])),
+                json!({"type": "orderedList", "content": [item("listItem", json!([empty]))]})
+            ])]),
+            json!({"type": "blockquote", "content": [
+                json!({"type": "taskList", "content": [task(true, json!([empty]))]})
+            ]}),
+            json!({"type": "table", "content": [
+                {"type": "tableRow", "content": [
+                    {"type": "tableHeader", "content": [empty]},
+                    {"type": "tableHeader", "content": [para(json!([t("a")]))]}
+                ]},
+                {"type": "tableRow", "content": [
+                    {"type": "tableCell", "content": [empty]},
+                    {"type": "tableCell", "content": [empty]}
+                ]}
+            ]}),
             // Control characters at a line's ends.
             para(json!([t("a\u{b}")])),
             para(json!([t("\u{c}")])),
@@ -2051,6 +2104,39 @@ mod tests {
             let markdown = to_markdown(&d, &kind, &ctx);
             assert_eq!(from_markdown(&markdown, &kind), Ok(d), "{markdown:?}");
         }
+        // P2: an empty quote is written as its marker alone.
+        let quote = doc(json!([{"type": "blockquote", "content": [{"type": "paragraph"}]}]));
+        assert_eq!(to_markdown(&quote, &kind, &ctx), ">");
+        // P1: a list numbered past the cap, or past nine digits, is refused (W1-R41).
+        let numbered = |start: u64, items: usize| {
+            let it = item("listItem", json!([para(json!([t("a")]))]));
+            doc(
+                json!([{"type": "orderedList", "attrs": {"start": start}, "content": vec![it; items]}]),
+            )
+        };
+        for d in [
+            numbered(1_000_000_000, 1),
+            numbered(999_999_999, 2),
+            numbered(1_000_001, 1),
+        ] {
+            let errors = super::super::validate(&d, &kind, "body").unwrap_err();
+            assert_eq!(errors[0].path, "body.content.0.attrs.start");
+        }
+        // NUL beside a delimiter: refused, so its flanking never matters (W1-R41).
+        let nul = doc(json!([para(json!([
+            t("\u{0}"),
+            marked(";", json!([{"type": "italic"}]))
+        ]))]));
+        let errors = super::super::validate(&nul, &kind, "body").unwrap_err();
+        assert_eq!(
+            (errors[0].path.as_str(), errors[0].message.as_str()),
+            (
+                "body.content.0.content.0.text",
+                "must not contain the NUL character"
+            )
+        );
+        // A directive behind a task box is refused, not kept as text: it fails closed.
+        assert!(from_markdown("- [ ] ::video{url=\"a\"}", &kind).is_err());
         // Raw HTML other than `<u>` and `<br>` is still refused.
         for (src, ok) in [
             ("a<br>b", true),
@@ -2130,6 +2216,42 @@ mod tests {
                 {"type": "orderedList", "content": [item("listItem", json!([para(json!([t("b")]))]))]},
                 {"type": "block", "attrs": {"blockType": "callout"}}
             ])))
+        );
+        // An empty paragraph beside other blocks goes, inside a container too; one alone
+        // in a quote, an item or a cell stays (W1-R39, W1-R41).
+        let beside = doc(json!([
+            bullets(vec![json!([para(json!([t("a")])), {"type": "paragraph"}])]),
+            {"type": "blockquote", "content": [{"type": "paragraph"}, para(json!([t("b")]))]},
+            {"type": "taskList", "content": [task(true, json!([{"type": "paragraph"}, {"type": "paragraph"}]))]}
+        ]));
+        assert_eq!(
+            from_markdown(&to_markdown(&beside, &kind, &ctx), &kind),
+            Ok(doc(json!([
+                bullets(vec![json!([para(json!([t("a")]))])]),
+                {"type": "blockquote", "content": [para(json!([t("b")]))]},
+                {"type": "taskList", "content": [task(true, json!([{"type": "paragraph"}]))]}
+            ])))
+        );
+        // A table's first row is its header: GFM has no table without one (W1-R39).
+        let row = |cell: &str, s: &str| json!({"type": "tableRow", "content": [{"type": cell, "content": [para(json!([t(s)]))]}]});
+        let headless = doc(
+            json!([{"type": "table", "content": [row("tableCell", "a"), row("tableCell", "b")]}]),
+        );
+        assert_eq!(
+            from_markdown(&to_markdown(&headless, &kind, &ctx), &kind),
+            Ok(doc(
+                json!([{"type": "table", "content": [row("tableHeader", "a"), row("tableCell", "b")]}])
+            ))
+        );
+        // A task item without `checked` reads back unchecked.
+        let unset = doc(json!([{"type": "taskList", "content": [
+            {"type": "taskItem", "content": [para(json!([t("a")]))]}
+        ]}]));
+        assert_eq!(
+            from_markdown(&to_markdown(&unset, &kind, &ctx), &kind),
+            Ok(doc(
+                json!([{"type": "taskList", "content": [task(false, json!([para(json!([t("a")]))]))]}])
+            ))
         );
         // Marks are a set: they read back in one order.
         let linked = doc(json!([para(json!([marked(

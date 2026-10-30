@@ -901,3 +901,51 @@ fn linked(link: &Value) -> &str {
     let v = &link["value"];
     v.get("id").unwrap_or(v).as_str().unwrap()
 }
+
+/// U+0000 is a 422 at the node holding it, sent as JSON or as Markdown, never a database
+/// error; so is a list numbered past the cap (W1-R41).
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "body", "type": "richText", "blocks": [
+                {"slug": "callout", "fields": [{"name": "kind", "type": "text"}]}
+            ]}
+        ]}),
+    )
+    .await;
+    let md = |s: &str| json!({"body": {"format": "markdown", "value": s}});
+    for (body, path) in [
+        (
+            json!({"body": text(json!([{"type": "paragraph", "content": [
+                {"type": "text", "text": "a\u{0}b"}
+            ]}]))}),
+            "body.content.0.content.0.text",
+        ),
+        (
+            json!({"body": text(json!([node("callout", json!({"kind": "\u{0}"}))]))}),
+            "body.content.0.attrs.fields.kind",
+        ),
+        (md("a\u{0}b"), "body.content.0.content.0.text"),
+        (
+            md("::callout{kind=\"\u{0}\"}"),
+            "body.content.0.attrs.fields.kind",
+        ),
+        (md("1000001. a"), "body.content.0.attrs.start"),
+    ] {
+        let res = send(&admin, "POST", "/api/pages", Some(&body.to_string())).await;
+        assert_problem(&res, 422);
+        assert_eq!(
+            res.json["errors"]
+                .as_array()
+                .map(|e| (e.len(), e[0]["path"].clone())),
+            Some((1, json!(path))),
+            "{body}: {}",
+            res.json
+        );
+    }
+}

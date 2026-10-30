@@ -73,6 +73,10 @@ pub const MAX_NODES: usize = 50_000;
 /// How many columns or rows one table cell may span.
 pub const MAX_SPAN: u64 = 1_000;
 
+/// The largest `start` an ordered list may take: with at most `MAX_NODES` nodes, its last
+/// number stays within the nine digits a Markdown list marker allows (W1-R41).
+pub const MAX_START: u64 = 1_000_000;
+
 const DOC_SHAPE: &str = "expected a rich text document like {\"type\": \"doc\", \"content\": []}";
 const SCHEMES: &str = "links must start with http://, https://, mailto:, tel:, / or #";
 
@@ -269,6 +273,13 @@ impl Check<'_, '_> {
         }
         let depth = self.budget.depth;
         self.children(doc, path, "doc", Holds::Blocks, depth, false);
+        // Postgres can't store U+0000, so it's a 422 at the node, not a database error
+        // (W1-R41). Last, so a fault that's also a NUL gets its own message.
+        if self.errors.is_empty()
+            && let Some(at) = crate::validate::nul_at(value, path)
+        {
+            self.fail(at, crate::validate::NUL);
+        }
     }
 
     /// The nodes in `node`'s `content`, which hold `holds`. `required`: at least one.
@@ -386,16 +397,19 @@ impl Check<'_, '_> {
         let at = |k: &str| format!("{path}.attrs.{k}");
         // An optional attribute may be missing or `null`.
         let given = |k: &str| attrs.get(k).filter(|v| !v.is_null());
-        let whole =
-            |k: &str, min: u64| given(k).is_none_or(|v| v.as_u64().is_some_and(|n| n >= min));
         match t {
             "heading" => match given("level").map(|v| v.as_u64().filter(|l| (1..=6).contains(l))) {
                 None => self.fail(at("level"), "is required"),
                 Some(None) => self.fail(at("level"), "expected a whole number from 1 to 6"),
                 Some(Some(_)) => {}
             },
-            "orderedList" if !whole("start", 0) => {
-                self.fail(at("start"), "expected a whole number of 0 or more")
+            "orderedList"
+                if given("start").is_some_and(|v| !v.as_u64().is_some_and(|n| n <= MAX_START)) =>
+            {
+                self.fail(
+                    at("start"),
+                    format!("expected a whole number from 0 to {MAX_START}"),
+                )
             }
             "taskItem" if given("checked").is_some_and(|v| !v.is_boolean()) => {
                 self.fail(at("checked"), "expected true or false")
@@ -1062,6 +1076,10 @@ mod tests {
     fn rich_text_accepts_the_full_node_set() {
         let body = full();
         assert_eq!(validate(&body, &everything()[0].kind, "body"), Ok(()));
+        let last = json!({"type": "orderedList", "attrs": {"start": 1_000_000}, "content": [
+            {"type": "listItem", "content": [para(json!([]))]}
+        ]});
+        assert!(check(&everything(), doc(json!([last]))).is_ok());
         let stored = check(&everything(), body.clone()).unwrap();
         // A new block node gets an ID; everything else is stored as sent.
         let nodes = stored["body"]["content"].as_array().unwrap();
@@ -1393,7 +1411,37 @@ mod tests {
                     {"type": "listItem", "content": [para(json!([]))]}
                 ]})),
                 "body.content.0.attrs.start",
-                "expected a whole number of 0 or more".into(),
+                "expected a whole number from 0 to 1000000".into(),
+            ),
+            // Past the cap, item numbers outgrow Markdown's nine digits (W1-R41).
+            (
+                all(),
+                one(json!({"type": "orderedList", "attrs": {"start": 1_000_001}, "content": [
+                    {"type": "listItem", "content": [para(json!([]))]}
+                ]})),
+                "body.content.0.attrs.start",
+                "expected a whole number from 0 to 1000000".into(),
+            ),
+            // U+0000 anywhere, at the node holding it: Postgres can't store it (W1-R41).
+            (
+                all(),
+                one(para(json!([text("a\u{0}b")]))),
+                "body.content.0.content.0.text",
+                "must not contain the NUL character".into(),
+            ),
+            (
+                everything(),
+                one(json!({"type": "block", "attrs": {"blockType": "cta", "fields": {"label": "\u{0}"}}})),
+                "body.content.0.attrs.fields.label",
+                "must not contain the NUL character".into(),
+            ),
+            (
+                boxed(),
+                one(json!({"type": "block", "attrs": {"blockType": "box", "fields": {"inner":
+                    doc(json!([para(json!([text("\u{0}")]))]))
+                }}})),
+                "body.content.0.attrs.fields.inner.content.0.content.0.text",
+                "must not contain the NUL character".into(),
             ),
             (
                 all(),
@@ -1584,6 +1632,8 @@ mod tests {
         ]);
         for (fields, body, path, message) in cases {
             let errors = check(&fields, body.clone()).expect_err(&format!("accepted {body}"));
+            // One error per fault: a NUL isn't named again at the field.
+            assert_eq!(errors.len(), 1, "{errors:?}");
             let first = &errors[0];
             assert_eq!(
                 (first.path.as_str(), first.message.as_str()),

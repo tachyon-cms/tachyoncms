@@ -52,10 +52,14 @@ pub fn validate_document(
     }
     let mut errors = Vec::new();
     check_object(fields, &doc, &[], "", &mut errors, None);
-    // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500.
+    // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500,
+    // unless the field's own rules already named it.
     for (key, value) in &doc {
-        if key.contains('\0') || contains_nul(value) {
-            errors.push(error(key.clone(), "must not contain the NUL character"));
+        let named = errors
+            .iter()
+            .any(|e| e.path == *key || e.path.starts_with(&format!("{key}.")));
+        if !named && (key.contains('\0') || nul_at(value, key).is_some()) {
+            errors.push(error(key.clone(), NUL));
         }
     }
     if !errors.is_empty() {
@@ -309,13 +313,33 @@ pub fn defaults(fields: &[Field]) -> Map<String, Value> {
     out
 }
 
-fn contains_nul(v: &Value) -> bool {
-    match v {
-        Value::String(s) => s.contains('\0'),
-        Value::Array(items) => items.iter().any(contains_nul),
-        Value::Object(obj) => obj.iter().any(|(k, v)| k.contains('\0') || contains_nul(v)),
-        _ => false,
+pub(crate) const NUL: &str = "must not contain the NUL character";
+
+/// The path of the first value under `v`, at `path`, whose string or key holds U+0000.
+pub(crate) fn nul_at(v: &Value, path: &str) -> Option<String> {
+    /// The keys down to it, innermost first: built only once one is found.
+    fn keys(v: &Value) -> Option<Vec<String>> {
+        let inside = |k: String, x: &Value| {
+            keys(x).map(|mut ks| {
+                ks.push(k);
+                ks
+            })
+        };
+        match v {
+            Value::String(s) => s.contains('\0').then(Vec::new),
+            Value::Array(items) => items
+                .iter()
+                .enumerate()
+                .find_map(|(i, x)| inside(i.to_string(), x)),
+            Value::Object(obj) => obj.iter().find_map(|(k, x)| match k.contains('\0') {
+                true => Some(Vec::new()),
+                false => inside(k.clone(), x),
+            }),
+            _ => None,
+        }
     }
+    let ks = keys(v)?;
+    Some(ks.iter().rev().fold(path.to_owned(), |p, k| join(&p, k)))
 }
 
 /// Stores date-times in UTC and relationship IDs in canonical form, whatever the client sent.

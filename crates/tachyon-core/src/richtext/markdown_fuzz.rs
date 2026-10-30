@@ -4,7 +4,7 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{RenderCtx, from_markdown, slug_refs_mut, to_markdown, to_text};
+use super::{MAX_START, RenderCtx, from_markdown, slug_refs_mut, to_markdown, to_text};
 use crate::schema::{Field, FieldKind};
 
 /// A callout holding text (which may hold an aside holding text) and a video leaf.
@@ -256,8 +256,18 @@ impl In {
     }
 }
 
+/// An empty paragraph: an empty line in an editor, or a container's only block.
+fn empty() -> Value {
+    json!({"type": "paragraph"})
+}
+
 fn blocks(r: &mut Rng, at: In, depth: usize, max: usize) -> Vec<Value> {
-    (0..1 + r.n(max)).map(|_| block(r, at, depth)).collect()
+    (0..1 + r.n(max))
+        .map(|_| match r.n(8) {
+            0 => empty(),
+            _ => block(r, at, depth),
+        })
+        .collect()
 }
 
 fn block(r: &mut Rng, at: In, depth: usize) -> Value {
@@ -282,13 +292,17 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
             n
         }
         4 => json!({"type": "horizontalRule"}),
-        5 => json!({"type": "blockquote", "content": blocks(r, at, depth + 1, 3)}),
+        5 => match r.n(4) {
+            0 => json!({"type": "blockquote", "content": [empty()]}),
+            _ => json!({"type": "blockquote", "content": blocks(r, at, depth + 1, 3)}),
+        },
         6 | 7 => {
             let kind = r.pick(&["bulletList", "orderedList", "taskList"]);
             let items: Vec<Value> = (0..1 + r.n(3))
                 .map(|_| {
-                    let mut content = vec![match r.n(4) {
+                    let mut content = vec![match r.n(5) {
                         0 => block(r, at, depth + 1),
+                        1 => empty(),
                         _ => para(inline(r, rels, true)),
                     }];
                     if r.n(3) == 0 {
@@ -302,19 +316,32 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
                 .collect();
             let mut n = json!({"type": kind, "content": items});
             if kind == "orderedList" && r.n(3) == 0 {
-                n["attrs"] = json!({"start": r.n(4)});
+                // Up to the cap, where the last number is still nine digits (W1-R41).
+                let start = match r.n(4) {
+                    0 => MAX_START - r.n(3) as u64,
+                    1 => r.n(MAX_START as usize + 1) as u64,
+                    _ => r.n(4) as u64,
+                };
+                n["attrs"] = json!({ "start": start });
             }
             n
         }
         8 => {
             let cols = 1 + r.n(3);
+            // Some tables have no header row, as an editor allows.
+            let headed = r.n(4) != 0;
             let rows: Vec<Value> = (0..1 + r.n(3))
                 .map(|i| {
-                    let t = if i == 0 { "tableHeader" } else { "tableCell" };
+                    let t = if i == 0 && headed {
+                        "tableHeader"
+                    } else {
+                        "tableCell"
+                    };
                     let cells: Vec<Value> = (0..cols)
                         .map(|_| {
-                            let content = match r.n(4) {
+                            let content = match r.n(5) {
                                 0 => blocks(r, at, 3, 2),
+                                1 => vec![empty()],
                                 _ => vec![para(inline(r, rels, true))],
                             };
                             json!({"type": t, "content": content})
@@ -392,7 +419,9 @@ const ORDER: [&str; 6] = ["bold", "italic", "underline", "strike", "link", "code
 
 /// `v` as Markdown gives it back: a line break in code text loses the code mark (R28);
 /// same-marked neighbours merge (R34); marks in one order (R37); a table cell is one
-/// paragraph, code blocks end lines with `\n`, `start: 1` and empty `fields` go (R39).
+/// paragraph, code blocks end lines with `\n`, `start: 1` and empty `fields` go, a
+/// table's first row is its header, and empty paragraphs go wherever a sibling sits
+/// beside them, a quote or item keeping one if that's all it holds (R39, R41).
 fn normal(v: &Value) -> Value {
     let Value::Object(o) = v else {
         return match v {
@@ -435,6 +464,26 @@ fn normal(v: &Value) -> Value {
         }
         if a.is_empty() {
             o.remove("attrs");
+        }
+    }
+    if kind == "table"
+        && let Some(Value::Array(rows)) = o.get_mut("content")
+    {
+        for (i, row) in rows.iter_mut().enumerate() {
+            let t = if i == 0 { "tableHeader" } else { "tableCell" };
+            for cell in row["content"].as_array_mut().into_iter().flatten() {
+                cell["type"] = t.into();
+            }
+        }
+    }
+    if matches!(
+        kind.as_str(),
+        "doc" | "blockquote" | "listItem" | "taskItem"
+    ) && let Some(Value::Array(content)) = o.get_mut("content")
+    {
+        content.retain(|b| *b != empty() && *b != json!({"type": "paragraph", "content": []}));
+        if content.is_empty() && kind != "doc" {
+            content.push(empty());
         }
     }
     if kind != "codeBlock"

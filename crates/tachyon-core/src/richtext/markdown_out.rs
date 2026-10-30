@@ -16,7 +16,10 @@ use crate::schema::FieldKind;
 /// A text's marks read back in one order, since Markdown can't say theirs (W1-R37).
 /// A cell holding one block that isn't a paragraph holds its text as one (W1-R39).
 /// Code blocks end lines with `\n`; Markdown has no other line end in them (W1-R39).
-/// Empty paragraphs are left out: Markdown has no empty paragraph (W1-R39).
+/// Empty paragraphs are left out wherever another block sits beside them: Markdown has
+/// no empty paragraph. A quote, list item or task item holding only empty paragraphs holds
+/// one, and a cell keeps its own as R37 says (W1-R39, W1-R41).
+/// A table's first row is its header, as GFM has no table without one (W1-R39).
 /// An ordered list's `start: 1` and a block's empty `fields` aren't written (W1-R39).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
@@ -99,17 +102,22 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> S
                 false => format!("{bullet} [ ] "),
             }
         }),
-        "blockquote" => blocks(children(node), k, ctx)
-            .lines()
-            .map(|l| {
-                if l.is_empty() {
-                    ">".into()
-                } else {
-                    format!("> {l}")
-                }
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+        // A quote with nothing to say is its marker alone, which reads back as a quote
+        // holding an empty paragraph (W1-R41).
+        "blockquote" => match blocks(children(node), k, ctx) {
+            b if b.is_empty() => ">".into(),
+            b => b
+                .lines()
+                .map(|l| {
+                    if l.is_empty() {
+                        ">".into()
+                    } else {
+                        format!("> {l}")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join("\n"),
+        },
         "horizontalRule" => "---".into(),
         "codeBlock" => {
             // Markdown ends every line with `\n` (W1-R39).
@@ -190,14 +198,22 @@ fn list(
                 && attr(child, "start")
                     .and_then(Value::as_u64)
                     .is_none_or(|s| s == 1)
-                && !ends_in_br(&body);
+                && !ends_in_br(&body)
+                // An empty item, its marker alone, can't interrupt a paragraph.
+                && text.lines().next().is_some_and(|l| l.contains(' '));
             if !body.is_empty() {
                 body.push_str(if runs_on { "\n" } else { "\n\n" });
             }
             body.push_str(&text);
         }
+        // An item with nothing to say is its marker alone, which reads back as an item
+        // holding an empty paragraph. A task box alone is text, so it takes an empty
+        // `<u></u>` after it, which the reader drops (W1-R41).
         if body.is_empty() {
-            out.push(marker.trim_end().to_owned());
+            out.push(match marker.ends_with("] ") {
+                true => format!("{marker}<u></u>"),
+                false => marker.trim_end().to_owned(),
+            });
             continue;
         }
         // A task item's content starts after its `- `; its box is part of the content.
