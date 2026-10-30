@@ -5,7 +5,7 @@ mod common;
 use axum::Router;
 use axum::http::Request;
 use common::{Res, add_user, admin_app, app_as, assert_problem, send, send_with, signed_in};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 
 async fn create(app: &Router, url: &str, body: Value) -> Value {
@@ -2184,7 +2184,8 @@ fn field_read_agrees(what: &str, answer: &Value, readable: &[Value], path: &str)
     agrees(what, answer, if seen.is_empty() { &[false] } else { &seen });
 }
 
-/// Whether `doc` holds the field at dotted `path`, through groups and every row of a list.
+/// Whether `doc` holds the field at dotted `path`, through groups, every row of a list and
+/// every block node of rich text.
 fn has(doc: &Value, path: &str) -> bool {
     let (head, rest) = path
         .split_once('.')
@@ -2195,12 +2196,31 @@ fn has(doc: &Value, path: &str) -> bool {
         (Some(Value::Array(rows)), Some(rest)) => {
             !rows.is_empty() && rows.iter().all(|r| has(r, rest))
         }
+        (Some(v), Some(rest)) if v["type"] == "doc" => {
+            let mut nodes = Vec::new();
+            block_fields(v, &mut nodes);
+            !nodes.is_empty() && nodes.iter().all(|f| has(f, rest))
+        }
         (Some(v), Some(rest)) => has(v, rest),
+    }
+}
+
+/// The `fields` of each block node in rich text `node`, at any depth.
+fn block_fields<'v>(node: &'v Value, out: &mut Vec<&'v Value>) {
+    if node["type"] == "block" {
+        out.push(&node["attrs"]["fields"]);
+    }
+    for child in node["content"].as_array().into_iter().flatten() {
+        block_fields(child, out);
     }
 }
 
 const LISTS: &[&str] = &["links"];
 const GROUPS: &[&str] = &["seo", "box"];
+/// Blocks fields, with their block types, each of which has every field the others do.
+const BLOCKS: &[(&str, &[&str])] = &[("layout", &["hero", "quote"])];
+/// Rich text fields, with the one block type their nodes take.
+const RICH: &[(&str, &str)] = &[("article", "note")];
 
 /// Every collection and global in `access_answers_match_what_the_api_allows`, with its fields.
 const KNOWN: &[(&str, &str, &[&str])] = &[
@@ -2229,6 +2249,20 @@ const KNOWN: &[(&str, &str, &[&str])] = &[
         ],
     ),
     ("collections", "notes", &["body"]),
+    (
+        "collections",
+        "pages",
+        &[
+            "article",
+            "article.secret",
+            "article.text",
+            "layout",
+            "layout.cite",
+            "layout.heading",
+            "layout.secret",
+            "title",
+        ],
+    ),
     ("collections", "inbox", &["body"]),
     ("collections", "users", &["name"]),
     ("globals", "home", &["banner", "live", "memo"]),
@@ -2293,21 +2327,37 @@ fn filled(a: &Value) -> Value {
     a
 }
 
-/// A body that writes only the field at dotted `path`: `leaf` for a value, an empty group
-/// or list for a container, wrapped in its groups and one list row.
-fn body_at(path: &str, leaf: Value) -> Value {
-    let mut segments: Vec<&str> = path.split('.').collect();
-    let last = segments.pop().unwrap();
-    let value = match last {
-        l if LISTS.contains(&l) => json!([]),
-        l if GROUPS.contains(&l) => json!({}),
-        _ => leaf,
+/// The bodies that write only the field at dotted `path`: `leaf` for a value, an empty
+/// group or list for a container, wrapped in its groups and one list row. A path through
+/// blocks gives one body per block type, its row of that type; a path into rich text gives
+/// one block node.
+fn bodies_at(path: &str, leaf: Value) -> Vec<Value> {
+    let Some((head, rest)) = path.split_once('.') else {
+        let value = match path {
+            l if LISTS.contains(&l) || BLOCKS.iter().any(|b| b.0 == l) => json!([]),
+            l if GROUPS.contains(&l) => json!({}),
+            _ => leaf,
+        };
+        return vec![json!({ path: value })];
     };
-    let mut out = json!({ last: value });
-    for s in segments.into_iter().rev() {
-        out = json!({ s: if LISTS.contains(&s) { json!([out]) } else { out } });
+    let inner = bodies_at(rest, leaf);
+    if let Some((_, types)) = BLOCKS.iter().find(|b| b.0 == head) {
+        let row = |v: &Value, t: &str| {
+            let mut row = v.clone();
+            row["blockType"] = t.into();
+            json!({ head: [row] })
+        };
+        return types
+            .iter()
+            .flat_map(|t| inner.iter().map(move |v| row(v, t)))
+            .collect();
     }
-    out
+    let wrap = |v: Value| match RICH.iter().find(|r| r.0 == head) {
+        Some((_, t)) => json!({ head: rich(json!([block_node(t, v)])) }),
+        None if LISTS.contains(&head) => json!({ head: [v] }),
+        None => json!({ head: v }),
+    };
+    inner.into_iter().map(wrap).collect()
 }
 
 /// One collection's answers for one caller, and what to probe them with.
@@ -2426,20 +2476,26 @@ async fn bears_out<L: Fn(&str) -> Value>(p: Probe<'_, L>) {
         .find(|(_, u)| **u)
         .map_or(&docs[0], |(d, _)| d)
         .clone();
+    // A name inside blocks answers for every block type that has it (R7), so it allows a
+    // write only when the write goes through in a row of each type.
     for (path, f) in fields {
-        let body = body_at(path, leaf(path));
-        let res = send(
-            app,
-            "POST",
-            &format!("/api/{slug}"),
-            Some(&body.to_string()),
-        )
-        .await;
-        let created = what(&format!("field {path} create"));
-        agrees(&created, &f["create"], &[wrote(&res)]);
-        let res = patch(app, &url(&target), body).await;
-        let updated = what(&format!("field {path} update"));
-        agrees(&updated, &f["update"], &[wrote(&res)]);
+        let (mut created, mut updated) = (Vec::new(), Vec::new());
+        for body in bodies_at(path, leaf(path)) {
+            let res = send(
+                app,
+                "POST",
+                &format!("/api/{slug}"),
+                Some(&body.to_string()),
+            )
+            .await;
+            created.push(wrote(&res));
+            updated.push(wrote(&patch(app, &url(&target), body).await));
+        }
+        let all = |w: Vec<bool>| json!(w.iter().all(|w| *w));
+        let what_c = what(&format!("field {path} create {created:?}"));
+        assert_eq!(f["create"], all(created), "{what_c}");
+        let what_u = what(&format!("field {path} update {updated:?}"));
+        assert_eq!(f["update"], all(updated), "{what_u}");
     }
 
     let mut deletes = Vec::new();
@@ -2447,6 +2503,44 @@ async fn bears_out<L: Fn(&str) -> Value>(p: Probe<'_, L>) {
         deletes.push(went_through(&send(app, "DELETE", &url(d), None).await));
     }
     agrees(&what("delete"), &answers["delete"], &deletes);
+}
+
+/// Everyone `/api/access` answers for, each with their user ID: nobody signed in, a
+/// Viewer, an Author, an Editor, the Admin, and a key of the Admin's with `scopes`. Also
+/// the Admin's ID.
+async fn callers(
+    pool: &PgPool,
+    admin: &Router,
+    scopes: Value,
+) -> (uuid::Uuid, Vec<(&'static str, Router, Option<uuid::Uuid>)>) {
+    let me = get(admin, "/api/auth/me").await;
+    let admin_id: uuid::Uuid = me.json["id"].as_str().unwrap().parse().unwrap();
+    let made = create(
+        admin,
+        "/api/auth/keys",
+        json!({"name": "k", "scopes": scopes}),
+    )
+    .await;
+    let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
+    let key = visitor(pool).await.layer(axum::middleware::map_request(
+        move |mut req: Request<axum::body::Body>| {
+            let bearer = bearer.clone();
+            async move {
+                let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
+                req.headers_mut().insert("authorization", value);
+                req
+            }
+        },
+    ));
+    let mut callers = vec![("anonymous", visitor(pool).await, None)];
+    for role in ["viewer", "author", "editor"] {
+        let email = format!("{role}@example.com");
+        let id = add_user(pool, &email, role).await;
+        callers.push((role, signed_in(visitor(pool).await, &email).await, Some(id)));
+    }
+    callers.push(("admin", admin.clone(), Some(admin_id)));
+    callers.push(("key", key, Some(admin_id)));
+    (admin_id, callers)
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -2528,37 +2622,7 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         json!({"title": "anchor", "stage": "published"}),
     )
     .await);
-    let me = get(&admin, "/api/auth/me").await;
-    let admin_id: uuid::Uuid = me.json["id"].as_str().unwrap().parse().unwrap();
-    let made = create(
-        &admin,
-        "/api/auth/keys",
-        json!({"name": "k", "scopes": ["posts:read", "notes:write"]}),
-    )
-    .await;
-    let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
-    let key = visitor(&pool).await.layer(axum::middleware::map_request(
-        move |mut req: Request<axum::body::Body>| {
-            let bearer = bearer.clone();
-            async move {
-                let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
-                req.headers_mut().insert("authorization", value);
-                req
-            }
-        },
-    ));
-    let mut callers = vec![("anonymous", visitor(&pool).await, None)];
-    for role in ["viewer", "author", "editor"] {
-        let email = format!("{role}@example.com");
-        let id = add_user(&pool, &email, role).await;
-        callers.push((
-            role,
-            signed_in(visitor(&pool).await, &email).await,
-            Some(id),
-        ));
-    }
-    callers.push(("admin", admin.clone(), Some(admin_id)));
-    callers.push(("key", key, Some(admin_id)));
+    let (admin_id, callers) = callers(&pool, &admin, json!(["posts:read", "notes:write"])).await;
 
     let mut answers = Vec::new();
     for (who, app, me) in &callers {
@@ -3322,4 +3386,426 @@ async fn profile_joins_and_references_read_like_content(pool: PgPool) {
         assert!(fans[0].get("secretPick").is_none(), "{who}: {}", res.json);
         assert_eq!(paths(&get(&app, &refs).await), ["users.favourite"], "{who}");
     }
+}
+
+fn rich(content: Value) -> Value {
+    json!({"type": "doc", "content": content})
+}
+
+fn see(collection: &str, id: &str) -> Value {
+    json!({"type": "paragraph", "content": [{"type": "text", "text": "see", "marks": [
+        {"type": "link", "attrs": {"doc": {"relationTo": collection, "value": id}}}
+    ]}]})
+}
+
+fn block_node(block_type: &str, fields: Value) -> Value {
+    json!({"type": "block", "attrs": {"blockType": block_type, "fields": fields}})
+}
+
+/// A document the caller can't read, linked from rich text by a link mark, a relationship
+/// node and a block node's fields: nothing of it but its ID shows, in any format at any
+/// depth, and nothing finds it through `where` or `/references`.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn rich_text_links_respect_read_rules(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "secrets", "url": "/s/{slug}", "access": {"read": {"role": "editor"}},
+            "fields": [{"name": "title", "type": "text"}, {"name": "slug", "type": "slug"}]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "body", "type": "richText", "relationTo": ["secrets"], "blocks": [
+                {"slug": "card", "fields": [
+                    {"name": "who", "type": "relationship", "relationTo": "secrets"},
+                    {"name": "inner", "type": "richText", "relationTo": ["secrets"]}
+                ]}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "pick", "fields": [{"name": "who", "type": "relationship", "relationTo": "secrets"}]}
+            ]}
+        ]}),
+    )
+    .await;
+    let hidden = id(&create(
+        &admin,
+        "/api/secrets",
+        json!({"title": "Classified", "slug": "plans"}),
+    )
+    .await);
+    let card = block_node(
+        "card",
+        json!({"who": hidden, "inner": rich(json!([see("secrets", &hidden)]))}),
+    );
+    let body = rich(json!([
+        see("secrets", &hidden),
+        {"type": "relationship", "attrs": {"relationTo": "secrets", "value": hidden}},
+        card
+    ]));
+    // One page links only from its text, the other only from a block row.
+    let text_page = id(&create(&admin, "/api/pages", json!({"title": "T", "body": body})).await);
+    let row_page = id(&create(
+        &admin,
+        "/api/pages",
+        json!({"title": "R", "layout": [{"blockType": "pick", "who": hidden}]}),
+    )
+    .await);
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    let leaks = |s: &str| {
+        ["Classified", "plans", "/s/"]
+            .into_iter()
+            .any(|w| s.contains(w))
+    };
+
+    for depth in 0..=2 {
+        for format in ["json", "html", "markdown", "text"] {
+            let q = format!("depth={depth}&format={format}");
+            for url in [
+                format!("/api/pages/{text_page}?{q}"),
+                format!("/api/pages?{q}"),
+            ] {
+                let res = get(&viewer, &url).await;
+                assert_eq!(res.status, 200, "{url}: {}", res.json);
+                assert!(!leaks(&res.json.to_string()), "{url}: {}", res.json);
+                // The same read shows the editor what it hides, so the check above bites.
+                let seen = get(&editor, &url).await.json.to_string();
+                if format != "text" && (depth > 0 || format != "json") {
+                    assert!(leaks(&seen), "{url}: {seen}");
+                }
+            }
+        }
+        // JSON keeps each link as the bare ID.
+        let doc = get(&viewer, &format!("/api/pages/{text_page}?depth={depth}"))
+            .await
+            .json;
+        let c = &doc["body"]["content"];
+        assert_eq!(
+            c[0]["content"][0]["marks"][0]["attrs"]["doc"]["value"],
+            hidden
+        );
+        assert_eq!(c[1]["attrs"]["value"], hidden);
+        let fields = &c[2]["attrs"]["fields"];
+        assert_eq!(fields["who"], hidden);
+        let inner = &fields["inner"]["content"][0]["content"][0]["marks"][0];
+        assert_eq!(inner["attrs"]["doc"]["value"], hidden);
+        let row = get(&viewer, &format!("/api/pages/{row_page}?depth={depth}")).await;
+        assert_eq!(row.json["layout"][0]["who"], hidden, "{}", row.json);
+        // HTML, Markdown and text give the link text alone; the relationship node goes.
+        let viewer = &viewer;
+        let read = |format: &str| {
+            let url = format!("/api/pages/{text_page}?depth={depth}&format={format}");
+            async move { get(viewer, &url).await.json["body"].clone() }
+        };
+        let html = read("html").await;
+        let html = html.as_str().unwrap();
+        assert!(
+            html.starts_with("<p>see</p><div data-block=\"card\""),
+            "{html}"
+        );
+        assert!(!html.contains("data-relationship"), "{html}");
+        let md = read("markdown").await;
+        assert_eq!(md, format!("see\n\n:::card{{who=\"{hidden}\"}}\nsee\n:::"));
+        assert!(read("text").await.as_str().unwrap().starts_with("see"));
+    }
+
+    // Filters can't reach it: not inside rich text, and not through a row's link.
+    assert_problem(
+        &get(
+            &viewer,
+            "/api/pages?where[body.who.title][equals]=Classified",
+        )
+        .await,
+        400,
+    );
+    let probe = "/api/pages?where[layout.who.title][equals]=Classified";
+    assert_eq!(titles(&get(&viewer, probe).await), Vec::<String>::new());
+    assert_eq!(titles(&get(&editor, probe).await), ["R"]);
+
+    // Its references are as hidden as it is; the editor sees every link.
+    let refs = format!("/api/secrets/{hidden}/references");
+    assert_problem(&get(&viewer, &refs).await, 404);
+    let res = get(&editor, &refs).await;
+    let mut paths: Vec<&str> = res.json["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|r| r["path"].as_str().unwrap())
+        .collect();
+    paths.sort_unstable();
+    assert_eq!(
+        paths,
+        [
+            "body.0",
+            "body.1",
+            "body.2.inner.0",
+            "body.2.who",
+            "layout.0.who"
+        ]
+    );
+
+    // Delete protection counts links in rich text: a count for the Admin only (R15).
+    let url = format!("/api/secrets/{hidden}");
+    let res = send(&editor, "DELETE", &url, None).await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "Other documents link to this one; remove those links first"
+    );
+    let res = send(&admin, "DELETE", &url, None).await;
+    assert_eq!(
+        res.json["detail"],
+        "2 other documents link to this one; remove those links first"
+    );
+    let gone = send(&admin, "DELETE", &format!("/api/pages/{row_page}"), None).await;
+    assert_eq!(gone.status, 204, "{}", gone.json);
+    let res = send(&admin, "DELETE", &url, None).await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "1 other document links to this one; remove that link first"
+    );
+}
+
+/// An Editor-only rich text field, and an Editor-only field in a shared block used as a
+/// row, as a node in rich text and as a node inside a row's rich text: a Viewer never sees
+/// them, in any format, on any read path, and can't filter on them.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn field_rules_cover_blocks_and_rich_text(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "hero", "kind": "block", "fields": [
+            {"name": "heading", "type": "text"},
+            {"name": "secret", "type": "text", "access": ed}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "notes", "type": "richText", "access": ed},
+            {"name": "body", "type": "richText", "blocks": [{"blockRef": "hero"}]},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"blockRef": "hero"},
+                // The same name with no rule: a quote's `secret` is anyone's.
+                {"slug": "quote", "fields": [
+                    {"name": "secret", "type": "text"},
+                    {"name": "text", "type": "richText", "blocks": [{"blockRef": "hero"}]}
+                ]}
+            ]}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "shelf", "fields": [
+            {"name": "page", "type": "relationship", "relationTo": "pages"}
+        ]}),
+    )
+    .await;
+    let hero = |n: u8| {
+        block_node(
+            "hero",
+            json!({"heading": "Shown", "secret": format!("hush{n}")}),
+        )
+    };
+    let para = |s: &str| json!({"type": "paragraph", "content": [{"type": "text", "text": s}]});
+    let page = id(&create(
+        &admin,
+        "/api/pages",
+        json!({"title": "P",
+        "notes": rich(json!([para("hush0")])),
+        "body": rich(json!([
+            para("Open"),
+            hero(1),
+            {"type": "blockquote", "content": [hero(2)]}
+        ])),
+        "layout": [
+            {"blockType": "hero", "heading": "Shown", "secret": "hush3"},
+            {"blockType": "quote", "secret": "public", "text": rich(json!([hero(4)]))},
+            {"blockType": "hero", "heading": "Shown", "secret": "hush5"}
+        ]}),
+    )
+    .await);
+    let shelf = id(&create(&admin, "/api/shelf", json!({"page": page})).await);
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+
+    for format in ["json", "html", "markdown", "text"] {
+        for (url, at) in [
+            (format!("/api/pages/{page}?format={format}"), ""),
+            (format!("/api/pages?format={format}"), "/docs/0"),
+            (
+                format!("/api/shelf/{shelf}?depth=1&format={format}"),
+                "/page",
+            ),
+        ] {
+            let res = get(&viewer, &url).await;
+            assert_eq!(res.status, 200, "{url}: {}", res.json);
+            let doc = res.json.pointer(at).unwrap();
+            let shown = doc.to_string();
+            assert!(doc.get("notes").is_none(), "{url}: {shown}");
+            assert!(!shown.contains("hush"), "{url}: {shown}");
+            assert!(
+                shown.contains("Shown") && shown.contains("public"),
+                "{url}: {shown}"
+            );
+            // The Editor gets them from the same read; text leaves out block nodes.
+            let full = get(&editor, &url).await.json.to_string();
+            let all: &[u8] = if format == "text" {
+                &[0, 3, 5]
+            } else {
+                &[0, 1, 2, 3, 4, 5]
+            };
+            for n in all {
+                assert!(full.contains(&format!("hush{n}")), "{url}: {n} {full}");
+            }
+        }
+    }
+    // In JSON, each hero row and node keeps its other fields; the quote keeps its `secret`.
+    let doc = get(&viewer, &format!("/api/pages/{page}")).await.json;
+    for at in [
+        "/body/content/1/attrs/fields",
+        "/body/content/2/content/0/attrs/fields",
+        "/layout/0",
+        "/layout/1/text/content/0/attrs/fields",
+        "/layout/2",
+    ] {
+        let fields = doc.pointer(at).unwrap();
+        assert_eq!(fields["heading"], "Shown", "{at}: {fields}");
+        assert!(fields.get("secret").is_none(), "{at}: {fields}");
+    }
+    assert_eq!(doc["layout"][1]["secret"], "public");
+
+    // Filtering on what's hidden is a 403 that names the parameter, at the top or in rows.
+    for (param, name) in [
+        ("where[notes][exists]=true", "notes"),
+        ("where[layout.secret][equals]=hush3", "layout.secret"),
+    ] {
+        let res = get(&viewer, &format!("/api/pages?{param}")).await;
+        assert_problem(&res, 403);
+        let detail = res.json["detail"].as_str().unwrap();
+        assert!(detail.contains(name), "{detail}");
+        assert_eq!(
+            get(&editor, &format!("/api/pages?{param}")).await.status,
+            200
+        );
+    }
+}
+
+/// `/api/access` on a blocks field and a rich text field, borne out by real requests. A
+/// name inside blocks goes without its block type (`layout.secret`, R34) and answers for
+/// every type that has it: `hero` hides its `secret` and `quote` its `cite` (R7).
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn access_answers_cover_blocks(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let editor = json!({"role": "editor"});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "hero", "kind": "block", "fields": [
+            {"name": "heading", "type": "text"},
+            {"name": "secret", "type": "text",
+             "access": {"read": editor, "create": editor, "update": editor}},
+            {"name": "cite", "type": "text"}
+        ]}),
+    )
+    .await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"blockRef": "hero"},
+                {"slug": "quote", "fields": [
+                    {"name": "heading", "type": "text"},
+                    {"name": "secret", "type": "text"},
+                    {"name": "cite", "type": "text", "access": {"update": editor}}
+                ]}
+            ]},
+            {"name": "article", "type": "richText", "blocks": [
+                {"slug": "note", "fields": [
+                    {"name": "text", "type": "text"},
+                    {"name": "secret", "type": "text", "access": {"read": editor}}
+                ]}
+            ]}
+        ]}),
+    )
+    .await;
+    let (_, callers) = callers(&pool, &admin, json!(["pages:read"])).await;
+    let row = |t: &str| json!({"blockType": t, "heading": "h", "secret": "s", "cite": "c"});
+    let article = || {
+        rich(json!([block_node(
+            "note",
+            json!({"text": "t", "secret": "s"})
+        )]))
+    };
+    let seed = || json!({"layout": [row("hero"), row("quote")], "article": article()});
+    let mut seen = Vec::new();
+    for (who, app, _) in &callers {
+        let res = get(app, "/api/access").await;
+        assert_eq!(res.status, 200, "{who}: {}", res.json);
+        lists_only_what_it_allows(who, &res.json);
+        let fields = &res.json["collections"]["pages"]["fields"];
+        if *who == "admin" {
+            let paths: Vec<&String> = fields.as_object().unwrap().keys().collect();
+            assert_eq!(paths, KNOWN[2].2, "{who}");
+        }
+        seen.push((*who, fields.clone()));
+        let a = filled(&res.json);
+        bears_out(Probe {
+            who,
+            app,
+            admin: &admin,
+            slug: "pages",
+            answers: &a["collections"]["pages"],
+            mark: "title",
+            seeds: vec![seed(), seed()],
+            // What anyone may create, and holds a field not everyone may change.
+            own: json!({"layout": [row("quote")], "article": article()}),
+            leaf: |path: &str| match path {
+                "article" => article(),
+                _ => json!("v"),
+            },
+        })
+        .await;
+    }
+    // The answers the requests bore out, for an Author and an Editor.
+    let (t, f) = (true, false);
+    let crud = |r: bool, c: bool, u: bool| json!({"read": r, "create": c, "update": u});
+    let author = &seen.iter().find(|s| s.0 == "author").unwrap().1;
+    assert_eq!(
+        author,
+        &json!({
+            "title": crud(t, t, t),
+            "layout": crud(t, t, f),
+            "layout.heading": crud(t, t, f),
+            "layout.cite": crud(t, t, f),
+            "article": crud(t, t, t),
+            "article.text": crud(t, t, t),
+            "article.secret": crud(f, t, t)
+        })
+    );
+    let everything = json!({"title": 0, "layout": 0, "layout.heading": 0, "layout.secret": 0,
+        "layout.cite": 0, "article": 0, "article.text": 0, "article.secret": 0});
+    let all_true: Map<String, Value> = everything
+        .as_object()
+        .unwrap()
+        .keys()
+        .map(|k| (k.clone(), crud(t, t, t)))
+        .collect();
+    let editor = &seen.iter().find(|s| s.0 == "editor").unwrap().1;
+    assert_eq!(editor, &Value::Object(all_true));
 }

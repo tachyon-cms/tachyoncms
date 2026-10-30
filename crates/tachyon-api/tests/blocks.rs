@@ -873,6 +873,77 @@ async fn rows_of_removed_block_types_show_only_their_type(pool: PgPool) {
     }
 }
 
+/// A row of a block type that's gone, in a global and in a profile: each route that reads
+/// them shows it as its type alone (W1-R9).
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn removed_block_rows_show_only_their_type_on_globals_and_users(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let layout = json!({"name": "layout", "type": "blocks", "blocks": [
+        {"slug": "card", "fields": [{"name": "note", "type": "text"}]}
+    ]});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "site", "kind": "global", "fields": [layout]}),
+    )
+    .await;
+    let users = json!({"schema": {"slug": "users", "fields": [
+        {"name": "name", "type": "text", "required": true}, layout
+    ]}});
+    let res = send(
+        &admin,
+        "PUT",
+        "/api/admin/collections/users",
+        Some(&users.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let rows = json!({"layout": [
+        {"blockType": "card", "note": "keep out"},
+        {"blockType": "card", "note": "fine"}
+    ]});
+    let site = patch(&admin, "/api/globals/site", rows.clone()).await;
+    assert_eq!(site.status, 200, "{}", site.json);
+    let vic = common::add_user(&pool, "vic@example.com", "viewer").await;
+    let me = format!("/api/users/{vic}");
+    assert_eq!(patch(&admin, &me, rows).await.status, 200);
+    // As removing a block type with rows would leave them.
+    for doc in [uuid::Uuid::parse_str(&id(&site.json)).unwrap(), vic] {
+        let done = sqlx::query(
+            "UPDATE documents SET published = jsonb_set(published, '{layout,0,blockType}', '\"gone\"') \
+             WHERE id = $1",
+        )
+        .bind(doc)
+        .execute(&pool)
+        .await
+        .unwrap();
+        assert_eq!(done.rows_affected(), 1);
+    }
+    let viewer = common::signed_in(visitor(&pool).await, "vic@example.com").await;
+    let anon = visitor(&pool).await;
+    let users = get(&admin, "/api/users").await.json;
+    let listed = users["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|u| u["id"] == vic.to_string());
+    let layouts = [
+        get(&admin, "/api/globals/site").await.json["layout"].clone(),
+        get(&anon, "/api/globals/site").await.json["layout"].clone(),
+        get(&admin, &me).await.json["layout"].clone(),
+        get(&viewer, &me).await.json["layout"].clone(),
+        listed.unwrap()["layout"].clone(),
+    ];
+    for layout in layouts {
+        assert_eq!(
+            layout[0],
+            json!({"id": layout[0]["id"], "blockType": "gone"}),
+            "{layout}"
+        );
+        assert_eq!(layout[1]["note"], "fine", "{layout}");
+    }
+}
+
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn profile_block_rows_answer_to_their_own_type(pool: PgPool) {
     let admin = admin_app(pool.clone()).await;
