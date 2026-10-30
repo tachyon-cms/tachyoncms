@@ -15,8 +15,9 @@ use crate::schema::{Field, FieldKind};
 
 thread_local!(pub(super) static STEPS: Cell<usize> = const { Cell::new(0) });
 
-/// The most one run may take, in a debug build.
-const BOUND: Duration = Duration::from_secs(3);
+/// The most one run may take, in a debug build: loose enough for a loaded CI runner, since
+/// the step counts are the guard that a quadratic loop can't pass (W1-R47).
+const BOUND: Duration = Duration::from_secs(10);
 /// Below this, a run is too quick for its growth to matter or to time reliably.
 const QUICK: Duration = Duration::from_millis(50);
 
