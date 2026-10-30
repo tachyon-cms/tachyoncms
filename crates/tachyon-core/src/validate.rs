@@ -71,8 +71,9 @@ pub fn validate_document(
 
 /// Turns each rich text value in `input` sent as `{"format": "markdown", "value": "…"}`
 /// into its JSON form (`richtext::from_markdown`), in place, and returns where each was
-/// (`body`, `layout.0.copy`), with its field's kind. Documents they name by slug are still named so. Callers run
-/// it before field rules; `validate_document` refuses Markdown left unconverted.
+/// (`body`, `layout.0.copy`), with its field's kind. Documents they name by slug are still
+/// named so. Callers run it before field rules; `validate_document` refuses Markdown left
+/// unconverted.
 pub fn markdown_inputs(
     fields: &[Field],
     input: &mut Value,

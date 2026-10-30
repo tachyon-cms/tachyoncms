@@ -146,9 +146,10 @@ fn join(path: &str, rest: &str) -> String {
     }
 }
 
-/// Calls `f` on `node` and every node inside it, the text of block nodes included, each
-/// with its path as validation names it. `kind` is the text's field; only block fields
-/// that are rich text are walked, since a json value shaped like it is data (W1-R44).
+/// Calls `f` on `node` and every node inside it, each with its path as validation names
+/// it. Of a block node, only its own rich text fields are followed (and block nodes in
+/// those), not rich text inside its groups or lists. `kind` is the text's field; a json
+/// value shaped like rich text is data, never walked (W1-R44).
 fn each_node_at(
     node: &mut Value,
     kind: &FieldKind,

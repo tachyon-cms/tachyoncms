@@ -295,7 +295,13 @@ Field rules work inside blocks, and inside rich text's block nodes, exactly as t
 ]}
 ```
 
-`features` narrows what a field allows (`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `code`, `link`, `heading`, `bulletList`, `orderedList`, `taskList`, `blockquote`, `horizontalRule`, `hardBreak`, `table`, `codeBlock`, `relationship`, `block`); leave it out and everything's allowed. Paragraphs and plain text always are. `relationTo` says which collections links and relationship nodes may point at. A link is either an `href` or a document, `{"doc": {"relationTo": "pages", "value": "<id>"}}`, and `"newTab": true` opens it in a new tab. An `href` has to start with `http://`, `https://`, `mailto:`, `tel:`, `/` or `#`, in any case, so `JavaScript:` and `//evil.example` are refused. One value nests at most 32 levels deep and holds at most 50,000 nodes, counting the rich text inside its block nodes. Anything else comes back as a 422 naming the node, such as `body.content.3.marks.0.attrs.href`.
+`features` narrows what a field allows (`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `code`, `link`, `heading`, `bulletList`, `orderedList`, `taskList`, `blockquote`, `horizontalRule`, `hardBreak`, `table`, `codeBlock`, `relationship`, `block`). Leave it out and everything's allowed. Paragraphs and plain text always are.
+
+`relationTo` says which collections links and relationship nodes may point at. A link is either an `href` or a document, `{"doc": {"relationTo": "pages", "value": "<id>"}}`, and `"newTab": true` opens it in a new tab.
+
+An `href` has to start with `http://`, `https://`, `mailto:`, `tel:`, `/` or `#`, in any case, so `JavaScript:` and `//evil.example` are refused.
+
+One value nests at most 32 levels deep and holds at most 50,000 nodes, counting the rich text inside its block nodes. Anything else comes back as a 422 naming the node, such as `body.content.3.marks.0.attrs.href`.
 
 Rich text can only be filtered on whether it's there: `where[body][exists]=true`. Nothing inside it can be named in a filter, and it can't be sorted on.
 
