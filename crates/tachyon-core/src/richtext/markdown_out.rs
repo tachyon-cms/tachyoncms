@@ -14,22 +14,64 @@ use crate::schema::FieldKind;
 /// written.
 /// A table cell's blocks become one paragraph, hard breaks between them (W1-R37).
 /// A text's marks read back in one order, since Markdown can't say theirs (W1-R37).
+/// A cell holding one block that isn't a paragraph holds its text as one (W1-R39).
+/// Code blocks end lines with `\n`; Markdown has no other line end in them (W1-R39).
+/// Empty paragraphs are left out: Markdown has no empty paragraph (W1-R39).
+/// An ordered list's `start: 1` and a block's empty `fields` aren't written (W1-R39).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
 }
 
 /// Block nodes apart by a blank line, empty ones left out.
 fn blocks(nodes: &[Value], k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
-    let parts: Vec<String> = nodes
-        .iter()
-        .map(|n| block(n, k, ctx))
-        .filter(|b| !b.is_empty())
-        .collect();
+    let mut parts: Vec<String> = Vec::new();
+    let mut lists = Lists::default();
+    for n in nodes {
+        let b = block(n, k, ctx, lists.next(n));
+        if !b.is_empty() {
+            lists.wrote();
+            parts.push(b);
+        }
+    }
     parts.join("\n\n")
 }
 
-fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
+/// Which marker each list takes. Two lists side by side with the same marker read as one,
+/// so a list after another of its kind takes the other marker: `*` for `-`, `)` for `.`.
+#[derive(Default)]
+struct Lists {
+    last: Option<(&'static str, bool)>,
+    pending: Option<(&'static str, bool)>,
+}
+
+impl Lists {
+    /// Whether `node` takes the other marker.
+    fn next(&mut self, node: &Value) -> bool {
+        let family = match kind(node) {
+            "bulletList" | "taskList" => Some("bullet"),
+            "orderedList" => Some("ordered"),
+            _ => None,
+        };
+        let other = matches!((self.last, family), (Some((f, alt)), Some(g)) if f == g && !alt);
+        self.pending = family.map(|f| (f, other));
+        other
+    }
+
+    /// The block `next` looked at was written, so the next list goes by it.
+    fn wrote(&mut self) {
+        self.last = self.pending.take();
+    }
+}
+
+/// Whether `s` ends in a line that is only `<br>`: Markdown reads that as an HTML block,
+/// which runs on into the next line unless a blank line follows (W1-R38).
+fn ends_in_br(s: &str) -> bool {
+    s.lines().next_back().is_some_and(|l| l.trim() == "<br>")
+}
+
+fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> String {
     let number = |name| attr(node, name).and_then(Value::as_u64);
+    let bullet = if other { "*" } else { "-" };
     match kind(node) {
         "paragraph" => line_start(inline(children(node), ctx, Where::Paragraph)),
         "heading" => {
@@ -43,15 +85,18 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
             };
             format!("{} {text}", "#".repeat(level))
         }
-        "bulletList" => list(node, k, ctx, |_, _| "- ".into()),
+        "bulletList" => list(node, k, ctx, |_, _| format!("{bullet} ")),
         "orderedList" => {
             let start = number("start").unwrap_or(1);
-            list(node, k, ctx, |i, _| format!("{}. ", start + i as u64))
+            let delimiter = if other { ")" } else { "." };
+            list(node, k, ctx, |i, _| {
+                format!("{}{delimiter} ", start + i as u64)
+            })
         }
         "taskList" => list(node, k, ctx, |_, item| {
             match attr(item, "checked") == Some(&Value::Bool(true)) {
-                true => "- [x] ".into(),
-                false => "- [ ] ".into(),
+                true => format!("{bullet} [x] "),
+                false => format!("{bullet} [ ] "),
             }
         }),
         "blockquote" => blocks(children(node), k, ctx)
@@ -67,10 +112,13 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
             .join("\n"),
         "horizontalRule" => "---".into(),
         "codeBlock" => {
+            // Markdown ends every line with `\n` (W1-R39).
             let code: String = children(node)
                 .iter()
                 .filter_map(|t| t.get("text")?.as_str())
-                .collect();
+                .collect::<String>()
+                .replace("\r\n", "\n")
+                .replace('\r', "\n");
             let fence = "`".repeat(longest_run(&code, '`').max(2) + 1);
             let lang = code_language(node).unwrap_or("");
             match code.is_empty() {
@@ -125,15 +173,24 @@ fn list(
         // or it would run on into the line before. So does a numbered list starting past
         // 1, which Markdown won't let interrupt a paragraph.
         let mut body = String::new();
+        let mut lists = Lists::default();
+        let mut first = None;
         for child in children(item) {
-            let text = block(child, k, ctx);
+            // A rule of the marker's own character would read as a rule, not an item.
+            let text = match kind(child) {
+                "horizontalRule" if marker.starts_with('-') => "***".to_owned(),
+                _ => block(child, k, ctx, lists.next(child)),
+            };
             if text.is_empty() {
                 continue;
             }
+            lists.wrote();
+            first.get_or_insert(kind(child));
             let runs_on = kind(child).ends_with("List")
                 && attr(child, "start")
                     .and_then(Value::as_u64)
-                    .is_none_or(|s| s == 1);
+                    .is_none_or(|s| s == 1)
+                && !ends_in_br(&body);
             if !body.is_empty() {
                 body.push_str(if runs_on { "\n" } else { "\n\n" });
             }
@@ -150,6 +207,11 @@ fn list(
             .unwrap_or(&marker)
             .len();
         let indent = " ".repeat(width);
+        // A task box only marks a paragraph, so anything else starts on the line below it.
+        let (marker, body) = match width < marker.len() && first != Some("paragraph") {
+            true => (format!("{}\n{indent}", marker.trim_end()), body),
+            false => (marker, body),
+        };
         let lines: Vec<String> = body
             .lines()
             .enumerate()
@@ -218,9 +280,10 @@ fn directive(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
             .max(2)
             + 1,
     );
-    match body.is_empty() {
-        true => format!("{colons}{head}\n{colons}"),
-        false => format!("{colons}{head}\n{body}\n{colons}"),
+    match (body.is_empty(), ends_in_br(&body)) {
+        (true, _) => format!("{colons}{head}\n{colons}"),
+        (false, true) => format!("{colons}{head}\n{body}\n\n{colons}"),
+        (false, false) => format!("{colons}{head}\n{body}\n{colons}"),
     }
 }
 
@@ -334,7 +397,7 @@ enum Where {
 fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
     let lines: Vec<String> = nodes
         .split(|n| kind(n) == "hardBreak")
-        .map(|line| line_ends(&marked_line(line, ctx, at == Where::Cell)))
+        .map(|line| marked_line(line, ctx, at == Where::Cell))
         .collect();
     let mut lines = lines.into_iter();
     let first = lines.next().unwrap_or_default();
@@ -369,6 +432,8 @@ fn cell_inline(cell: &Value) -> Vec<Value> {
 /// mark that `pair` numbers.
 enum Piece {
     Text(String),
+    /// Code spans: literal, so never escaped or encoded further.
+    Code(String),
     Run {
         ch: char,
         len: usize,
@@ -413,17 +478,17 @@ fn marked_line(nodes: &[Value], ctx: &RenderCtx, cell: bool) -> String {
             Some("link") => {
                 let dest = destination(&link_destination(&mark, ctx).unwrap_or_default());
                 let dest = if cell { dest.replace('|', "\\|") } else { dest };
-                // A line starting `[` whose code holds `]:` reads as a link reference
-                // definition, unless something follows its destination on the line: an
-                // empty title does.
+                // A line starting `[` whose code holds `]:` would read as a link reference
+                // definition, whatever title followed, so it starts with an empty `<u></u>`
+                // instead, which the reader drops (W1-R38).
                 let defines = starts[pair] == 0
                     && pieces[1..]
                         .iter()
-                        .any(|p| matches!(p, Piece::Text(s) if s.contains("]:")));
-                match defines {
-                    true => Piece::Text(format!("]({dest} \"\")")),
-                    false => Piece::Text(format!("]({dest})")),
+                        .any(|p| matches!(p, Piece::Code(s) if s.contains("]:")));
+                if defines && let Some(Piece::Text(open)) = pieces.first_mut() {
+                    open.insert_str(0, "<u></u>");
                 }
+                Piece::Text(format!("]({dest})"))
             }
             t => delimiter(t, false, pair),
         };
@@ -452,22 +517,26 @@ fn marked_line(nodes: &[Value], ctx: &RenderCtx, cell: bool) -> String {
             pairs += 1;
         }
         let edges = !marks.is_empty();
-        pieces.push(Piece::Text(match code {
-            true if cell => code_spans(text).replace('|', "\\|"),
-            true => code_spans(text),
-            false if edges => edged(text),
-            false => escape(text),
-        }));
+        pieces.push(match code {
+            true if cell => Piece::Code(code_spans(text).replace('|', "\\|")),
+            true => Piece::Code(code_spans(text)),
+            false if edges => Piece::Text(edged(text)),
+            false => Piece::Text(escape(text)),
+        });
     }
     while let Some(o) = open.pop() {
         close(&mut pieces, &starts, o);
     }
     choose_delimiters(&mut pieces, pairs);
     flank(&mut pieces);
+    // Line ends are looked for outside code spans only, where entities are text (W1-R38).
+    let last = pieces.len().saturating_sub(1);
     pieces
         .into_iter()
-        .map(|p| match p {
-            Piece::Text(s) => s,
+        .enumerate()
+        .map(|(i, p)| match p {
+            Piece::Text(s) => line_ends(&s, i == last),
+            Piece::Code(s) => s,
             Piece::Run { ch, len, .. } => ch.to_string().repeat(len),
         })
         .collect()
@@ -581,6 +650,8 @@ fn neighbour(pieces: &[Piece], i: usize, before: bool) -> Option<(Option<usize>,
     let at = |j: usize| match &pieces[j] {
         Piece::Text(s) if before => s.chars().next_back().map(|c| (Some(j), c)),
         Piece::Text(s) => s.chars().next().map(|c| (Some(j), c)),
+        Piece::Code(s) if before => s.chars().next_back().map(|c| (None, c)),
+        Piece::Code(s) => s.chars().next().map(|c| (None, c)),
         Piece::Run { ch, .. } => Some((None, *ch)),
     };
     match before {
@@ -604,10 +675,10 @@ fn entity(c: char) -> String {
     format!("&#{};", c as u32)
 }
 
-/// `s` with the spaces, tabs, VT and FF before its end, and before each line break written
-/// as an entity, written as entities too: Markdown drops them there, or reads two spaces
-/// as a hard break (W1-R31, W1-R35).
-fn line_ends(s: &str) -> String {
+/// `s` with the spaces, tabs, VT and FF before each line break written as an entity, and
+/// before its end when `end`, written as entities too: Markdown drops them there, or reads
+/// two spaces as a hard break (W1-R31, W1-R35).
+fn line_ends(s: &str, end: bool) -> String {
     let mut out = String::with_capacity(s.len());
     let mut run = String::new();
     let mut rest = s;
@@ -621,7 +692,7 @@ fn line_ends(s: &str) -> String {
         }
         rest = &rest[c.len_utf8()..];
     }
-    flush(&mut out, &mut run, true);
+    flush(&mut out, &mut run, end);
     out
 }
 

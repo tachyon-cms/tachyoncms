@@ -237,26 +237,36 @@ impl<'s, 'k> Reader<'s, 'k> {
     /// a list item, a quote) and can't run it into the lines around it. Lines in code and
     /// HTML blocks are left as they are.
     fn patch(&mut self) -> String {
-        let verbatim: Vec<Range<usize>> = Parser::new_ext(self.src, options())
-            .into_offset_iter()
-            .filter(|(e, _)| matches!(e, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)))
-            .map(|(_, r)| r)
-            .collect();
+        // Every line that looks like a directive is patched first, so the parse that finds
+        // code and HTML blocks sees the lines as the real parse will (W1-R38).
         let mut out = self.src.as_bytes().to_vec();
+        let mut found = Vec::new();
         for (n, &start) in self.starts.iter().enumerate() {
             let end = self.starts.get(n + 1).copied().unwrap_or(self.src.len());
             let Some(at) = directive_at(&self.src[start..end]).map(|i| start + i) else {
                 continue;
             };
-            // Sorted and apart, as blocks are.
-            let i = verbatim.partition_point(|r| r.end <= at);
-            if verbatim.get(i).is_some_and(|r| r.contains(&at)) {
-                continue;
-            }
             let colons = out[at..].iter().take_while(|&&b| b == b':').count();
             out[at] = b'#';
             out[at + 1..at + colons].fill(b' ');
-            self.directives.insert(n + 1, at);
+            found.push((n + 1, at, colons));
+        }
+        let patched = String::from_utf8(out).expect("only ASCII colons were replaced");
+        let verbatim: Vec<Range<usize>> = Parser::new_ext(&patched, options())
+            .into_offset_iter()
+            .filter(|(e, _)| matches!(e, Event::Start(Tag::CodeBlock(_) | Tag::HtmlBlock)))
+            .map(|(_, r)| r)
+            .collect();
+        // Lines in code and HTML blocks are put back as they were.
+        let mut out = patched.into_bytes();
+        for (line, at, colons) in found {
+            // Sorted and apart, as blocks are.
+            let i = verbatim.partition_point(|r| r.end <= at);
+            if verbatim.get(i).is_some_and(|r| r.contains(&at)) {
+                out[at..at + colons].fill(b':');
+            } else {
+                self.directives.insert(line, at);
+            }
         }
         String::from_utf8(out).expect("only ASCII colons were replaced")
     }
@@ -877,8 +887,8 @@ fn list(
     Ok(n)
 }
 
-/// Where a line's directive starts, past any quote and list markers: the first of at
-/// least two colons.
+/// Where a line's directive starts, past any quote markers, list markers and task boxes,
+/// however many: the first of at least two colons.
 fn directive_at(line: &str) -> Option<usize> {
     let b = line.as_bytes();
     let skip = |mut i: usize| {
@@ -888,15 +898,25 @@ fn directive_at(line: &str) -> Option<usize> {
         i
     };
     let mut i = skip(0);
-    // A list item's marker: `-`, `+` or `*`, or digits and `.` or `)`; then a space.
-    let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
-    let marker = match b.get(i) {
-        Some(b'-' | b'+' | b'*') => 1,
-        _ if digits > 0 && b.get(i + digits).is_some_and(|c| b".)".contains(c)) => digits + 1,
-        _ => 0,
-    };
-    if marker > 0 && b.get(i + marker).is_some_and(|c| b" \t".contains(c)) {
-        i = skip(i + marker);
+    let mut listed = false;
+    loop {
+        // A list item's marker: `-`, `+` or `*`, or digits and `.` or `)`; after one, a task
+        // box.
+        let digits = b[i..].iter().take_while(|c| c.is_ascii_digit()).count();
+        let boxed = b.get(i) == Some(&b'[')
+            && b.get(i + 1).is_some_and(|c| b" xX".contains(c))
+            && b.get(i + 2) == Some(&b']');
+        let marker = match b.get(i) {
+            Some(b'-' | b'+' | b'*') => 1,
+            _ if listed && boxed => 3,
+            _ if digits > 0 && b.get(i + digits).is_some_and(|c| b".)".contains(c)) => digits + 1,
+            _ => 0,
+        };
+        match b.get(i + marker) {
+            Some(b' ' | b'\t') if marker > 0 => i = skip(i + marker),
+            _ => break,
+        }
+        listed = true;
     }
     b[i..].starts_with(b"::").then_some(i)
 }
@@ -1850,121 +1870,24 @@ mod tests {
         );
     }
 
-    /// Random documents over every context and mark, from a fixed seed, read back as
-    /// written once mark order is normalised and same-marked neighbours merged (W1-R35).
-    #[test]
-    fn markdown_fuzz_round_trips() {
-        let none = |_: &str, _: &Value| None;
-        let ctx = RenderCtx {
-            link_url: &none,
-            title: &none,
-            slug: &none,
-        };
-        let kind = body().kind;
-        // xorshift64, seeded: the same cases every run.
-        let mut seed: u64 = 0x9e37_79b9_7f4a_7c15;
-        let mut n = |m: usize| {
-            seed ^= seed << 13;
-            seed ^= seed >> 7;
-            seed ^= seed << 17;
-            (seed % m as u64) as usize
-        };
-        let frags = [
-            "a", "b", "1", " ", "\t", "*", "_", "~", "`", "``", "[", "]", "]:", "!", "&", "#",
-            "\\", "<", ">", "|", "é", "\u{2014}", "\u{24B6}", "e\u{301}", "\u{a0}", "中", "(", ")",
-            ":", "-", "=", "+", ".", "'", "\"", "\u{200b}", "\u{3000}", "$", "\u{20ac}", "<u>",
-            "<br>", "**", "__", "&amp;", "&#32;", "\u{ff01}", "\u{2028}", "\u{85}", "\u{c}",
-            "\u{b}", "\u{ad}",
-        ];
-        // The reader's mark order (W1-R37).
-        let order = ["bold", "italic", "underline", "strike", "link", "code"];
-        let normal = |nodes: &[Value]| {
-            let mut out: Vec<Value> = Vec::new();
-            for node in nodes {
-                let mut node = node.clone();
-                if let Some(Value::Array(marks)) = node.get_mut("marks") {
-                    marks.sort_by_key(|m| order.iter().position(|o| m["type"] == *o));
-                }
-                match out.last_mut() {
-                    Some(last)
-                        if last["type"] == "text"
-                            && node["type"] == "text"
-                            && last.get("marks") == node.get("marks") =>
-                    {
-                        let joined = format!(
-                            "{}{}",
-                            last["text"].as_str().unwrap(),
-                            node["text"].as_str().unwrap()
-                        );
-                        last["text"] = joined.into();
-                    }
-                    _ => out.push(node),
-                }
-            }
-            Value::Array(out)
-        };
-        let contexts = ["paragraph", "heading", "quote", "list", "cell"];
-        let (cases, mut failures) = (20_000, Vec::new());
-        for case in 0..cases {
-            let mut nodes = Vec::new();
-            for i in 0..1 + n(6) {
-                if i > 0 && n(5) == 0 {
-                    nodes.push(json!({"type": "hardBreak"}));
-                }
-                let text: String = (0..1 + n(3)).map(|_| frags[n(frags.len())]).collect();
-                let mut marks = Vec::new();
-                for m in order {
-                    if n(3) == 0 {
-                        marks.push(match m {
-                            "link" => {
-                                let href = ["/a", "/b"][n(2)];
-                                json!({"type": "link", "attrs": {"href": href}})
-                            }
-                            m => json!({"type": m}),
-                        });
-                    }
-                }
-                nodes.push(match marks.is_empty() {
-                    true => t(&text),
-                    false => marked(&text, Value::Array(marks)),
-                });
-            }
-            let wrap = |content: Value| match contexts[case % contexts.len()] {
-                "heading" => json!({"type": "heading", "attrs": {"level": 2}, "content": content}),
-                "quote" => json!({"type": "blockquote", "content": [para(content)]}),
-                "list" => {
-                    json!({"type": "orderedList", "content": [item("listItem", json!([para(content)]))]})
-                }
-                "cell" => json!({"type": "table", "content": [{"type": "tableRow", "content": [
-                    {"type": "tableHeader", "content": [para(content)]}
-                ]}]}),
-                _ => para(content),
-            };
-            let fixture = doc(json!([wrap(Value::Array(nodes.clone()))]));
-            let expected = doc(json!([wrap(normal(&nodes))]));
-            let markdown = to_markdown(&fixture, &kind, &ctx);
-            let back = from_markdown(&markdown, &kind);
-            if back.as_ref() != Ok(&expected) {
-                failures.push(format!(
-                    "{}\n{markdown:?}\n{back:?}",
-                    serde_json::to_string(&nodes).unwrap()
-                ));
-            }
-        }
-        assert!(
-            failures.is_empty(),
-            "{} of {cases} failed; first:\n{}",
-            failures.len(),
-            failures
-                .iter()
-                .take(5)
-                .cloned()
-                .collect::<Vec<_>>()
-                .join("\n\n")
-        );
+    fn callout_of(content: Vec<Value>) -> Value {
+        json!({"type": "block", "attrs": {"blockType": "callout", "fields": {"body": doc(Value::Array(content))}}})
     }
 
-    /// The fuzz's known failures, each pinned (W1-R35, W1-R36).
+    fn bullets(items: Vec<Value>) -> Value {
+        let items: Vec<Value> = items.into_iter().map(|c| item("listItem", c)).collect();
+        json!({"type": "bulletList", "content": items})
+    }
+
+    fn tasks(first: Value) -> Value {
+        json!({"type": "taskList", "content": [task(true, json!([first]))]})
+    }
+
+    fn video(url: &str) -> Value {
+        json!({"type": "block", "attrs": {"blockType": "video", "fields": {"url": url}}})
+    }
+
+    /// The fuzz's known failures, each pinned (W1-R35, W1-R36, W1-R38).
     #[test]
     fn markdown_edge_cases_round_trip() {
         let none = |_: &str, _: &Value| None;
@@ -2044,6 +1967,60 @@ mod tests {
             para(json!([br, t("a")])),
             para(json!([br])),
             para(json!([t("a"), br, br, t("b")])),
+            // N1: a break-only paragraph is never run into what follows it (W1-R38).
+            callout_of(vec![para(json!([br]))]),
+            callout_of(vec![para(json!([t("a")])), para(json!([br]))]),
+            bullets(vec![json!([
+                para(json!([br])),
+                bullets(vec![json!([para(json!([t("x")]))])])
+            ])]),
+            bullets(vec![json!([
+                para(json!([br])),
+                json!({"type": "orderedList", "content": [
+                    item("listItem", json!([para(json!([t("x")]))]))
+                ]})
+            ])]),
+            // N2: entities in code are text, wherever whitespace sits.
+            para(json!([marked(" &#10;", m(&["code"]))])),
+            para(json!([marked("a\t&#13;", m(&["code"]))])),
+            para(json!([marked("&#10;`", m(&["code"]))])),
+            // N3: no link reference definition, whatever title might follow.
+            para(json!([marked("]: x '", m(&["link", "code"])), br, t("'")])),
+            bullets(vec![json!([para(json!([
+                marked("]: x '", m(&["link", "code"])),
+                br,
+                t("'")
+            ]))])]),
+            // O1: a task item whose first block isn't a paragraph.
+            tasks(json!({"type": "horizontalRule"})),
+            tasks(json!({"type": "codeBlock", "content": [t("a")]})),
+            tasks(json!({"type": "codeBlock", "content": [t("```:")]})),
+            tasks(heading(3, "h")),
+            tasks(
+                json!({"type": "orderedList", "content": [item("listItem", json!([para(json!([t("a")]))]))]}),
+            ),
+            tasks(
+                json!({"type": "table", "content": [{"type": "tableRow", "content": [
+                    {"type": "tableHeader", "content": [para(json!([t("a")]))]}
+                ]}]}),
+            ),
+            tasks(callout_of(vec![para(json!([t("a")]))])),
+            tasks(video("<t>")),
+            // O3: a rule opening a list item.
+            bullets(vec![json!([{"type": "horizontalRule"}])]),
+            // O4: directives behind several list markers, and a task box.
+            bullets(vec![json!([bullets(vec![json!([video("u")])])])]),
+            bullets(vec![json!([bullets(vec![json!([video("<t>")])])])]),
+            tasks(json!({"type": "orderedList", "content": [
+                item("listItem", json!([video("u")])),
+                item("listItem", json!([video("v")]))
+            ]})),
+            // O5: a body opening with a list Markdown won't let interrupt a paragraph.
+            callout_of(vec![
+                json!({"type": "orderedList", "attrs": {"start": 2}, "content": [
+                    item("listItem", json!([{"type": "codeBlock"}]))
+                ]}),
+            ]),
             // Control characters at a line's ends.
             para(json!([t("a\u{b}")])),
             para(json!([t("\u{c}")])),
@@ -2051,6 +2028,26 @@ mod tests {
         ];
         for fixture in fixtures {
             let d = doc(json!([fixture]));
+            let markdown = to_markdown(&d, &kind, &ctx);
+            assert_eq!(from_markdown(&markdown, &kind), Ok(d), "{markdown:?}");
+        }
+        // O2: lists side by side stay apart.
+        let one = |kind: &str, text: &str| {
+            let it = if kind == "taskList" {
+                task(false, json!([para(json!([t(text)]))]))
+            } else {
+                item("listItem", json!([para(json!([t(text)]))]))
+            };
+            json!({"type": kind, "content": [it]})
+        };
+        for (a, b) in [
+            ("bulletList", "bulletList"),
+            ("orderedList", "orderedList"),
+            ("taskList", "bulletList"),
+            ("bulletList", "taskList"),
+            ("taskList", "taskList"),
+        ] {
+            let d = doc(json!([one(a, "a"), one(b, "b"), one(a, "c")]));
             let markdown = to_markdown(&d, &kind, &ctx);
             assert_eq!(from_markdown(&markdown, &kind), Ok(d), "{markdown:?}");
         }
@@ -2094,6 +2091,45 @@ mod tests {
                     t("a"), {"type": "hardBreak"}, t("b")
                 ]))]})
             ))
+        );
+        // A cell holding one block that isn't a paragraph holds its text as one (W1-R39).
+        let heading_cell = table(json!({"type": "tableHeader", "content": [heading(2, "a")]}));
+        let code_cell = table(
+            json!({"type": "tableHeader", "content": [{"type": "codeBlock", "content": [t("a")]}]}),
+        );
+        for cell in [heading_cell, code_cell] {
+            let markdown = to_markdown(&cell, &kind, &ctx);
+            assert_eq!(
+                from_markdown(&markdown, &kind),
+                Ok(table(
+                    json!({"type": "tableHeader", "content": [para(json!([t("a")]))]})
+                )),
+                "{markdown}"
+            );
+        }
+        // Code blocks end lines with `\n`.
+        let code = doc(json!([{"type": "codeBlock", "content": [t("a\r\nb\rc")]}]));
+        assert_eq!(
+            from_markdown(&to_markdown(&code, &kind, &ctx), &kind),
+            Ok(doc(
+                json!([{"type": "codeBlock", "content": [t("a\nb\nc")]}])
+            ))
+        );
+        // Empty paragraphs are left out, `start: 1` and empty `fields` go.
+        let shapes = doc(json!([
+            {"type": "paragraph"},
+            para(json!([t("a")])),
+            {"type": "paragraph", "content": []},
+            {"type": "orderedList", "attrs": {"start": 1}, "content": [item("listItem", json!([para(json!([t("b")]))]))]},
+            {"type": "block", "attrs": {"blockType": "callout", "fields": {}}}
+        ]));
+        assert_eq!(
+            from_markdown(&to_markdown(&shapes, &kind, &ctx), &kind),
+            Ok(doc(json!([
+                para(json!([t("a")])),
+                {"type": "orderedList", "content": [item("listItem", json!([para(json!([t("b")]))]))]},
+                {"type": "block", "attrs": {"blockType": "callout"}}
+            ])))
         );
         // Marks are a set: they read back in one order.
         let linked = doc(json!([para(json!([marked(

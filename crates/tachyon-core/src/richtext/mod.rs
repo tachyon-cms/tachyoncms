@@ -10,6 +10,8 @@ use crate::schema::{BlockSource, FieldKind};
 use crate::validate::{FieldError, slugify};
 
 mod html;
+#[cfg(test)]
+mod markdown_fuzz;
 mod markdown_in;
 mod markdown_out;
 mod text;
