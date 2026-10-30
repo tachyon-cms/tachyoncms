@@ -2183,9 +2183,10 @@ fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
 
 /// Holds a field's read answer against the documents the caller could read, each of which
 /// holds every field: shown in every place it can be (`shown`), or in none. With none
-/// readable, it's false. Inside block rows or block nodes, each block type answers for its own rows, one outcome
-/// a row, and the field's answer is the AND across types (W1-R7): a `false` stands while
-/// another type's rows show the field, but not while one row of a refusing type does.
+/// readable, it's false. Inside block rows or block nodes, each block type answers for its
+/// own rows, one outcome a row, and the field's answer is the AND across types (W1-R7): a
+/// `false` stands while another type's rows show the field, but not while one row of a
+/// refusing type does.
 fn field_read_agrees(what: &str, answer: &Value, readable: &[Value], path: &str) {
     let types = path.split_once('.').and_then(|(head, rest)| {
         let types: &[&str] = match (

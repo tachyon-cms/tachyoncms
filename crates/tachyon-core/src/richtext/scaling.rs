@@ -111,6 +111,17 @@ fn breaks(n: usize) -> Value {
     doc(vec![json!({"type": "paragraph", "content": content})])
 }
 
+/// One paragraph of non-ASCII text, bold and plain in turn: every run needs a flank fix.
+fn flanked(n: usize) -> Value {
+    let content: Vec<Value> = (0..n - 1)
+        .map(|i| match i % 2 {
+            0 => text("é", json!([{"type": "bold"}])),
+            _ => text("é", json!([])),
+        })
+        .collect();
+    doc(vec![json!({"type": "paragraph", "content": content})])
+}
+
 type Shape = fn(usize) -> Value;
 
 const SHAPES: &[(&str, Shape)] = &[
@@ -121,6 +132,7 @@ const SHAPES: &[(&str, Shape)] = &[
     ("block nodes", blocks),
     ("links", links),
     ("hard breaks", breaks),
+    ("flank fixes", flanked),
 ];
 
 /// Each shape at the node limit and at half of it.
@@ -161,18 +173,19 @@ fn measure<T>(input: &T, op: &impl Fn(&T), runs: usize) -> (Duration, usize) {
 fn guard<T>(path: &str, input: impl Fn(&Value, bool) -> T, op: impl Fn(&T)) {
     for (name, full, half) in corpus() {
         let (full, half) = (input(full, false), input(half, true));
-        // Noise can only make the half look slower, which passes, so it runs once.
+        // The full one takes its best of two; the half runs once, to keep the guard quick.
         let (t_full, steps) = measure(&full, &op, 2);
         let (t_half, _) = measure(&half, &op, 1);
         eprintln!("{path} on {name}: {t_full:?} (half: {t_half:?}, steps: {steps})");
+        // Steps first: they're the guard a machine's speed can't sway (W1-R47).
+        assert!(
+            steps <= 8 * MAX_NODES,
+            "{path} on {name} took {steps} steps for {MAX_NODES} nodes"
+        );
         assert!(t_full < BOUND, "{path} on {name} took {t_full:?}");
         assert!(
             t_full < t_half * 3 || t_full < QUICK,
             "{path} on {name} grows faster than its input: {t_half:?}, then {t_full:?}"
-        );
-        assert!(
-            steps <= 8 * MAX_NODES,
-            "{path} on {name} took {steps} steps for {MAX_NODES} nodes"
         );
     }
 }

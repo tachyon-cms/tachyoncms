@@ -327,9 +327,9 @@ async fn check_guard(
     }
 }
 
-/// Live documents that link to `id`.
-// A rich text link's index in `path` (`layout.0.intro.1`) counts links the caller can't
-// see too: a change that hides their bare IDs must renumber it.
+/// Live documents that link to `id`. A rich text link's index in `path`
+/// (`layout.0.intro.1`) counts links the caller can't see too: a change that hides their
+/// bare IDs must renumber it.
 pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbError> {
     Ok(sqlx::query_as!(
         Reference,
