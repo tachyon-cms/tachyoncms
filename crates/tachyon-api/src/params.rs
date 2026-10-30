@@ -32,6 +32,7 @@ pub(crate) struct ListParams {
     pub select: Option<Select>,
     pub populate: Shapes,
     pub joins: Joins,
+    pub format: Format,
 }
 
 /// How a single read is shaped.
@@ -40,6 +41,16 @@ pub(crate) struct ReadParams {
     pub select: Option<Select>,
     pub populate: Shapes,
     pub joins: Joins,
+    pub format: Format,
+}
+
+/// `format=`: how rich text fields come back. JSON as stored, or rendered to a string.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Format {
+    Json,
+    Html,
+    Markdown,
+    Text,
 }
 
 /// `joins=false`, or per join field: `joins[posts][limit]=5` and the like.
@@ -302,6 +313,21 @@ fn joins(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
     Ok(Joins::On(out))
 }
 
+fn format(params: &Map<String, Value>) -> Result<Format, ApiError> {
+    Ok(match single(params, "format")? {
+        None | Some("json") => Format::Json,
+        Some("html") => Format::Html,
+        Some("markdown") => Format::Markdown,
+        Some("text") => Format::Text,
+        Some(_) => return Err(bad("format must be json, html, markdown or text")),
+    })
+}
+
+/// The parameters of a read that takes only `format`, such as a single user's.
+pub(crate) fn format_param(raw: Option<&str>) -> Result<Format, ApiError> {
+    format(&params(raw, &["format"])?)
+}
+
 fn depth(params: &Map<String, Value>) -> Result<u8, ApiError> {
     match single(params, "depth")? {
         None => Ok(DEFAULT_DEPTH),
@@ -325,7 +351,7 @@ pub(crate) fn list_params(
         raw,
         &[
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
-            "joins",
+            "joins", "format",
         ],
     )?;
     let fields = c.schema.data();
@@ -381,6 +407,7 @@ pub(crate) fn list_params(
         select: select(&params, fields)?,
         populate: populate(&params, schemas)?,
         joins: joins(&params, c, access)?,
+        format: format(&params)?,
         filter,
         sort,
     })
@@ -391,11 +418,12 @@ pub(crate) fn read_params(
     c: &Collection,
     access: &Access,
 ) -> Result<ReadParams, ApiError> {
-    let params = params(raw, &["depth", "select", "populate", "joins"])?;
+    let params = params(raw, &["depth", "select", "populate", "joins", "format"])?;
     Ok(ReadParams {
         depth: depth(&params)?,
         select: select(&params, c.schema.data())?,
         populate: populate(&params, access.schemas())?,
         joins: joins(&params, c, access)?,
+        format: format(&params)?,
     })
 }

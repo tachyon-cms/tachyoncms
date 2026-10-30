@@ -9,7 +9,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
 use serde_json::{Map, Value};
 use tachyon_core::auth::{Action, Decision, check_password};
-use tachyon_core::{FieldError, is_email, validate_document};
+use tachyon_core::{FieldError, is_email, merged, validate_document};
 use tachyon_db::auth::{self, NewAccount};
 use tachyon_db::documents::{self, Actor};
 use uuid::Uuid;
@@ -19,7 +19,10 @@ use super::routes::{check_new_password, user_json};
 use super::{actor, authorize};
 use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
-use crate::populate::{check_links, link_ids, link_targets, prepare, vouched_links};
+use crate::params::{Format, format_param};
+use crate::populate::{
+    Shapes, check_links, from_markdown, link_ids, link_targets, populate, prepare, vouched_links,
+};
 use crate::{ApiError, AppState};
 
 pub(crate) use tachyon_db::auth::ACCOUNT_KEYS;
@@ -128,14 +131,36 @@ pub(crate) async fn list(
     Ok(Json(body))
 }
 
+/// A user's account and profile. `format` renders the profile's rich text, as it does for
+/// any other document.
+// ponytail: only `format`; depth and select on this route are in the backlog.
 pub(crate) async fn get(
     State(state): State<AppState>,
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let id = user_id(path)?;
     self_or_admin(&principal, id)?;
-    Ok(Json(user_json(&state, id, &caller_of(&principal)).await?))
+    let format = format_param(raw.as_deref())?;
+    let value = user_json(&state, id, &caller_of(&principal)).await?;
+    if format == Format::Json {
+        return Ok(Json(value));
+    }
+    // Depth 0: nothing is populated, but rich text renders through the same path, reading
+    // its links as this caller may.
+    let users = any_collection(&state, auth::USERS)?;
+    let access = Access::new(&state, principal, Reach::From(&users)).await?;
+    let mut rendered = populate(
+        &state,
+        &access,
+        vec![(value, users)],
+        0,
+        &Shapes::new(),
+        format,
+    )
+    .await?;
+    Ok(Json(rendered.remove(0)))
 }
 
 fn user_id(path: Result<Path<String>, PathRejection>) -> Result<Uuid, ApiError> {
@@ -176,14 +201,27 @@ pub(crate) async fn create(
     }
     let users = any_collection(&state, auth::USERS)?;
     let caller = caller_of(&principal);
-    let profile = Value::Object(profile);
-    refuse_fields(&users, &profile, Action::Create, &caller)?;
-    let data = validate_document(users.schema.data(), &profile, None);
+    let mut profile = Value::Object(profile);
+    let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+    let data = match from_markdown(&state, &access, &users, &mut profile, None).await {
+        Err(ApiError::Validation(more)) => Err(more),
+        Err(e) => return Err(e),
+        Ok(()) => {
+            refuse_fields(&users, &profile, Action::Create, &caller, None)?;
+            validate_document(users.schema.data(), &profile, None)
+        }
+    };
     if let Err(more) = &data {
         errors.extend(more.iter().cloned());
     }
     if !errors.is_empty() {
-        return Err(hide_errors(&users, ApiError::Validation(errors), &caller));
+        let doc = merged(users.schema.data(), &profile, None);
+        return Err(hide_errors(
+            &users,
+            ApiError::Validation(errors),
+            &caller,
+            Some(&doc),
+        ));
     }
     known_role(&state, &role).await?;
     check_new_password(&state, "password", &password).await?;
@@ -191,7 +229,10 @@ pub(crate) async fn create(
     let prepared = data
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &users, data))
-        .map_err(|e| hide_errors(&users, e, &caller))?;
+        .map_err(|e| {
+            let doc = merged(users.schema.data(), &profile, None);
+            hide_errors(&users, e, &caller, Some(&doc))
+        })?;
     let hash = state
         .auth
         .hasher
@@ -213,7 +254,7 @@ pub(crate) async fn create(
         actor(&principal, decision).map(|a| a.id),
     )
     .await
-    .map_err(|e| hide_errors(&users, unique_error(&users, e.into()), &caller))?;
+    .map_err(|e| hide_errors(&users, unique_error(&users, e.into()), &caller, None))?;
     Ok((
         StatusCode::CREATED,
         Json(user_json(&state, id, &caller_of(&principal)).await?),
@@ -231,9 +272,19 @@ pub(crate) async fn update(
     let admin = manages_users(&principal);
     let (account, profile) = split(json_body(body)?)?;
     let users = any_collection(&state, auth::USERS)?;
-    let profile = Value::Object(profile);
+    let mut profile = Value::Object(profile);
     let caller = caller_of(&principal);
-    refuse_fields(&users, &profile, Action::Update, &caller)?;
+    // Which fields the patch writes depends on the block rows it replaces, so it's checked
+    // against the stored profile, then again against the locked one.
+    let stored = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
+        from_markdown(&state, &access, &users, &mut profile, Some(&stored)).await?;
+        refuse_fields(&users, &profile, Action::Update, &caller, Some(&stored))?;
+        Some(stored)
+    } else {
+        None
+    };
     let current = auth::account(&state.pool, id)
         .await?
         .ok_or(ApiError::NotFound)?;
@@ -289,19 +340,22 @@ pub(crate) async fn update(
         }
     };
     // An account-only change (role, email, password) leaves the profile alone.
-    let profile_write = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+    let profile_write = if let Some(stored) = stored {
         let targets = link_targets(&state, &users).await?;
         let (users, patch, caller) = (&users, &profile, &caller);
         let apply = move |current: &Map<String, Value>| {
+            refuse_fields(users, patch, Action::Update, caller, Some(current))?;
             validate_document(users.schema.data(), patch, Some(current))
                 .map_err(ApiError::Validation)
                 .and_then(|data| prepare(&targets, users, data))
-                .map_err(|e| hide_errors(users, e, caller))
+                .map_err(|e| {
+                    let doc = merged(users.schema.data(), patch, Some(current));
+                    hide_errors(users, e, caller, Some(&doc))
+                })
         };
         // Links the profile gains must point at documents the caller can read (all of
         // them, for an Admin editing someone else's).
         let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
-        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
         let next = apply(&stored)?;
         let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
         Some((apply, vouched))
@@ -334,7 +388,7 @@ pub(crate) async fn update(
             },
         )
         .await
-        .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller))?;
+        .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller, None))?;
     }
     if let Some(role) = role {
         auth::set_role(&mut tx, id, role).await?;

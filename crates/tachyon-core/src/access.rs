@@ -10,7 +10,10 @@ use serde_json::{Map, Value, json};
 use crate::FieldError;
 use crate::auth::Action;
 use crate::query::{Filter, Lookup, check_target, parse_filter_with};
-use crate::schema::{CollectionKind, CollectionSchema, Field, FieldKind, SchemaError, data_fields};
+use crate::schema::{
+    BLOCK_ROW_KEYS, BlockSource, CollectionKind, CollectionSchema, Field, FieldKind, SchemaError,
+    data_fields,
+};
 
 /// One access rule, as stored in the schema.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -383,7 +386,9 @@ pub fn named_roles(schema: &CollectionSchema) -> BTreeSet<String> {
                     .flatten()
                     .for_each(|r| from_rule(r, out));
             }
-            from_fields(children(f), out);
+            for inner in inside(f) {
+                from_fields(inner, out);
+            }
         }
     }
     let mut out = BTreeSet::new();
@@ -553,6 +558,14 @@ impl Checker<'_> {
                 FieldKind::Row { fields } | FieldKind::Collapsible { fields, .. } => {
                     self.fields(fields, prefix, &format!("{here}.fields"))?
                 }
+                // A block's fields are named like a list's, without the block type; so are
+                // a rich text block node's.
+                FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+                    for (b, block) in blocks.iter().enumerate() {
+                        let Some(block) = block.def() else { continue };
+                        self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
+                    }
+                }
                 FieldKind::Tabs { tabs } => {
                     for (t, tab) in tabs.iter().enumerate() {
                         let loc = format!("{here}.tabs.{t}.fields");
@@ -593,11 +606,60 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
         .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
 }
 
-fn children(f: &Field) -> &[Field] {
+/// The fields directly inside `f`: a group's or a list's, or each block type's (of a
+/// blocks field or of rich text's block nodes).
+fn inside(f: &Field) -> Vec<&[Field]> {
     match &f.kind {
-        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
-        _ => &[],
+        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => vec![fields],
+        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks
+            .iter()
+            .filter_map(BlockSource::def)
+            .map(|b| b.fields.as_slice())
+            .collect(),
+        _ => Vec::new(),
     }
+}
+
+/// The fields one dotted path can reach at some depth. A path into blocks doesn't name the
+/// block type (`layout.heading`), so a level holds the fields of every block type there,
+/// and a name is answered for all the fields that share it: each must allow what's asked.
+type Level<'a> = Vec<&'a [Field]>;
+
+/// Every field named `name` in `level`: one, or one per block type that has it.
+fn named<'a>(level: &[&'a [Field]], name: &str) -> Vec<&'a Field> {
+    level
+        .iter()
+        .filter_map(|fields| fields.iter().find(|f| f.name == name))
+        .collect()
+}
+
+/// The level inside `peers`.
+fn below<'a>(peers: &[&'a Field]) -> Level<'a> {
+    peers.iter().flat_map(|f| inside(f)).collect()
+}
+
+/// The names in `level`, each once, in schema order.
+fn names<'a>(level: &[&'a [Field]]) -> Vec<&'a str> {
+    let mut out: Vec<&str> = Vec::new();
+    for f in level.iter().flat_map(|fields| fields.iter()) {
+        if !out.contains(&f.name.as_str()) {
+            out.push(&f.name);
+        }
+    }
+    out
+}
+
+/// Whether every field sharing a path lets the caller do `action`.
+fn all_allow(peers: &[&Field], action: Action, caller: &Caller) -> bool {
+    peers.iter().all(|f| field_allows(f, action, caller))
+}
+
+/// Holds rows, or block nodes: replaced whole, and reached past an index (`body.<k>`).
+fn is_list(f: &Field) -> bool {
+    matches!(
+        f.kind,
+        FieldKind::Array { .. } | FieldKind::Blocks { .. } | FieldKind::RichText { .. }
+    )
 }
 
 /// What the caller may do with each of `fields` (data fields), at any depth, by dotted path
@@ -606,53 +668,100 @@ fn children(f: &Field) -> &[Field] {
 /// (as `unwritable` counts it), so a list and everything in it can be updated only when all
 /// of it can. Join and virtual fields are filled on read, so they're never written.
 pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3])> {
-    fn updatable(fields: &[Field], caller: &Caller) -> bool {
-        fields
+    fn updatable(level: &[&[Field]], caller: &Caller) -> bool {
+        level
             .iter()
-            .all(|f| field_allows(f, Action::Update, caller) && updatable(children(f), caller))
+            .flat_map(|fields| fields.iter())
+            .all(|f| field_allows(f, Action::Update, caller) && updatable(&inside(f), caller))
     }
     fn walk(
-        fields: &[Field],
+        level: &[&[Field]],
         prefix: &str,
         within: [bool; 3],
         caller: &Caller,
         out: &mut Vec<(String, [bool; 3])>,
     ) {
-        for f in fields {
+        for name in names(level) {
+            let peers = named(level, name);
             let path = if prefix.is_empty() {
-                f.name.clone()
+                name.to_owned()
             } else {
-                format!("{prefix}.{}", f.name)
+                format!("{prefix}.{name}")
             };
             let [read, create, update] = within;
             let mut answer = [
-                read && field_allows(f, Action::Read, caller),
-                create && field_allows(f, Action::Create, caller),
-                update && field_allows(f, Action::Update, caller),
+                read && all_allow(&peers, Action::Read, caller),
+                create && all_allow(&peers, Action::Create, caller),
+                update && all_allow(&peers, Action::Update, caller),
             ];
-            if matches!(f.kind, FieldKind::Array { .. }) {
-                answer[2] = answer[2] && updatable(children(f), caller);
+            let next = below(&peers);
+            if peers.iter().any(|f| is_list(f)) {
+                answer[2] = answer[2] && updatable(&next, caller);
             }
-            if matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some() {
+            if peers
+                .iter()
+                .any(|f| matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some())
+            {
                 (answer[1], answer[2]) = (false, false);
             }
             out.push((path.clone(), answer));
-            walk(children(f), &path, answer, caller, out);
+            walk(&next, &path, answer, caller, out);
         }
     }
     let mut out = Vec::new();
-    walk(fields, "", [true; 3], caller, &mut out);
+    walk(&[fields], "", [true; 3], caller, &mut out);
     out
 }
 
+/// Whether the caller can't read some field in `fields`, at any depth.
+fn hides(fields: &[Field], caller: &Caller) -> bool {
+    fields.iter().any(|f| {
+        !field_allows(f, Action::Read, caller) || inside(f).iter().any(|i| hides(i, caller))
+    })
+}
+
 /// `fields` (data fields) without those the caller can't read, at any depth: all that
-/// filters and sorts may name. Borrows when nothing is hidden.
+/// filters and sorts may name. A path into blocks has no row to say which block type it
+/// means, so a name goes from every block type when any one hides it. Borrows when nothing
+/// is hidden.
 pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field]> {
-    fn hides(fields: &[Field], caller: &Caller) -> bool {
+    /// `fields`, one part of `level`, without each field whose name any field sharing its
+    /// path hides.
+    fn prune(fields: &[Field], level: &[&[Field]], caller: &Caller) -> Vec<Field> {
         fields
             .iter()
-            .any(|f| !field_allows(f, Action::Read, caller) || hides(children(f), caller))
+            .filter_map(|f| {
+                let peers = named(level, &f.name);
+                if !all_allow(&peers, Action::Read, caller) {
+                    return None;
+                }
+                let next = below(&peers);
+                let mut f = f.clone();
+                match &mut f.kind {
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        *fields = prune(fields, &next, caller)
+                    }
+                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
+                            b.fields = prune(&b.fields, &next, caller);
+                        }
+                    }
+                    _ => {}
+                }
+                Some(f)
+            })
+            .collect()
     }
+    if !hides(fields, caller) {
+        return Cow::Borrowed(fields);
+    }
+    Cow::Owned(prune(fields, &[fields], caller))
+}
+
+/// `fields` (data fields) as a document shows them to the caller: each block type keeps
+/// what its own rules let them read, since a row says which type it is. Borrows when
+/// nothing is hidden.
+pub fn readable_rows<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field]> {
     if !hides(fields, caller) {
         return Cow::Borrowed(fields);
     }
@@ -662,13 +771,31 @@ pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Fie
             .filter(|f| field_allows(f, Action::Read, caller))
             .map(|f| {
                 let mut f = f.clone();
-                if let FieldKind::Group { fields } | FieldKind::Array { fields, .. } = &mut f.kind {
-                    *fields = readable_fields(fields, caller).into_owned();
+                match &mut f.kind {
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        *fields = readable_rows(fields, caller).into_owned()
+                    }
+                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
+                            b.fields = readable_rows(&b.fields, caller).into_owned();
+                        }
+                    }
+                    _ => {}
                 }
                 f
             })
             .collect(),
     )
+}
+
+/// Whether `fields` hold a blocks field, or rich text with block types, at any depth, whose
+/// rows or nodes of a removed block type every read cuts down.
+pub fn has_blocks(fields: &[Field]) -> bool {
+    fields.iter().any(|f| {
+        matches!(f.kind, FieldKind::Blocks { .. })
+            || !f.kind.block_sources().is_empty()
+            || inside(f).iter().any(|i| has_blocks(i))
+    })
 }
 
 /// `schema` with only the fields the caller can read.
@@ -677,34 +804,65 @@ pub fn readable_schema(schema: &CollectionSchema, caller: &Caller) -> Collection
 }
 
 /// Removes every field the caller can't read from `doc` of `fields` (data fields), at any
-/// depth: inside groups and in each list row.
+/// depth: inside groups and in each list row, and cuts rows of removed block types down.
 pub fn strip_unreadable(fields: &[Field], doc: &mut Map<String, Value>, caller: &Caller) {
-    if let Cow::Owned(visible) = readable_fields(fields, caller) {
+    let visible = readable_rows(fields, caller);
+    if matches!(visible, Cow::Owned(_)) || has_blocks(fields) {
         strip_to(fields, &visible, doc);
     }
 }
 
-/// Removes from `doc` of `fields` what `visible` (`fields` as `readable_fields` pruned them)
+/// Removes from `doc` of `fields` what `visible` (`fields` as `readable_rows` pruned them)
 /// leaves out, at any depth, without compiling a rule: worked out once, used per document.
+/// A block row is stripped by its block type; one whose type isn't in the schema keeps
+/// only its `id` and `blockType`, whoever reads it, since the schema says nothing of the
+/// rest. With nothing hidden, pass `fields` as `visible` to do just that.
 pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value>) {
     for f in fields {
         let Some(v) = visible.iter().find(|v| v.name == f.name) else {
             doc.remove(&f.name);
             continue;
         };
-        // Something may be hidden at any depth below, so every container is walked.
-        let (all, kept) = (children(f), children(v));
-        if all.is_empty() {
+        if inside(f).is_empty() {
             continue;
         }
-        match doc.get_mut(&f.name) {
-            Some(Value::Object(inner)) => strip_to(all, kept, inner),
-            Some(Value::Array(rows)) => {
-                for row in rows.iter_mut().filter_map(Value::as_object_mut) {
-                    strip_to(all, kept, row);
+        // Block nodes, wherever they sit in the text, are stripped as block rows are.
+        if let (FieldKind::RichText { .. }, Some(text)) = (&v.kind, doc.get_mut(&f.name)) {
+            crate::richtext::blocks_mut(text, &mut |attrs| {
+                let slug = attrs.get("blockType").and_then(Value::as_str);
+                match slug.and_then(|s| Some((f.kind.block(s)?, v.kind.block(s)?))) {
+                    Some((all, kept)) => {
+                        if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
+                            strip_to(&all.fields, &kept.fields, fields)
+                        }
+                    }
+                    None => attrs.retain(|k, _| BLOCK_ROW_KEYS.contains(&k.as_str())),
                 }
+            });
+            continue;
+        }
+        // Something may be hidden at any depth below, so every container and row is walked.
+        let rows: Vec<&mut Map<String, Value>> = match doc.get_mut(&f.name) {
+            Some(Value::Object(inner)) => vec![inner],
+            Some(Value::Array(rows)) => rows.iter_mut().filter_map(Value::as_object_mut).collect(),
+            _ => Vec::new(),
+        };
+        for row in rows {
+            match (&f.kind, &v.kind) {
+                (FieldKind::Blocks { .. }, FieldKind::Blocks { .. }) => {
+                    let slug = row.get("blockType").and_then(Value::as_str);
+                    let types = slug.and_then(|s| Some((f.kind.block(s)?, v.kind.block(s)?)));
+                    match types {
+                        Some((all, kept)) => strip_to(&all.fields, &kept.fields, row),
+                        None => row.retain(|k, _| BLOCK_ROW_KEYS.contains(&k.as_str())),
+                    }
+                }
+                (
+                    FieldKind::Group { fields: all } | FieldKind::Array { fields: all, .. },
+                    FieldKind::Group { fields: kept } | FieldKind::Array { fields: kept, .. },
+                ) => strip_to(all, kept, row),
+                _ => {}
             }
-            _ => {}
         }
     }
 }
@@ -712,31 +870,131 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
 /// Walks `path` (dotted, as validation and references name fields) in `fields` (data
 /// fields): `Some(false)` at the first field the caller can't read, `Some(true)` when every
 /// field along it is readable, `None` when it names no field. A list's row index is
-/// skipped, and what follows a field that holds no fields (a link's `value`, a list
-/// item's index, a key inside `json`) is inside its value.
-fn walk_path(fields: &[Field], path: &str, caller: &Caller) -> Option<bool> {
-    let mut current = fields;
-    let mut segments = path.split('.').peekable();
-    while let Some(segment) = segments.next() {
-        let f = current.iter().find(|f| f.name == segment)?;
-        if !field_allows(f, Action::Read, caller) {
+/// skipped, and what comes right after a field that holds no fields (a link's `value`, a
+/// list item's index, a key inside `json`) is inside its value. With `doc`, the document
+/// the path is in, a block row's own type answers for it; without, every block type that
+/// has the name must allow it.
+fn walk_path(
+    fields: &[Field],
+    path: &str,
+    caller: &Caller,
+    doc: Option<&Map<String, Value>>,
+) -> Option<bool> {
+    let segments: Vec<&str> = path.split('.').collect();
+    walk(vec![fields], &segments, caller, doc, (false, false))
+}
+
+/// `walk_path` on from `level`, inside `here` when it's known. `value` says whether the
+/// field matched last holds no fields, so what follows is inside its value: (all of the
+/// fields sharing its name, any of them).
+fn walk(
+    mut level: Level,
+    mut rest: &[&str],
+    caller: &Caller,
+    mut here: Option<&Map<String, Value>>,
+    mut value: (bool, bool),
+) -> Option<bool> {
+    let number = |s: &str| s.parse::<usize>().is_ok();
+    let text = |f: &Field| matches!(f.kind, FieldKind::RichText { .. });
+    while let Some((&segment, tail)) = rest.split_first() {
+        let peers = named(&level, segment);
+        if peers.is_empty() {
+            // A name one block type's field holds could be another's hidden field; only an
+            // index can't be a name.
+            return (value.0 || value.1 && number(segment)).then_some(true);
+        }
+        if !all_allow(&peers, Action::Read, caller) {
             return Some(false);
         }
-        match &f.kind {
-            FieldKind::Group { fields } => current = fields,
-            FieldKind::Array { fields, .. } => {
-                segments.next_if(|s| s.parse::<usize>().is_ok());
-                current = fields;
+        let next_is_name = tail.first().is_some_and(|s| !number(s));
+        // Block types that give the name different kinds read the rest differently: rich
+        // text by its nodes, the others by their fields. It must hold in every reading.
+        if next_is_name && peers.iter().any(|f| text(f)) && !peers.iter().all(|f| text(f)) {
+            let only = |rich: bool| -> Level {
+                level
+                    .iter()
+                    .filter(|fs| {
+                        fs.iter()
+                            .find(|f| f.name == segment)
+                            .is_some_and(|f| text(f) == rich)
+                    })
+                    .copied()
+                    .collect()
+            };
+            return match (
+                walk(only(true), rest, caller, here, value),
+                walk(only(false), rest, caller, here, value),
+            ) {
+                (Some(false), _) | (_, Some(false)) => Some(false),
+                (Some(true), Some(true)) => Some(true),
+                _ => None,
+            };
+        }
+        rest = tail;
+        let mut found = here.and_then(|h| h.get(segment));
+        // A path validation names through rich text's nodes: on to a block node's fields,
+        // or into the text's own value.
+        if next_is_name && peers.iter().all(|f| text(f)) {
+            while let ["content", i, tail @ ..] = rest {
+                let i = i.parse::<usize>().ok()?;
+                found = found.and_then(|v| v.get("content")?.get(i));
+                rest = tail;
             }
-            _ => return Some(true),
+            let ["attrs", "fields", tail @ ..] = rest else {
+                return Some(true);
+            };
+            rest = tail;
+            let attrs = found
+                .and_then(|v| v.get("attrs"))
+                .and_then(Value::as_object);
+            here = attrs
+                .and_then(|a| a.get("fields"))
+                .and_then(Value::as_object);
+            level = peers.iter().flat_map(|f| inside_row(f, attrs)).collect();
+            value = (false, false);
+            if rest.is_empty() {
+                return Some(true);
+            }
+            continue;
+        }
+        let mut indexed = false;
+        if peers.iter().any(|f| is_list(f))
+            && let Some((i, tail)) = rest
+                .split_first()
+                .and_then(|(i, tail)| Some((i.parse::<usize>().ok()?, tail)))
+        {
+            found = found.and_then(|v| v.get(i));
+            rest = tail;
+            indexed = true;
+        }
+        let empty = |f: &&Field| inside(f).is_empty();
+        value = if indexed {
+            (false, false)
+        } else {
+            (peers.iter().all(empty), peers.iter().any(empty))
+        };
+        here = found.and_then(Value::as_object);
+        level = peers.iter().flat_map(|f| inside_row(f, here)).collect();
+        if level.is_empty() {
+            return Some(true);
         }
     }
     Some(true)
 }
 
+/// The fields inside `f`, narrowed to `row`'s own block type when `f` holds blocks and
+/// `row` names one of them.
+fn inside_row<'a>(f: &'a Field, row: Option<&Map<String, Value>>) -> Vec<&'a [Field]> {
+    let slug = row.and_then(|r| r.get("blockType")).and_then(Value::as_str);
+    match slug.and_then(|s| f.kind.block(s)) {
+        Some(block) => vec![&block.fields],
+        None => inside(f),
+    }
+}
+
 /// Whether `path` names a field the caller can read through every field along it.
 pub fn path_readable(fields: &[Field], path: &str, caller: &Caller) -> bool {
-    walk_path(fields, path, caller) == Some(true)
+    walk_path(fields, path, caller, None) == Some(true)
 }
 
 /// Whether `path` names a field in `fields`, readable or not.
@@ -745,20 +1003,23 @@ pub fn path_exists(fields: &[Field], path: &str) -> bool {
         admin: true,
         ..Caller::default()
     };
-    walk_path(fields, path, &anyone) == Some(true)
+    walk_path(fields, path, &anyone, None) == Some(true)
 }
 
 /// What validation tells the caller, `errors` about `fields`, without naming or describing
 /// a field they can't read: those become one entry with no path. Errors about the document
-/// as a whole, or a field that doesn't exist, are theirs to see.
+/// as a whole, or a field that doesn't exist, are theirs to see. `doc` is the document
+/// validated (`validate::merged`), so a row index finds that row's block type; without it,
+/// every block type with the name must let them read it.
 pub fn visible_errors(
     fields: &[Field],
     errors: Vec<FieldError>,
     caller: &Caller,
+    doc: Option<&Map<String, Value>>,
 ) -> Vec<FieldError> {
     let (hidden, mut out): (Vec<_>, Vec<_>) = errors
         .into_iter()
-        .partition(|e| walk_path(fields, &e.path, caller) == Some(false));
+        .partition(|e| walk_path(fields, &e.path, caller, doc) == Some(false));
     if !hidden.is_empty() {
         out.push(FieldError {
             path: String::new(),
@@ -771,19 +1032,48 @@ pub fn visible_errors(
 /// The fields in `input` the caller may not write with `action` (create or update), by
 /// path. Sending a field counts as writing it, whatever the value. An update replaces a
 /// list whole, and a group sent as anything but an object, so every field inside counts.
+/// A block row answers to its own type's rules, at every depth: on create, the rows sent;
+/// on update, the rows sent and the rows replaced in `existing` (the stored document).
+/// Without `existing`, every block type counts.
 pub fn unwritable(
     fields: &[Field],
     input: &Map<String, Value>,
     action: Action,
     caller: &Caller,
+    existing: Option<&Map<String, Value>>,
 ) -> Vec<String> {
+    static NOTHING: std::sync::LazyLock<Map<String, Value>> = std::sync::LazyLock::new(Map::new);
     fn push(out: &mut Vec<String>, path: String) {
         if !out.contains(&path) {
             out.push(path);
         }
     }
-    fn within(
+    /// The values at `name` in each of `values`.
+    fn at<'v>(values: &[&'v Value], name: &str) -> Vec<&'v Value> {
+        values.iter().filter_map(|v| v.get(name)).collect()
+    }
+    /// The rows of each list in `values`.
+    fn rows<'v>(values: &[&'v Value]) -> Vec<&'v Value> {
+        values
+            .iter()
+            .filter_map(|v| v.as_array())
+            .flatten()
+            .collect()
+    }
+    /// The rows of block type `slug`.
+    fn of_type<'v>(rows: &[&'v Value], slug: &str) -> Vec<&'v Value> {
+        rows.iter()
+            .copied()
+            .filter(|r| r.get("blockType").and_then(Value::as_str) == Some(slug))
+            .collect()
+    }
+    /// What replacing `fields` writes: every field inside, except in block types with no
+    /// row in what's sent (`sent`) or replaced (`stored`; `None` when not known, and then
+    /// every block type counts).
+    fn replaced(
         fields: &[Field],
+        sent: &[&Value],
+        stored: Option<&[&Value]>,
         prefix: &str,
         action: Action,
         caller: &Caller,
@@ -791,16 +1081,106 @@ pub fn unwritable(
     ) {
         for f in fields {
             let path = format!("{prefix}.{}", f.name);
-            if field_allows(f, action, caller) {
-                within(children(f), &path, action, caller, out);
-            } else {
+            if !field_allows(f, action, caller) {
                 push(out, path);
+                continue;
             }
+            let stored = stored.map(|s| at(s, &f.name));
+            replaced_in(
+                f,
+                &at(sent, &f.name),
+                stored.as_deref(),
+                &path,
+                action,
+                caller,
+                out,
+            );
+        }
+    }
+    /// `replaced` for what's inside `f`, whose values are `sent` and `stored`.
+    fn replaced_in<'v>(
+        f: &Field,
+        sent: &[&'v Value],
+        stored: Option<&[&'v Value]>,
+        path: &str,
+        action: Action,
+        caller: &Caller,
+        out: &mut Vec<String>,
+    ) {
+        match &f.kind {
+            FieldKind::Group { fields } => {
+                replaced(fields, sent, stored, path, action, caller, out)
+            }
+            FieldKind::Array { fields, .. } => {
+                let stored = stored.map(rows);
+                replaced(
+                    fields,
+                    &rows(sent),
+                    stored.as_deref(),
+                    path,
+                    action,
+                    caller,
+                    out,
+                )
+            }
+            FieldKind::Blocks { blocks, .. } => {
+                let (sent, stored) = (rows(sent), stored.map(rows));
+                for b in blocks.iter().filter_map(BlockSource::def) {
+                    let (mine, held) = (
+                        of_type(&sent, &b.slug),
+                        stored.as_deref().map(|s| of_type(s, &b.slug)),
+                    );
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.is_empty() && mine.is_empty())
+                    {
+                        continue;
+                    }
+                    replaced(&b.fields, &mine, held.as_deref(), path, action, caller, out);
+                }
+            }
+            // Block nodes, wherever they sit, as block rows.
+            FieldKind::RichText { blocks, .. } => {
+                let nodes = |values: &[&'v Value]| -> Vec<&'v Value> {
+                    values
+                        .iter()
+                        .flat_map(|v| crate::richtext::block_attrs(v))
+                        .collect()
+                };
+                let fields = |nodes: Vec<&'v Value>| -> Vec<&'v Value> {
+                    nodes.iter().filter_map(|n| n.get("fields")).collect()
+                };
+                let (sent, stored) = (nodes(sent), stored.map(nodes));
+                for b in blocks.iter().filter_map(BlockSource::def) {
+                    let (mine, held) = (
+                        of_type(&sent, &b.slug),
+                        stored.as_deref().map(|s| of_type(s, &b.slug)),
+                    );
+                    if held
+                        .as_ref()
+                        .is_some_and(|h| h.is_empty() && mine.is_empty())
+                    {
+                        continue;
+                    }
+                    let held = held.map(fields);
+                    replaced(
+                        &b.fields,
+                        &fields(mine),
+                        held.as_deref(),
+                        path,
+                        action,
+                        caller,
+                        out,
+                    );
+                }
+            }
+            _ => {}
         }
     }
     fn walk(
         fields: &[Field],
         input: &Map<String, Value>,
+        existing: Option<&Map<String, Value>>,
         prefix: &str,
         action: Action,
         caller: &Caller,
@@ -821,17 +1201,42 @@ pub fn unwritable(
             }
             match (&f.kind, value) {
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    walk(fields, inner, &path, action, caller, out)
+                    let stored = existing.map(|e| {
+                        e.get(&f.name)
+                            .and_then(Value::as_object)
+                            .unwrap_or(&NOTHING)
+                    });
+                    walk(fields, inner, stored, &path, action, caller, out)
                 }
                 // `field_answers` reports a list as updatable only as a whole, to match.
-                (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, _)
-                    if action != Action::Create =>
-                {
-                    within(fields, &path, action, caller, out)
+                (
+                    FieldKind::Group { .. }
+                    | FieldKind::Array { .. }
+                    | FieldKind::Blocks { .. }
+                    | FieldKind::RichText { .. },
+                    _,
+                ) if action != Action::Create => {
+                    let stored: Option<Vec<&Value>> =
+                        existing.map(|e| e.get(&f.name).into_iter().collect());
+                    replaced_in(f, &[value], stored.as_deref(), &path, action, caller, out)
                 }
                 (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                     for row in rows.iter().filter_map(Value::as_object) {
-                        walk(fields, row, &path, action, caller, out);
+                        walk(fields, row, None, &path, action, caller, out);
+                    }
+                }
+                (FieldKind::Blocks { .. }, Value::Array(rows)) => {
+                    for row in rows.iter().filter_map(Value::as_object) {
+                        let fields = crate::validate::row_fields(&f.kind, row);
+                        walk(fields, row, None, &path, action, caller, out);
+                    }
+                }
+                (FieldKind::RichText { .. }, text) => {
+                    for attrs in crate::richtext::blocks(text) {
+                        let fields = crate::validate::node_fields(&f.kind, attrs);
+                        if let Some(Value::Object(sent)) = attrs.get("fields") {
+                            walk(fields, sent, None, &path, action, caller, out);
+                        }
                     }
                 }
                 _ => {}
@@ -840,7 +1245,15 @@ pub fn unwritable(
     }
     let mut out = Vec::new();
     if !caller.admin {
-        walk(&data_fields(fields), input, "", action, caller, &mut out);
+        walk(
+            &data_fields(fields),
+            input,
+            existing,
+            "",
+            action,
+            caller,
+            &mut out,
+        );
     }
     out
 }
@@ -996,7 +1409,9 @@ mod tests {
                 for f in fields {
                     let path = format!("{prefix}{}", f.name);
                     out.push(path.clone());
-                    walk(children(f), &format!("{path}."), out);
+                    for inner in inside(f) {
+                        walk(inner, &format!("{path}."), out);
+                    }
                 }
             }
             let mut out = Vec::new();
@@ -1064,7 +1479,7 @@ mod tests {
             "a field you can't see needs fixing; ask someone who can see it",
         );
         assert_eq!(
-            visible_errors(s.data(), errors.clone(), &viewer),
+            visible_errors(s.data(), errors.clone(), &viewer, None),
             [
                 errors[0].clone(),
                 errors[1].clone(),
@@ -1072,11 +1487,14 @@ mod tests {
                 generic
             ]
         );
-        assert_eq!(visible_errors(s.data(), errors.clone(), &editor), errors);
+        assert_eq!(
+            visible_errors(s.data(), errors.clone(), &editor, None),
+            errors
+        );
 
         // Writes: by name, at any depth.
         let refused = |input: Value, action: Action, caller: &Caller| {
-            unwritable(&s.fields, input.as_object().unwrap(), action, caller)
+            unwritable(&s.fields, input.as_object().unwrap(), action, caller, None)
         };
         let input = json!({"title": "T", "secret": null, "seo": {"note": "n"},
             "links": [{"label": "a"}, {"url": "u"}, {"url": "v"}], "inRow": "r"});
@@ -1113,6 +1531,635 @@ mod tests {
 
     fn check(s: &CollectionSchema) -> Result<(), String> {
         check_rules(s, &users().fields, ROLES, &lookup).map_err(|e| e.to_string())
+    }
+
+    #[test]
+    fn block_rows_answer_to_their_own_type_and_paths_to_every_type() {
+        let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [
+                    {"name": "heading", "type": "text"},
+                    {"type": "row", "fields": [{"name": "secret", "type": "text", "access": ed}]},
+                    {"name": "meta", "type": "group", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"name": "inner", "type": "blocks", "blocks": [
+                        {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]},
+                        {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+                    ]},
+                    {"name": "cards", "type": "array", "fields": [{"name": "label", "type": "text"}]}
+                ]},
+                // The same names with no rule: a quote row's `secret` is anyone's to read.
+                {"slug": "quote", "fields": [
+                    {"name": "text", "type": "text"},
+                    {"name": "secret", "type": "text"},
+                    {"name": "meta", "type": "text"},
+                    {"name": "cards", "type": "text"}
+                ]}
+            ]}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let bad = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"name": "s", "type": "text", "access": {"read": {"title": "x"}}}]}
+            ]}]}),
+        );
+        assert_eq!(
+            check(&bad),
+            Err("field `layout.s`: access.read: field rules can use only roles, signedIn, true and false".into())
+        );
+        let roles = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"type": "row", "fields": [
+                    {"name": "s", "type": "text", "access": {"read": {"role": "author"}}}
+                ]}]}
+            ]}]}),
+        );
+        assert_eq!(named_roles(&roles), BTreeSet::from(["author".to_owned()]));
+
+        let viewer = signed_in("viewer");
+        let editor = signed_in("editor");
+        let admin = Caller {
+            admin: true,
+            ..signed_in("admin")
+        };
+        let doc = json!({"layout": [
+            {"id": "1", "blockType": "hero", "heading": "h", "secret": "s",
+             "meta": {"x": "x"}, "inner": [
+                {"id": "2", "blockType": "a", "x": "x", "y": "y"},
+                {"id": "3", "blockType": "b", "x": "x"}
+             ]},
+            {"id": "4", "blockType": "quote", "text": "t", "secret": "s", "meta": "m"},
+            {"id": "5", "blockType": "gone", "secret": "s"}
+        ]});
+        let doc = doc.as_object().unwrap();
+        // A row whose type has gone shows only its id and type, to everyone.
+        let mut whole = doc.clone();
+        whole["layout"][2] = json!({"id": "5", "blockType": "gone"});
+        let mut hidden = whole.clone();
+        hidden["layout"][0] = json!({"id": "1", "blockType": "hero", "heading": "h", "meta": {},
+            "inner": [{"id": "2", "blockType": "a", "y": "y"}, {"id": "3", "blockType": "b", "x": "x"}]});
+        for (caller, want) in [(&viewer, &hidden), (&editor, &whole), (&admin, &whole)] {
+            let mut by_rule = doc.clone();
+            strip_unreadable(s.data(), &mut by_rule, caller);
+            assert_eq!(&by_rule, want);
+            let visible = readable_rows(s.data(), caller);
+            let mut by_shape = doc.clone();
+            strip_to(s.data(), &visible, &mut by_shape);
+            assert_eq!(&by_shape, want);
+        }
+        assert!(has_blocks(s.data()));
+        assert!(!has_blocks(posts().data()));
+
+        // Paths with no row (filters, references, joins) answer for every block type.
+        for (path, readable) in [
+            ("layout", true),
+            ("layout.0.heading", true),
+            ("layout.1.secret", false),
+            ("layout.secret", false),
+            ("layout.0.meta", true),
+            ("layout.0.meta.x", false),
+            ("layout.0.inner.1.x", false),
+            ("layout.0.inner.0.y", true),
+            ("layout.1.text", true),
+            ("layout.0.heading.x", true),
+            ("layout.1.nope", false),
+            ("layout.0.nope.x", false),
+            ("layout.x.text", false),
+            // Right after a field that holds no fields is inside its value; after a row
+            // index, or a field that holds fields, an unknown name is no field. So is one
+            // after a name that one block type gives a list and another a value.
+            ("layout.1.cards.x", false),
+            ("layout.1.cards.0", true),
+            ("layout.0.cards.0.nope", false),
+            ("layout.0.cards.0.label", true),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert_eq!(
+                path_readable(s.data(), path, &editor),
+                path_exists(s.data(), path),
+                "{path}"
+            );
+        }
+        let visible = readable_fields(s.data(), &viewer);
+        assert!(path_exists(&visible, "layout.0.text"));
+        assert!(!path_exists(&visible, "layout.1.secret"));
+        assert!(!path_exists(&visible, "layout.0.inner.0.x"));
+        // Pruned, a hidden field leaves no trace for a value of the same name to cover.
+        assert!(!path_exists(&visible, "layout.0.meta.x"));
+
+        // Validation errors in a known document answer to their row's type.
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        let generic = FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        };
+        let errors = || {
+            vec![
+                e("layout.0.heading"),
+                e("layout.0.secret"),
+                e("layout.1.secret"),
+                e("layout.0.inner.1.x"),
+            ]
+        };
+        assert_eq!(
+            visible_errors(s.data(), errors(), &viewer, Some(doc)),
+            [
+                e("layout.0.heading"),
+                e("layout.1.secret"),
+                e("layout.0.inner.1.x"),
+                generic.clone()
+            ]
+        );
+        assert_eq!(
+            visible_errors(s.data(), errors(), &viewer, None),
+            [e("layout.0.heading"), generic]
+        );
+        assert_eq!(
+            visible_errors(s.data(), errors(), &editor, Some(doc)),
+            errors()
+        );
+
+        // Writes: each row answers to its own type. An update replaces the list, so every
+        // type it holds or will hold counts, or every type when what's stored isn't known.
+        let refused = |input: Value, action: Action, existing: Option<&Value>| {
+            let existing = existing.map(|v| v.as_object().unwrap());
+            unwritable(
+                &s.fields,
+                input.as_object().unwrap(),
+                action,
+                &viewer,
+                existing,
+            )
+        };
+        let quotes = json!({"layout": [{"blockType": "quote", "secret": "s"}]});
+        let all_hidden = ["layout.secret", "layout.meta.x", "layout.inner.x"];
+        assert_eq!(refused(quotes.clone(), Action::Update, None), all_hidden);
+        assert!(refused(quotes.clone(), Action::Update, Some(&quotes)).is_empty());
+        assert_eq!(
+            refused(
+                quotes.clone(),
+                Action::Update,
+                Some(&Value::Object(doc.clone()))
+            ),
+            all_hidden
+        );
+        assert!(refused(json!({"layout": []}), Action::Update, Some(&json!({}))).is_empty());
+        assert!(refused(quotes, Action::Create, None).is_empty());
+        let hero = |row: Value| {
+            let mut row = row;
+            row["blockType"] = "hero".into();
+            refused(json!({"layout": [row]}), Action::Create, None)
+        };
+        assert_eq!(hero(json!({"secret": "s"})), ["layout.secret"]);
+        assert!(hero(json!({"inner": [{"blockType": "b", "x": "x"}]})).is_empty());
+        assert_eq!(
+            hero(json!({"inner": [{"blockType": "a", "x": "x"}]})),
+            ["layout.inner.x"]
+        );
+        assert!(unwritable(&s.fields, &whole, Action::Update, &editor, None).is_empty());
+
+        // At every depth: nested rows answer to their own type too, sent or replaced.
+        let nested = schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "section", "fields": [{"name": "inner", "type": "blocks", "blocks": [
+                    {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+                ]}]}
+            ]}]}),
+        );
+        let section = |types: &[&str]| {
+            let inner: Vec<Value> = types
+                .iter()
+                .map(|t| json!({"blockType": t, "x": "x"}))
+                .collect();
+            json!({"layout": [{"blockType": "section", "inner": inner}]})
+        };
+        let update = |sent: Value, stored: Option<Value>| {
+            let stored = stored.as_ref().map(|v| v.as_object().unwrap());
+            unwritable(
+                &nested.fields,
+                sent.as_object().unwrap(),
+                Action::Update,
+                &viewer,
+                stored,
+            )
+        };
+        assert!(update(section(&["b"]), Some(section(&["b", "b"]))).is_empty());
+        assert!(update(section(&[]), Some(section(&["b"]))).is_empty());
+        let inner_x = ["layout.inner.x"];
+        assert_eq!(update(section(&["b"]), Some(section(&["a", "b"]))), inner_x);
+        assert_eq!(update(section(&["a"]), Some(section(&["b"]))), inner_x);
+        assert_eq!(
+            update(json!({"layout": []}), Some(section(&["a"]))),
+            inner_x
+        );
+        assert_eq!(update(section(&["b"]), None), inner_x);
+
+        // `/api/access` has no row either: block paths have no type or index, and answers
+        // are ANDed across types.
+        let viewer_answers = field_answers(s.data(), &viewer);
+        let find = |path: &str| {
+            viewer_answers
+                .iter()
+                .find(|(p, _)| p == path)
+                .map(|(_, a)| *a)
+                .unwrap_or_else(|| panic!("{path}: {viewer_answers:?}"))
+        };
+        assert_eq!(find("layout"), [true, true, false]);
+        assert_eq!(find("layout.heading"), [true, true, false]);
+        assert_eq!(find("layout.secret"), [false, false, false]);
+        assert_eq!(find("layout.meta.x"), [false, false, false]);
+        assert_eq!(find("layout.inner.x"), [false, false, false]);
+        assert_eq!(find("layout.inner.y"), [true, true, false]);
+        let paths: Vec<&str> = viewer_answers.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(
+            paths,
+            [
+                "layout",
+                "layout.heading",
+                "layout.secret",
+                "layout.meta",
+                "layout.meta.x",
+                "layout.inner",
+                "layout.inner.x",
+                "layout.inner.y",
+                "layout.cards",
+                "layout.cards.label",
+                "layout.text"
+            ]
+        );
+        assert!(
+            field_answers(s.data(), &editor)
+                .iter()
+                .all(|(_, a)| *a == [true; 3])
+        );
+    }
+
+    #[test]
+    fn rich_text_block_nodes_answer_to_field_rules() {
+        let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText", "blocks": [
+                {"slug": "hero", "fields": [
+                    {"name": "heading", "type": "text"},
+                    {"type": "row", "fields": [{"name": "secret", "type": "text", "access": ed}]},
+                    {"name": "meta", "type": "group", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"name": "inner", "type": "richText", "blocks": [
+                        {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]},
+                        {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+                    ]}
+                ]},
+                // The same name with no rule: a quote node's `secret` is anyone's to read.
+                {"slug": "quote", "fields": [{"name": "text", "type": "text"}, {"name": "secret", "type": "text"}]}
+            ]}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let bad = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText", "blocks": [
+                {"slug": "hero", "fields": [{"name": "s", "type": "text", "access": {"read": {"title": "x"}}}]}
+            ]}]}),
+        );
+        assert_eq!(
+            check(&bad),
+            Err("field `body.s`: access.read: field rules can use only roles, signedIn, true and false".into())
+        );
+        let roles = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText", "blocks": [
+                {"slug": "hero", "fields": [{"name": "s", "type": "text", "access": {"read": {"role": "author"}}}]}
+            ]}]}),
+        );
+        assert_eq!(named_roles(&roles), BTreeSet::from(["author".to_owned()]));
+
+        let viewer = signed_in("viewer");
+        let editor = signed_in("editor");
+        let node = |t: &str, id: &str, fields: Value| json!({"type": "block", "attrs": {"blockType": t, "id": id, "fields": fields}});
+        let text = |content: Value| json!({"type": "doc", "content": content});
+        let cell = |inner: Value| {
+            json!({"type": "table", "content": [{"type": "tableRow", "content": [
+                {"type": "tableCell", "content": [inner]}
+            ]}]})
+        };
+        // Block nodes at every depth: in a list in a quote, in a table, in rich text inside
+        // a block node, and one of a type that's gone.
+        let hero = node(
+            "hero",
+            "1",
+            json!({"heading": "h", "secret": "s", "meta": {"x": "x"},
+            "inner": text(json!([node("a", "2", json!({"x": "x", "y": "y"})), cell(node("b", "3", json!({"x": "x"})))]))}),
+        );
+        let doc = json!({"body": text(json!([
+            {"type": "blockquote", "content": [{"type": "bulletList", "content": [
+                {"type": "listItem", "content": [hero]}
+            ]}]},
+            node("quote", "4", json!({"text": "t", "secret": "s"})),
+            cell(node("gone", "5", json!({"secret": "s"})))
+        ]))});
+        let doc = doc.as_object().unwrap();
+        let hero_at = "/body/content/0/content/0/content/0/content/0/attrs";
+        let mut whole = doc.clone();
+        *whole
+            .get_mut("body")
+            .unwrap()
+            .pointer_mut("/content/2/content/0/content/0/content/0/attrs")
+            .unwrap() = json!({"blockType": "gone", "id": "5"});
+        let mut hidden = Value::Object(whole.clone());
+        *hidden.pointer_mut(&format!("{hero_at}/fields")).unwrap() = json!({"heading": "h", "meta": {},
+            "inner": text(json!([node("a", "2", json!({"y": "y"})), cell(node("b", "3", json!({"x": "x"})))]))});
+        let hidden = hidden.as_object().unwrap().clone();
+        let admin = Caller {
+            admin: true,
+            ..signed_in("admin")
+        };
+        for (caller, want) in [(&viewer, &hidden), (&editor, &whole), (&admin, &whole)] {
+            let mut by_rule = doc.clone();
+            strip_unreadable(s.data(), &mut by_rule, caller);
+            assert_eq!(&by_rule, want);
+            let visible = readable_rows(s.data(), caller);
+            let mut by_shape = doc.clone();
+            strip_to(s.data(), &visible, &mut by_shape);
+            assert_eq!(&by_shape, want);
+        }
+        assert!(has_blocks(s.data()));
+        let plain = schema(json!({"slug": "p", "fields": [{"name": "body", "type": "richText"}]}));
+        assert!(!has_blocks(plain.data()));
+
+        // Paths as references name them (`body.<k>.<field>`) have no node to say which
+        // block type they mean, so they answer for every type with the name.
+        let deep = "body.content.0.content.0.content.0.content.0.attrs.fields";
+        for (path, readable) in [
+            ("body", true),
+            ("body.0", true),
+            ("body.0.heading", true),
+            ("body.0.secret", false),
+            ("body.1.text", true),
+            ("body.0.meta.x", false),
+            ("body.0.inner.0.x", false),
+            ("body.0.inner.0.y", true),
+            ("body.0.nope", false),
+            // Paths as validation names them, through the nodes.
+            ("body.content.0.content.0.content.0", true),
+            ("body.content.1.attrs.blockType", true),
+            ("body.content.1.marks.0.attrs.href", true),
+            (&format!("{deep}.heading"), true),
+            (&format!("{deep}.secret"), false),
+            (&format!("{deep}.meta.x"), false),
+            (&format!("{deep}.inner.content.0.attrs.fields.y"), true),
+            (&format!("{deep}.inner.content.0.attrs.fields.x"), false),
+            (&format!("{deep}.nope"), false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert_eq!(
+                path_readable(s.data(), path, &editor),
+                path_exists(s.data(), path),
+                "{path}"
+            );
+        }
+        let visible = readable_fields(s.data(), &viewer);
+        assert!(path_exists(&visible, "body.1.text"));
+        assert!(!path_exists(&visible, "body.1.secret"));
+        assert!(!path_exists(&visible, "body.0.inner.0.x"));
+
+        // Validation errors in a known document answer to their node's own type.
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        let generic = FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        };
+        let quote_secret = "body.content.1.attrs.fields.secret";
+        let b_x = format!("{deep}.inner.content.1.content.0.content.0.content.0.attrs.fields.x");
+        let errors = || {
+            vec![
+                e(&format!("{deep}.heading")),
+                e(&format!("{deep}.secret")),
+                e(quote_secret),
+                e(&format!("{deep}.inner.content.0.attrs.fields.x")),
+                e(&b_x),
+                e("body.content.2.content.0.content.0.content.0.attrs.fields.secret"),
+                e("body.3"),
+            ]
+        };
+        // A node of a type that's gone answers for every type, like a path with no node.
+        assert_eq!(
+            visible_errors(s.data(), errors(), &viewer, Some(doc)),
+            [
+                e(&format!("{deep}.heading")),
+                e(quote_secret),
+                e(&b_x),
+                e("body.3"),
+                generic.clone()
+            ]
+        );
+        assert_eq!(
+            visible_errors(s.data(), errors(), &viewer, None),
+            [e(&format!("{deep}.heading")), e("body.3"), generic]
+        );
+        assert_eq!(
+            visible_errors(s.data(), errors(), &editor, Some(doc)),
+            errors()
+        );
+
+        // Writes: each node answers to its own type, at any depth. The text is replaced
+        // whole, so an update counts every type it holds or held.
+        let refused = |input: Value, action: Action, existing: Option<&Value>| {
+            let existing = existing.map(|v| v.as_object().unwrap());
+            unwritable(
+                &s.fields,
+                input.as_object().unwrap(),
+                action,
+                &viewer,
+                existing,
+            )
+        };
+        let quotes =
+            json!({"body": text(json!([cell(node("quote", "9", json!({"secret": "s"})))]))});
+        let all_hidden = ["body.secret", "body.meta.x", "body.inner.x"];
+        assert_eq!(refused(quotes.clone(), Action::Update, None), all_hidden);
+        assert!(refused(quotes.clone(), Action::Update, Some(&quotes)).is_empty());
+        assert_eq!(
+            refused(
+                quotes.clone(),
+                Action::Update,
+                Some(&Value::Object(doc.clone()))
+            ),
+            all_hidden
+        );
+        assert_eq!(
+            refused(
+                json!({"body": text(json!([]))}),
+                Action::Update,
+                Some(&Value::Object(doc.clone()))
+            ),
+            all_hidden
+        );
+        assert!(refused(json!({"body": null}), Action::Update, Some(&json!({}))).is_empty());
+        assert!(refused(quotes, Action::Create, None).is_empty());
+        let created = |fields: Value| {
+            let body =
+                text(json!([{"type": "blockquote", "content": [node("hero", "1", fields)]}]));
+            refused(json!({ "body": body }), Action::Create, None)
+        };
+        assert_eq!(created(json!({"secret": "s"})), ["body.secret"]);
+        assert!(created(json!({"heading": "h"})).is_empty());
+        assert!(
+            created(json!({"inner": text(json!([cell(node("b", "1", json!({"x": "x"})))]))}))
+                .is_empty()
+        );
+        assert_eq!(
+            created(json!({"inner": text(json!([cell(node("a", "1", json!({"x": "x"})))]))})),
+            ["body.inner.x"]
+        );
+        assert!(unwritable(&s.fields, &whole, Action::Update, &editor, None).is_empty());
+
+        // Nested nodes on update answer to their own type, sent or replaced.
+        let nested = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText", "blocks": [
+                {"slug": "section", "fields": [{"name": "inner", "type": "richText", "blocks": [
+                    {"slug": "a", "fields": [{"name": "x", "type": "text", "access": ed}]},
+                    {"slug": "b", "fields": [{"name": "x", "type": "text"}]}
+                ]}]}
+            ]}]}),
+        );
+        let section = |types: &[&str]| {
+            let inner: Vec<Value> = types
+                .iter()
+                .map(|t| node(t, "1", json!({"x": "x"})))
+                .collect();
+            json!({"body": text(json!([node("section", "2", json!({"inner": text(json!(inner))}))]))})
+        };
+        let update = |sent: Value, stored: Option<Value>| {
+            let stored = stored.as_ref().map(|v| v.as_object().unwrap());
+            unwritable(
+                &nested.fields,
+                sent.as_object().unwrap(),
+                Action::Update,
+                &viewer,
+                stored,
+            )
+        };
+        assert!(update(section(&["b"]), Some(section(&["b", "b"]))).is_empty());
+        assert!(update(section(&[]), Some(section(&["b"]))).is_empty());
+        let inner_x = ["body.inner.x"];
+        assert_eq!(update(section(&["b"]), Some(section(&["a", "b"]))), inner_x);
+        assert_eq!(update(section(&["a"]), Some(section(&["b"]))), inner_x);
+        assert_eq!(update(section(&["b"]), None), inner_x);
+
+        // `/api/access`: block node fields by their path without type or index, ANDed.
+        let viewer_answers = field_answers(s.data(), &viewer);
+        let paths: Vec<(&str, [bool; 3])> = viewer_answers
+            .iter()
+            .map(|(p, a)| (p.as_str(), *a))
+            .collect();
+        let (yes, no, read_only) = ([true; 3], [false; 3], [true, true, false]);
+        assert_eq!(
+            paths,
+            [
+                ("body", read_only),
+                ("body.heading", read_only),
+                ("body.secret", no),
+                ("body.meta", read_only),
+                ("body.meta.x", no),
+                ("body.inner", read_only),
+                ("body.inner.x", no),
+                ("body.inner.y", read_only),
+                ("body.text", read_only)
+            ]
+        );
+        assert!(
+            field_answers(s.data(), &editor)
+                .iter()
+                .all(|(_, a)| *a == yes)
+        );
+    }
+
+    /// `body` is rich text in block type `a` and a group in `b`, and `extra` json in `a`
+    /// and a group in `b`; each group hides `secret` from all but editors.
+    fn two_kinds() -> CollectionSchema {
+        let ed = json!({"read": {"role": "editor"}});
+        schema(
+            json!({"slug": "pages", "fields": [{"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "a", "fields": [
+                    {"name": "body", "type": "richText", "blocks": [
+                        {"slug": "note", "fields": [{"name": "x", "type": "text", "access": ed}, {"name": "y", "type": "text"}]}
+                    ]},
+                    {"name": "extra", "type": "json"}
+                ]},
+                {"slug": "b", "fields": [
+                    {"name": "body", "type": "group", "fields": [
+                        {"name": "secret", "type": "text", "access": ed}, {"name": "open", "type": "text"}
+                    ]},
+                    {"name": "extra", "type": "group", "fields": [{"name": "secret", "type": "text", "access": ed}]}
+                ]}
+            ]}]}),
+        )
+    }
+
+    /// A path through a name of two kinds must hold in every reading, so the group's hidden
+    /// field stays hidden.
+    #[test]
+    fn a_name_of_two_kinds_answers_for_both() {
+        let s = two_kinds();
+        assert_eq!(check(&s), Ok(()));
+        let viewer = signed_in("viewer");
+        let visible = readable_fields(s.data(), &viewer);
+        for (path, readable, exists) in [
+            ("layout.0.body.secret", false, true),
+            ("layout.0.body.open", true, true),
+            ("layout.0.extra.secret", false, true),
+            // Rich text's own readings still hold.
+            ("layout.0.body.0.y", true, true),
+            ("layout.0.body.0.x", false, true),
+            // Validation's path through nodes names no field of the group.
+            ("layout.0.body.content.0.attrs.fields.x", false, false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert_eq!(path_exists(&visible, path), readable, "{path}");
+            assert_eq!(path_exists(s.data(), path), exists, "{path}");
+        }
+    }
+
+    /// Validation errors under a name of two kinds: with no document, and with one whose row
+    /// doesn't say its type, the group's hidden field isn't named.
+    #[test]
+    fn errors_under_a_name_of_two_kinds_stay_hidden() {
+        let s = two_kinds();
+        let viewer = signed_in("viewer");
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        let generic = FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        };
+        let unknown = json!({"layout": [{"id": "1"}]});
+        let row = |t: &str| json!({"layout": [{"id": "1", "blockType": t}]});
+        for doc in [None, Some(&unknown), Some(&row("b"))] {
+            let doc = doc.map(|d| d.as_object().unwrap());
+            for path in ["layout.0.body.secret", "layout.0.extra.secret"] {
+                assert_eq!(
+                    visible_errors(s.data(), vec![e(path)], &viewer, doc),
+                    std::slice::from_ref(&generic),
+                    "{path} {doc:?}"
+                );
+            }
+        }
+        // In an `a` row the same path is inside the text's value, which they can read.
+        let a = row("a");
+        assert_eq!(
+            visible_errors(
+                s.data(),
+                vec![e("layout.0.body.secret")],
+                &viewer,
+                a.as_object()
+            ),
+            [e("layout.0.body.secret")]
+        );
     }
 
     /// `posts` with `access` set on the collection.

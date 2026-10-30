@@ -14,8 +14,8 @@ use axum::http::request::Parts;
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::access::{
-    Caller, Compiled, Rule, compile, field_answers, path_exists, readable_fields, strip_to,
-    unwritable, visible_errors,
+    Caller, Compiled, Rule, compile, field_answers, has_blocks, path_exists, readable_fields,
+    readable_rows, strip_to, unwritable, visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{Filter, Target};
@@ -42,12 +42,24 @@ pub(crate) struct Access {
     /// `readable()`, worked out once per request.
     readable: OnceLock<HashMap<Uuid, Option<Filter>>>,
     /// Each collection (by ID and schema version) as the caller can read it, worked out
-    /// once per request; `None` when they can read all of it.
-    visible: Mutex<HashMap<(Uuid, i32), Pruned>>,
+    /// once per request.
+    visible: Mutex<HashMap<(Uuid, i32), Shape>>,
 }
 
 /// A collection with the fields the caller can't read removed, or `None` for all of it.
 type Pruned = Option<Arc<CollectionSchema>>;
+
+/// A collection as the caller can read it.
+#[derive(Clone)]
+struct Shape {
+    /// What filters, sorts and paths may name: a name inside blocks only when every block
+    /// type with it lets the caller read it.
+    named: Pruned,
+    /// What documents show, each block row by its own type; `None` when nothing is hidden.
+    rows: Option<Arc<Vec<Field>>>,
+    /// Holds blocks, whose rows of a removed block type every read cuts down.
+    blocks: bool,
+}
 
 /// A collection's fields as the caller can read them: all of them, or a pruned copy
 /// shared for the request.
@@ -149,27 +161,35 @@ pub(crate) fn caller_of(principal: &Principal) -> Caller<'_> {
 }
 
 /// `e`, with validation errors about fields `caller` can't read folded into one that
-/// names none of them.
-pub(crate) fn hide_errors(c: &Collection, e: ApiError, caller: &Caller) -> ApiError {
+/// names none of them. `doc` is the document validated (`merged`), when there is one, so a
+/// block row's own type decides what in it they can read.
+pub(crate) fn hide_errors(
+    c: &Collection,
+    e: ApiError,
+    caller: &Caller,
+    doc: Option<&Map<String, Value>>,
+) -> ApiError {
     match e {
         ApiError::Validation(errors) => {
-            ApiError::Validation(visible_errors(c.schema.data(), errors, caller))
+            ApiError::Validation(visible_errors(c.schema.data(), errors, caller, doc))
         }
         e => e,
     }
 }
 
-/// A 403 naming each field in `input` that `caller` may not write with `action`.
+/// A 403 naming each field in `input` that `caller` may not write with `action`, over
+/// `existing` (the stored document) when it's known.
 pub(crate) fn refuse_fields(
     c: &Collection,
     input: &Value,
     action: Action,
     caller: &Caller,
+    existing: Option<&Map<String, Value>>,
 ) -> Result<(), ApiError> {
     let Value::Object(input) = input else {
         return Ok(());
     };
-    let refused = unwritable(c.schema.data(), input, action, caller);
+    let refused = unwritable(c.schema.data(), input, action, caller, existing);
     if refused.is_empty() {
         return Ok(());
     }
@@ -307,22 +327,43 @@ impl Access {
         }
     }
 
-    /// `c` as the caller can read it, when some of it is hidden from them.
-    fn pruned(&self, c: &Collection) -> Pruned {
+    /// `c` as the caller can read it.
+    fn shape(&self, c: &Collection) -> Shape {
         let mut visible = self.visible.lock().expect("never held across a panic");
         visible
             .entry((c.id, c.schema_version))
-            .or_insert_with(|| match readable_fields(c.schema.data(), &self.caller()) {
-                Cow::Borrowed(_) => None,
-                Cow::Owned(fields) => Some(Arc::new(c.schema.with_fields(fields))),
+            .or_insert_with(|| {
+                let caller = self.caller();
+                let fields = c.schema.data();
+                Shape {
+                    named: match readable_fields(fields, &caller) {
+                        Cow::Borrowed(_) => None,
+                        Cow::Owned(fields) => Some(Arc::new(c.schema.with_fields(fields))),
+                    },
+                    rows: match readable_rows(fields, &caller) {
+                        Cow::Borrowed(_) => None,
+                        Cow::Owned(fields) => Some(Arc::new(fields)),
+                    },
+                    blocks: has_blocks(fields),
+                }
             })
             .clone()
     }
 
-    /// `doc` of `c` without the fields the caller can't read.
+    /// `c` as filters and paths may name it, when some of it is hidden from the caller.
+    fn pruned(&self, c: &Collection) -> Pruned {
+        self.shape(c).named
+    }
+
+    /// `doc` of `c` without the fields the caller can't read, and with rows of removed block
+    /// types cut down to their `id` and `blockType`, whoever reads them.
     pub(crate) fn strip(&self, c: &Collection, doc: &mut Value) {
-        if let (Some(visible), Value::Object(doc)) = (self.pruned(c), doc) {
-            strip_to(c.schema.data(), visible.data(), doc);
+        let Value::Object(doc) = doc else { return };
+        let shape = self.shape(c);
+        match (&shape.rows, shape.blocks) {
+            (Some(visible), _) => strip_to(c.schema.data(), visible, doc),
+            (None, true) => strip_to(c.schema.data(), c.schema.data(), doc),
+            (None, false) => {}
         }
     }
 
@@ -353,19 +394,26 @@ impl Access {
     }
 
     /// `e`, with validation errors about fields of `c` the caller can't read folded into
-    /// one that names none of them.
-    pub(crate) fn hide(&self, c: &Collection, e: ApiError) -> ApiError {
-        hide_errors(c, e, &self.caller())
+    /// one that names none of them; `doc` is the document validated, when there is one.
+    pub(crate) fn hide(
+        &self,
+        c: &Collection,
+        e: ApiError,
+        doc: Option<&Map<String, Value>>,
+    ) -> ApiError {
+        hide_errors(c, e, &self.caller(), doc)
     }
 
-    /// A 403 naming each field in `input` the caller may not write with `action`.
+    /// A 403 naming each field in `input` the caller may not write with `action`, over
+    /// `existing` (the stored document) when it's known.
     pub(crate) fn writes(
         &self,
         c: &Collection,
         input: &Value,
         action: Action,
+        existing: Option<&Map<String, Value>>,
     ) -> Result<(), ApiError> {
-        refuse_fields(c, input, action, &self.caller())
+        refuse_fields(c, input, action, &self.caller(), existing)
     }
 
     /// The role default, narrowed by a key's scopes.
@@ -650,9 +698,14 @@ impl Access {
                     guards,
                 }
             }
-            Target::Row { list, inner } => Target::Row {
+            Target::Row {
+                list,
+                inner,
+                blocks,
+            } => Target::Row {
                 list,
                 inner: Box::new(self.guard_target(*inner)),
+                blocks,
             },
             other => other,
         }

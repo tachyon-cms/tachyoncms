@@ -5,17 +5,25 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
+use tachyon_core::access::Compiled;
+use tachyon_core::auth::Action;
+use tachyon_core::query::parse_filter;
+use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
+use tachyon_core::validate::markdown_inputs;
 use tachyon_core::virtuals::{self, VirtualField};
-use tachyon_core::{CollectionKind, FieldError, map_relations, relations};
+use tachyon_core::{
+    CollectionKind, FieldError, FieldKind, map_relations, merged, relations, rich_texts_mut,
+};
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
-use tachyon_db::query::get_many_readable;
+use tachyon_db::query::{self, ListQuery, get_many_readable};
 use uuid::Uuid;
 
-use crate::access::Access;
+use crate::access::{Access, both};
+use crate::params::Format;
 use crate::{ApiError, AppState};
 
 type Populated<'a> = Pin<Box<dyn Future<Output = Result<Vec<Value>, ApiError>> + Send + 'a>>;
@@ -59,12 +67,13 @@ pub(crate) fn prepare(
         match targets.get(&r.relation_to) {
             Some(&collection_id) => found.push(Relation {
                 path: r.path,
+                at: r.at,
                 collection_id,
                 id: r.id,
             }),
             None => errors.push(FieldError {
                 message: format!("links to `{}`, which isn't a collection", r.relation_to),
-                path: r.path,
+                path: r.at,
             }),
         }
     }
@@ -83,6 +92,144 @@ pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
         .into_iter()
         .map(|r| r.id)
         .collect()
+}
+
+/// The most documents one write may name by slug.
+const MAX_SLUGS: usize = 1000;
+
+/// Turns the rich text `input` sends as Markdown (`{"format": "markdown", …}`) into its
+/// JSON form. Runs before field rules see `input`, since a directive's block can hold
+/// fields they guard. Each document the Markdown names by slug (`doc:posts/intro`, `::ref`)
+/// is found among those the caller may read and linked by ID; one they can't read is
+/// refused exactly as one that isn't there. `existing` is the stored document, if any.
+pub(crate) async fn from_markdown(
+    state: &AppState,
+    access: &Access,
+    c: &Collection,
+    input: &mut Value,
+    existing: Option<&Map<String, Value>>,
+) -> Result<(), ApiError> {
+    let fields = c.schema.data();
+    let hide = |e: Vec<FieldError>, input: &Value| {
+        let doc = merged(fields, input, existing);
+        access.hide(c, ApiError::Validation(e), Some(&doc))
+    };
+    let paths = markdown_inputs(fields, input).map_err(|e| hide(e, input))?;
+    let text_at = |path: &str| format!("/{}", path.replace('.', "/"));
+    let get = |link: &Map<String, Value>, k: &str| {
+        link.get(k)
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_owned()
+    };
+    // Each lookup is a query per 100 slugs, so a write may name only so many.
+    let mut named: HashMap<String, HashSet<String>> = HashMap::new();
+    let mut count = 0;
+    for (path, kind) in &paths {
+        if let Some(text) = input.pointer_mut(&text_at(path)) {
+            richtext::slug_refs_mut(text, kind, &mut |_, link| {
+                let to = get(link, "relationTo");
+                count += usize::from(named.entry(to).or_default().insert(get(link, "slug")));
+            });
+        }
+        if count > MAX_SLUGS {
+            let message = format!("names more than {MAX_SLUGS} documents by slug");
+            return Err(hide(
+                vec![FieldError {
+                    path: path.clone(),
+                    message,
+                }],
+                input,
+            ));
+        }
+    }
+    let mut found: HashMap<(String, String), Uuid> = HashMap::new();
+    for (to, slugs) in named {
+        for (slug, id) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
+            found.insert((to.clone(), slug), id);
+        }
+    }
+    let mut errors = Vec::new();
+    for (path, kind) in &paths {
+        if let Some(text) = input.pointer_mut(&text_at(path)) {
+            richtext::slug_refs_mut(text, kind, &mut |at, link| {
+                let (to, slug) = (get(link, "relationTo"), get(link, "slug"));
+                let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
+                match found.get(&(to.clone(), slug.clone())) {
+                    Some(id) => {
+                        link.remove("slug");
+                        link.remove("line");
+                        link.insert("value".into(), id.to_string().into());
+                    }
+                    None => errors.push(FieldError {
+                        path: format!("{path}.{at}"),
+                        message: format!(
+                            "line {line}: no `{to}` document you can read has the slug `{}`",
+                            clipped(&slug)
+                        ),
+                    }),
+                }
+            });
+        }
+    }
+    match errors.is_empty() {
+        true => Ok(()),
+        false => Err(hide(errors, input)),
+    }
+}
+
+/// `s` cut to 100 characters and `…`, so an error never echoes a whole long input (W1-R44).
+fn clipped(s: &str) -> String {
+    match s.char_indices().nth(100) {
+        Some((i, _)) => format!("{}…", &s[..i]),
+        None => s.to_owned(),
+    }
+}
+
+/// The IDs of the documents of collection `to` the caller may read whose slug is one of
+/// `slugs`, by slug. None when they can't read the collection or its slug field.
+async fn by_slug(
+    state: &AppState,
+    access: &Access,
+    to: &str,
+    slugs: Vec<String>,
+) -> Result<HashMap<String, Uuid>, ApiError> {
+    let mut out = HashMap::new();
+    let Some(c) = state
+        .schemas
+        .get(to)
+        .filter(|c| c.schema.kind == CollectionKind::Collection)
+    else {
+        return Ok(out);
+    };
+    let Some(field) = c.schema.slug_field().filter(|f| access.reads(&c, &f.name)) else {
+        return Ok(out);
+    };
+    let read = match access.allows(Action::Read, &c) {
+        Compiled::Deny => return Ok(out),
+        Compiled::Allow => None,
+        Compiled::Filter(f) => Some(f),
+    };
+    // A filter's `in` takes 100 values at most.
+    for chunk in slugs.chunks(100) {
+        let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
+            .map_err(|e| ApiError::Internal(e.to_string()))?;
+        let filter = both(Some(named), read.clone());
+        let q = ListQuery {
+            filter: filter.as_ref(),
+            sort: None,
+            limit: chunk.len() as i64,
+            offset: 0,
+            after: None,
+            count: false,
+        };
+        for doc in query::list(&state.pool, c.id, &q).await?.docs {
+            if let Some(slug) = c.schema.slug_of(&doc.data) {
+                out.insert(slug, doc.id);
+            }
+        }
+    }
+    Ok(out)
 }
 
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
@@ -138,7 +285,7 @@ pub(crate) fn vouched_links(
         .iter()
         .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
-            path: r.path.clone(),
+            path: r.at.clone(),
             message: MISSING_LINK.into(),
         })
         .collect();
@@ -235,27 +382,105 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     .ok()
 }
 
-/// A link to a document the caller can't read stays an ID.
+/// A link to a document the caller can't read stays an ID. Rich text in every document,
+/// populated ones included, comes back as `format` asks.
 pub(crate) fn populate<'a>(
     state: &'a AppState,
     access: &'a Access,
     docs: Vec<(Value, Arc<Collection>)>,
     depth: u8,
     shapes: &'a Shapes,
+    format: Format,
 ) -> Populated<'a> {
     let items = docs.into_iter().map(|(v, c)| (v, c, depth)).collect();
-    populate_each(state, access, items, shapes)
+    populate_each(state, access, items, shapes, format)
+}
+
+/// Renders the rich text in `items` as `format` asks, in place. What it links to is read
+/// as the caller may read it, whatever the depth, in one query for all of `items`: a link
+/// to a document they can't read, or whose collection has no `url`, is its text alone.
+// ponytail: a second query per level beside populate's own, and it also reads the targets
+// of relationship fields inside block nodes, which render as IDs. Fold it into populate's
+// query if rendered reads show up in a profile.
+async fn render(
+    state: &AppState,
+    access: &Access,
+    items: &mut [(Value, Arc<Collection>, u8)],
+    format: Format,
+) -> Result<(), ApiError> {
+    let to_string: fn(&Value, &FieldKind, &RenderCtx) -> String = match format {
+        Format::Json => return Ok(()),
+        Format::Html => |text, _, ctx| richtext::to_html(text, ctx),
+        Format::Markdown => richtext::to_markdown,
+        Format::Text => |text, _, _| richtext::to_text(text),
+    };
+    // The links inside each rich text field, block nodes' fields included.
+    let mut ids = Vec::new();
+    for (v, c, _) in items.iter_mut() {
+        let Some(doc) = v.as_object_mut() else {
+            continue;
+        };
+        let mut texts = Vec::new();
+        rich_texts_mut(c.schema.data(), doc, &mut |path, _, _| {
+            texts.push(format!("{path}."))
+        });
+        ids.extend(
+            relations(c.schema.data(), doc)
+                .into_iter()
+                .filter(|r| texts.iter().any(|t| r.path.starts_with(t)))
+                .map(|r| r.id),
+        );
+    }
+    ids.sort_unstable();
+    ids.dedup();
+    let mut targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = HashMap::new();
+    if !ids.is_empty() {
+        for (collection_id, doc) in get_many_readable(&state.pool, &ids, access.readable()).await? {
+            let Some(c) = state.schemas.get_by_id(collection_id) else {
+                continue;
+            };
+            let mut value = to_value(&doc)?;
+            access.strip(&c, &mut value);
+            if let Value::Object(fields) = value {
+                targets.insert(doc.id, (c, fields));
+            }
+        }
+    }
+    // A link's target, if the caller read it and it's in the collection the link names.
+    let target = |to: &str, value: &Value| {
+        let (c, doc) = targets.get(&Uuid::try_parse(value.as_str()?).ok()?)?;
+        (c.schema.slug == to).then_some((c, doc))
+    };
+    let link_url = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.link_url(d));
+    let title = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.title_of(d));
+    let slug = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.slug_of(d));
+    let ctx = RenderCtx {
+        link_url: &link_url,
+        title: &title,
+        slug: &slug,
+    };
+    for (v, c, _) in items.iter_mut() {
+        if let Some(doc) = v.as_object_mut() {
+            rich_texts_mut(c.schema.data(), doc, &mut |_, kind, text| {
+                *text = Value::String(to_string(text, kind, &ctx))
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
-/// short. One query per level for every distinct link, whatever the depths.
+/// short. One query per level for every distinct link, whatever the depths. Rich text is
+/// rendered first, so a link inside text that's now a string isn't populated.
 fn populate_each<'a>(
     state: &'a AppState,
     access: &'a Access,
-    items: Vec<(Value, Arc<Collection>, u8)>,
+    mut items: Vec<(Value, Arc<Collection>, u8)>,
     shapes: &'a Shapes,
+    format: Format,
 ) -> Populated<'a> {
     Box::pin(async move {
+        render(state, access, &mut items, format).await?;
         // For each document: the link at each path, and how deep to populate it.
         let wanted: Vec<HashMap<String, (Uuid, u8)>> = items
             .iter()
@@ -330,7 +555,7 @@ fn populate_each<'a>(
                 (value, c, remaining)
             })
             .collect();
-        let children = populate_each(state, access, children, shapes).await?;
+        let children = populate_each(state, access, children, shapes, format).await?;
         let by_key: HashMap<(Uuid, u8), Value> = child_keys.into_iter().zip(children).collect();
 
         Ok(items

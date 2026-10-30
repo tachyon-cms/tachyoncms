@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, schema AS \"schema: Json<CollectionSchema>\", schema_version, created_at, updated_at\n               FROM collections WHERE tenant_id = $1 AND slug = $2\n               FOR UPDATE",
+  "query": "UPDATE collections\n               SET schema = $2, schema_version = schema_version + 1, updated_at = now()\n               WHERE id = $1\n               RETURNING id, schema AS \"schema: Json<CollectionSchema>\", schema_version, created_at, updated_at",
   "describe": {
     "columns": [
       {
@@ -62,7 +62,7 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "Text"
+        "Jsonb"
       ]
     },
     "nullable": [
@@ -73,5 +73,5 @@
       false
     ]
   },
-  "hash": "5ed10c20878b57f166549b6b23b15d22b35be7680f38612ac322f9983cf50815"
+  "hash": "b789f4ef4d320a585a49032145df98f80c22ac66783f1be6ab7dd48a4cd19cb6"
 }

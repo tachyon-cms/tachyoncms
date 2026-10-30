@@ -9,7 +9,7 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
 use serde_json::{Map, Value};
 use tachyon_core::auth::Action;
-use tachyon_core::{CollectionKind, defaults, validate_document};
+use tachyon_core::{CollectionKind, defaults, merged, validate_document};
 use tachyon_db::DbError;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
@@ -17,10 +17,10 @@ use tachyon_db::query::get_many_readable;
 
 use crate::access::{Access, both};
 use crate::documents::{json_body, shaped, unique_error};
-use crate::params::read_params;
+use crate::params::{Format, read_params};
 use crate::populate::{
-    Shapes, check_links, fill_virtuals, link_ids, link_targets, populate, prepare, to_value,
-    vouched_links,
+    Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
+    to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -52,7 +52,7 @@ async fn respond(
     let mut items = vec![(value, c)];
     fill_virtuals(state, access, &mut items, None).await?;
     Ok(Json(
-        populate(state, access, items, depth, &Shapes::new())
+        populate(state, access, items, depth, &Shapes::new(), Format::Json)
             .await?
             .remove(0),
     ))
@@ -90,9 +90,16 @@ pub async fn get(
     let (value, c) = items.remove(0);
     let value = shaped(value, p.select.as_ref());
     Ok(Json(
-        populate(&state, &access, vec![(value, c)], p.depth, &p.populate)
-            .await?
-            .remove(0),
+        populate(
+            &state,
+            &access,
+            vec![(value, c)],
+            p.depth,
+            &p.populate,
+            p.format,
+        )
+        .await?
+        .remove(0),
     ))
 }
 
@@ -113,25 +120,34 @@ pub async fn update(
         Ok((read, write)) => both(read, write),
     };
     let who = access.actor(Action::UpdateGlobal, &c);
-    let patch = json_body(body)?;
-    access.writes(&c, &patch, Action::UpdateGlobal)?;
+    let mut patch = json_body(body)?;
+    let stored = match documents::get(&state.pool, c.id, c.id).await {
+        Ok(doc) => Some(doc.data.0),
+        Err(DbError::NotFound) => None,
+        Err(e) => return Err(e.into()),
+    };
+    from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
     let targets = link_targets(&state, &c).await?;
+    // Which fields the patch writes depends on the block rows it replaces, so it's checked
+    // against what's stored (nothing, before the first save) each time it's applied.
+    let nothing = Map::new();
     let apply = |current: Option<&Map<String, Value>>| {
+        access.writes(
+            &c,
+            &patch,
+            Action::UpdateGlobal,
+            Some(current.unwrap_or(&nothing)),
+        )?;
         validate_document(c.schema.data(), &patch, current)
             .map_err(ApiError::Validation)
             .and_then(|data| prepare(&targets, &c, data))
-            .map_err(|e| access.hide(&c, e))
+            .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, current))))
     };
     let before = |current: Option<&Map<String, Value>>| {
         current.map_or_else(Vec::new, |data| link_ids(&c, data))
     };
     // Links the patch adds are checked against the stored document (or none), then again
     // against the one the write locks.
-    let stored = match documents::get(&state.pool, c.id, c.id).await {
-        Ok(doc) => Some(doc.data.0),
-        Err(DbError::NotFound) => None,
-        Err(e) => return Err(e.into()),
-    };
     let vouched = check_links(
         &state,
         &access,
@@ -159,7 +175,7 @@ pub async fn update(
             Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
             Err(ApiError::NotFound) if guard.is_some() => return Err(DbError::Forbidden.into()),
             Err(ApiError::NotFound) => {}
-            Err(e) => return Err(access.hide(&c, unique_error(&c, e))),
+            Err(e) => return Err(access.hide(&c, unique_error(&c, e), None)),
         }
         let next = apply(None)?;
         vouched_links(&next, &[], &vouched)?;
@@ -175,7 +191,7 @@ pub async fn update(
         {
             Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
             Err(DbError::UniqueViolation(ref name)) if name == "documents_pkey" => continue,
-            Err(e) => return Err(access.hide(&c, unique_error(&c, e.into()))),
+            Err(e) => return Err(access.hide(&c, unique_error(&c, e.into()), None)),
         }
     }
     Err(ApiError::Internal(

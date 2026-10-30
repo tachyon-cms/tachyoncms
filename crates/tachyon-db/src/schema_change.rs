@@ -4,17 +4,24 @@
 //! and rolls back. Apply does the same scan, decides, then rewrites every document,
 //! re-syncs links, and stores the new schema, all in one transaction that holds the
 //! collection row `FOR UPDATE`, so no document write can interleave.
+//!
+//! A shared block has no documents. Changing one changes every schema that reaches it,
+//! directly or through other shared blocks, so each of those runs the same passes in the
+//! same transaction. Several schemas can be saved as one change (`apply_all`), which a
+//! schema file uses: all of it goes in, or none.
 
-use std::collections::{BTreeSet, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 
 use serde::Serialize;
 use serde_json::{Map, Value};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
-use tachyon_core::diff::{Renames, SchemaDiff, diff, migrate_document, relink};
+use tachyon_core::access::check_rules;
+use tachyon_core::diff::{Change, LinkChange, Renames, SchemaDiff, diff, migrate_document, relink};
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
 };
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::collections::Collection;
@@ -40,6 +47,9 @@ pub struct Preview {
     /// Live documents that lose a link because its collection is no longer allowed.
     pub cleared: i64,
     pub indexes: IndexChanges,
+    /// For a shared block: the change in each schema that names it, by slug.
+    #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+    pub collections: BTreeMap<String, Preview>,
 }
 
 /// Indexes the change builds and drops, labelled like `title (unique)`.
@@ -75,16 +85,38 @@ impl From<sqlx::Error> for ChangeError {
     }
 }
 
+/// One schema to save: a change to a stored one, or a new one when `new`.
+pub struct Save<'a> {
+    /// The stored schema it changes. A different `schema.slug` would rename it, which isn't
+    /// supported.
+    pub slug: &'a str,
+    pub schema: &'a CollectionSchema,
+    pub renames: &'a Renames,
+    pub new: bool,
+}
+
+/// What a save did, or would do.
+#[derive(Debug, Clone)]
+pub struct Outcome {
+    pub collection: Collection,
+    pub created: bool,
+    pub preview: Preview,
+}
+
 pub async fn preview(
     pool: &PgPool,
     slug: &str,
     new: &CollectionSchema,
     renames: &Renames,
-    pending: &[&str],
 ) -> Result<Preview, ChangeError> {
-    run(pool, slug, new, renames, pending, None)
-        .await
-        .map(|(_, p)| p)
+    let save = Save {
+        slug,
+        schema: new,
+        renames,
+        new: false,
+    };
+    let mut out = run(pool, &[save], None).await?;
+    Ok(out.remove(0).preview)
 }
 
 pub async fn apply(
@@ -94,7 +126,42 @@ pub async fn apply(
     renames: &Renames,
     confirm: bool,
 ) -> Result<(Collection, Preview), ChangeError> {
-    run(pool, slug, new, renames, &[], Some(confirm)).await
+    let save = Save {
+        slug,
+        schema: new,
+        renames,
+        new: false,
+    };
+    let o = run(pool, &[save], Some(confirm)).await?.remove(0);
+    Ok((o.collection, o.preview))
+}
+
+/// Several saves as one change, such as a schema file's: each sees the others' versions,
+/// so a shared block's cascade reaches a schema the file also changes as the file has it.
+pub async fn preview_all(pool: &PgPool, saves: &[Save<'_>]) -> Result<Vec<Outcome>, ChangeError> {
+    run(pool, saves, None).await
+}
+
+/// Creates one schema, with every check a change gets, under the lock: its shared blocks
+/// expanded (loops and depth refused) and every join, virtual and rule rechecked against
+/// what's stored, not what a server's cache last heard.
+pub async fn create(pool: &PgPool, schema: &CollectionSchema) -> Result<Collection, ChangeError> {
+    let save = Save {
+        slug: &schema.slug,
+        schema,
+        renames: &Renames::new(),
+        new: true,
+    };
+    Ok(run(pool, &[save], Some(true)).await?.remove(0).collection)
+}
+
+/// `preview_all`, applied in one transaction: all of it goes in, or none of it.
+pub async fn apply_all(
+    pool: &PgPool,
+    saves: &[Save<'_>],
+    confirm: bool,
+) -> Result<Vec<Outcome>, ChangeError> {
+    run(pool, saves, Some(confirm)).await
 }
 
 fn index_changes(id: Uuid, old: &CollectionSchema, new: &CollectionSchema) -> IndexChanges {
@@ -148,76 +215,422 @@ async fn batch(
         .collect())
 }
 
+/// One collection's or global's part of a change, expanded before and after: a schema
+/// saved, or one a saved shared block reaches. Shared blocks have no documents, so they're
+/// never parts.
+struct Part {
+    id: Uuid,
+    slug: String,
+    old: CollectionSchema,
+    new: CollectionSchema,
+    /// Its own renames, and a shared block's: those name fields within the block (`note`),
+    /// so here they become paths into this schema (`layout.cta.note`).
+    renames: Renames,
+    /// The saves it's reported under: its own, or every saved shared block reaching it. A
+    /// schema reached by several shows their combined change under each.
+    owners: Vec<usize>,
+    /// Saved itself, rather than only reached.
+    saved: bool,
+}
+
+impl Preview {
+    fn of(diff: SchemaDiff) -> Self {
+        Self {
+            diff,
+            documents: 0,
+            invalid: 0,
+            examples: Vec::new(),
+            duplicates: Vec::new(),
+            needs_confirmation: false,
+            cleared: 0,
+            indexes: IndexChanges::default(),
+            collections: BTreeMap::new(),
+        }
+    }
+}
+
+/// A shared block's preview: its own change, and each schema it reaches. It loses data only
+/// through those, so only they can need confirmation.
+fn summarize(own: &SchemaDiff, reached: Vec<(String, Preview)>) -> Preview {
+    let mut duplicates: Vec<String> = reached
+        .iter()
+        .flat_map(|(_, p)| p.duplicates.iter().cloned())
+        .collect();
+    duplicates.sort();
+    duplicates.dedup();
+    Preview {
+        documents: reached.iter().map(|(_, p)| p.documents).sum(),
+        invalid: reached.iter().map(|(_, p)| p.invalid).sum(),
+        cleared: reached.iter().map(|(_, p)| p.cleared).sum(),
+        needs_confirmation: reached.iter().any(|(_, p)| p.needs_confirmation),
+        duplicates,
+        collections: reached.into_iter().collect(),
+        ..Preview::of(own.clone())
+    }
+}
+
 // NOTE: the whole change runs in one transaction; very large collections should move to a
 // background job once the M4 job queue exists.
 async fn run(
     pool: &PgPool,
-    slug: &str,
-    new: &CollectionSchema,
-    renames: &Renames,
-    pending: &[&str],
+    saves: &[Save<'_>],
     write: Option<bool>,
-) -> Result<(Collection, Preview), ChangeError> {
-    new.check().map_err(ChangeError::Invalid)?;
-    crate::auth::check_users_schema(new).map_err(ChangeError::Invalid)?;
-    let mut tx = pool.begin().await?;
-    // Only a real change locks the collection; a preview reads without blocking saves.
-    let current = if write.is_some() {
-        sqlx::query_as!(
-            Collection,
-            r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
-               FROM collections WHERE tenant_id = $1 AND slug = $2
-               FOR UPDATE"#,
-            DEFAULT_TENANT,
-            slug,
-        )
-        .fetch_optional(&mut *tx)
-        .await?
-    } else {
-        sqlx::query_as!(
-            Collection,
-            r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
-               FROM collections WHERE tenant_id = $1 AND slug = $2"#,
-            DEFAULT_TENANT,
-            slug,
-        )
-        .fetch_optional(&mut *tx)
-        .await?
+) -> Result<Vec<Outcome>, ChangeError> {
+    // Several saves name the one at fault; with one, the caller knows which.
+    let named = saves.len() > 1;
+    let own = |slug: &str, e: SchemaError| {
+        ChangeError::Invalid(if named {
+            SchemaError::InvalidChange(format!("{slug}: {e}"))
+        } else {
+            e
+        })
+    };
+    let breaks = |slug: &str, e: SchemaError| {
+        ChangeError::Invalid(SchemaError::InvalidChange(format!(
+            "this change would break {slug}: {e}"
+        )))
+    };
+    for s in saves {
+        if s.slug != s.schema.slug {
+            return Err(own(
+                s.slug,
+                SchemaError::InvalidChange("renaming a collection isn't supported yet".into()),
+            ));
+        }
+        crate::auth::check_users_schema(s.schema).map_err(|e| own(s.slug, e))?;
     }
-    .ok_or(ChangeError::NotFound)?;
-    let changes = diff(&current.schema.0, new, renames).map_err(ChangeError::Invalid)?;
+    let mut tx = pool.begin().await?;
+    if write.is_some() {
+        // Every schema save holds R42's lock to its commit (W1-R16), so what's read below
+        // stays true until then: no other schema, shared block or role changes meanwhile.
+        crate::auth::lock_rule_roles(&mut tx).await?;
+    }
+    let stored = sqlx::query_as!(
+        Collection,
+        r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
+           FROM collections WHERE tenant_id = $1 ORDER BY slug"#,
+        DEFAULT_TENANT,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    // Each save's stored row, or the one it'll create.
+    let mut current = Vec::new();
+    for s in saves {
+        let found = stored.iter().find(|c| c.schema.slug == s.slug);
+        current.push(match (found, s.new) {
+            (Some(c), false) => c.clone(),
+            (None, false) => return Err(ChangeError::NotFound),
+            (Some(_), true) => {
+                return Err(DbError::Conflict(format!("collection `{}`", s.slug)).into());
+            }
+            (None, true) => {
+                let now = OffsetDateTime::now_utc();
+                Collection {
+                    id: Uuid::now_v7(),
+                    schema: Json(s.schema.clone()),
+                    schema_version: 1,
+                    created_at: now,
+                    updated_at: now,
+                }
+            }
+        });
+    }
+    let saved = |slug: &str| saves.iter().position(|s| s.slug == slug);
+    let before = |slug: &str| stored.iter().map(|c| &c.schema.0).find(|c| c.slug == slug);
+    let after = |slug: &str| {
+        saved(slug)
+            .map(|i| saves[i].schema)
+            .or_else(|| before(slug))
+    };
 
-    // Every relationship must point at an existing collection (not a global).
-    let others = sqlx::query!(
-        "SELECT id, slug, kind FROM collections WHERE tenant_id = $1",
+    // Every schema as it'll be, expanded, with where each shared block went.
+    let mut world: Vec<(CollectionSchema, Vec<(String, String)>)> = Vec::new();
+    let new_slugs = saves.iter().filter(|s| s.new).map(|s| s.slug);
+    for slug in stored
+        .iter()
+        .map(|c| c.schema.slug.as_str())
+        .chain(new_slugs)
+    {
+        let raw = after(slug).expect("every slug listed has a schema");
+        world.push(raw.expand_placed(after).map_err(|e| match saved(slug) {
+            Some(_) => own(slug, e),
+            None => breaks(slug, e),
+        })?);
+    }
+    let blocks: Vec<&str> = saves
+        .iter()
+        .filter(|s| s.schema.kind == CollectionKind::Block)
+        .map(|s| s.slug)
+        .collect();
+    let reaches = |placed: &[(String, String)]| {
+        blocks
+            .iter()
+            .copied()
+            .find(|b| placed.iter().any(|(_, s)| s == b))
+    };
+
+    // Rechecked here, under the lock, against what's stored now: a cache can be a change
+    // behind, and a join, virtual or rule must never be stored pointing at a field that's
+    // gone, such as one a shared block dropped.
+    let id_of = |slug: &str| {
+        saved(slug)
+            .map(|i| current[i].id)
+            .or_else(|| stored.iter().find(|c| c.schema.slug == slug).map(|c| c.id))
+    };
+    let mut targets: HashMap<String, Uuid> = HashMap::new();
+    for (schema, _) in &world {
+        let kept = schema.kind == CollectionKind::Collection
+            || (saved(&schema.slug).is_some() && schema.kind != CollectionKind::Block);
+        if kept && let Some(id) = id_of(&schema.slug) {
+            targets.insert(schema.slug.clone(), id);
+        }
+    }
+    let roles = sqlx::query_scalar!(
+        "SELECT slug FROM roles WHERE tenant_id = $1",
         DEFAULT_TENANT
     )
     .fetch_all(&mut *tx)
     .await?;
-    let mut targets: HashMap<String, Uuid> = others
-        .iter()
-        .filter(|c| c.kind == CollectionKind::Collection.as_str())
-        .map(|c| (c.slug.clone(), c.id))
-        .collect();
-    targets.insert(slug.to_owned(), current.id);
-    for target in new.relation_targets() {
-        if !targets.contains_key(target) && !pending.contains(&target) {
-            return Err(ChangeError::Invalid(SchemaError::InvalidChange(format!(
-                "relationTo `{target}` doesn't match an existing collection"
-            ))));
+    let roles: Vec<&str> = roles.iter().map(String::as_str).collect();
+    let lookup = |slug: &str| {
+        world
+            .iter()
+            .map(|(s, _)| s)
+            .find(|s| s.slug == slug)
+            .cloned()
+    };
+    let users = lookup(crate::auth::USERS)
+        .map(|u| u.fields)
+        .unwrap_or_default();
+    for (schema, placed) in &world {
+        let slug = schema.slug.as_str();
+        let fail = |e: SchemaError| match saved(slug) {
+            Some(_) => own(slug, e),
+            None => breaks(slug, e),
+        };
+        if saved(slug).is_some() || reaches(placed).is_some() {
+            schema.check().map_err(fail)?;
+            let own_target = |t: &str| t == slug && schema.kind != CollectionKind::Block;
+            if let Some(t) = schema
+                .relation_targets()
+                .into_iter()
+                .find(|t| !targets.contains_key(*t) && !own_target(t))
+            {
+                return Err(fail(SchemaError::InvalidChange(format!(
+                    "relationTo `{t}` doesn't match an existing collection"
+                ))));
+            }
         }
+        schema
+            .check_virtual_targets(lookup)
+            .and_then(|()| schema.check_join_targets(lookup))
+            .and_then(|()| check_rules(schema, &users, &roles, &lookup))
+            .map_err(fail)?;
+    }
+
+    // The parts, and each saved shared block's own change.
+    let mut parts = Vec::new();
+    for (schema, placed) in &world {
+        let Some(row) = stored.iter().find(|c| c.schema.slug == schema.slug) else {
+            continue; // New: no documents yet.
+        };
+        if schema.kind == CollectionKind::Block {
+            continue;
+        }
+        let (old, old_placed) = row
+            .schema
+            .expand_placed(before)
+            .map_err(|e| breaks(&schema.slug, e))?;
+        let owners: Vec<usize> = match saved(&schema.slug) {
+            Some(i) => vec![i],
+            None => blocks
+                .iter()
+                .filter(|b| placed.iter().chain(&old_placed).any(|(_, s)| s == *b))
+                .map(|b| saved(b).expect("a reaching block is saved"))
+                .collect(),
+        };
+        if owners.is_empty() {
+            continue;
+        }
+        let mut renames = match saved(&schema.slug) {
+            Some(i) => saves[i].renames.clone(),
+            None => Renames::new(),
+        };
+        for (path, slug) in &old_placed {
+            if let Some(b) = saved(slug).filter(|_| blocks.contains(&slug.as_str())) {
+                for (from, to) in saves[b].renames {
+                    renames.insert(format!("{path}.{slug}.{from}"), to.clone());
+                }
+            }
+        }
+        parts.push(Part {
+            id: row.id,
+            slug: schema.slug.clone(),
+            old,
+            new: schema.clone(),
+            renames,
+            owners,
+            saved: saved(&schema.slug).is_some(),
+        });
+    }
+    let mut own_diffs = Vec::new();
+    for (s, c) in saves.iter().zip(&current) {
+        own_diffs.push(if s.new || s.schema.kind != CollectionKind::Block {
+            None
+        } else {
+            let old = c.schema.expand(before).map_err(|e| own(s.slug, e))?;
+            let new = lookup(s.slug).expect("a save is in the world");
+            Some(diff(&old, &new, s.renames).map_err(|e| own(s.slug, e))?)
+        });
     }
 
     // Pass 1: what would happen to every live document.
+    let mut previews = Vec::new();
+    for part in &parts {
+        if write.is_some() {
+            // Document writes hold this row FOR KEY SHARE, so none interleaves from here on.
+            sqlx::query!(
+                "SELECT id FROM collections WHERE id = $1 FOR UPDATE",
+                part.id
+            )
+            .fetch_one(&mut *tx)
+            .await?;
+        }
+        let changes = diff(&part.old, &part.new, &part.renames).map_err(|e| match part.saved {
+            true => own(&part.slug, e),
+            false => breaks(&part.slug, e),
+        })?;
+        previews.push(scan(&mut tx, part, changes).await?);
+    }
+    let stored_differs: Vec<bool> = current
+        .iter()
+        .zip(saves)
+        .map(|(c, s)| c.schema.0 != *s.schema)
+        .collect();
+    let entry = |i: usize, previews: &[Preview]| -> Preview {
+        if saves[i].new {
+            return Preview::of(SchemaDiff::default());
+        }
+        let mut p = match &own_diffs[i] {
+            None => {
+                let k = parts
+                    .iter()
+                    .position(|p| p.saved && p.owners.contains(&i))
+                    .expect("a saved collection or global is a part");
+                previews[k].clone()
+            }
+            Some(own) => summarize(
+                own,
+                parts
+                    .iter()
+                    .zip(previews)
+                    .filter(|(p, _)| !p.saved && p.owners.contains(&i))
+                    .map(|(p, preview)| (p.slug.clone(), preview.clone()))
+                    .collect(),
+            ),
+        };
+        // Swapping an inline block for a reference to the same definition stores nothing
+        // new, but is still a change to save.
+        if p.diff.is_empty() && stored_differs[i] {
+            p.diff.changes.push(Change::LayoutChanged);
+        }
+        p
+    };
+    let out: Vec<Preview> = (0..saves.len()).map(|i| entry(i, &previews)).collect();
+    let outcomes = |current: Vec<Collection>, out: Vec<Preview>| {
+        current
+            .into_iter()
+            .zip(out)
+            .zip(saves)
+            .map(|((collection, preview), s)| Outcome {
+                collection,
+                created: s.new,
+                preview,
+            })
+            .collect()
+    };
+
+    let Some(confirm) = write else {
+        return Ok(outcomes(current, out));
+    };
+    let changed = |i: usize| saves[i].new || !out[i].diff.is_empty();
+    if !(0..saves.len()).any(changed) {
+        return Ok(outcomes(current, out));
+    }
+    if let Some(p) = out.iter().find(|p| !p.duplicates.is_empty()) {
+        return Err(ChangeError::Duplicates(Box::new(p.clone())));
+    }
+    if !confirm && let Some(p) = out.iter().find(|p| p.needs_confirmation) {
+        return Err(ChangeError::NeedsConfirmation(Box::new(p.clone())));
+    }
+    for s in saves {
+        crate::auth::check_rule_roles(&mut tx, s.schema).await?;
+    }
+    // New ones first, so links into them are kept.
+    for (i, s) in saves.iter().enumerate().filter(|(_, s)| s.new) {
+        current[i] = crate::collections::insert(&mut tx, current[i].id, s.schema).await?;
+    }
+
+    // Pass 2.
+    for k in 0..parts.len() {
+        if previews[k].diff.is_empty() {
+            continue;
+        }
+        let part = &parts[k];
+        if let Some(field) = rewrite(&mut tx, part, &targets, &previews[k].diff.links).await? {
+            previews[k].duplicates = vec![field];
+            return Err(ChangeError::Duplicates(Box::new(entry(
+                part.owners[0],
+                &previews,
+            ))));
+        }
+        if !part.saved {
+            // Its fields changed with a shared block, so writes validated against the old
+            // ones must retry (see `documents::check_schema`).
+            sqlx::query!(
+                "UPDATE collections SET schema_version = schema_version + 1, updated_at = now() WHERE id = $1",
+                part.id
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    for (i, s) in saves.iter().enumerate() {
+        if s.new || !changed(i) {
+            continue;
+        }
+        current[i] = sqlx::query_as!(
+            Collection,
+            r#"UPDATE collections
+               SET schema = $2, schema_version = schema_version + 1, updated_at = now()
+               WHERE id = $1
+               RETURNING id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at"#,
+            current[i].id,
+            Json(s.schema) as _,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+    }
+    for s in saves {
+        // Delivered to every listening server when the transaction commits.
+        sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", s.slug)
+            .execute(&mut *tx)
+            .await?;
+    }
+    tx.commit().await?;
+    Ok(outcomes(current, out))
+}
+
+/// Pass 1 for one part: what its diff would do to every live document.
+async fn scan(
+    conn: &mut PgConnection,
+    part: &Part,
+    changes: SchemaDiff,
+) -> Result<Preview, ChangeError> {
+    let (old, new) = (&part.old, &part.new);
     let mut p = Preview {
-        diff: changes,
-        documents: 0,
-        invalid: 0,
-        examples: Vec::new(),
-        duplicates: Vec::new(),
-        needs_confirmation: false,
-        cleared: 0,
-        indexes: index_changes(current.id, &current.schema.0, new),
+        indexes: index_changes(part.id, old, new),
+        ..Preview::of(changes)
     };
     let data = new.data();
     let unique: Vec<&str> = data
@@ -227,22 +640,22 @@ async fn run(
         .collect();
     // Relationships whose targets changed: links are reshaped, and dropped where their
     // collection is no longer allowed.
-    let links = p.diff.links.clone();
+    let links = &p.diff.links;
     let mut seen: HashMap<&str, HashSet<String>> = HashMap::new();
     let mut duplicates = BTreeSet::new();
     let mut after = None;
     loop {
-        let rows = batch(&mut tx, current.id, after).await?;
+        let rows = batch(&mut *conn, part.id, after).await?;
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
-            let mut migrated = migrate_document(new.data(), renames, &row.data);
-            if relink(&mut migrated, &links) {
+            let mut migrated = migrate_document(data, &part.renames, &row.data);
+            if relink(data, &mut migrated, links) {
                 p.cleared += 1;
             }
             if let Err(errors) =
-                validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
+                validate_document(data, &Value::Object(Map::new()), Some(&migrated))
             {
                 p.invalid += 1;
                 if p.examples.len() < MAX_EXAMPLES {
@@ -260,30 +673,27 @@ async fn run(
     }
     p.duplicates = duplicates.into_iter().collect();
     p.needs_confirmation = p.diff.is_destructive() || p.invalid > 0;
+    Ok(p)
+}
 
-    let Some(confirm) = write else {
-        return Ok((current, p));
-    };
-    if p.diff.is_empty() {
-        return Ok((current, p));
-    }
-    if !p.duplicates.is_empty() {
-        return Err(ChangeError::Duplicates(Box::new(p)));
-    }
-    if p.needs_confirmation && !confirm {
-        return Err(ChangeError::NeedsConfirmation(Box::new(p)));
-    }
-    crate::auth::check_rule_roles(&mut tx, new).await?;
-
-    // Pass 2: rewrite every document, deleted ones included so Trash restores cleanly.
+/// Pass 2 for one part: rewrites every document, deleted ones included so Trash restores
+/// cleanly, then builds its new unique indexes. Returns a unique field whose index found
+/// duplicate values.
+async fn rewrite(
+    conn: &mut PgConnection,
+    part: &Part,
+    targets: &HashMap<String, Uuid>,
+    links: &[LinkChange],
+) -> Result<Option<String>, ChangeError> {
+    let new = &part.new;
     let mut after = None;
     loop {
-        let rows = batch(&mut tx, current.id, after).await?;
+        let rows = batch(&mut *conn, part.id, after).await?;
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows {
-            let mut migrated = migrate_document(new.data(), renames, &row.data);
-            relink(&mut migrated, &links);
+            let mut migrated = migrate_document(new.data(), &part.renames, &row.data);
+            relink(new.data(), &mut migrated, links);
             // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
             let stored = validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
                 .unwrap_or(migrated);
@@ -293,7 +703,7 @@ async fn run(
                     row.id,
                     Json(&stored) as _
                 )
-                .execute(&mut *tx)
+                .execute(&mut *conn)
                 .await?;
             }
             // Deleted documents keep their old link rows; they re-sync when restored and saved (M4).
@@ -303,12 +713,13 @@ async fn run(
                     .filter_map(|r| {
                         Some(Relation {
                             path: r.path,
+                            at: r.at,
                             collection_id: *targets.get(&r.relation_to)?,
                             id: r.id,
                         })
                     })
                     .collect();
-                sync_relations(&mut tx, row.id, &links).await?;
+                sync_relations(&mut *conn, row.id, &links).await?;
             }
         }
     }
@@ -318,8 +729,8 @@ async fn run(
     // without its constraint.
     // NOTE: a plain CREATE INDEX blocks writes to `documents` while it builds; fine at
     // today's sizes, revisit with the M4 job queue.
-    let existing = existing_indexes(&mut tx, current.id).await?;
-    for w in wanted_indexes(current.id, new)
+    let existing = existing_indexes(&mut *conn, part.id).await?;
+    for w in wanted_indexes(part.id, new)
         .into_iter()
         .filter(|w| w.unique)
     {
@@ -327,38 +738,21 @@ async fn run(
             continue;
         }
         if existing.iter().any(|e| e.name == w.name) {
-            ddl(&mut tx, format!("DROP INDEX {}", w.name)).await?;
+            ddl(&mut *conn, format!("DROP INDEX {}", w.name)).await?;
         }
         match ddl(
-            &mut tx,
+            &mut *conn,
             format!("CREATE UNIQUE INDEX {} {}", w.name, w.definition),
         )
         .await
         {
             Err(DbError::Sqlx(sqlx::Error::Database(e))) if e.is_unique_violation() => {
-                p.duplicates = vec![w.field];
-                return Err(ChangeError::Duplicates(Box::new(p)));
+                return Ok(Some(w.field));
             }
             result => result?,
         }
     }
-
-    let updated = sqlx::query_as!(
-        Collection,
-        r#"UPDATE collections
-           SET schema = $2, schema_version = schema_version + 1, updated_at = now()
-           WHERE id = $1
-           RETURNING id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at"#,
-        current.id,
-        Json(new) as _,
-    )
-    .fetch_one(&mut *tx)
-    .await?;
-    sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", slug)
-        .execute(&mut *tx)
-        .await?;
-    tx.commit().await?;
-    Ok((updated, p))
+    Ok(None)
 }
 
 /// How a unique index sees a value: numbers by numeric value, so 1 and 1.0 collide.

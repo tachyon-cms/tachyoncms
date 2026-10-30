@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{Field, FieldKind, SelectOption, data_fields};
+use crate::schema::{BlockSource, Field, FieldKind, SelectOption, data_fields};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -132,6 +132,9 @@ pub enum Target {
     Row {
         list: Vec<String>,
         inner: Box<Target>,
+        /// For a `blocks` list, the block types whose rows can match: those that have the
+        /// field. `None` for an array, whose rows all have it.
+        blocks: Option<Vec<String>>,
     },
 }
 
@@ -178,6 +181,8 @@ pub enum ValueKind {
     LinkList,
     /// A `[longitude, latitude]` location.
     Point,
+    /// A rich text document: it has a value or it doesn't.
+    RichText,
 }
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
@@ -196,6 +201,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
         FieldKind::Point => ValueKind::Point,
+        FieldKind::RichText { .. } => ValueKind::RichText,
         FieldKind::Text { .. }
         | FieldKind::Textarea { .. }
         | FieldKind::Email
@@ -209,6 +215,7 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         | FieldKind::Join { .. }
         | FieldKind::Group { .. }
         | FieldKind::Array { .. }
+        | FieldKind::Blocks { .. }
         | FieldKind::Row { .. }
         | FieldKind::Collapsible { .. }
         | FieldKind::Tabs { .. } => return None,
@@ -279,6 +286,7 @@ impl Op {
             ValueKind::Point => matches!(self, Near | Exists),
             ValueKind::Boolean => matches!(self, Equals | NotEquals | Exists),
             ValueKind::List | ValueKind::LinkList => matches!(self, Contains | Exists),
+            ValueKind::RichText => self == Exists,
         }
     }
 }
@@ -619,11 +627,68 @@ fn resolve(
                     Target::Row {
                         list: path,
                         inner: Box::new(inner),
+                        blocks: None,
+                    },
+                    field,
+                ));
+            }
+            FieldKind::Blocks { blocks, .. } if !last => {
+                if hops.lists >= MAX_HOPS {
+                    return Err(format!(
+                        "`{full}` reaches into too many nested lists ({MAX_HOPS} at most)"
+                    ));
+                }
+                let hops = Hops {
+                    lists: hops.lists + 1,
+                    ..hops
+                };
+                let slugs = || {
+                    blocks
+                        .iter()
+                        .filter_map(BlockSource::def)
+                        .map(|b| b.slug.clone())
+                        .collect::<Vec<_>>()
+                };
+                if rest == "blockType" {
+                    let options = slugs().into_iter().map(SelectOption::Value).collect();
+                    let block_type = Field {
+                        kind: FieldKind::Select {
+                            options,
+                            multiple: false,
+                        },
+                        ..f.clone()
+                    };
+                    return Ok((
+                        Target::Row {
+                            list: path,
+                            inner: Box::new(Target::Field {
+                                path: vec!["blockType".into()],
+                                kind: ValueKind::Text,
+                            }),
+                            blocks: Some(slugs()),
+                        },
+                        Some(block_type),
+                    ));
+                }
+                let (inner, field, types) =
+                    in_blocks(scope, blocks, &rest, full, verb, lookup, hops)?;
+                return Ok((
+                    Target::Row {
+                        list: path,
+                        inner: Box::new(inner),
+                        blocks: Some(types),
                     },
                     field,
                 ));
             }
             FieldKind::Group { fields } if !last => current = fields,
+            // ponytail: nothing inside rich text (nodes, links, block node fields) can be
+            // filtered or sorted in W1; a path into it is refused, not guessed at.
+            FieldKind::RichText { .. } if !last => {
+                return Err(format!(
+                    "`{full}` is inside rich text, which can't be {verb} yet"
+                ));
+            }
             // A polymorphic link is an object: its `relationTo`, or its `value` (the default).
             FieldKind::Relationship {
                 relation_to,
@@ -741,6 +806,76 @@ fn resolve(
         i += 1;
     }
     Err(unknown(name))
+}
+
+/// `rest` inside the rows of a blocks field: resolved in each block type that has it, all of
+/// which must agree on what it is, and those types. A select or radio takes every type's
+/// options.
+fn in_blocks(
+    scope: &Scope<'_>,
+    blocks: &[BlockSource],
+    rest: &str,
+    full: &str,
+    verb: &str,
+    lookup: Option<Lookup<'_>>,
+    hops: Hops,
+) -> Result<(Target, Option<Field>, Vec<String>), String> {
+    let mut found: Option<(Target, Option<Field>)> = None;
+    let mut types = Vec::new();
+    let mut first_error = None;
+    for b in blocks.iter().filter_map(BlockSource::def) {
+        let row = Scope {
+            root: scope.root,
+            fields: &b.fields,
+            collection: scope.collection,
+            in_row: true,
+        };
+        let (inner, field) = match resolve(&row, rest, full, verb, lookup, hops) {
+            Ok(resolved) => resolved,
+            // A type without the field has no rows that could match.
+            Err(e) => {
+                first_error.get_or_insert(e);
+                continue;
+            }
+        };
+        match &mut found {
+            None => found = Some((inner, field)),
+            Some((seen, seen_field)) => {
+                let same = match (&*seen_field, &field) {
+                    (Some(a), Some(b)) => crate::diff::same_type(&a.kind, &b.kind),
+                    (a, b) => a.is_none() && b.is_none(),
+                };
+                if *seen != inner || !same {
+                    return Err(format!(
+                        "`{full}` means different things in block types {} and {}",
+                        types[0], b.slug
+                    ));
+                }
+                if let (
+                    Some(Field {
+                        kind: FieldKind::Select { options, .. } | FieldKind::Radio { options },
+                        ..
+                    }),
+                    Some(Field {
+                        kind:
+                            FieldKind::Select { options: more, .. } | FieldKind::Radio { options: more },
+                        ..
+                    }),
+                ) = (seen_field, &field)
+                {
+                    for o in more {
+                        if !options.iter().any(|x| x.value() == o.value()) {
+                            options.push(o.clone());
+                        }
+                    }
+                }
+            }
+        }
+        types.push(b.slug.clone());
+    }
+    let (inner, field) =
+        found.ok_or_else(|| first_error.unwrap_or_else(|| format!("unknown field `{full}`")))?;
+    Ok((inner, field, types))
 }
 
 /// `lng,lat[,maxDistance[,minDistance]]`, distances in metres.
@@ -915,6 +1050,12 @@ pub fn parse_sort(fields: &[Field], input: &str) -> Result<Sort, FilterError> {
         return Err(err(
             "sort",
             format!("`{name}` holds a location and can't be sorted"),
+        ));
+    }
+    if target.kind() == ValueKind::RichText {
+        return Err(err(
+            "sort",
+            format!("`{name}` holds rich text and can't be sorted"),
         ));
     }
     Ok(Sort { target, descending })
@@ -1512,6 +1653,59 @@ mod tests {
     }
 
     #[test]
+    fn rich_text_can_only_be_tested_for_a_value() {
+        let fields: Vec<Field> = serde_json::from_value(json!([
+            {"name": "body", "type": "richText", "relationTo": ["posts"], "blocks": [
+                {"slug": "cta", "fields": [{"name": "label", "type": "text"}]}
+            ]}
+        ]))
+        .unwrap();
+        let filter = |qs: &str| {
+            let params = parse_query(qs).unwrap();
+            parse_filter(&fields, &params["where"]).map_err(|e| e.to_string())
+        };
+        assert_eq!(
+            filter("where[body][exists]=true"),
+            Ok(cond(
+                field("body", ValueKind::RichText),
+                Op::Exists,
+                Operand::One(Scalar::Bool(true))
+            ))
+        );
+        for op in ["equals", "not_equals", "like", "contains", "in", "gt"] {
+            assert_eq!(
+                filter(&format!("where[body][{op}]=x")),
+                Err(format!(
+                    "where[body][{op}]: {op} can't be used on this field"
+                )),
+            );
+        }
+        // Nothing inside the text can be filtered on: not its nodes, links or block fields.
+        for path in [
+            "body.label",
+            "body.content",
+            "body.0.label",
+            "body.cta.label",
+            "body.type",
+        ] {
+            assert_eq!(
+                filter(&format!("where[{path}][exists]=true")),
+                Err(format!(
+                    "where[{path}][exists]: `{path}` is inside rich text, which can't be filtered yet"
+                )),
+            );
+        }
+        assert_eq!(
+            parse_sort(&fields, "body").unwrap_err().to_string(),
+            "sort: `body` holds rich text and can't be sorted"
+        );
+        assert_eq!(
+            parse_sort(&fields, "body.label").unwrap_err().to_string(),
+            "sort: `body.label` is inside rich text, which can't be sorted yet"
+        );
+    }
+
+    #[test]
     fn sorting_on_a_value_that_cant_be_sorted_says_sorted() {
         assert_eq!(
             parse_sort(&fields(), "data").unwrap_err().to_string(),
@@ -1560,6 +1754,25 @@ mod tests {
                     {"name": "url", "type": "url"},
                     {"name": "by", "type": "relationship", "relationTo": "authors"},
                     {"name": "parts", "type": "array", "fields": [{"name": "n", "type": "number"}]}
+                ]},
+                {"name": "layout", "type": "blocks", "blocks": [
+                    {"slug": "hero", "fields": [
+                        {"name": "heading", "type": "text"},
+                        {"name": "by", "type": "relationship", "relationTo": "authors"},
+                        {"name": "rows", "type": "array", "fields": [{"name": "n", "type": "number"}]},
+                        {"name": "x", "type": "text"}
+                    ]},
+                    {"slug": "quote", "fields": [
+                        {"name": "by", "type": "relationship", "relationTo": "authors"},
+                        {"name": "x", "type": "number"},
+                        {"name": "cta", "type": "text"}
+                    ]},
+                    {"slug": "card", "fields": [
+                        {"name": "cta", "type": "group", "fields": [{"name": "label", "type": "text"}]},
+                        {"name": "deep", "type": "array", "fields": [
+                            {"name": "deeper", "type": "array", "fields": [{"name": "n", "type": "number"}]}
+                        ]}
+                    ]}
                 ]}
             ]))
             .unwrap()
@@ -1598,7 +1811,92 @@ mod tests {
             Target::Row {
                 list: list.split('.').map(str::to_owned).collect(),
                 inner: Box::new(inner),
+                blocks: None,
             }
+        }
+
+        fn blocks(list: &str, types: &[&str], inner: Target) -> Target {
+            Target::Row {
+                list: list.split('.').map(str::to_owned).collect(),
+                inner: Box::new(inner),
+                blocks: Some(types.iter().map(|s| (*s).to_owned()).collect()),
+            }
+        }
+
+        #[test]
+        fn paths_into_blocks_resolve_to_rows_of_the_types_that_have_them() {
+            let all = ["hero", "quote", "card"];
+            assert_eq!(
+                target("where[layout.blockType][equals]=quote"),
+                blocks("layout", &all, field("blockType", ValueKind::Text))
+            );
+            assert_eq!(
+                target("where[layout.heading][like]=a"),
+                blocks("layout", &["hero"], field("heading", ValueKind::Text))
+            );
+            let by = via(
+                "by",
+                false,
+                false,
+                &["authors"],
+                field("name", ValueKind::Text),
+            );
+            assert_eq!(
+                target("where[layout.by.name][equals]=Ann"),
+                blocks("layout", &["hero", "quote"], by)
+            );
+            assert_eq!(
+                target("where[layout.rows.n][gt]=1"),
+                blocks(
+                    "layout",
+                    &["hero"],
+                    row("rows", field("n", ValueKind::Number))
+                )
+            );
+            // quote's `cta` is text, so only card's group has a `label`.
+            assert_eq!(
+                target("where[layout.cta.label][equals]=Go"),
+                blocks("layout", &["card"], field("cta.label", ValueKind::Text))
+            );
+            for (qs, message) in [
+                (
+                    "where[layout.blockType][equals]=nope",
+                    "where[layout.blockType][equals]: expected one of: hero, quote, card",
+                ),
+                (
+                    "where[layout.x][equals]=1",
+                    "where[layout.x][equals]: `layout.x` means different things in block types hero and quote",
+                ),
+                (
+                    "where[layout.nope][equals]=1",
+                    "where[layout.nope][equals]: unknown field `layout.nope`",
+                ),
+                (
+                    "where[layout.by.nope][equals]=1",
+                    "where[layout.by.nope][equals]: `layout.by.nope`: authors has no field `nope`",
+                ),
+                (
+                    "where[layout.id][equals]=1",
+                    "where[layout.id][equals]: unknown field `layout.id`",
+                ),
+            ] {
+                assert_eq!(filter(qs).unwrap_err(), message, "{qs}");
+            }
+            // Blocks count as a list towards the limit.
+            assert_eq!(
+                target("where[layout.deep.deeper.n][gt]=1"),
+                blocks(
+                    "layout",
+                    &["card"],
+                    row("deep", row("deeper", field("n", ValueKind::Number)))
+                )
+            );
+            assert_eq!(
+                parse_sort(&posts(), "layout.heading")
+                    .unwrap_err()
+                    .to_string(),
+                "sort: `layout.heading` is inside a list and can't be sorted"
+            );
         }
 
         #[test]

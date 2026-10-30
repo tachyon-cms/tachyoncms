@@ -30,6 +30,8 @@ pub struct Document {
 #[derive(Debug, Clone)]
 pub struct Relation {
     pub path: String,
+    /// Where validation names the link, for errors about it (`RelationRef::at`).
+    pub at: String,
     pub collection_id: Uuid,
     pub id: Uuid,
 }
@@ -291,7 +293,7 @@ pub async fn delete_as(
     }
     check_guard(&mut tx, id, guard).await?;
     let linked = sqlx::query_scalar!(
-        r#"SELECT count(*) AS "n!" FROM relations r
+        r#"SELECT count(DISTINCT r.from_doc) AS "n!" FROM relations r
            JOIN documents d ON d.id = r.from_doc
            WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL"#,
         id,
@@ -325,7 +327,9 @@ async fn check_guard(
     }
 }
 
-/// Live documents that link to `id`.
+/// Live documents that link to `id`. A rich text link's index in `path`
+/// (`layout.0.intro.1`) counts links the caller can't see too: a change that hides their
+/// bare IDs must renumber it.
 pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbError> {
     Ok(sqlx::query_as!(
         Reference,
@@ -383,7 +387,7 @@ pub(crate) async fn sync_relations(
         .iter()
         .filter(|r| !found.contains(&(r.id, r.collection_id)))
         .map(|r| FieldError {
-            path: r.path.clone(),
+            path: r.at.clone(),
             message: MISSING_LINK.into(),
         })
         .collect();

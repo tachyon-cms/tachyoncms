@@ -5,7 +5,7 @@ use std::collections::BTreeMap;
 use serde_json::{Map, Value};
 
 use crate::query::FilterError;
-use crate::schema::{Field, FieldKind, data_fields};
+use crate::schema::{BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, data_fields};
 
 /// Keys every document carries besides its fields. `id` always comes back.
 const BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "status"];
@@ -37,7 +37,7 @@ pub fn parse_select(fields: &[Field], input: &Value, param: &str) -> Result<Sele
     };
     let fields: &[Field] = &data_fields(fields);
     let mut modes = Vec::new();
-    let tree = parse_tree(fields, input, param, true, &mut modes)?;
+    let tree = parse_tree(&[fields], input, param, true, false, &mut modes)?;
     match (modes.contains(&true), modes.contains(&false)) {
         (true, true) => Err(err(param, "use either true or false throughout, not both")),
         (false, true) => Ok(Select::Exclude(tree)),
@@ -45,11 +45,14 @@ pub fn parse_select(fields: &[Field], input: &Value, param: &str) -> Result<Sele
     }
 }
 
+/// `sets` are the field lists a name can come from: one, or every block type's inside a
+/// `blocks` field (`block_rows`), since a select there doesn't name the block type.
 fn parse_tree(
-    fields: &[Field],
+    sets: &[&[Field]],
     input: &Map<String, Value>,
     param: &str,
     top: bool,
+    block_rows: bool,
     modes: &mut Vec<bool>,
 ) -> Result<Tree, FilterError> {
     let mut tree = Tree::default();
@@ -59,8 +62,14 @@ fn parse_tree(
             param: here.clone(),
             message,
         };
-        let field = fields.iter().find(|f| &f.name == name);
-        let built_in = top && BUILT_INS.contains(&name.as_str());
+        let matches: Vec<&Field> = sets
+            .iter()
+            .flat_map(|s| s.iter())
+            .filter(|f| &f.name == name)
+            .collect();
+        let field = matches.first();
+        let built_in = top && BUILT_INS.contains(&name.as_str())
+            || block_rows && BLOCK_ROW_KEYS.contains(&name.as_str());
         if field.is_none() && !built_in {
             return Err(err("unknown field".into()));
         }
@@ -78,21 +87,49 @@ fn parse_tree(
                 });
                 None
             }
-            Value::Object(inner) => match field.map(|f| &f.kind) {
-                Some(FieldKind::Group { fields } | FieldKind::Array { fields, .. }) => {
-                    Some(parse_tree(fields, inner, &here, false, modes)?)
+            Value::Object(inner) => {
+                let inside: Vec<&[Field]> = matches
+                    .iter()
+                    .flat_map(|f| match &f.kind {
+                        FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                            vec![fields.as_slice()]
+                        }
+                        FieldKind::Blocks { blocks, .. } => blocks
+                            .iter()
+                            .filter_map(BlockSource::def)
+                            .map(|b| b.fields.as_slice())
+                            .collect(),
+                        _ => vec![],
+                    })
+                    .collect();
+                match (field, inside.is_empty()) {
+                    (Some(f), true) => {
+                        return Err(err(format!(
+                            "{} fields have nothing inside to select",
+                            f.kind.name()
+                        )));
+                    }
+                    (None, _) => {
+                        return Err(err(format!("{name} has nothing inside to select")));
+                    }
+                    (Some(_), false) => {
+                        let blocks = matches
+                            .iter()
+                            .any(|f| matches!(f.kind, FieldKind::Blocks { .. }));
+                        Some(parse_tree(&inside, inner, &here, false, blocks, modes)?)
+                    }
                 }
-                Some(kind) => {
-                    return Err(err(format!(
-                        "{} fields have nothing inside to select",
-                        kind.name()
-                    )));
-                }
-                None => return Err(err(format!("{name} has nothing inside to select"))),
-            },
+            }
             _ => return Err(err("expected true or false".into())),
         };
         tree.0.insert(name.clone(), child);
+    }
+    // A block row always says what it is. An empty subtree keeps a value untouched under
+    // both include and exclude, whichever the select turns out to be.
+    if block_rows {
+        for key in BLOCK_ROW_KEYS {
+            tree.0.insert((*key).to_owned(), Some(Tree::default()));
+        }
     }
     Ok(tree)
 }
@@ -252,6 +289,58 @@ mod tests {
             json!({"id": "1", "status": "published", "createdAt": "c", "updatedAt": "u", "title": "T",
                    "seo": {"description": "SD"},
                    "links": [{"url": "https://a.test"}, {"url": "https://b.test"}]})
+        );
+    }
+
+    #[test]
+    fn select_reaches_into_blocks() {
+        let fields: Vec<Field> = serde_json::from_value(json!([
+            {"name": "title", "type": "text"},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "hero", "fields": [{"name": "heading", "type": "text"}, {"name": "sub", "type": "text"}]},
+                {"slug": "cards", "fields": [
+                    {"name": "heading", "type": "text"},
+                    {"name": "items", "type": "array", "fields": [{"name": "label", "type": "text"}, {"name": "n", "type": "number"}]}
+                ]}
+            ]}
+        ]))
+        .unwrap();
+        let doc = json!({"id": "1", "title": "T", "layout": [
+            {"id": "r1", "blockType": "hero", "heading": "H", "sub": "S"},
+            {"id": "r2", "blockType": "cards", "heading": "C", "items": [{"label": "a", "n": 1}]}
+        ]});
+        let shaped = |qs: &str| {
+            let params = parse_query(qs).unwrap();
+            let select = parse_select(&fields, &params["select"], "select")?;
+            let mut d = doc.as_object().unwrap().clone();
+            project(&select, &mut d);
+            Ok::<_, FilterError>(Value::Object(d))
+        };
+        assert_eq!(
+            shaped("select[layout][heading]=true").unwrap(),
+            json!({"id": "1", "layout": [
+                {"id": "r1", "blockType": "hero", "heading": "H"},
+                {"id": "r2", "blockType": "cards", "heading": "C"}
+            ]})
+        );
+        assert_eq!(
+            shaped(
+                "select[layout][heading]=false&select[layout][items][n]=false&select[title]=false"
+            )
+            .unwrap(),
+            json!({"id": "1", "layout": [
+                {"id": "r1", "blockType": "hero", "sub": "S"},
+                {"id": "r2", "blockType": "cards", "items": [{"label": "a"}]}
+            ]})
+        );
+        assert_eq!(
+            shaped("select[layout][blockType]=false").unwrap()["layout"][0]["blockType"],
+            "hero",
+            "a row always says what it is"
+        );
+        assert_eq!(
+            shaped("select[layout][nope]=true").unwrap_err().to_string(),
+            "select[layout][nope]: unknown field"
         );
     }
 

@@ -40,6 +40,7 @@ We think you can have both. Here's what we're building toward:
 - Ask for only what you need. `select[title]=true` returns just the title (and `id`), `populate[authors][name]=true` trims the documents your links fill in, and a collection's `defaultPopulate` sets that trim once. A relationship's `maxDepth` stops population going deeper than you want, whatever `depth` a request asks for.
 - Virtual fields show a value from a linked document without storing it: a field with `"virtual": "author.name"` reads the author's name on every read, and you can filter on it like any other field.
 - Join fields list the documents that link to this one. Give a category `{"type": "join", "collection": "posts", "on": "category"}` and every read shows its posts, newest first. Page, sort, filter and count them per request with `joins[posts][limit]=5&joins[posts][sort]=-title`, or switch them off with `joins=false`. A join inside a group goes by its path, `joins[meta.recent]` or `joins[meta][recent]`.
+- Build pages from blocks, and write long-form text as rich text, in JSON or Markdown. Read it back as JSON, HTML, Markdown or plain text with `?format=`. [Pages and rich text](#pages-and-rich-text) shows how.
 
 ## Try it
 
@@ -226,6 +227,122 @@ A collection or global answers `true`, `false` or `"conditional"`. Conditional m
 - A unique field gives one thing away. Saving a duplicate value fails with a 422, even when the document holding that value is one you can't read, so the error tells you some document has it. Don't make a field unique if its values must stay secret.
 - A required field that someone can't create, and that has no default, means they can't create the document at all. Give it a default, or let them set it.
 - The `users` collection doesn't take collection rules yet; saving one is refused rather than left to do nothing. Rules on its profile fields work.
+
+### Pages and rich text
+
+A landing page isn't one long text field. It's a hero, then a row of features, a quote, a call to action, in whatever order the editor wants this week. That's what a `blocks` field holds: a list of rows, each one of the block types you define, each with its own fields. Long-form writing goes in a `richText` field, and blocks can sit inside that too.
+
+Define a block once and you can use it anywhere. A shared block is a schema of its own, with `"kind": "block"`:
+
+```json
+{"slug": "cta", "kind": "block",
+ "labels": {"singular": "Call to action", "plural": "Calls to action"},
+ "fields": [
+   {"name": "label", "type": "text", "required": true},
+   {"name": "href", "type": "text"}
+ ]}
+```
+
+Then name it with `{"blockRef": "cta"}` beside block types written in place:
+
+```json
+{
+  "slug": "pages",
+  "url": "/{slug}",
+  "fields": [
+    {"name": "title", "type": "text", "required": true},
+    {"name": "slug", "type": "slug", "from": "title"},
+    {"name": "layout", "type": "blocks", "blocks": [
+      {"slug": "hero", "fields": [
+        {"name": "heading", "type": "text"},
+        {"name": "intro", "type": "richText", "features": ["bold", "italic", "link"]}
+      ]},
+      {"blockRef": "cta"}
+    ]},
+    {"name": "body", "type": "richText", "relationTo": ["pages"], "blocks": [
+      {"slug": "callout", "fields": [
+        {"name": "kind", "type": "select", "options": ["note", "warning"]},
+        {"name": "text", "type": "richText"}
+      ]},
+      {"blockRef": "cta"}
+    ]}
+  ]
+}
+```
+
+Each row says which block type it is:
+
+```json
+{"title": "Home", "layout": [
+  {"blockType": "hero", "heading": "Welcome"},
+  {"blockType": "cta", "label": "Get started", "href": "/start"}
+]}
+```
+
+Every row gets an `id` and keeps it. Lists are replaced whole, so to change one block on a long page, send the whole `layout` back with its `id`s. `minRows` and `maxRows` set how few and how many rows the field takes. Change a shared block and every schema that uses it changes too, with renames carrying the data across. Shared blocks can use other shared blocks, but not in a loop, and you can't delete one while a schema still names it: the 409 says which.
+
+Field rules work inside blocks, and inside rich text's block nodes, exactly as they do in groups and lists. Each row answers to its own block type's rules, so a `secret` that only Editors read in a `hero` row stays readable in a `quote` row with no rule on it. Filters go by path without the block type: `where[layout.heading][equals]=Welcome` searches every row that has a `heading`. `/api/access` lists `layout.heading` the same way, and where block types disagree it answers with what all of them allow.
+
+**What rich text holds.** Paragraphs, headings, bullet, numbered and task lists, quotes, code blocks, tables, horizontal rules and hard breaks; bold, italic, underline, strikethrough, subscript, superscript, inline code and links. A `relationship` node points at a document, and a `block` node holds a row of any block type the field lists. Images are coming with the media library. It's stored as a JSON tree:
+
+```json
+{"type": "doc", "content": [
+  {"type": "paragraph", "content": [
+    {"type": "text", "text": "Takes "},
+    {"type": "text", "text": "two", "marks": [{"type": "bold"}]},
+    {"type": "text", "text": " minutes."}
+  ]}
+]}
+```
+
+`features` narrows what a field allows (`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `code`, `link`, `heading`, `bulletList`, `orderedList`, `taskList`, `blockquote`, `horizontalRule`, `hardBreak`, `table`, `codeBlock`, `relationship`, `block`). Leave it out and everything's allowed. Paragraphs and plain text always are.
+
+`relationTo` says which collections links and relationship nodes may point at. A link is either an `href` or a document, `{"doc": {"relationTo": "pages", "value": "<id>"}}`, and `"newTab": true` opens it in a new tab.
+
+An `href` has to start with `http://`, `https://`, `mailto:`, `tel:`, `/` or `#`, in any case, so `JavaScript:` and `//evil.example` are refused.
+
+One value nests at most 32 levels deep and holds at most 50,000 nodes, counting the rich text inside its block nodes. Anything else comes back as a 422 naming the node, such as `body.content.3.marks.0.attrs.href`.
+
+Rich text can only be filtered on whether it's there: `where[body][exists]=true`. Nothing inside it can be named in a filter, and it can't be sorted on.
+
+Removing a block type, or taking a feature off a field, while documents still use it works like dropping a select option. You get a 409 with a preview that counts the documents that won't validate, with examples, and the change only goes through when you send it again with `"confirm": true`. Stored text is never rewritten behind your back. A row of a removed block type reads back as its `id` and `blockType` alone, to everyone. When you narrow `features`, drop the settings the shorter list can't use: `blocks` needs `block` in the list, and `relationTo` needs `link` or `relationship`. Otherwise the save is refused.
+
+**Writing Markdown.** Send `{"format": "markdown", "value": "..."}` in place of the JSON tree, on collections, globals and users alike, and it's stored as rich text:
+
+```json
+{"title": "Clean up", "body": {"format": "markdown", "value": "## Before you start\n\nBack up first. The [install guide](doc:pages/install) has the steps.\n\n:::callout{kind=\"warning\"}\nThis empties the **bin**.\n:::\n\n::cta{label=\"Get started\" href=\"/start\"}\n\n- [x] Read the guide\n- [ ] Run <u>migrate</u>\n"}}
+```
+
+That's GitHub-flavoured Markdown (tables, `~~strikethrough~~`, task lists) plus a few extensions, which are also what `?format=markdown` writes:
+
+- `[text](doc:pages/install)` links to the `pages` document whose slug is `install`. You can only name documents you can read; anything else gets the same 422 as a slug that doesn't exist. One write names at most 1,000 documents this way.
+- `::ref{collection="pages" slug="install"}` on its own line is a relationship node.
+- `::cta{label="Get started" href="/start"}` is a block node. Numbers and checkboxes read as you'd expect (`start="30"` is 30), and a `json` field's value is written as JSON.
+- `:::callout{kind="warning"}`, a block of Markdown, then `:::` puts that Markdown in the block's rich text field. It works when the block type has exactly one. Nest one inside another by giving the outer one more colons: `::::callout` around `:::callout`.
+- `<u>…</u>` is underline and `<br>` (or `<br/>`, `<br />`) is a hard break. That's all the HTML there is.
+
+Markdown that doesn't fit is refused with a 422 and the line it's on, never half-converted: `line 3: raw HTML isn't allowed; the only tags are <u>…</u> and <br>`, or ``line 3: unknown directive `:::aside` ``. A value can be up to 1 MiB, a numbered list starts at 1,000,000 at most, a NUL character is refused anywhere, and so is a directive straight after a task box (`- [ ] ::cta{…}`). Some things have no Markdown at all: subscript and superscript come out as plain text, and cell spans and `newTab` are dropped.
+
+Markdown can't say everything JSON can, so a few things change on the way through. Each one is deliberate:
+
+- A table cell holding several blocks, or one block that isn't a paragraph, becomes one paragraph, with `<br>` between the blocks.
+- Marks come back in a fixed order, and neighbouring text with the same marks becomes one text node.
+- Code blocks end their lines with `\n`, never `\r\n` or `\r`.
+- An empty paragraph beside other blocks is dropped.
+- A numbered list's `"start": 1` and a block node's empty `fields` aren't written.
+- A table without a header row gets its first row as the header.
+- A task item with no `checked` comes back unchecked.
+
+**Reading it back.** Ask for `?format=html`, `markdown` or `text` on any read of a collection or a global, single or list, and every rich text field comes back as a string, in populated and joined documents too. JSON is the default. `GET /api/users/{id}` takes `format` as well, though not `depth` or `select` (both are a 400 there). Here are two pieces of what `?format=html` makes of that body:
+
+```html
+<p>Back up first. The <a href="/install">install guide</a> has the steps.</p>
+<div data-block="cta" data-href="/start" data-label="Get started"></div>
+```
+
+A link to a document goes to its collection's `url`, here `/{slug}`; without one, it's the link text alone. Block fields become `data-*` attributes (`ctaLabel` is `data-cta-label`), and anything that isn't a plain value is written as JSON. A relationship node is a `<div data-relationship>` around the linked document's first text field. Text is escaped, every `href` is checked again on the way out, and `newTab` links get `target="_blank" rel="noopener noreferrer"`. As `text`, you get the words alone, the rich text inside block nodes included.
+
+What you can't read stays hidden in every format. A field you can't read isn't there, inside block nodes included. A link to a document you can't read is its text alone, and a relationship node pointing at one is left out entirely. In JSON that link stays a bare ID, whatever the `depth`.
 
 ### Putting it online
 

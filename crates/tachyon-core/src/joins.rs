@@ -1,42 +1,56 @@
 //! Join fields: the documents of another collection that link to this one, found through
 //! the `relations` table on read and never stored.
 
-use crate::schema::{Field, FieldKind};
+use crate::schema::{BlockSource, Field, FieldKind};
 
 pub use crate::schema::JoinField;
 
 /// An anchored Postgres regular expression matching the `relations.field_path` values a
 /// link at `on` produces: `links.target` is stored as `links.0.target`, a list of links
-/// as `tags.0`, `tags.1`. `None` when `on` doesn't end at a relationship.
+/// as `tags.0`, `tags.1`. Inside blocks, each block type that has the path adds its own
+/// shape. `None` when `on` doesn't end at a relationship.
 pub fn on_pattern(target: &[Field], on: &str) -> Option<String> {
-    let segments: Vec<&str> = on.split('.').collect();
-    let mut current = target;
-    let mut out = String::from("^");
-    for (i, segment) in segments.iter().enumerate() {
-        let f = current.iter().find(|f| f.name == *segment)?;
-        // Field names are identifiers, so they need no escaping.
-        out.push_str(segment);
-        let last = i + 1 == segments.len();
-        match (&f.kind, last) {
-            (FieldKind::Relationship { has_many, .. }, true) => {
-                if *has_many {
-                    out.push_str(r"(\.\d+)?");
-                }
-                out.push('$');
-                return Some(out);
-            }
-            (FieldKind::Group { fields }, false) => {
-                out.push_str(r"\.");
-                current = fields;
-            }
-            (FieldKind::Array { fields, .. }, false) => {
-                out.push_str(r"\.\d+\.");
-                current = fields;
-            }
-            _ => return None,
+    pattern(target, on).map(|p| format!("^{p}$"))
+}
+
+fn pattern(fields: &[Field], path: &str) -> Option<String> {
+    let (head, rest) = path
+        .split_once('.')
+        .map_or((path, None), |(h, r)| (h, Some(r)));
+    let f = fields.iter().find(|f| f.name == head)?;
+    // Field names are identifiers, so they need no escaping.
+    match (&f.kind, rest) {
+        (FieldKind::Relationship { has_many, .. }, None) => Some(if *has_many {
+            format!(r"{head}(\.\d+)?")
+        } else {
+            head.to_owned()
+        }),
+        (FieldKind::Group { fields }, Some(rest)) => {
+            Some(format!(r"{head}\.{}", pattern(fields, rest)?))
         }
+        (FieldKind::Array { fields, .. }, Some(rest)) => {
+            Some(format!(r"{head}\.\d+\.{}", pattern(fields, rest)?))
+        }
+        // A rich text block node's links are stored like a block row's: `body.<k>.<name>`.
+        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
+            let mut shapes: Vec<String> = Vec::new();
+            for shape in blocks
+                .iter()
+                .filter_map(BlockSource::def)
+                .filter_map(|b| pattern(&b.fields, rest))
+            {
+                if !shapes.contains(&shape) {
+                    shapes.push(shape);
+                }
+            }
+            match shapes.as_slice() {
+                [] => None,
+                [one] => Some(format!(r"{head}\.\d+\.{one}")),
+                _ => Some(format!(r"{head}\.\d+\.(?:{})", shapes.join("|"))),
+            }
+        }
+        _ => None,
     }
-    None
 }
 
 #[cfg(test)]
@@ -67,7 +81,20 @@ mod tests {
                 {"name": "target", "type": "relationship", "relationTo": "categories"},
                 {"name": "many", "type": "relationship", "relationTo": "categories", "hasMany": true}
             ]},
-            {"name": "author", "type": "relationship", "relationTo": "authors"}
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "body", "type": "richText", "relationTo": ["categories"], "blocks": [
+                {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "tagged", "fields": [{"name": "who", "type": "relationship", "relationTo": "tags"}]},
+                {"slug": "card", "fields": [{"name": "who", "type": "relationship", "relationTo": "categories"}]},
+                {"slug": "list", "fields": [
+                    {"name": "who", "type": "relationship", "relationTo": "categories", "hasMany": true},
+                    {"name": "rows", "type": "array", "fields": [
+                        {"name": "who", "type": "relationship", "relationTo": "categories"}
+                    ]}
+                ]}
+            ]}
         ]}))
     }
 
@@ -127,10 +154,21 @@ mod tests {
     #[test]
     fn join_targets_are_checked() {
         let lookup = |slug: &str| (slug == "posts").then(posts);
-        let ok = categories(
-            json!({"name": "posts", "type": "join", "collection": "posts", "on": "links.target"}),
+        // `layout.who` links to categories in `card` and `list`, and to tags in `tagged`.
+        for on in ["links.target", "layout.who", "layout.rows.who", "body.who"] {
+            let ok = categories(
+                json!({"name": "posts", "type": "join", "collection": "posts", "on": on}),
+            );
+            assert_eq!(ok.check_join_targets(lookup), Ok(()), "{on}");
+        }
+        let join = json!({"name": "j", "type": "join", "collection": "posts", "on": "layout.who"});
+        let tags = schema(json!({"slug": "tags", "fields": [join]}));
+        assert_eq!(tags.check_join_targets(lookup), Ok(()));
+        let authors = schema(json!({"slug": "authors", "fields": [join]}));
+        assert_eq!(
+            authors.check_join_targets(lookup).unwrap_err().to_string(),
+            "field `j`: posts.layout.who links to tags, not authors"
         );
-        assert_eq!(ok.check_join_targets(lookup), Ok(()));
         for (join, message) in [
             (
                 json!({"name": "j", "type": "join", "collection": "nope", "on": "category"}),
@@ -139,6 +177,10 @@ mod tests {
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "title"}),
                 "field `j`: posts.title isn't a relationship field",
+            ),
+            (
+                json!({"name": "j", "type": "join", "collection": "posts", "on": "body"}),
+                "field `j`: posts.body isn't a relationship field",
             ),
             (
                 json!({"name": "j", "type": "join", "collection": "posts", "on": "missing"}),
@@ -176,6 +218,12 @@ mod tests {
             ("meta.main", r"^meta\.main$"),
             ("links.target", r"^links\.\d+\.target$"),
             ("links.many", r"^links\.\d+\.many(\.\d+)?$"),
+            // Each block type's own shape: one link in `card`, several in `list`.
+            ("layout.who", r"^layout\.\d+\.(?:who|who(\.\d+)?)$"),
+            ("layout.rows.who", r"^layout\.\d+\.rows\.\d+\.who$"),
+            // A block node's link is `<field>.<k>.<name>`, `k` its place among the text's
+            // references.
+            ("body.who", r"^body\.\d+\.who$"),
         ] {
             assert_eq!(
                 super::on_pattern(p.data(), on).as_deref(),
@@ -184,6 +232,10 @@ mod tests {
             );
         }
         assert_eq!(super::on_pattern(p.data(), "title"), None);
+        assert_eq!(super::on_pattern(p.data(), "layout.nope"), None);
+        assert_eq!(super::on_pattern(p.data(), "layout"), None);
+        // The text's own links aren't a relationship field to join on.
+        assert_eq!(super::on_pattern(p.data(), "body"), None);
     }
 
     #[test]

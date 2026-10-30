@@ -599,6 +599,7 @@ mod joins {
             .iter()
             .map(|(path, id)| Relation {
                 path: (*path).to_owned(),
+                at: (*path).to_owned(),
                 collection_id: f.categories,
                 id: *id,
             })
@@ -1002,9 +1003,14 @@ mod cross {
                         .map(|(slug, f)| ((*slug).to_owned(), f.clone().map(Box::new)))
                         .collect(),
                 },
-                Target::Row { list, inner } => Target::Row {
+                Target::Row {
+                    list,
+                    inner,
+                    blocks,
+                } => Target::Row {
                     list,
                     inner: Box::new(target(*inner, guards)),
+                    blocks,
                 },
                 other => other,
             }
