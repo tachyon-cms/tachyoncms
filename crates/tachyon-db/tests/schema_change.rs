@@ -514,22 +514,21 @@ async fn creates_get_every_check_under_the_lock(pool: PgPool) {
     create(&pool, &byline(json!([{"name": "heading", "type": "text"}])))
         .await
         .unwrap();
-    create(
-        &pool,
-        &schema(json!({"slug": "stories", "fields": [
-            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "byline"}]}
-        ]})),
-    )
-    .await
-    .unwrap();
+    let stories = schema(json!({"slug": "stories", "fields": [
+        {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "byline"}]}
+    ]}));
+    create(&pool, &stories).await.unwrap();
     let notes = schema(json!({"slug": "notes",
         "access": {"read": {"story.layout.heading": {"equals": "x"}}},
         "fields": [{"name": "story", "type": "relationship", "relationTo": "stories"}]}));
-    // Checked against the block as it was, as a stale cache would: it fits.
+    // Checked against the block as it was, as a stale cache would: its rule passes.
     let fits = |s: &CollectionSchema| {
         let all = [byline(json!([{"name": "heading", "type": "text"}]))];
-        s.expand(|slug: &str| all.iter().find(|b| b.slug == slug))
-            .is_ok()
+        let raw = |slug: &str| all.iter().find(|b| b.slug == slug);
+        let stories = stories.expand(raw).unwrap();
+        let lookup = |slug: &str| (slug == "stories").then(|| stories.clone());
+        let s = s.expand(raw).unwrap();
+        tachyon_core::access::check_rules(&s, &[], &[], &lookup).is_ok()
     };
     assert!(fits(&notes));
     apply(

@@ -2165,53 +2165,128 @@ fn wrote(res: &Res) -> bool {
     !unsettable && went_through(res)
 }
 
-/// Holds `answer` against what the requests behind `outcomes` did: `true` when every one
+/// What the requests behind `outcomes` say an answer should be: `true` when every one
 /// went through, `false` when none did, "conditional" when only some did.
-fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
-    assert!(!outcomes.is_empty(), "{what}: nothing was tried");
-    let expected = match (outcomes.iter().all(|o| *o), outcomes.iter().any(|o| *o)) {
+fn expected(outcomes: &[bool]) -> Value {
+    match (outcomes.iter().all(|o| *o), outcomes.iter().any(|o| *o)) {
         (true, _) => json!(true),
         (false, false) => json!(false),
         _ => json!("conditional"),
-    };
-    assert_eq!(answer, &expected, "{what}: {outcomes:?}");
+    }
+}
+
+/// Holds `answer` against what the requests behind `outcomes` did (`expected`).
+fn agrees(what: &str, answer: &Value, outcomes: &[bool]) {
+    assert!(!outcomes.is_empty(), "{what}: nothing was tried");
+    assert_eq!(answer, &expected(outcomes), "{what}: {outcomes:?}");
 }
 
 /// Holds a field's read answer against the documents the caller could read, each of which
-/// holds every field: shown in all of them, or in none. With none readable, it's false.
+/// holds every field: shown in every place it can be (`shown`), or in none. With none
+/// readable, it's false. Inside block rows or block nodes, each block type answers for its own rows, one outcome
+/// a row, and the field's answer is the AND across types (W1-R7): a `false` stands while
+/// another type's rows show the field, but not while one row of a refusing type does.
 fn field_read_agrees(what: &str, answer: &Value, readable: &[Value], path: &str) {
-    let seen: Vec<bool> = readable.iter().map(|doc| has(doc, path)).collect();
-    agrees(what, answer, if seen.is_empty() { &[false] } else { &seen });
+    let types = path.split_once('.').and_then(|(head, rest)| {
+        let types: &[&str] = match (
+            BLOCKS.iter().find(|b| b.0 == head),
+            RICH.iter().find(|r| r.0 == head),
+        ) {
+            (Some(b), _) => b.1,
+            (_, Some(r)) => std::slice::from_ref(&r.1),
+            _ => return None,
+        };
+        Some((head, rest, types))
+    });
+    let Some((head, rest, types)) = types else {
+        let mut seen = Vec::new();
+        readable.iter().for_each(|doc| shown(doc, path, &mut seen));
+        return agrees(what, answer, if seen.is_empty() { &[false] } else { &seen });
+    };
+    let mut answers = Vec::new();
+    for t in types {
+        let mut seen = Vec::new();
+        for doc in readable {
+            let rows: Vec<&Value> = match &doc[head] {
+                Value::Array(rows) => rows.iter().filter(|r| r["blockType"] == *t).collect(),
+                Value::Null => Vec::new(),
+                text => {
+                    let mut nodes = Vec::new();
+                    block_nodes(text, &mut nodes);
+                    let of = |n: &&Value| n["attrs"]["blockType"] == *t;
+                    nodes
+                        .into_iter()
+                        .filter(of)
+                        .map(|n| &n["attrs"]["fields"])
+                        .collect()
+                }
+            };
+            match rows.is_empty() {
+                // The field it's in isn't shown, or holds no row of this type.
+                true => seen.push(false),
+                false => rows.iter().for_each(|r| shown(r, rest, &mut seen)),
+            }
+        }
+        answers.push(expected(if seen.is_empty() { &[false] } else { &seen }));
+    }
+    let and = [json!(false), json!("conditional")]
+        .into_iter()
+        .find(|a| answers.contains(a))
+        .unwrap_or(json!(true));
+    assert_eq!(answer, &and, "{what}: by block type {types:?}: {answers:?}");
 }
 
-/// Whether `doc` holds the field at dotted `path`, through groups, every row of a list and
-/// every block node of rich text.
-fn has(doc: &Value, path: &str) -> bool {
+/// Whether `doc` shows the field at dotted `path`, once for each place it can be: through
+/// groups, in each row of a list and in each block node of rich text, so a strip that
+/// missed one row is seen. A container that's missing or empty is one place it isn't.
+fn shown(doc: &Value, path: &str, out: &mut Vec<bool>) {
     let (head, rest) = path
         .split_once('.')
         .map_or((path, None), |(h, r)| (h, Some(r)));
     match (doc.get(head), rest) {
-        (None, _) => false,
-        (Some(_), None) => true,
-        (Some(Value::Array(rows)), Some(rest)) => {
-            !rows.is_empty() && rows.iter().all(|r| has(r, rest))
-        }
+        (None, _) => out.push(false),
+        (Some(_), None) => out.push(true),
+        (Some(Value::Array(rows)), Some(_)) if rows.is_empty() => out.push(false),
+        (Some(Value::Array(rows)), Some(rest)) => rows.iter().for_each(|r| shown(r, rest, out)),
         (Some(v), Some(rest)) if v["type"] == "doc" => {
             let mut nodes = Vec::new();
-            block_fields(v, &mut nodes);
-            !nodes.is_empty() && nodes.iter().all(|f| has(f, rest))
+            block_nodes(v, &mut nodes);
+            match nodes.is_empty() {
+                true => out.push(false),
+                false => nodes
+                    .iter()
+                    .for_each(|n| shown(&n["attrs"]["fields"], rest, out)),
+            }
         }
-        (Some(v), Some(rest)) => has(v, rest),
+        (Some(v), Some(rest)) => shown(v, rest, out),
     }
 }
 
-/// The `fields` of each block node in rich text `node`, at any depth.
-fn block_fields<'v>(node: &'v Value, out: &mut Vec<&'v Value>) {
+/// The field read check sees a strip that missed one row: a `false` answer stands while
+/// another block type's rows show the field (W1-R7), not while one row of a list or of a
+/// refusing type does.
+#[test]
+fn field_read_check_sees_one_row_left_unstripped() {
+    let fails = |doc: Value, path: &str| {
+        let check = || field_read_agrees("probe", &json!(false), std::slice::from_ref(&doc), path);
+        std::panic::catch_unwind(check).is_err()
+    };
+    assert!(fails(json!({"links": [{"url": "u"}, {}]}), "links.url"));
+    let rows = |hero: Value| json!({"layout": [hero, {"blockType": "hero"}, {"blockType": "quote", "secret": "s"}]});
+    assert!(fails(
+        rows(json!({"blockType": "hero", "secret": "s"})),
+        "layout.secret"
+    ));
+    assert!(!fails(rows(json!({"blockType": "hero"})), "layout.secret"));
+}
+
+/// Each block node in rich text `node`, at any depth.
+fn block_nodes<'v>(node: &'v Value, out: &mut Vec<&'v Value>) {
     if node["type"] == "block" {
-        out.push(&node["attrs"]["fields"]);
+        out.push(node);
     }
     for child in node["content"].as_array().into_iter().flatten() {
-        block_fields(child, out);
+        block_nodes(child, out);
     }
 }
 
@@ -3761,7 +3836,11 @@ async fn access_answers_cover_blocks(pool: PgPool) {
         let fields = &res.json["collections"]["pages"]["fields"];
         if *who == "admin" {
             let paths: Vec<&String> = fields.as_object().unwrap().keys().collect();
-            assert_eq!(paths, KNOWN[2].2, "{who}");
+            assert_eq!(
+                paths,
+                KNOWN.iter().find(|k| k.1 == "pages").unwrap().2,
+                "{who}"
+            );
         }
         seen.push((*who, fields.clone()));
         let a = filled(&res.json);
