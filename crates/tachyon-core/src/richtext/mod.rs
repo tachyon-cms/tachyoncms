@@ -189,13 +189,15 @@ pub fn validate(value: &Value, kind: &FieldKind, path: &str) -> Result<(), Vec<F
     validate_within(value, kind, path, &mut Budget::default())
 }
 
-/// What one rich text value has used of its limits: the nodes counted so far, and the
-/// depth of the block node whose fields are being checked. Rich text inside a block node
-/// goes on from these rather than starting again (W1-R18).
+/// What one rich text value has used of its limits: the nodes counted so far, the depth
+/// of the block node whose fields are being checked, and the block node IDs seen. Rich
+/// text inside a block node goes on from these rather than starting again (W1-R18), so an
+/// ID can't repeat at any depth (W1-R3).
 #[derive(Default)]
 pub(crate) struct Budget {
     nodes: usize,
     depth: usize,
+    ids: HashSet<Uuid>,
 }
 
 /// `validate`, for rich text inside a block node of the text `budget` belongs to.
@@ -218,7 +220,6 @@ pub(crate) fn validate_within(
         features: features.as_deref(),
         relation_to,
         budget,
-        ids: HashSet::new(),
         errors: Vec::new(),
     };
     check.doc(value, path);
@@ -235,7 +236,6 @@ struct Check<'a, 'b> {
     features: Option<&'a [Feature]>,
     relation_to: &'a [String],
     budget: &'b mut Budget,
-    ids: HashSet<Uuid>,
     errors: Vec<FieldError>,
 }
 
@@ -525,7 +525,7 @@ impl Check<'_, '_> {
             None => {}
             // Compared as UUIDs, so the same ID in another case still counts.
             Some(Some(Ok(id))) => {
-                if !self.ids.insert(id) {
+                if !self.budget.ids.insert(id) {
                     return self.fail(at("id"), "this block ID is used twice");
                 }
             }
@@ -1606,6 +1606,16 @@ mod tests {
                     {"type": "block", "attrs": {"blockType": "cta", "id": B1.to_uppercase(), "fields": {"label": "y"}}}
                 ])),
                 "body.content.1.attrs.id",
+                "this block ID is used twice".into(),
+            ),
+            // Nor in the rich text of a block node, one level down (W1-R3).
+            (
+                fields(json!({"blocks": [{"slug": "box", "fields": [{"name": "inner",
+                    "type": "richText", "blocks": [{"slug": "leaf", "fields": []}]}]}]})),
+                one(json!({"type": "block", "attrs": {"blockType": "box", "id": B1, "fields": {"inner":
+                    doc(json!([{"type": "block", "attrs": {"blockType": "leaf", "id": B1}}]))
+                }}})),
+                "body.content.0.attrs.fields.inner.content.0.attrs.id",
                 "this block ID is used twice".into(),
             ),
             (
