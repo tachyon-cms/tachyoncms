@@ -1,6 +1,9 @@
 //! Rich text as Markdown: GitHub-flavoured, with the extensions Markdown input reads
 //! (`:::block{…}` directives, `::ref{…}`, `doc:` links and `<u>`).
 
+use std::cmp::Reverse;
+use std::collections::BinaryHeap;
+
 use serde_json::Value;
 
 use super::{RenderCtx, attr, children, code_language, field_text, kind, safe_href};
@@ -429,13 +432,21 @@ fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
         .map(|line| marked_line(line, ctx, at == Where::Cell))
         .collect();
     let mut lines = lines.into_iter();
-    let first = lines.next().unwrap_or_default();
-    lines.fold(first, |out, l| {
+    let mut out = lines.next().unwrap_or_default();
+    // Pushed onto one string: a copy a break would make the line quadratic (W1-R46).
+    for l in lines {
         match at == Where::Paragraph && !l.is_empty() {
-            true => format!("{out}\\\n{}", line_start(l)),
-            false => format!("{out}<br>{l}"),
+            true => {
+                out.push_str("\\\n");
+                out.push_str(&line_start(l));
+            }
+            false => {
+                out.push_str("<br>");
+                out.push_str(&l);
+            }
         }
-    })
+    }
+    out
 }
 
 /// A table cell's blocks as one line of inline nodes, hard breaks between them: a cell is
@@ -589,15 +600,20 @@ fn delimiter(t: Option<&str>, open: bool, pair: usize) -> Piece {
 /// Picks `*` or `_` for each bold and italic mark so that no run touches another of the
 /// same character, which would read as one run.
 fn choose_delimiters(pieces: &mut [Piece], pairs: usize) {
-    let at = |pieces: &[Piece], pair: usize| -> Vec<usize> {
-        let found = pieces
-            .iter()
-            .enumerate()
-            .filter(|(_, p)| matches!(p, Piece::Run { pair: q, ch: '*' | '_', .. } if *q == pair));
-        found.map(|(i, _)| i).collect()
-    };
-    for pair in 0..pairs {
-        let sites = at(pieces, pair);
+    // Each mark's runs, found in one pass rather than a pass a mark (W1-R46).
+    let mut runs: Vec<Vec<usize>> = vec![Vec::new(); pairs];
+    for (i, p) in pieces.iter().enumerate() {
+        super::step();
+        if let Piece::Run {
+            pair,
+            ch: '*' | '_',
+            ..
+        } = p
+        {
+            runs[*pair].push(i);
+        }
+    }
+    for (pair, sites) in runs.into_iter().enumerate() {
         if sites.is_empty() {
             continue;
         }
@@ -629,15 +645,36 @@ fn choose_delimiters(pieces: &mut [Piece], pairs: usize) {
 /// as punctuation there and as itself in the text.
 fn flank(pieces: &mut [Piece]) {
     // Encoding only ever turns a character into ASCII punctuation, so this ends; it runs
-    // until nothing changes, since one run's fix can change another's neighbour.
-    while (0..pieces.len()).any(|i| flank_one(pieces, i)) {}
+    // until nothing changes, since one run's fix can change another's neighbour. A fix
+    // changes one text piece, so only the runs beside it are looked at again, lowest
+    // first, which makes the fixes, and so the output, those of a scan from the start
+    // after every fix (W1-R46).
+    let mut todo: BinaryHeap<Reverse<usize>> = (0..pieces.len()).map(Reverse).collect();
+    while let Some(Reverse(i)) = todo.pop() {
+        super::step();
+        let Some(j) = flank_one(pieces, i) else {
+            continue;
+        };
+        todo.push(Reverse(i));
+        // The runs whose neighbour piece `j` is: the nearest on each side, past anything
+        // empty, since `neighbour` looks past that too.
+        let full =
+            |k: &usize| !matches!(&pieces[*k], Piece::Text(s) | Piece::Code(s) if s.is_empty());
+        let near = [(0..j).rev().find(full), (j + 1..pieces.len()).find(full)];
+        for k in near.into_iter().flatten() {
+            if matches!(pieces[k], Piece::Run { .. }) {
+                todo.push(Reverse(k));
+            }
+        }
+    }
 }
 
-/// Fixes the first neighbour of run `i` that stops it opening or closing, if any. Outside
-/// ASCII, a neighbour is always encoded, rather than classified (W1-R35).
-fn flank_one(pieces: &mut [Piece], i: usize) -> bool {
+/// Fixes the first neighbour of run `i` that stops it opening or closing, if any, and
+/// says which text piece it changed. Outside ASCII, a neighbour is always encoded, rather
+/// than classified (W1-R35).
+fn flank_one(pieces: &mut [Piece], i: usize) -> Option<usize> {
     let Piece::Run { ch, open, .. } = pieces[i] else {
-        return false;
+        return None;
     };
     // The outer neighbour is before an opening run and after a closing one.
     let (outer, inner) = (neighbour(pieces, i, open), neighbour(pieces, i, !open));
@@ -655,10 +692,10 @@ fn flank_one(pieces: &mut [Piece], i: usize) -> bool {
         None
     };
     let Some((Some(j), _)) = fix else {
-        return false;
+        return None;
     };
     let Piece::Text(s) = &mut pieces[j] else {
-        return false;
+        return None;
     };
     match j < i {
         true => {
@@ -670,7 +707,7 @@ fn flank_one(pieces: &mut [Piece], i: usize) -> bool {
             s.insert_str(0, &entity(c));
         }
     }
-    true
+    Some(j)
 }
 
 /// The character beside run `i`, before it or after it, with the text piece it's in (none

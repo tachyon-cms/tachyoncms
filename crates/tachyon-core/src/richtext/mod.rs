@@ -1,6 +1,6 @@
 //! Rich text: a tree of nodes and marks, stored as the JSON the editor works in.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -14,12 +14,22 @@ mod html;
 mod markdown_fuzz;
 mod markdown_in;
 mod markdown_out;
+#[cfg(test)]
+mod scaling;
 mod text;
 
 pub use html::to_html;
 pub use markdown_in::{from_markdown, slug_refs_mut};
 pub use markdown_out::to_markdown;
 pub use text::to_text;
+
+/// One step of a loop the scaling tests count, so a quadratic one fails them on any machine.
+#[cfg(test)]
+pub(crate) fn step() {
+    scaling::STEPS.with(|s| s.set(s.get() + 1));
+}
+#[cfg(not(test))]
+pub(crate) fn step() {}
 
 /// What the renderers need to know about the documents rich text links to. Each answer
 /// takes a link's collection and its `value`: the ID, or the document populated in its
@@ -873,6 +883,10 @@ pub fn links(value: &Value) -> Vec<(String, LinkRef)> {
 /// heading with no letters or digits is `heading`.
 pub fn heading_ids(value: &Value) -> Vec<String> {
     let mut seen = HashSet::new();
+    // The next suffix to try for each base: the ones before it are all taken, so the k-th
+    // heading of one text doesn't try k ids first (W1-R46). An explicit `intro-2` still
+    // counts, since every try checks `seen`.
+    let mut next: HashMap<String, usize> = HashMap::new();
     let mut out = Vec::new();
     each_node(value, &mut |node| {
         if node.get("type").and_then(Value::as_str) != Some("heading") {
@@ -887,10 +901,11 @@ pub fn heading_ids(value: &Value) -> Vec<String> {
             base = "heading".into();
         }
         let mut id = base.clone();
-        let mut n = 2;
+        let n = next.entry(base.clone()).or_insert(2);
         while !seen.insert(id.clone()) {
+            step();
             id = format!("{base}-{n}");
-            n += 1;
+            *n += 1;
         }
         out.push(id);
     });
@@ -1780,7 +1795,12 @@ mod tests {
                 text("Getting "), {"type": "hardBreak"}, text("started-2")
             ]},
             heading("!!!"),
-            {"type": "blockquote", "content": [heading("Getting started")]}
+            {"type": "blockquote", "content": [heading("Getting started")]},
+            // An explicit `intro-2` is skipped by the `intro`s on either side of it.
+            heading("Intro"),
+            heading("Intro 2"),
+            heading("Intro"),
+            heading("Intro-2")
         ]));
         assert_eq!(
             heading_ids(&body),
@@ -1789,7 +1809,11 @@ mod tests {
                 "getting-started-2",
                 "getting-started-2-2",
                 "heading",
-                "getting-started-3"
+                "getting-started-3",
+                "intro",
+                "intro-2",
+                "intro-3",
+                "intro-2-2"
             ]
         );
     }
