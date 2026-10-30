@@ -173,9 +173,13 @@ fn measure<T>(input: &T, op: &impl Fn(&T), runs: usize) -> (Duration, usize) {
 fn guard<T>(path: &str, input: impl Fn(&Value, bool) -> T, op: impl Fn(&T)) {
     for (name, full, half) in corpus() {
         let (full, half) = (input(full, false), input(half, true));
-        // The full one takes its best of two; the half runs once, to keep the guard quick.
-        let (t_full, steps) = measure(&full, &op, 2);
-        let (t_half, _) = measure(&half, &op, 1);
+        // Best of three each, taken in turn, so a busy machine slows both sides alike.
+        let (mut t_full, mut t_half, mut steps) = (Duration::MAX, Duration::MAX, 0);
+        for _ in 0..3 {
+            t_half = t_half.min(measure(&half, &op, 1).0);
+            let (t, s) = measure(&full, &op, 1);
+            (t_full, steps) = (t_full.min(t), s);
+        }
         eprintln!("{path} on {name}: {t_full:?} (half: {t_half:?}, steps: {steps})");
         // Steps first: they're the guard a machine's speed can't sway (W1-R47).
         assert!(
