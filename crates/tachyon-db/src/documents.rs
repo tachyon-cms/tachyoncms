@@ -566,12 +566,31 @@ pub async fn trashed_in(
     Ok((row.draft.map(|d| d.0), row.published.map(|d| d.0)))
 }
 
+/// `errors` about `copy` of a document of `c`, saying which copy when `c` has two: a
+/// restore checks both.
+pub fn copy_errors(c: &Collection, copy: DocCopy, errors: Vec<FieldError>) -> Vec<FieldError> {
+    if !c.schema.drafts() {
+        return errors;
+    }
+    let which = match copy {
+        DocCopy::Draft => "the draft",
+        DocCopy::Published => "the published copy",
+    };
+    errors
+        .into_iter()
+        .map(|e| FieldError {
+            message: format!("{which}: {}", e.message),
+            ..e
+        })
+        .collect()
+}
+
 /// Takes trashed document `id` of `c` out of the trash inside `tx`: each of `prepared`,
 /// validated against the current schema, replaces its copy and re-syncs that copy's links,
-/// so a link to a document that's gone or in the trash is a `Validation` error at its path.
-/// A unique clash with a live document is a `UniqueViolation`. The caller has locked it
-/// (`query::lock_trash_in`) and passes every copy it has. Returns the copy a write to `c`
-/// changes: the draft, with drafts.
+/// so a link to a document that's gone or in the trash is a `Validation` error at its path
+/// (both copies' errors, each saying its copy). A unique clash with a live document is a
+/// `UniqueViolation`. The caller has locked it (`query::lock_trash_in`) and passes every
+/// copy it has. Returns the copy a write to `c` changes: the draft, with drafts.
 pub async fn restore_in(
     tx: &mut PgConnection,
     c: &Collection,
@@ -579,6 +598,26 @@ pub async fn restore_in(
     prepared: &[(DocCopy, Prepared)],
     by: Option<Uuid>,
 ) -> Result<Document, DbError> {
+    // Lock order: the document (by the caller), then every link target in id order, and
+    // only then are its link rows replaced. A purge locks its targets FOR UPDATE, then
+    // deletes the rows linking them; taking the targets before touching those rows means a
+    // restore waits on the purge (and then finds the target gone) instead of deadlocking.
+    let mut targets: Vec<Uuid> = prepared
+        .iter()
+        .flat_map(|(_, p)| p.relations.iter().map(|r| r.id))
+        .collect();
+    targets.sort_unstable();
+    targets.dedup();
+    if !targets.is_empty() {
+        sqlx::query!(
+            "SELECT id FROM documents WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL
+             ORDER BY id FOR KEY SHARE",
+            DEFAULT_TENANT,
+            &targets,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+    }
     let data = |copy| {
         prepared
             .iter()
@@ -589,7 +628,7 @@ pub async fn restore_in(
         Document,
         r#"UPDATE documents
            SET published = COALESCE($4::jsonb, published), draft = COALESCE($5::jsonb, draft),
-               deleted_at = NULL, updated_by = COALESCE($6, updated_by)
+               deleted_at = NULL, updated_at = now(), updated_by = COALESCE($6, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NOT NULL
            RETURNING id, status, created_at, updated_at,
                      CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
@@ -606,8 +645,15 @@ pub async fn restore_in(
     .await
     .map_err(map_unique)?
     .ok_or(DbError::NotFound)?;
+    let mut errors = Vec::new();
     for (copy, p) in prepared {
-        sync_relations(&mut *tx, id, *copy, &p.relations).await?;
+        match sync_relations(&mut *tx, id, *copy, &p.relations).await {
+            Err(DbError::Validation(e)) => errors.extend(copy_errors(c, *copy, e)),
+            other => other?,
+        }
+    }
+    if !errors.is_empty() {
+        return Err(DbError::Validation(errors));
     }
     Ok(doc)
 }

@@ -643,28 +643,31 @@ fn push_where(qb: &mut QueryBuilder<Postgres>, s: &Scope<'_>) {
 }
 
 pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Result<Page, DbError> {
-    list_from(pool, collection_id, q, false).await
+    list_from(pool, collection_id, q, None).await
 }
 
-/// `list`, of the collection's trash: most recently deleted first unless `q` sorts, each
-/// with its `deleted_at`. It pages by number only.
+/// `list`, of the collection's trash, each with its `deleted_at`: unless `q` sorts, most
+/// recently deleted first, or least recently with `oldest_first`. It pages by number only.
 pub async fn list_trash(
     pool: &PgPool,
     collection_id: Uuid,
     q: &ListQuery<'_>,
+    oldest_first: bool,
 ) -> Result<Page, DbError> {
     if q.after.is_some() {
         return Err(DbError::InvalidQuery("the trash pages by number only"));
     }
-    list_from(pool, collection_id, q, true).await
+    list_from(pool, collection_id, q, Some(oldest_first)).await
 }
 
+/// `list`, or with `trash` (`Some(oldest_first)`) `list_trash`.
 async fn list_from(
     pool: &PgPool,
     collection_id: Uuid,
     q: &ListQuery<'_>,
-    trashed: bool,
+    trash: Option<bool>,
 ) -> Result<Page, DbError> {
+    let trashed = trash.is_some();
     let (sort_expr, descending) = match q.sort {
         Some(s) => (expr(q.copy, &s.target), s.descending),
         None => ("id".to_owned(), true),
@@ -707,7 +710,10 @@ async fn list_from(
             qb.push(" ASC NULLS LAST, id DESC LIMIT ");
         }
         None if trashed && q.sort.is_none() => {
-            qb.push(" ORDER BY deleted_at DESC, id DESC LIMIT ");
+            let direction = if trash == Some(true) { "ASC" } else { "DESC" };
+            qb.push(format!(
+                " ORDER BY deleted_at {direction}, id {direction} LIMIT "
+            ));
         }
         None => {
             qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.copy, q.sort)));
@@ -1021,8 +1027,34 @@ pub async fn lock_trash_in(
 ) -> Result<Vec<Uuid>, DbError> {
     crate::documents::check_schema(&mut *conn, collection_id, schema_version).await?;
     let mut qb = QueryBuilder::<Postgres>::new("SELECT id FROM documents");
+    push_trash_where(&mut qb, collection_id, read, id);
+    qb.push(" ORDER BY id FOR UPDATE");
+    Ok(qb.build_query_scalar().fetch_all(conn).await?)
+}
+
+/// `lock_trash_in`, as a plain read that locks nothing: whether `read` reaches trashed
+/// document `id` of `collection_id`.
+pub async fn in_trash(
+    conn: &mut sqlx::PgConnection,
+    collection_id: Uuid,
+    read: &Readable,
+    id: Uuid,
+) -> Result<bool, DbError> {
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT EXISTS (");
+    qb.push("SELECT id FROM documents");
+    push_trash_where(&mut qb, collection_id, read, Some(id));
+    qb.push(")");
+    Ok(qb.build_query_scalar().fetch_one(conn).await?)
+}
+
+fn push_trash_where(
+    qb: &mut QueryBuilder<Postgres>,
+    collection_id: Uuid,
+    read: &Readable,
+    id: Option<Uuid>,
+) {
     push_where(
-        &mut qb,
+        qb,
         &Scope {
             collection_id,
             copy: read.copy,
@@ -1034,8 +1066,6 @@ pub async fn lock_trash_in(
     if let Some(id) = id {
         qb.push(" AND id = ").push_bind(id);
     }
-    qb.push(" ORDER BY id FOR UPDATE");
-    Ok(qb.build_query_scalar().fetch_all(conn).await?)
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.

@@ -10,14 +10,15 @@ use axum::Json;
 use axum::extract::rejection::PathRejection;
 use axum::extract::{Path, RawQuery, State};
 use axum::http::StatusCode;
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sqlx::PgConnection;
 use tachyon_core::auth::Action;
 use tachyon_core::query::Readable;
 use tachyon_core::validate_document_in;
 use tachyon_db::collections::Collection;
-use tachyon_db::documents::{self, Prepared};
+use tachyon_db::documents::{self, Prepared, copy_errors};
 use tachyon_db::query::{self, ListQuery};
+use tachyon_db::versions::record_version;
 use tachyon_db::{DbError, DocCopy};
 use uuid::Uuid;
 
@@ -28,7 +29,7 @@ use crate::populate::{Vouched, check_links, link_targets, prepare, to_value, vou
 use crate::{ApiError, AppState};
 
 /// A page of the trashed documents of a collection the caller may delete, most recently
-/// deleted first, each with `deletedAt`. Links stay IDs.
+/// deleted first unless sorted (`deletedAt` too), each with `deletedAt`. Links stay IDs.
 pub async fn list(
     State(state): State<AppState>,
     access: Access,
@@ -39,6 +40,8 @@ pub async fn list(
     // Checked again later; here so a key's 403 comes before an unknown slug's 404.
     access.scope(Action::Delete, &slug)?;
     let c = collection(&state, &slug)?;
+    // A collection they can't read at all is refused as a plain list refuses it (Ruling T8-3).
+    access.permit(Action::Read, &c)?;
     let read = access.trash_readable(&c)?;
     let p = trash_params(raw.as_deref(), &c, &access)?;
     let filter = both(p.filter, read.filter);
@@ -52,11 +55,11 @@ pub async fn list(
         limit: p.limit,
         offset,
         after: None,
-        count: false,
+        count: p.count,
         copy: read.copy,
         owner: read.owner,
     };
-    let found = query::list_trash(&state.pool, c.id, &q).await?;
+    let found = query::list_trash(&state.pool, c.id, &q, p.oldest_first).await?;
     let docs = found
         .docs
         .iter()
@@ -66,18 +69,25 @@ pub async fn list(
             Ok(shaped(v, p.select.as_ref()))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
-    Ok(Json(json!({
+    let mut body = json!({
         "docs": docs,
         "limit": p.limit,
         "page": page,
         "hasNextPage": found.has_more,
-    })))
+    });
+    if let Some(total) = found.total {
+        body["totalDocs"] = total.into();
+    }
+    Ok(Json(body))
 }
 
-/// Takes a document out of the trash, as it was, once each copy still validates against
-/// the current schema (422), links only to documents that are there and the caller may
-/// read (422 at the link), and clashes with no live document's unique value (422 at the
-/// field, Ruling T5-1). Answers with the document as a write answers.
+/// Takes a document out of the trash once each copy still validates against the current
+/// schema (422), links only to documents that are there and the caller may read (422 at
+/// the link), and clashes with no live document's unique value (422 at the field, Ruling
+/// T5-1). With drafts, each error says which copy it's about, and both copies are checked
+/// (Ruling T8-2). It's a write (Ruling T8-1): `updatedAt` moves, and a copy validation
+/// changed is recorded as a version of its kind. Answers with the document as a write
+/// answers.
 pub async fn restore(
     State(state): State<AppState>,
     access: Access,
@@ -95,29 +105,83 @@ pub async fn restore(
     // Links are checked outside the transaction, as an update checks them, then held to
     // what was checked once the document is locked.
     let mut conn = state.pool.acquire().await.map_err(DbError::from)?;
-    let stored = stored_in(&mut conn, &access, &c, &read, &targets, id).await?;
+    let stored = stored_in(&mut conn, &access, &c, &read, &targets, id, false).await?;
     drop(conn);
     let mut vouched = Vouched::new();
-    for (_, p) in &stored {
-        vouched.extend(check_links(&state, &access, p, &[]).await?);
+    let mut errors = Errors::default();
+    for (copy, p, _) in &stored {
+        match check_links(&state, &access, p, &[]).await {
+            Ok(v) => vouched.extend(v),
+            Err(e) => errors.add(&c, *copy, e)?,
+        }
     }
+    errors.check()?;
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let locked = stored_in(&mut tx, &access, &c, &read, &targets, id).await?;
-    for (_, p) in &locked {
-        vouched_links(p, &[], &vouched)?;
+    let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
+    for (copy, p, _) in &locked {
+        if let Err(e) = vouched_links(p, &[], &vouched) {
+            errors.add(&c, *copy, e)?;
+        }
     }
-    let doc = documents::restore_in(&mut tx, &c, id, &locked, access.user_id())
+    errors.check()?;
+    let by = access.user_id();
+    let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
+    let doc = documents::restore_in(&mut tx, &c, id, &copies, by)
         .await
-        .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+        .map_err(|e| {
+            let e = match e {
+                // Only published copies are unique.
+                DbError::UniqueViolation(_) => match unique_error(&c, e.into()) {
+                    ApiError::Validation(v) => {
+                        ApiError::Validation(copy_errors(&c, DocCopy::Published, v))
+                    }
+                    e => e,
+                },
+                e => e.into(),
+            };
+            access.hide(&c, e, None)
+        })?;
+    if c.schema.versioned() {
+        for (copy, p, changed) in &locked {
+            if *changed {
+                record_version(&mut tx, id, &c, *copy, &p.data, by).await?;
+            }
+        }
+    }
     tx.commit().await.map_err(DbError::from)?;
     respond(&state, &access, c, &doc, read.copy, 1).await
 }
 
+/// Each copy's 422 errors, gathered so a restore reports both copies at once.
+#[derive(Default)]
+struct Errors(Vec<tachyon_core::FieldError>);
+
+impl Errors {
+    /// Keeps `e`'s field errors about `copy` of a document of `c`; any other error stops.
+    fn add(&mut self, c: &Collection, copy: DocCopy, e: ApiError) -> Result<(), ApiError> {
+        match e {
+            ApiError::Validation(v) => {
+                self.0.extend(copy_errors(c, copy, v));
+                Ok(())
+            }
+            e => Err(e),
+        }
+    }
+
+    fn check(&mut self) -> Result<(), ApiError> {
+        match self.0.is_empty() {
+            true => Ok(()),
+            false => Err(ApiError::Validation(std::mem::take(&mut self.0))),
+        }
+    }
+}
+
 type Targets = std::collections::HashMap<String, Uuid>;
 
-/// Trashed document `id` of `c`, locked, each copy it has validated against the current
-/// schema (the draft as a draft save, the published copy in full) and ready to write: a
-/// 404 when `read` doesn't reach it.
+/// Trashed document `id` of `c`, each copy it has validated against the current schema
+/// (the draft as a draft save, the published copy in full) and ready to write, with
+/// whether validation changed it: a 404 when `read` doesn't reach it. With `lock`, inside
+/// the caller's transaction, it's locked; otherwise it's only read.
 async fn stored_in(
     conn: &mut PgConnection,
     access: &Access,
@@ -125,25 +189,35 @@ async fn stored_in(
     read: &Readable,
     targets: &Targets,
     id: Uuid,
-) -> Result<Vec<(DocCopy, Prepared)>, ApiError> {
-    if query::lock_trash_in(conn, c.id, c.schema_version, read, Some(id))
-        .await?
-        .is_empty()
-    {
+    lock: bool,
+) -> Result<Vec<(DocCopy, Prepared, bool)>, ApiError> {
+    let reached = match lock {
+        true => !query::lock_trash_in(conn, c.id, c.schema_version, read, Some(id))
+            .await?
+            .is_empty(),
+        false => query::in_trash(conn, c.id, read, id).await?,
+    };
+    if !reached {
         return Err(ApiError::NotFound);
     }
     let (draft, published) = documents::trashed_in(conn, c.id, id).await?;
-    [(DocCopy::Draft, draft), (DocCopy::Published, published)]
-        .into_iter()
-        .filter_map(|(copy, data)| Some((copy, data?)))
-        .map(|(copy, data): (DocCopy, Map<String, Value>)| {
-            validate_document_in(mode_for(copy), c.schema.data(), &json!({}), Some(&data))
-                .map_err(ApiError::Validation)
-                .and_then(|valid| prepare(targets, c, valid))
-                .map(|p| (copy, p))
-                .map_err(|e| access.hide(c, e, Some(&data)))
-        })
-        .collect()
+    let mut out = Vec::new();
+    let mut errors = Errors::default();
+    for (copy, data) in [(DocCopy::Draft, draft), (DocCopy::Published, published)] {
+        let Some(data) = data else { continue };
+        match validate_document_in(mode_for(copy), c.schema.data(), &json!({}), Some(&data))
+            .map_err(ApiError::Validation)
+            .and_then(|valid| prepare(targets, c, valid))
+        {
+            Ok(p) => {
+                let changed = p.data != data;
+                out.push((copy, p, changed));
+            }
+            Err(e) => errors.add(c, copy, access.hide(c, e, Some(&data)))?,
+        }
+    }
+    errors.check()?;
+    Ok(out)
 }
 
 /// Deletes a trashed document for good, with its versions and jobs.
@@ -179,6 +253,8 @@ pub async fn empty(
     let c = collection(&state, &slug)?;
     let read = access.trash_readable(&c)?;
     no_params(raw.as_deref())?;
+    // shortcut: one transaction locks and purges the whole trash at once (ids bound as one
+    // array); fine for thousands, batch it (and report progress) past ~50k trashed rows.
     let deleted = purge_where(&state, &c, &read, None).await?;
     Ok(Json(json!({ "deleted": deleted })))
 }

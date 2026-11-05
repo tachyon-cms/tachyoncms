@@ -58,6 +58,16 @@ fn errors(res: &Res, path: &str, message: &str) {
     );
 }
 
+/// The same error about both copies of a drafts document, each saying its copy.
+fn both_copies(res: &Res, path: &str, message: &str) {
+    assert_problem(res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([{"path": path, "message": format!("the draft: {message}")},
+               {"path": path, "message": format!("the published copy: {message}")}])
+    );
+}
+
 async fn count(pool: &PgPool, sql: &'static str, id: &str) -> i64 {
     sqlx::query_scalar(sql)
         .bind(id.parse::<Uuid>().unwrap())
@@ -115,7 +125,7 @@ async fn trash_round_trip(pool: PgPool) {
     assert_eq!(listed["hasNextPage"], false);
     // Trashing the category is allowed now: only a trashed post links to it.
     trash(&admin, "categories", &cat).await;
-    errors(&restore(&admin, "posts", &post).await, "category", MISSING);
+    both_copies(&restore(&admin, "posts", &post).await, "category", MISSING);
     assert_eq!(
         restore(&admin, "categories", &cat).await.status,
         200,
@@ -169,7 +179,7 @@ async fn restore_refuses_broken_links_and_clashes(pool: PgPool) {
     .await;
     trash(&admin, "posts", &linked).await;
     trash(&admin, "categories", &cat).await;
-    errors(
+    both_copies(
         &restore(&editor, "posts", &linked).await,
         "category",
         MISSING,
@@ -190,7 +200,7 @@ async fn restore_refuses_broken_links_and_clashes(pool: PgPool) {
         Some(json!({"visible": false})),
     )
     .await;
-    errors(
+    both_copies(
         &restore(&editor, "posts", &linked).await,
         "category",
         MISSING,
@@ -211,7 +221,7 @@ async fn restore_refuses_broken_links_and_clashes(pool: PgPool) {
     errors(
         &restore(&editor, "posts", &first).await,
         "title",
-        "must be unique; another document already uses this value",
+        "the published copy: must be unique; another document already uses this value",
     );
     assert_eq!(
         ids(&ok(&admin, "GET", "/api/posts/trash", None).await).len(),
@@ -277,7 +287,21 @@ async fn restore_validates_current_schema(pool: PgPool) {
     // What's published is held to the schema in full ...
     let res = restore(&admin, "posts", &live).await;
     assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"].as_array().unwrap().len(),
+        1,
+        "{}",
+        res.json
+    );
     assert_eq!(res.json["errors"][0]["path"], "summary", "{}", res.json);
+    assert!(
+        res.json["errors"][0]["message"]
+            .as_str()
+            .unwrap()
+            .starts_with("the published copy: "),
+        "{}",
+        res.json
+    );
     // ... and a draft as a draft save is.
     let res = restore(&admin, "posts", &unpublished).await;
     assert_eq!(res.status, 200, "{}", res.json);
@@ -333,7 +357,11 @@ async fn empty_trash_deletes_only_mine(pool: PgPool) {
     let left = ok(&admin, "GET", "/api/posts/trash", None).await;
     assert_eq!(ids(&left), [others.as_str(), theirs.as_str()]);
     // The link to what's gone went with it, so restoring says so.
-    errors(&restore(&admin, "posts", &theirs).await, "related", MISSING);
+    errors(
+        &restore(&admin, "posts", &theirs).await,
+        "related",
+        &format!("the draft: {MISSING}"),
+    );
 
     // One at a time, too; then it's gone.
     let one = format!("/api/posts/trash/{others}");
@@ -423,4 +451,197 @@ async fn trash_is_guarded(pool: PgPool) {
     let res = call(&author, "POST", &restore_uri, None).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["title"], "Mine");
+}
+
+async fn kinds(pool: &PgPool, id: &str) -> Vec<String> {
+    sqlx::query_scalar("SELECT kind FROM versions WHERE document_id = $1 ORDER BY created_at, id")
+        .bind(id.parse::<Uuid>().unwrap())
+        .fetch_all(pool)
+        .await
+        .unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn restore_is_a_write(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let cat = create(&admin, "categories", json!({"name": "News"})).await;
+    let post = create(&admin, "posts", json!({"title": "Hello", "category": cat})).await;
+    ok(&admin, "POST", &format!("/api/posts/{post}/publish"), None).await;
+    let plain = create(&admin, "posts", json!({"title": "Plain"})).await;
+    for id in [&post, &plain] {
+        trash(&admin, "posts", id).await;
+    }
+    // The draft stores its link in a form validation rewrites (an upper-case ID).
+    sqlx::query("UPDATE documents SET draft = jsonb_set(draft, '{category}', to_jsonb(upper($2))) WHERE id = $1")
+        .bind(post.parse::<Uuid>().unwrap())
+        .bind(&cat)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let before_kinds = kinds(&pool, &post).await;
+    let before = ok(&admin, "GET", "/api/posts/trash", None).await["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|d| d["id"] == post.as_str())
+        .unwrap()["updatedAt"]
+        .clone();
+
+    let res = restore(&admin, "posts", &post).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["category"]["id"], cat.as_str());
+    assert_ne!(res.json["updatedAt"], before, "a restore is a write");
+    // Only the copy validation changed is recorded, as its own kind.
+    let mut expected = before_kinds;
+    expected.push("draft".into());
+    assert_eq!(kinds(&pool, &post).await, expected);
+
+    let unchanged = kinds(&pool, &plain).await;
+    assert_eq!(restore(&admin, "posts", &plain).await.status, 200);
+    assert_eq!(kinds(&pool, &plain).await, unchanged, "nothing changed");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn restore_reports_both_copies(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let post = create(&admin, "posts", json!({"title": "Hello"})).await;
+    ok(&admin, "POST", &format!("/api/posts/{post}/publish"), None).await;
+    trash(&admin, "posts", &post).await;
+    // The draft breaks a type, and the published copy lacks a field now required.
+    sqlx::query("UPDATE documents SET draft = '{\"title\": 5}' WHERE id = $1")
+        .bind(post.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let res = call(
+        &admin,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(
+            json!({"schema": {"slug": "posts", "versions": {"drafts": true},
+            "fields": [{"name": "title", "type": "text", "unique": true},
+                       {"name": "category", "type": "relationship", "relationTo": "categories"},
+                       {"name": "related", "type": "relationship", "relationTo": "posts"},
+                       {"name": "summary", "type": "text", "required": true}]}}),
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    let res = restore(&admin, "posts", &post).await;
+    assert_problem(&res, 422);
+    let errors = res.json["errors"].as_array().unwrap();
+    let said: Vec<(&str, &str)> = errors
+        .iter()
+        .map(|e| (e["path"].as_str().unwrap(), e["message"].as_str().unwrap()))
+        .collect();
+    assert_eq!(said.len(), 2, "{}", res.json);
+    assert!(
+        said[0].0 == "title" && said[0].1.starts_with("the draft: "),
+        "{said:?}"
+    );
+    assert!(
+        said[1].0 == "summary" && said[1].1.starts_with("the published copy: "),
+        "{said:?}"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn trash_lists_like_a_list(pool: PgPool) {
+    let admin = blog(&pool).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(
+            json!({"slug": "memos", "access": {"read": {"role": "admin"}},
+                    "fields": [{"name": "title", "type": "text"}]}),
+        ),
+    )
+    .await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "files", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "secret", "type": "text", "access": {"read": {"role": "admin"}}}]})),
+    )
+    .await;
+    // Made after the collections, so its schema cache already holds them.
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    // A collection they can't read at all is a 403, as a plain list says (Ruling T8-3).
+    for uri in ["/api/memos", "/api/memos/trash"] {
+        assert_problem(&call(&editor, "GET", uri, None).await, 403);
+    }
+    // A field they can't read can't be filtered or sorted by, as in a plain list.
+    for q in ["where[secret][equals]=x", "sort=secret"] {
+        let plain = call(&editor, "GET", &format!("/api/files?{q}"), None).await;
+        let trash = call(&editor, "GET", &format!("/api/files/trash?{q}"), None).await;
+        assert_problem(&trash, plain.status.as_u16());
+        assert_eq!(trash.json["detail"], plain.json["detail"], "{q}");
+    }
+
+    // `count`, and sorting by when each went (Ruling T8-4); cursors stay out.
+    let mut trashed = Vec::new();
+    for title in ["a", "b", "c"] {
+        let id = create(&admin, "notes", json!({"title": title})).await;
+        trash(&admin, "notes", &id).await;
+        trashed.push(id);
+    }
+    let newest: Vec<&str> = trashed.iter().rev().map(String::as_str).collect();
+    let oldest: Vec<&str> = trashed.iter().map(String::as_str).collect();
+    let res = ok(&admin, "GET", "/api/notes/trash?count=true&limit=2", None).await;
+    assert_eq!(res["totalDocs"], 3);
+    assert_eq!(ids(&res), newest[..2]);
+    assert_eq!(res["hasNextPage"], true);
+    let res = ok(&admin, "GET", "/api/notes/trash?sort=-deletedAt", None).await;
+    assert_eq!(ids(&res), newest);
+    let res = ok(&admin, "GET", "/api/notes/trash?sort=deletedAt", None).await;
+    assert_eq!(ids(&res), oldest);
+    assert!(res.get("totalDocs").is_none());
+    assert_problem(
+        &call(&admin, "GET", "/api/notes/trash?after=x", None).await,
+        400,
+    );
+    // Plain lists don't know the column.
+    assert_problem(
+        &call(&admin, "GET", "/api/notes?sort=deletedAt", None).await,
+        400,
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn purge_takes_jobs_and_spares_the_living(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let cat = create(&admin, "categories", json!({"name": "News"})).await;
+    let live = create(&admin, "posts", json!({"title": "Live", "category": cat})).await;
+    ok(&admin, "POST", &format!("/api/posts/{live}/publish"), None).await;
+    let gone = create(&admin, "posts", json!({"title": "Gone", "related": live})).await;
+    let when = (time::OffsetDateTime::now_utc() + time::Duration::hours(1))
+        .replace_nanosecond(0)
+        .unwrap()
+        .format(&time::format_description::well_known::Rfc3339)
+        .unwrap();
+    ok(
+        &admin,
+        "PUT",
+        &format!("/api/posts/{gone}/schedule"),
+        Some(json!({"publishAt": when})),
+    )
+    .await;
+    let jobs = "SELECT count(*) FROM jobs WHERE document_id = $1";
+    assert_eq!(count(&pool, jobs, &gone).await, 1);
+    trash(&admin, "posts", &gone).await;
+
+    let res = call(&admin, "DELETE", &format!("/api/posts/trash/{gone}"), None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    assert_eq!(count(&pool, jobs, &gone).await, 0, "its jobs went with it");
+    let rows = "SELECT count(*) FROM relations WHERE from_doc = $1";
+    assert_eq!(count(&pool, rows, &gone).await, 0);
+    // What it linked lives on, its own links intact, and nothing holds it now.
+    assert_eq!(count(&pool, rows, &live).await, 2);
+    let res = ok(&admin, "GET", &format!("/api/posts/{live}"), None).await;
+    assert_eq!(res["category"]["name"], "News");
+    trash(&admin, "posts", &live).await;
 }

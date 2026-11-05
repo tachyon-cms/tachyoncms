@@ -33,6 +33,8 @@ pub(crate) struct ListParams {
     pub populate: Shapes,
     pub joins: Joins,
     pub format: Format,
+    /// The trash only: least recently deleted first (`sort=deletedAt`).
+    pub oldest_first: bool,
 }
 
 /// How a single read is shaped.
@@ -432,11 +434,12 @@ pub(crate) fn list_params(
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
             "joins", "format", "draft",
         ],
+        false,
     )
 }
 
 /// `list_params` for the trash, which reads at depth 0 and pages by number:
-/// `limit`, `page`, `where`, `sort` and `select` only.
+/// `limit`, `page`, `count`, `where`, `sort` (by `deletedAt` too) and `select` only.
 pub(crate) fn trash_params(
     raw: Option<&str>,
     c: &Collection,
@@ -446,16 +449,19 @@ pub(crate) fn trash_params(
         raw,
         c,
         access,
-        &["limit", "page", "where", "sort", "select"],
+        &["limit", "page", "count", "where", "sort", "select"],
+        true,
     )
 }
 
-/// `list_params`, taking only the parameters in `allowed`.
+/// `list_params`, taking only the parameters in `allowed`, and with `trash` sorting by
+/// `deletedAt` too.
 fn list_params_of(
     raw: Option<&str>,
     c: &Collection,
     access: &Access,
     allowed: &[&str],
+    trash: bool,
 ) -> Result<ListParams, ApiError> {
     let schemas = access.schemas();
     let params = params(raw, allowed)?;
@@ -482,9 +488,15 @@ fn list_params_of(
         })
         .transpose()?
         .map(|f| access.guard(f));
-    let sort = single(&params, "sort")?
-        .map(|s| readable(|v| parse_sort(if v { &visible } else { fields }, s)))
-        .transpose()?;
+    let (sort, oldest_first) = match single(&params, "sort")? {
+        Some("deletedAt") if trash => (None, true),
+        Some("-deletedAt") if trash => (None, false),
+        sort => (
+            sort.map(|s| readable(|v| parse_sort(if v { &visible } else { fields }, s)))
+                .transpose()?,
+            false,
+        ),
+    };
     let after = single(&params, "after")?
         .map(|s| Cursor::decode(s).ok_or_else(|| bad("after isn't a valid cursor")))
         .transpose()?;
@@ -512,6 +524,7 @@ fn list_params_of(
         format: format(&params)?,
         filter,
         sort,
+        oldest_first,
     })
 }
 
