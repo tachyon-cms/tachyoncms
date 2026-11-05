@@ -2189,7 +2189,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -2209,7 +2209,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-api"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "arc-swap",
  "argon2",
@@ -2239,7 +2239,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "pulldown-cmark",
  "serde",
@@ -2253,7 +2253,7 @@ dependencies = [
 
 [[package]]
 name = "tachyon-db"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "serde",
  "serde_json",
