@@ -3889,3 +3889,107 @@ async fn access_answers_cover_blocks(pool: PgPool) {
     let editor = &seen.iter().find(|s| s.0 == "editor").unwrap().1;
     assert_eq!(editor, &Value::Object(all_true));
 }
+
+/// `/api/access` on drafts, versions and publishing: `readDrafts` and `publish` wherever
+/// there are drafts, `readVersions` wherever there are versions, each `true`, `false` or
+/// `"conditional"` as the routes judge it, and none of them anywhere else.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn access_answers_cover_drafts_versions_and_publishing(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let title = json!([{"name": "title", "type": "text"}]);
+    for schema in [
+        // Role defaults throughout.
+        json!({"slug": "posts", "versions": {"drafts": true}, "fields": title}),
+        // A filter on drafts, for everyone, and publishing by role.
+        json!({"slug": "pages", "versions": {"drafts": true},
+               "access": {"readDrafts": {"title": "open"},
+                          "publish": {"role": ["author", "editor"]}},
+               "fields": title}),
+        json!({"slug": "notes", "versions": true, "fields": title}),
+        json!({"slug": "plain", "fields": title}),
+        json!({"slug": "home", "kind": "global", "versions": {"drafts": true}, "fields": title}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    let (_, mut callers) = callers(&pool, &admin, json!(["posts:read", "notes:read"])).await;
+    for (who, scopes) in [
+        ("write key", json!(["posts:write", "notes:write"])),
+        ("publish key", json!(["posts:publish"])),
+    ] {
+        let made = create(
+            &admin,
+            "/api/auth/keys",
+            json!({"name": who, "scopes": scopes}),
+        )
+        .await;
+        let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
+        let key = visitor(&pool).await.layer(axum::middleware::map_request(
+            move |mut req: Request<axum::body::Body>| {
+                let bearer = bearer.clone();
+                async move {
+                    let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
+                    req.headers_mut().insert("authorization", value);
+                    req
+                }
+            },
+        ));
+        callers.push((who, key, None));
+    }
+
+    let (t, f, c) = (json!(true), json!(false), json!("conditional"));
+    // [readDrafts, publish, readVersions] for posts, pages and the home global, and
+    // readVersions for notes.
+    let want = |who: &str| -> ([&Value; 3], [&Value; 3], [&Value; 3], &Value) {
+        match who {
+            "anonymous" | "viewer" => ([&f, &f, &f], [&c, &f, &f], [&f, &f, &f], &f),
+            // Own-only: what they created, which reaches no global.
+            "author" => ([&c, &f, &c], [&c, &c, &c], [&f, &f, &f], &c),
+            "editor" => ([&t, &t, &t], [&c, &c, &t], [&t, &t, &t], &t),
+            "admin" => ([&t, &t, &t], [&t, &t, &t], [&t, &t, &t], &t),
+            // A `:read` key sees published content only.
+            "key" => ([&f, &f, &f], [&f, &f, &f], [&f, &f, &f], &f),
+            // `:write` covers drafts and versions, never publishing.
+            "write key" => ([&t, &f, &t], [&f, &f, &f], [&f, &f, &f], &t),
+            // `:publish` covers only publishing, judged by its owner's read rights.
+            "publish key" => ([&f, &t, &f], [&f, &f, &f], [&f, &f, &f], &f),
+            _ => unreachable!("{who}"),
+        }
+    };
+    for (who, app, _) in &callers {
+        let res = get(app, "/api/access").await;
+        assert_eq!(res.status, 200, "{who}: {}", res.json);
+        let a = &res.json;
+        // A collection left out is no access at all.
+        let right = |section: &str, slug: &str, right: &str| {
+            let entry = &a[section][slug];
+            match entry.is_null() {
+                true => json!(false),
+                false => entry[right].clone(),
+            }
+        };
+        let (posts, pages, home, notes) = want(who);
+        for (section, slug, want) in [
+            ("collections", "posts", posts),
+            ("collections", "pages", pages),
+            ("globals", "home", home),
+        ] {
+            let got = ["readDrafts", "publish", "readVersions"].map(|r| right(section, slug, r));
+            assert_eq!(got.each_ref(), want, "{who}: {slug} {}", a[section][slug]);
+        }
+        assert_eq!(
+            &right("collections", "notes", "readVersions"),
+            notes,
+            "{who}"
+        );
+        // Rights to what a collection doesn't have are never listed.
+        for (slug, rights) in [
+            ("notes", &["readDrafts", "publish"][..]),
+            ("plain", &["readDrafts", "publish", "readVersions"][..]),
+        ] {
+            for r in rights {
+                let entry = &a["collections"][slug];
+                assert!(entry.get(r).is_none(), "{who}: {slug} {entry}");
+            }
+        }
+    }
+}

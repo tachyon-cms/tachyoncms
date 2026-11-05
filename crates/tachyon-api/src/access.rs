@@ -944,6 +944,30 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<Readable, ApiError> {
+        let global = c.schema.kind == CollectionKind::Global;
+        let draft = self.publish_rules(c)?;
+        // Checked first so a hidden document is a 404; the lock checks it again.
+        let one = HashMap::from([(c.id, draft.clone())]);
+        if get_many_readable(pool, &[id], &one).await?.is_empty() {
+            let known = match global {
+                true => documents::get(pool, c.id, id, DocCopy::Draft).await.is_ok(),
+                false => self.sees_published(pool, c, id).await?,
+            };
+            return Err(if known {
+                self.refuse()
+            } else {
+                ApiError::NotFound
+            });
+        }
+        Ok(draft)
+    }
+
+    /// What publishing a document of `c` runs under, before any document is looked at (see
+    /// `publish_guard`, which also judges the document): the draft under the read,
+    /// `readDrafts` and `publish` rules. A 400 when `c` has no drafts; a 404 when the
+    /// caller can't read the collection, or a 403 for a global; a 403 when they may not
+    /// publish or read its drafts.
+    fn publish_rules(&self, c: &Collection) -> Result<Readable, ApiError> {
         let slug = &c.schema.slug;
         // Callers check the `:publish` scope first, before anything about the request.
         if !c.schema.drafts() {
@@ -964,19 +988,6 @@ impl Access {
         let draft = self
             .draft_readable_in(c, read, false)
             .ok_or_else(|| self.refuse())?;
-        // Checked first so a hidden document is a 404; the lock checks it again.
-        let one = HashMap::from([(c.id, draft.clone())]);
-        if get_many_readable(pool, &[id], &one).await?.is_empty() {
-            let known = match global {
-                true => documents::get(pool, c.id, id, DocCopy::Draft).await.is_ok(),
-                false => self.sees_published(pool, c, id).await?,
-            };
-            return Err(if known {
-                self.refuse()
-            } else {
-                ApiError::NotFound
-            });
-        }
         Ok(Readable {
             filter: both(draft.filter, publish),
             ..draft
@@ -996,6 +1007,40 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<bool, ApiError> {
+        let global = c.schema.kind == CollectionKind::Global;
+        let (versions, read) = self.versions_rules(c)?;
+        let copy = versions.copy;
+        // A rule could refuse even what isn't saved yet, so a global it limits is refused,
+        // saved or not; only a global nothing limits can be missing, a 404.
+        let limited = versions.filter.is_some();
+        let one = HashMap::from([(c.id, versions)]);
+        if get_many_readable(pool, &[id], &one).await?.is_empty() {
+            let known = global && (limited || documents::get(pool, c.id, id, copy).await.is_ok());
+            return Err(if known {
+                self.refuse()
+            } else {
+                ApiError::NotFound
+            });
+        }
+        // Without drafts, every version is of what was published.
+        let Some(drafts) = self.draft_readable(c, read) else {
+            return Ok(!c.schema.drafts());
+        };
+        // The draft was just found, so only a filter or an owner can still hide it. Not
+        // folded into the query above: each takes one readable per collection, and these
+        // two judge the same copy by different rules.
+        if drafts.filter.is_none() && drafts.owner.is_none() {
+            return Ok(true);
+        }
+        let one = HashMap::from([(c.id, drafts)]);
+        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
+    }
+
+    /// What reading the past versions of a document of `c` runs under, before any document
+    /// is looked at (see `versions_of`, which also judges the document): its current copy
+    /// under the read and `readVersions` rules, and the creator for an own-only right. Also
+    /// the read filter alone. Refusals are as `versions_of` gives them.
+    fn versions_rules(&self, c: &Collection) -> Result<(Readable, Option<Filter>), ApiError> {
         let slug = &c.schema.slug;
         self.scope(Action::ReadVersions, slug)?;
         if !c.schema.versioned() {
@@ -1022,36 +1067,42 @@ impl Access {
             true => DocCopy::Draft,
             false => DocCopy::Published,
         };
-        // A rule could refuse even what isn't saved yet, so a global it limits is refused,
-        // saved or not; only a global nothing limits can be missing, a 404.
-        let limited = filter.is_some();
         let versions = Readable {
             filter,
             copy,
             owner,
             otherwise: None,
         };
-        let one = HashMap::from([(c.id, versions)]);
-        if get_many_readable(pool, &[id], &one).await?.is_empty() {
-            let known = global && (limited || documents::get(pool, c.id, id, copy).await.is_ok());
-            return Err(if known {
-                self.refuse()
-            } else {
-                ApiError::NotFound
-            });
-        }
-        // Without drafts, every version is of what was published.
-        let Some(drafts) = self.draft_readable(c, read) else {
-            return Ok(!c.schema.drafts());
+        Ok((versions, read))
+    }
+
+    /// `/api/access`'s answers for drafts and history on `c`, added to `a`: `readDrafts`
+    /// and `publish` when it has drafts, `readVersions` when it keeps versions. Each is
+    /// judged as its routes judge it before looking at a document, and is conditional when
+    /// a rule is a filter or the right is own-only, as `write_answer` is.
+    fn history_answers(&self, c: &Collection, a: &mut Value) {
+        let answer = |r: Option<Readable>| -> Value {
+            match r {
+                None => false.into(),
+                Some(r) if r.filter.is_none() && r.owner.is_none() => true.into(),
+                Some(_) => "conditional".into(),
+            }
         };
-        // The draft was just found, so only a filter or an owner can still hide it. Not
-        // folded into the query above: each takes one readable per collection, and these
-        // two judge the same copy by different rules.
-        if drafts.filter.is_none() && drafts.owner.is_none() {
-            return Ok(true);
+        if c.schema.drafts() {
+            // What `?draft=true` reads, which every draft route goes by.
+            let drafts = self
+                .readable_in(c, true)
+                .filter(|r| r.copy == DocCopy::Draft);
+            a["readDrafts"] = answer(drafts);
+            let publish = match self.scope(Action::Publish, &c.schema.slug) {
+                Ok(()) => self.publish_rules(c).ok(),
+                Err(_) => None,
+            };
+            a["publish"] = answer(publish);
         }
-        let one = HashMap::from([(c.id, drafts)]);
-        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
+        if c.schema.versioned() {
+            a["readVersions"] = answer(self.versions_rules(c).ok().map(|(r, _)| r));
+        }
     }
 
     /// What a published copy may link to: each collection's published documents the caller
@@ -1205,6 +1256,9 @@ fn field_map(c: &Collection, caller: &Caller, gate: [bool; 3]) -> Value {
 ///   fields have no create.
 /// - For `users`, `read` is about profiles as links show them, like content; create,
 ///   update and delete are about the account routes, which keep to self-or-admin.
+/// - A collection or global with drafts also answers `readDrafts` and `publish`, and one
+///   that keeps versions `readVersions`; a `:publish` key's `publish` goes by its owner's
+///   read rights, as publishing does.
 pub(crate) async fn report(
     State(state): State<AppState>,
     principal: Principal,
@@ -1233,6 +1287,9 @@ pub(crate) async fn report(
                 "delete": access.write_answer(Action::Delete, c),
             })
         };
+        if c.schema.slug != USERS {
+            access.history_answers(c, &mut a);
+        }
         if a.as_object()
             .is_some_and(|m| m.values().all(|v| v == false))
         {
