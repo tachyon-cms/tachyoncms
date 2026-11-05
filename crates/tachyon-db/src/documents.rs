@@ -369,8 +369,9 @@ pub async fn lock_in(
 /// Publishes document `id` of `c`, a collection with drafts, inside `tx`: `doc` (the
 /// stored draft and its links when `None`) becomes the published copy, the status
 /// `published` and `published_at` now, and a `published` version is recorded. The caller
-/// has locked the row (`lock_in`) and validated what's published. A unique clash is a
-/// `UniqueViolation`; a link to a document that's gone, a `Validation` error.
+/// has locked the row with `lock_in`, which also checked the schema, and validated what's
+/// published. A unique clash is a `UniqueViolation`; a link to a document that's gone, a
+/// `Validation` error.
 pub async fn publish_in(
     tx: &mut PgConnection,
     c: &Collection,
@@ -378,7 +379,6 @@ pub async fn publish_in(
     doc: Option<&Prepared>,
     by: Option<Uuid>,
 ) -> Result<Document, DbError> {
-    check_schema(&mut *tx, c.id, c.schema_version).await?;
     let published = sqlx::query_as!(
         Document,
         r#"UPDATE documents
@@ -424,13 +424,27 @@ pub async fn publish_in(
 /// Takes document `id` of `c` off the site inside `tx`: no published copy or links, status
 /// `draft`, never published as far as reads tell. The draft stays as it is, and documents
 /// that link here keep their links. The caller has locked the row (`lock_in`). Returns the
-/// draft.
+/// draft. One that isn't published is `Refused`, and nothing is written.
 pub async fn unpublish_in(
     tx: &mut PgConnection,
     c: &Collection,
     id: Uuid,
     by: Option<Uuid>,
 ) -> Result<Document, DbError> {
+    let published = sqlx::query_scalar!(
+        r#"SELECT published IS NOT NULL AS "published!" FROM documents
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+             AND draft IS NOT NULL"#,
+        DEFAULT_TENANT,
+        c.id,
+        id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    if !published {
+        return Err(DbError::Refused(format!("`{id}` isn't published")));
+    }
     let draft = sqlx::query_as!(
         Document,
         r#"UPDATE documents

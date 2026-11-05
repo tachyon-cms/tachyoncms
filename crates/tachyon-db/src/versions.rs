@@ -79,10 +79,11 @@ pub struct Version {
 }
 
 /// Up to `limit` versions of live document `doc`, newest first, after skipping `offset`,
-/// without their data.
+/// without their data; with `drafts` false, only those of what was published.
 pub async fn list(
     pool: &PgPool,
     doc: Uuid,
+    drafts: bool,
     limit: i64,
     offset: i64,
 ) -> Result<Vec<Version>, DbError> {
@@ -90,12 +91,14 @@ pub async fn list(
         r#"SELECT v.id, v.kind, v.created_at, v.created_by FROM versions v
            JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id
            WHERE v.tenant_id = $1 AND v.document_id = $2 AND d.deleted_at IS NULL
+             AND ($5 OR v.kind = 'published')
            ORDER BY v.created_at DESC, v.id DESC
            LIMIT $3 OFFSET $4"#,
         DEFAULT_TENANT,
         doc,
         limit,
         offset,
+        drafts,
     )
     .fetch_all(pool)
     .await?;

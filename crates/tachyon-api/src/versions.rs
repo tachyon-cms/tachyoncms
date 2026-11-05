@@ -93,7 +93,10 @@ async fn publish_doc(
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
     let c = &d.c;
-    access.scope(Action::Publish, &c.schema.slug)?;
+    // A collection's handler checked it before reading the ID.
+    if d.global() {
+        access.scope(Action::Publish, &c.schema.slug)?;
+    }
     no_params(raw.as_deref())?;
     let guard = access.publish_guard(&state.pool, c, d.id).await?;
     let targets = link_targets(state, c).await?;
@@ -130,7 +133,10 @@ async fn unpublish_doc(
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
     let c = &d.c;
-    access.scope(Action::Publish, &c.schema.slug)?;
+    // A collection's handler checked it before reading the ID.
+    if d.global() {
+        access.scope(Action::Publish, &c.schema.slug)?;
+    }
     no_params(raw.as_deref())?;
     let guard = access.publish_guard(&state.pool, c, d.id).await?;
     // The answer is the draft, its links read as a draft's are.
@@ -158,12 +164,12 @@ async fn list_versions(
     d: Doc,
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
-    access.versions_of(&state.pool, &d.c, d.id).await?;
+    let drafts = access.versions_of(&state.pool, &d.c, d.id).await?;
     let (limit, page) = page_params(raw.as_deref())?;
     let offset = (page - 1)
         .checked_mul(limit)
         .ok_or_else(|| ApiError::BadRequest("page is too large".into()))?;
-    let mut docs = versions::list(&state.pool, d.id, limit + 1, offset).await?;
+    let mut docs = versions::list(&state.pool, d.id, drafts, limit + 1, offset).await?;
     let more = docs.len() as i64 > limit;
     docs.truncate(limit as usize);
     Ok(Json(json!({
@@ -174,15 +180,31 @@ async fn list_versions(
     })))
 }
 
-/// Version `vid` of the document, without the fields the caller can't read.
+/// Version `vid` of the document, as stored: a 404 when it was a draft and `drafts` (from
+/// `versions_of`) says the caller can't read those.
+async fn stored_version(
+    state: &AppState,
+    d: &Doc,
+    vid: &str,
+    drafts: bool,
+) -> Result<versions::Version, ApiError> {
+    let vid = parse_id(vid)?;
+    let v = versions::get(&state.pool, d.id, vid).await?;
+    match v.kind == DocCopy::Draft.as_str() && !drafts {
+        true => Err(ApiError::NotFound),
+        false => Ok(v),
+    }
+}
+
+/// `stored_version`, without the fields the caller can't read.
 async fn version(
     state: &AppState,
     access: &Access,
     d: &Doc,
     vid: &str,
+    drafts: bool,
 ) -> Result<versions::Version, ApiError> {
-    let vid = parse_id(vid)?;
-    let mut v = versions::get(&state.pool, d.id, vid).await?;
+    let mut v = stored_version(state, d, vid, drafts).await?;
     if let Some(data) = v.data.take() {
         v.data = Some(stripped(access, &d.c, data));
     }
@@ -205,9 +227,9 @@ async fn get_version(
     vid: String,
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
-    access.versions_of(&state.pool, &d.c, d.id).await?;
+    let drafts = access.versions_of(&state.pool, &d.c, d.id).await?;
     no_params(raw.as_deref())?;
-    Ok(Json(json!(version(state, access, &d, &vid).await?)))
+    Ok(Json(json!(version(state, access, &d, &vid, drafts).await?)))
 }
 
 /// What a restore of `version` writes over `current`: the version's value of each field
@@ -251,9 +273,8 @@ async fn restore_version(
         access.may_write(action, c)?;
     }
     no_params(raw.as_deref())?;
-    access.versions_of(&state.pool, c, d.id).await?;
-    let vid = parse_id(&vid)?;
-    let data = versions::get(&state.pool, d.id, vid)
+    let drafts = access.versions_of(&state.pool, c, d.id).await?;
+    let data = stored_version(state, &d, &vid, drafts)
         .await?
         .data
         .unwrap_or_default();
@@ -322,8 +343,8 @@ async fn side(
         "draft" => DocCopy::Draft,
         "published" => DocCopy::Published,
         vid => {
-            access.versions_of(&state.pool, &d.c, d.id).await?;
-            return Ok(version(state, access, d, vid)
+            let drafts = access.versions_of(&state.pool, &d.c, d.id).await?;
+            return Ok(version(state, access, d, vid, drafts)
                 .await?
                 .data
                 .unwrap_or_default());

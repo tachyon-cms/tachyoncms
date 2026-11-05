@@ -674,10 +674,14 @@ async fn global_history(pool: PgPool) {
     .await;
     assert_eq!(restored["name"], "One");
     // Nobody created a global, so an own-only right reaches none of its history.
-    assert_problem(
-        &call(&author, "GET", "/api/globals/site/versions", None).await,
-        404,
-    );
+    // Refused as a global is, not hidden (Ruling T5-5).
+    for uri in [
+        "/api/globals/site/versions".to_owned(),
+        format!("/api/globals/site/versions/{first}"),
+        format!("/api/globals/site/diff?from={first}&to=published"),
+    ] {
+        assert_problem(&call(&author, "GET", &uri, None).await, 403);
+    }
     assert_problem(
         &call(&author, "POST", "/api/globals/site/publish", None).await,
         403,
@@ -689,5 +693,82 @@ async fn global_history(pool: PgPool) {
             .await
             .get("name")
             .is_none()
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn draft_versions_need_read_drafts(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "pages", "versions": {"drafts": true},
+                    "access": {"readVersions": true, "readDrafts": false},
+                    "fields": [{"name": "title", "type": "text"}]})),
+    )
+    .await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let id = id_of(
+        &ok(
+            &admin,
+            "POST",
+            "/api/pages",
+            Some(json!({"title": "Secret"})),
+        )
+        .await,
+    );
+    let one = format!("/api/pages/{id}");
+    ok(&admin, "PATCH", &one, Some(json!({"title": "Live"}))).await;
+    ok(&admin, "POST", &format!("{one}/publish"), None).await;
+    ok(&admin, "PATCH", &one, Some(json!({"title": "Next"}))).await;
+    let all = ok(&admin, "GET", &format!("{one}/versions"), None).await["docs"].clone();
+    let all = all.as_array().unwrap();
+    assert_eq!(all.len(), 4);
+    let draft = all[0]["id"].as_str().unwrap();
+    let published = all[1]["id"].as_str().unwrap();
+
+    // Only what was published, and pages that count only that.
+    let list = ok(&viewer, "GET", &format!("{one}/versions"), None).await;
+    assert_eq!(list["docs"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["docs"][0]["id"], published);
+    let page = ok(&viewer, "GET", &format!("{one}/versions?limit=1"), None).await;
+    assert_eq!(page["hasNextPage"], false, "{page}");
+    let v = ok(&viewer, "GET", &format!("{one}/versions/{published}"), None).await;
+    assert_eq!(v["data"]["title"], "Live");
+    // A draft's version reads as one that isn't there.
+    let random = Uuid::now_v7();
+    for vid in [draft.to_owned(), random.to_string()] {
+        for uri in [
+            format!("{one}/versions/{vid}"),
+            format!("{one}/diff?from={vid}&to=published"),
+        ] {
+            let res = call(&viewer, "GET", &uri, None).await;
+            assert_problem(&res, 404);
+            assert!(!res.json.to_string().contains("Next"), "{}", res.json);
+        }
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn unpublishing_what_isnt_published_is_refused(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let id = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "New"}))).await);
+    let one = format!("/api/posts/{id}");
+    let before = ok(&admin, "GET", &format!("{one}?draft=true"), None).await;
+    let res = call(&admin, "POST", &format!("{one}/unpublish"), None).await;
+    assert_problem(&res, 409);
+    assert_eq!(res.json["detail"], format!("`{id}` isn't published"));
+    let after = ok(&admin, "GET", &format!("{one}?draft=true"), None).await;
+    assert_eq!(
+        before["updatedAt"], after["updatedAt"],
+        "nothing was written"
+    );
+    // Once published and taken down, a second time is refused too.
+    ok(&admin, "POST", &format!("{one}/publish"), None).await;
+    ok(&admin, "POST", &format!("{one}/unpublish"), None).await;
+    assert_problem(
+        &call(&admin, "POST", &format!("{one}/unpublish"), None).await,
+        409,
     );
 }

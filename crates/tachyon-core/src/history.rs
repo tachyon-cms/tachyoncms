@@ -118,17 +118,21 @@ fn row_fields<'f>(f: &'f Field, row: &Value) -> Option<&'f [Field]> {
 }
 
 fn diff_rows(f: &Field, before: &[Value], after: &[Value], path: &str, out: &mut Vec<FieldChange>) {
-    // A row without an ID can't be followed, so it's matched by its place in the list.
-    let find = |row: &Value, i: usize| match row_id(row) {
-        Some(id) => before.iter().position(|r| row_id(r) == Some(id)),
-        None => (i < before.len() && row_id(&before[i]).is_none()).then_some(i),
-    };
     let mut matched = vec![false; before.len()];
+    // One to one, the first match winning, so a repeated ID can't pair twice. A row
+    // without an ID can't be followed, so it's matched by its place in the list.
+    let find = |row: &Value, i: usize, matched: &[bool]| {
+        let j = match row_id(row) {
+            Some(id) => before.iter().position(|r| row_id(r) == Some(id)),
+            None => (i < before.len() && row_id(&before[i]).is_none()).then_some(i),
+        }?;
+        (!matched[j]).then_some(j)
+    };
     let mut order = Vec::new();
     for (i, row) in after.iter().enumerate() {
         let at = format!("{path}.{i}");
         let id = row_id(row);
-        let Some(j) = find(row, i) else {
+        let Some(j) = find(row, i, &matched) else {
             push(out, at, None, Some(row), id);
             continue;
         };
@@ -334,6 +338,17 @@ mod tests {
                 json!("S"),
                 None
             )]
+        );
+
+        // A repeated row ID pairs once: the second copy is a row added.
+        let mut next = base.clone();
+        next["links"] = json!([
+            {"id": "l1", "url": "a"}, {"id": "l1", "url": "z"}, {"id": "l2", "url": "b"}
+        ]);
+        let extra = json!({"id": "l1", "url": "z"});
+        assert_eq!(
+            diff_documents(&fields, &doc(base.clone()), &doc(next)),
+            [change("links.1", Op::Added, Value::Null, extra, Some("l1"))]
         );
     }
 }

@@ -918,7 +918,7 @@ impl Access {
         id: Uuid,
     ) -> Result<Readable, ApiError> {
         let slug = &c.schema.slug;
-        self.scope(Action::Publish, slug)?;
+        // Callers check the `:publish` scope first, before anything about the request.
         if !c.schema.drafts() {
             return Err(ApiError::BadRequest(format!("`{slug}` has no drafts")));
         }
@@ -959,43 +959,62 @@ impl Access {
     /// Refuses unless the caller may read the past versions of document `id` of `c`: its
     /// `readVersions` and read rules, judged on its current copy (the draft, with drafts),
     /// and the creator for an own-only right, which reaches no global. Refused and missing
-    /// are both a 404 (W1-R14), as is a document in the trash.
+    /// are both a 404 (W1-R14), as is a document in the trash; a global, whose existence
+    /// isn't secret, is refused with a 403. Answers whether they may also read the versions
+    /// that were drafts, which takes `readDrafts` on the document too (Ruling T5-3).
     pub(crate) async fn versions_of(
         &self,
         pool: &PgPool,
         c: &Collection,
         id: Uuid,
-    ) -> Result<(), ApiError> {
+    ) -> Result<bool, ApiError> {
         let slug = &c.schema.slug;
         self.scope(Action::ReadVersions, slug)?;
         if !c.schema.versioned() {
             return Err(ApiError::BadRequest(format!("`{slug}` keeps no versions")));
         }
+        let global = c.schema.kind == CollectionKind::Global;
+        let refused = || match global {
+            true => self.refuse(),
+            false => ApiError::NotFound,
+        };
         let rule = |action| match self.allows(action, c) {
-            Compiled::Deny => Err(ApiError::NotFound),
+            Compiled::Deny => Err(refused()),
             Compiled::Allow => Ok(None),
             Compiled::Filter(f) => Ok(Some(f)),
         };
-        let filter = both(rule(Action::Read)?, rule(Action::ReadVersions)?);
+        let read = rule(Action::Read)?;
+        let filter = both(read.clone(), rule(Action::ReadVersions)?);
         let owner = match self.own_only(Action::ReadVersions, c) {
             false => None,
-            true if c.schema.kind == CollectionKind::Global => return Err(ApiError::NotFound),
-            true => Some(self.principal.identity().ok_or(ApiError::NotFound)?.user_id),
+            true if global => return Err(refused()),
+            true => Some(self.principal.identity().ok_or_else(refused)?.user_id),
         };
-        let read = Readable {
+        let copy = match c.schema.drafts() {
+            true => DocCopy::Draft,
+            false => DocCopy::Published,
+        };
+        let versions = Readable {
             filter,
-            copy: match c.schema.drafts() {
-                true => DocCopy::Draft,
-                false => DocCopy::Published,
-            },
+            copy,
             owner,
             otherwise: None,
         };
-        let one = HashMap::from([(c.id, read)]);
-        match get_many_readable(pool, &[id], &one).await?.is_empty() {
-            true => Err(ApiError::NotFound),
-            false => Ok(()),
+        let one = HashMap::from([(c.id, versions)]);
+        if get_many_readable(pool, &[id], &one).await?.is_empty() {
+            let known = global && documents::get(pool, c.id, id, copy).await.is_ok();
+            return Err(if known {
+                self.refuse()
+            } else {
+                ApiError::NotFound
+            });
         }
+        // Without drafts, every version is of what was published.
+        let Some(drafts) = self.draft_readable(c, read) else {
+            return Ok(!c.schema.drafts());
+        };
+        let one = HashMap::from([(c.id, drafts)]);
+        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
     }
 
     /// What a published copy may link to: each collection's published documents the caller

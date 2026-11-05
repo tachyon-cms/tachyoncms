@@ -278,6 +278,13 @@ pub(crate) async fn check_links(
 /// Refuses every link in `next`, about to be published, to a document with no published
 /// copy the caller may read: a draft may link to drafts, what's published may not. A
 /// hidden target and a missing one get the same error.
+///
+/// Read outside the publish's row locks on purpose. A target trashed meanwhile can't slip
+/// through: `sync_relations` re-checks every target under `FOR KEY SHARE`, which blocks a
+/// delete. A target unpublished, or hidden by a rule change, meanwhile leaves what
+/// unpublishing it a moment later would anyway, which is allowed: published copies keep
+/// their links to it, shown as bare IDs. Locking targets `FOR SHARE` would only add
+/// deadlocks between documents that link each other.
 pub(crate) async fn published_links(
     state: &AppState,
     access: &Access,
