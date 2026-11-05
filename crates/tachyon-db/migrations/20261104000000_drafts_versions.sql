@@ -48,9 +48,11 @@ CREATE TABLE jobs (
     key_id        uuid,
     created_at    timestamptz NOT NULL DEFAULT now(),
     finished_at   timestamptz,
-    -- MATCH SIMPLE: a job about no document (document_id NULL) isn't checked.
+    -- MATCH SIMPLE: a job about no document (document_id NULL) isn't checked. One about a
+    -- document must name its collection, or the key would skip the check too.
     FOREIGN KEY (tenant_id, collection_id, document_id)
-        REFERENCES documents (tenant_id, collection_id, id) ON DELETE CASCADE
+        REFERENCES documents (tenant_id, collection_id, id) ON DELETE CASCADE,
+    CHECK (document_id IS NULL OR collection_id IS NOT NULL)
 );
 
 CREATE UNIQUE INDEX jobs_one_pending ON jobs (dedupe_key) WHERE state IN ('queued', 'running');

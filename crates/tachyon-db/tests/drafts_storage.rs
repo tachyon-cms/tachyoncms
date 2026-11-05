@@ -379,11 +379,12 @@ async fn pruning_versions_needs_confirm(pool: PgPool) {
     add_version(&pool, &s, b, json!({"title": "b0"})).await;
     // A queued publish holds a's oldest version.
     sqlx::query(
-        "INSERT INTO jobs (id, tenant_id, kind, document_id, payload, run_at, state)
-         VALUES ($1, $2, 'publish', $3, $4, now() + interval '1 day', 'queued')",
+        "INSERT INTO jobs (id, tenant_id, kind, collection_id, document_id, payload, run_at, state)
+         VALUES ($1, $2, 'publish', $3, $4, $5, now() + interval '1 day', 'queued')",
     )
     .bind(Uuid::now_v7())
     .bind(DEFAULT_TENANT)
+    .bind(s.posts)
     .bind(a)
     .bind(json!({"version": held.unwrap()}))
     .execute(&pool)
@@ -466,4 +467,26 @@ async fn versions_and_jobs_stay_in_their_documents_collection(pool: PgPool) {
             "{e}"
         );
     }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_job_about_a_document_names_its_collection(pool: PgPool) {
+    let s = seed(&pool, json!(null)).await;
+    let a = post(&pool, &s, "A", s.ann).await;
+    let refused = sqlx::query(
+        "INSERT INTO jobs (id, tenant_id, kind, document_id, run_at, state)
+         VALUES ($1, $2, 'publish', $3, now(), 'queued')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(DEFAULT_TENANT)
+    .bind(a)
+    .execute(&pool)
+    .await
+    .unwrap_err();
+    assert!(
+        refused
+            .as_database_error()
+            .is_some_and(|e| e.is_check_violation()),
+        "{refused}"
+    );
 }
