@@ -1183,6 +1183,8 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::Field;
+    use serde_json::json;
 
     #[test]
     fn doc_copies_parse_only_their_own_names() {
@@ -1192,8 +1194,6 @@ mod tests {
         assert_eq!(DocCopy::parse("Draft"), None);
         assert_eq!(DocCopy::parse(""), None);
     }
-    use crate::Field;
-    use serde_json::json;
 
     fn fields() -> Vec<Field> {
         serde_json::from_value(json!([

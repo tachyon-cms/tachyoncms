@@ -208,6 +208,17 @@ pub(crate) struct Budget {
     nodes: usize,
     depth: usize,
     ids: HashSet<Uuid>,
+    /// How strictly the fields of block nodes are checked.
+    mode: crate::validate::Mode,
+}
+
+impl Budget {
+    pub(crate) fn new(mode: crate::validate::Mode) -> Self {
+        Self {
+            mode,
+            ..Self::default()
+        }
+    }
 }
 
 /// `validate`, for rich text inside a block node of the text `budget` belongs to.
@@ -551,6 +562,7 @@ impl Check<'_, '_> {
         // deeper inside one field must not carry its depth to the next.
         let outer = self.budget.depth;
         self.budget.depth = depth;
+        let mode = self.budget.mode;
         crate::validate::check_object(
             &block.fields,
             fields,
@@ -558,6 +570,7 @@ impl Check<'_, '_> {
             &at("fields"),
             &mut self.errors,
             Some(&mut *self.budget),
+            mode,
         );
         self.budget.depth = outer;
     }

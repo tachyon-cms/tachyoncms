@@ -2393,7 +2393,14 @@ fn check_fields(
         check_admin(&f.admin, root, &[join(prefix, &f.name)], false, within).map_err(invalid)?;
         if let Some(default) = &f.default {
             let mut errors = Vec::new();
-            crate::validate::check_value(f, default, &f.name, &mut errors, None);
+            crate::validate::check_value(
+                f,
+                default,
+                &f.name,
+                &mut errors,
+                None,
+                crate::validate::Mode::Full,
+            );
             if let Some(e) = errors.first() {
                 return Err(invalid(format!("default: {}", e.message)));
             }
