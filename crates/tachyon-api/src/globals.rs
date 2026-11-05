@@ -9,16 +9,16 @@ use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, RawQuery, State};
 use serde_json::{Map, Value};
 use tachyon_core::auth::Action;
-use tachyon_core::{CollectionKind, defaults, merged, validate_document};
+use tachyon_core::{CollectionKind, defaults, merged, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
-use tachyon_db::query::{Readable, get_many_readable};
+use tachyon_db::query::get_many_readable;
 
-use crate::access::{Access, both};
-use crate::documents::{json_body, shaped, unique_error};
-use crate::params::{Format, read_params};
+use crate::access::Access;
+use crate::documents::{json_body, mode_for, record, shaped, unique_error};
+use crate::params::{Format, autosave_param, read_params};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
     to_value, vouched_links,
@@ -42,10 +42,11 @@ async fn respond(
     access: &Access,
     c: Arc<Collection>,
     doc: &Document,
+    copy: DocCopy,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
     // Only its ID when the caller can't read what they just wrote.
-    if !access.can_read(&state.pool, &c, doc.id).await? {
+    if !access.can_read(&state.pool, &c, doc.id, copy).await? {
         return Ok(Json(serde_json::json!({ "id": doc.id })));
     }
     let mut value = to_value(doc)?;
@@ -59,8 +60,9 @@ async fn respond(
     ))
 }
 
-/// A global's read rule judges its stored document. One that hasn't been saved yet shows
-/// its defaults, unless the rule is a filter: there's nothing yet for it to match.
+/// A global's read rule judges its stored document, in the copy read. One that hasn't been
+/// saved yet (or, with drafts, published) shows its defaults, unless the rule is a filter:
+/// there's nothing yet for it to match.
 pub async fn get(
     State(state): State<AppState>,
     access: Access,
@@ -68,22 +70,23 @@ pub async fn get(
     RawQuery(raw): RawQuery,
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
-    let read = access.permit(Action::Read, &c)?;
+    access.permit(Action::Read, &c)?;
     let p = read_params(raw.as_deref(), &c, &access)?;
-    let mut value = match read {
-        Some(filter) => {
-            let one = HashMap::from([(c.id, Readable::published(Some(filter)))]);
+    let read = access.readable_of(&c).ok_or_else(|| access.refuse())?;
+    let mut value = match (&read.filter, read.owner) {
+        (None, None) => match documents::get(&state.pool, c.id, c.id, read.copy).await {
+            Ok(doc) => to_value(&doc)?,
+            Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
+            Err(e) => return Err(e.into()),
+        },
+        _ => {
+            let one = HashMap::from([(c.id, read)]);
             let (_, doc) = get_many_readable(&state.pool, &[c.id], &one)
                 .await?
                 .pop()
                 .ok_or(ApiError::NotFound)?;
             to_value(&doc)?
         }
-        None => match documents::get(&state.pool, c.id, c.id, DocCopy::Published).await {
-            Ok(doc) => to_value(&doc)?,
-            Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
-            Err(e) => return Err(e.into()),
-        },
     };
     access.strip(&c, &mut value);
     let mut items = vec![(value, c)];
@@ -111,18 +114,18 @@ pub async fn update(
     State(state): State<AppState>,
     access: Access,
     path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let c = global(&state, path)?;
     access.scope(Action::UpdateGlobal, &c.schema.slug)?;
-    // A global's existence isn't secret, so one the caller can't read is refused, not hidden.
-    let guard = match access.write_rules(Action::UpdateGlobal, &c) {
-        Err(_) => return Err(access.refuse()),
-        Ok((read, write)) => both(read, write),
-    };
+    let autosave = autosave_param(raw.as_deref(), &c)?;
+    let guard = access.global_guard(&c)?;
+    let copy = access.write_copy(&c);
     let who = access.actor(Action::UpdateGlobal, &c);
+    let by = who.map(|a| a.id);
     let mut patch = json_body(body)?;
-    let stored = match documents::get(&state.pool, c.id, c.id, DocCopy::Published).await {
+    let stored = match documents::get(&state.pool, c.id, c.id, copy).await {
         Ok(doc) => Some(doc.data.0),
         Err(DbError::NotFound) => None,
         Err(e) => return Err(e.into()),
@@ -139,7 +142,7 @@ pub async fn update(
             Action::UpdateGlobal,
             Some(current.unwrap_or(&nothing)),
         )?;
-        validate_document(c.schema.data(), &patch, current)
+        validate_document_in(mode_for(copy), c.schema.data(), &patch, current)
             .map_err(ApiError::Validation)
             .and_then(|data| prepare(&targets, &c, data))
             .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, current))))
@@ -158,11 +161,13 @@ pub async fn update(
     .await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
-        let updated = documents::update_as(
-            &state.pool,
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        let updated = documents::update_in(
+            &mut tx,
             c.id,
             c.schema_version,
             c.id,
+            copy,
             who,
             guard.as_ref(),
             |current| {
@@ -173,24 +178,27 @@ pub async fn update(
         )
         .await;
         match updated {
-            Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
+            Ok(doc) => {
+                record(&mut tx, &c, &doc, copy, by, autosave).await?;
+                tx.commit().await.map_err(DbError::from)?;
+                return respond(&state, &access, c.clone(), &doc, copy, 1).await;
+            }
             Err(ApiError::NotFound) if guard.is_some() => return Err(DbError::Forbidden.into()),
             Err(ApiError::NotFound) => {}
             Err(e) => return Err(access.hide(&c, unique_error(&c, e), None)),
         }
+        drop(tx);
         let next = apply(None)?;
         vouched_links(&next, &[], &vouched)?;
-        match documents::insert_as(
-            &state.pool,
-            c.id,
-            c.schema_version,
-            Some(c.id),
-            &next,
-            who.map(|a| a.id),
-        )
-        .await
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        match documents::insert_in(&mut tx, c.id, c.schema_version, Some(c.id), copy, &next, by)
+            .await
         {
-            Ok(doc) => return respond(&state, &access, c.clone(), &doc, 1).await,
+            Ok(doc) => {
+                record(&mut tx, &c, &doc, copy, by, autosave).await?;
+                tx.commit().await.map_err(DbError::from)?;
+                return respond(&state, &access, c.clone(), &doc, copy, 1).await;
+            }
             Err(DbError::UniqueViolation(ref name)) if name == "documents_pkey" => continue,
             Err(e) => return Err(access.hide(&c, unique_error(&c, e.into()), None)),
         }

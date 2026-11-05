@@ -131,6 +131,43 @@ fn single<'a>(params: &'a Map<String, Value>, name: &str) -> Result<Option<&'a s
     }
 }
 
+/// A `true`/`false` parameter, false when absent.
+fn flag(params: &Map<String, Value>, name: &str) -> Result<bool, ApiError> {
+    match single(params, name)? {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(bad(format!("{name} must be true or false"))),
+    }
+}
+
+/// `draft=true`: read `c`'s drafts. Worked out before anything that reaches through links,
+/// since it decides which copy of each linked collection they read.
+fn draft(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result<(), ApiError> {
+    let draft = flag(params, "draft").map_err(|_| bad("`draft` must be true or false"))?;
+    access.copy_for(c, draft).map(|_| ())
+}
+
+/// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
+/// that turns autosave on.
+pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {
+    let params = params(raw, &["autosave"])?;
+    let autosave =
+        flag(&params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
+    let on = c
+        .schema
+        .versions
+        .as_ref()
+        .and_then(|v| v.drafts.as_ref())
+        .is_some_and(|d| d.autosave.is_some());
+    if autosave && !on {
+        return Err(bad(format!(
+            "`autosave`: `{}` doesn't autosave",
+            c.schema.slug
+        )));
+    }
+    Ok(autosave)
+}
+
 fn number(params: &Map<String, Value>, name: &str) -> Result<Option<i64>, ApiError> {
     single(params, name)?
         .map(|s| {
@@ -360,9 +397,10 @@ pub(crate) fn list_params(
         raw,
         &[
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
-            "joins", "format",
+            "joins", "format", "draft",
         ],
     )?;
+    draft(&params, c, access)?;
     let fields = c.schema.data();
 
     let limit = number(&params, "limit")?.unwrap_or(DEFAULT_LIMIT);
@@ -373,11 +411,7 @@ pub(crate) fn list_params(
     if page.is_some_and(|p| p < 1) {
         return Err(bad("page must be at least 1"));
     }
-    let count = match single(&params, "count")? {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(_) => return Err(bad("count must be true or false")),
-    };
+    let count = flag(&params, "count")?;
     let visible = access.readable_fields(c);
     let filter = params
         .get("where")
@@ -427,7 +461,11 @@ pub(crate) fn read_params(
     c: &Collection,
     access: &Access,
 ) -> Result<ReadParams, ApiError> {
-    let params = params(raw, &["depth", "select", "populate", "joins", "format"])?;
+    let params = params(
+        raw,
+        &["depth", "select", "populate", "joins", "format", "draft"],
+    )?;
+    draft(&params, c, access)?;
     Ok(ReadParams {
         depth: depth(&params)?,
         select: select(&params, c.schema.data(), c.schema.drafts())?,

@@ -100,7 +100,7 @@ impl Filter {
 
 /// One of a document's two copies: what's live, or the working draft beside it (drafts on).
 /// Each keeps its own links.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
 #[serde(rename_all = "lowercase")]
 pub enum DocCopy {
     Published,

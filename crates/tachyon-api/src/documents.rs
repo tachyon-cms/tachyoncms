@@ -11,18 +11,20 @@ use std::sync::Arc;
 use tachyon_core::auth::Action;
 use tachyon_core::query::value_kind;
 use tachyon_core::select::{Select, project};
-use tachyon_core::{CollectionKind, FieldError, merged, validate_document};
+use tachyon_core::validate::Mode;
+use tachyon_core::{CollectionKind, FieldError, merged, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 use tachyon_db::indexes::{IndexKind, index_name};
 use tachyon_db::query::{self, ListQuery, get_many_readable};
+use tachyon_db::versions::record_version;
 use uuid::Uuid;
 
 use crate::access::{Access, both};
 use crate::joins::fill_joins;
-use crate::params::{Format, Joins, list_params, read_params};
+use crate::params::{Format, Joins, autosave_param, list_params, read_params};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
     to_value, vouched_links,
@@ -68,6 +70,30 @@ pub(crate) fn unique_error(c: &Collection, e: ApiError) -> ApiError {
     e
 }
 
+/// How strictly a save to `copy` is validated: a draft may leave out what's required.
+pub(crate) fn mode_for(copy: DocCopy) -> Mode {
+    match copy {
+        DocCopy::Draft => Mode::Draft,
+        DocCopy::Published => Mode::Full,
+    }
+}
+
+/// Records `doc`, just saved to `copy` of `c`, as a version when `c` keeps them, unless
+/// it's an autosave.
+pub(crate) async fn record(
+    tx: &mut sqlx::PgConnection,
+    c: &Collection,
+    doc: &Document,
+    copy: DocCopy,
+    by: Option<Uuid>,
+    autosave: bool,
+) -> Result<(), ApiError> {
+    if c.schema.versioned() && !autosave {
+        record_version(tx, doc.id, c, copy, &doc.data.0, by).await?;
+    }
+    Ok(())
+}
+
 /// A malformed ID can't match any document, so it's a 404 rather than a 400.
 fn parse_id(id: &str) -> Result<Uuid, ApiError> {
     id.parse().map_err(|_| ApiError::NotFound)
@@ -104,9 +130,10 @@ pub(crate) async fn list_in(
     c: Arc<Collection>,
     raw: Option<String>,
 ) -> Result<Json<Value>, ApiError> {
-    let read = access.permit(Action::Read, &c)?;
+    access.permit(Action::Read, &c)?;
     let p = list_params(raw.as_deref(), &c, access)?;
-    let filter = both(p.filter, read);
+    let read = access.readable_of(&c).ok_or_else(|| access.refuse())?;
+    let filter = both(p.filter, read.filter);
     let page = p.page.unwrap_or(1);
     let offset = (page - 1)
         .checked_mul(p.limit)
@@ -118,8 +145,8 @@ pub(crate) async fn list_in(
         offset: if p.after.is_some() { 0 } else { offset },
         after: p.after.as_ref(),
         count: p.count,
-        copy: DocCopy::Published,
-        owner: None,
+        copy: read.copy,
+        owner: read.owner,
     };
     let found = query::list(&state.pool, c.id, &q).await?;
     let mut docs = found
@@ -170,16 +197,18 @@ pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
     value
 }
 
-/// The document just written as JSON, with its relationships populated to `depth` as far as
-/// the caller may read them; only its ID when they can't read the document itself.
+/// The document just written, as the `copy` written, in JSON with its relationships
+/// populated to `depth` as far as the caller may read them; only its ID when they can't
+/// read that copy.
 async fn respond(
     state: &AppState,
     access: &Access,
     c: Arc<Collection>,
     doc: &Document,
+    copy: DocCopy,
     depth: u8,
 ) -> Result<Json<Value>, ApiError> {
-    if !access.can_read(&state.pool, &c, doc.id).await? {
+    if !access.can_read(&state.pool, &c, doc.id, copy).await? {
         return Ok(Json(json!({ "id": doc.id })));
     }
     let mut value = to_value(doc)?;
@@ -216,28 +245,26 @@ pub async fn create(
     if !access.may_create(&c) {
         return Err(access.refuse());
     }
+    let copy = access.write_copy(&c);
     let mut body = json_body(body)?;
     from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
     let targets = link_targets(&state, &c).await?;
-    let prepared = validate_document(c.schema.data(), &body, None)
+    let prepared = validate_document_in(mode_for(copy), c.schema.data(), &body, None)
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &c, data))
         .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &body, None))))?;
     check_links(&state, &access, &prepared, &[]).await?;
-    let doc = documents::insert_as(
-        &state.pool,
-        c.id,
-        c.schema_version,
-        None,
-        &prepared,
-        access.actor(Action::Create, &c).map(|a| a.id),
-    )
-    .await
-    .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+    let by = access.actor(Action::Create, &c).map(|a| a.id);
+    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+    let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
+        .await
+        .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+    record(&mut tx, &c, &doc, copy, by, false).await?;
+    tx.commit().await.map_err(DbError::from)?;
     Ok((
         StatusCode::CREATED,
-        respond(&state, &access, c, &doc, 1).await?,
+        respond(&state, &access, c, &doc, copy, 1).await?,
     ))
 }
 
@@ -289,6 +316,7 @@ pub async fn update(
     State(state): State<AppState>,
     access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
+    RawQuery(raw): RawQuery,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
@@ -296,22 +324,22 @@ pub async fn update(
     access.scope(Action::Update, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    let autosave = autosave_param(raw.as_deref(), &c)?;
+    let copy = access.write_copy(&c);
     let guard = access
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
     let mut patch = json_body(body)?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
-    // against the stored document, then again against the locked one.
-    let stored = documents::get(&state.pool, c.id, id, DocCopy::Published)
-        .await?
-        .data
-        .0;
+    // against the stored document, then again against the locked one. `write_guard` has
+    // seen the caller may read this copy of it.
+    let stored = documents::get(&state.pool, c.id, id, copy).await?.data.0;
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     let targets = link_targets(&state, &c).await?;
     let apply = |current: &Map<String, Value>| {
         access.writes(&c, &patch, Action::Update, Some(current))?;
-        validate_document(c.schema.data(), &patch, Some(current))
+        validate_document_in(mode_for(copy), c.schema.data(), &patch, Some(current))
             .map_err(ApiError::Validation)
             .and_then(|data| prepare(&targets, &c, data))
             .map_err(|e| {
@@ -322,12 +350,15 @@ pub async fn update(
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
     let vouched = check_links(&state, &access, &apply(&stored)?, &link_ids(&c, &stored)).await?;
-    let doc = documents::update_as(
-        &state.pool,
+    let actor = access.actor(Action::Update, &c);
+    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+    let doc = documents::update_in(
+        &mut tx,
         c.id,
         c.schema_version,
         id,
-        access.actor(Action::Update, &c),
+        copy,
+        actor,
         guard.as_ref(),
         |current| {
             let next = apply(current)?;
@@ -337,7 +368,9 @@ pub async fn update(
     )
     .await
     .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
-    respond(&state, &access, c, &doc, 1).await
+    record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    respond(&state, &access, c, &doc, copy, 1).await
 }
 
 pub async fn delete(
@@ -350,6 +383,7 @@ pub async fn delete(
     access.scope(Action::Delete, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    let copy = access.write_copy(&c);
     let guard = access
         .write_guard(&state.pool, Action::Delete, &c, id)
         .await?;
@@ -359,7 +393,7 @@ pub async fn delete(
         id,
         access.actor(Action::Delete, &c),
         guard.as_ref(),
-        DocCopy::Published,
+        copy,
     )
     .await
     .map_err(|e| match e {
@@ -383,28 +417,33 @@ pub async fn references(
     access.scope(Action::Read, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    access.read_one(&state.pool, &c, id).await?;
-    // A draft's links are only an unscoped Admin's to see until drafts have their own read
-    // right: a `:read` key sees published content only.
-    let copies: &[DocCopy] = if access.unscoped_admin() {
-        &[DocCopy::Published, DocCopy::Draft]
-    } else {
-        &[DocCopy::Published]
-    };
-    let mut refs = documents::references(&state.pool, id, copies).await?;
+    if !access.sees(&state.pool, &c, id).await? {
+        return Err(ApiError::NotFound);
+    }
+    let mut refs =
+        documents::references(&state.pool, id, &[DocCopy::Published, DocCopy::Draft]).await?;
     if !refs.is_empty() {
         let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
-        let readable: HashSet<Uuid> =
-            get_many_readable(&state.pool, &ids, &access.readable_with_globals())
-                .await?
-                .into_iter()
-                .map(|(_, doc)| doc.id)
-                .collect();
+        // Each link is seen only by who may read the copy holding it: a draft's, by who
+        // may read that draft.
+        let mut readable: HashSet<(Uuid, DocCopy)> = HashSet::new();
+        for drafts in [false, true] {
+            let mut read = access.readable_with_globals(drafts);
+            read.retain(|_, r| (r.copy == DocCopy::Draft) == drafts);
+            let copy = if drafts {
+                DocCopy::Draft
+            } else {
+                DocCopy::Published
+            };
+            for (_, doc) in get_many_readable(&state.pool, &ids, &read).await? {
+                readable.insert((doc.id, copy));
+            }
+        }
         // A link held in a field the caller can't read isn't theirs to see either. Admins
         // read every field, and see every link, so they can always tell what blocks a delete.
         let admin = access.caller().admin;
         refs.retain(|r| {
-            readable.contains(&r.id)
+            readable.contains(&(r.id, r.copy))
                 && (admin
                     || state
                         .schemas

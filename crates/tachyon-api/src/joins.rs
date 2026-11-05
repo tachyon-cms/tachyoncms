@@ -5,8 +5,6 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use tachyon_core::CollectionKind;
-use tachyon_core::access::Compiled;
-use tachyon_core::auth::Action;
 use tachyon_core::joins::{JoinField, on_pattern};
 use tachyon_core::query::{Filter, parse_filter_with, parse_sort};
 use tachyon_core::select::{Select, project};
@@ -57,6 +55,9 @@ struct Plan {
     pattern: String,
     filter: Option<Filter>,
     sort: Option<tachyon_core::query::Sort>,
+    /// The copy of the joined documents read, and the creator an own-only right needs.
+    copy: DocCopy,
+    owner: Option<Uuid>,
 }
 
 // ponytail: the schema's `where` and `defaultSort` are parsed on every read; cache them on
@@ -66,11 +67,7 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         .schemas
         .get(&j.collection)
         .filter(|t| t.schema.kind == CollectionKind::Collection)?;
-    let read = match access.allows(Action::Read, &target) {
-        Compiled::Deny => return None,
-        Compiled::Allow => None,
-        Compiled::Filter(f) => Some(f),
-    };
+    let read = access.readable_of(&target)?;
     // Which documents link here through a field the caller can't read is hidden too.
     if !access.reads(&target, &j.on) {
         return None;
@@ -85,7 +82,7 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
     };
     // The schema's filter and the caller's read rule always apply; a request can only
     // narrow them.
-    let filter = both(both(schema_filter, read), req.filter.take());
+    let filter = both(both(schema_filter, read.filter), req.filter.take());
     // A default sort on a field the caller can't read would rank what they can't see, so
     // they get the usual order instead.
     let sort = req.sort.take().or_else(|| {
@@ -98,6 +95,8 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         pattern,
         filter,
         sort,
+        copy: read.copy,
+        owner: read.owner,
     })
 }
 
@@ -159,8 +158,8 @@ pub(crate) async fn fill_joins(
                 limit,
                 offset,
                 count,
-                copy: DocCopy::Published,
-                owner: None,
+                copy: plan.copy,
+                owner: plan.owner,
             };
             #[cfg(test)]
             let _ = JOIN_QUERIES.try_with(|n| n.set(n.get() + 1));
