@@ -34,8 +34,8 @@ pub struct CollectionSchema {
     #[serde(default)]
     pub url: Option<String>,
     /// Keep past versions of each document, and with `drafts`, a working copy apart from
-    /// the published one.
-    #[serde(default)]
+    /// the published one. `true` turns it on with the defaults.
+    #[serde(default, deserialize_with = "versions_flag")]
     pub versions: Option<Versions>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
@@ -81,6 +81,24 @@ pub struct Versions {
 
 fn default_max_versions() -> u32 {
     100
+}
+
+/// `versions` as a flag or as options. `true` is written back as `{"drafts": false,
+/// "maxVersions": 100}`, which means the same.
+fn versions_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Versions>, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Null | Value::Bool(false) => Ok(None),
+        Value::Bool(true) => Ok(Some(Versions {
+            drafts: None,
+            max_versions: default_max_versions(),
+        })),
+        v @ Value::Object(_) => Versions::deserialize(v)
+            .map(Some)
+            .map_err(serde::de::Error::custom),
+        _ => Err(serde::de::Error::custom(
+            "versions is true, false or {\"drafts\": true, \"maxVersions\": 100}",
+        )),
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -1687,20 +1705,20 @@ fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaEr
     Ok(())
 }
 
-/// `unknown_key` at every depth. Where `known` holds a flag for an object given as input
-/// (`"drafts": true` for `{}`), that object's keys are all unknown.
-fn unknown_deep(input: &Value, known: &Value, field: &str) -> Result<(), SchemaError> {
+/// `unknown_key` at every depth of a collection option such as `versions`, named by its
+/// `path`. Where `known` holds a flag for an object given as input (`"drafts": true` for
+/// `{}`), that object's keys are all unknown.
+fn unknown_deep(input: &Value, known: &Value, path: &str) -> Result<(), SchemaError> {
     let Value::Object(input) = input else {
         return Ok(());
     };
-    for (k, v) in input.iter().filter(|(_, v)| !v.is_null()) {
+    for (k, v) in input {
         let Some(known) = known.get(k) else {
-            return Err(SchemaError::UnknownOption {
-                field: field.into(),
-                option: k.clone(),
-            });
+            return Err(SchemaError::InvalidOption(format!(
+                "{path}: unknown option `{k}`"
+            )));
         };
-        unknown_deep(v, known, &format!("{field}.{k}"))?;
+        unknown_deep(v, known, &format!("{path}.{k}"))?;
     }
     Ok(())
 }
@@ -3911,12 +3929,42 @@ mod tests {
         ] {
             let input = json!({"slug": "posts", "fields": [], "versions": input});
             assert_eq!(
-                schema(input.clone()).reject_unknown_options(&input),
-                Err(SchemaError::UnknownOption {
-                    field: field.into(),
-                    option: option.into()
-                })
+                schema(input.clone())
+                    .reject_unknown_options(&input)
+                    .unwrap_err()
+                    .to_string(),
+                format!("{field}: unknown option `{option}`")
             );
         }
+        // A null is skipped only where the key is known.
+        let typo =
+            json!({"slug": "posts", "fields": [], "versions": {"drafts": true, "typo": null}});
+        assert_eq!(
+            schema(typo.clone())
+                .reject_unknown_options(&typo)
+                .unwrap_err()
+                .to_string(),
+            "versions: unknown option `typo`"
+        );
+        let null = json!({"slug": "posts", "fields": [], "versions": {"drafts": null}});
+        assert_eq!(schema(null.clone()).reject_unknown_options(&null), Ok(()));
+
+        // `true` is versions with the defaults, `false` none.
+        let on = json!({"slug": "posts", "fields": [], "versions": true});
+        let s = schema(on.clone());
+        assert_eq!(
+            s.versions,
+            Some(Versions {
+                drafts: None,
+                max_versions: 100
+            })
+        );
+        assert_eq!(s.reject_unknown_options(&on), Ok(()));
+        assert_eq!(schema(serde_json::to_value(&s).unwrap()), s);
+        let off = json!({"slug": "posts", "fields": [], "versions": false});
+        let s = schema(off.clone());
+        assert!(!s.versioned());
+        assert_eq!(s.reject_unknown_options(&off), Ok(()));
+        assert_eq!(schema(serde_json::to_value(&s).unwrap()), s);
     }
 }

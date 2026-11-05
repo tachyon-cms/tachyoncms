@@ -623,15 +623,11 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
         return true;
     };
     let rule = match action {
-        Action::Read => &a.read,
+        // A field hidden from readers stays hidden in drafts and past versions.
+        Action::Read | Action::ReadDrafts | Action::ReadVersions => &a.read,
         Action::Create => &a.create,
         Action::Update | Action::UpdateGlobal => &a.update,
-        Action::Delete
-        | Action::Schemas
-        | Action::Users
-        | Action::ReadDrafts
-        | Action::ReadVersions
-        | Action::Publish => return true,
+        Action::Delete | Action::Schemas | Action::Users | Action::Publish => return true,
     };
     rule.as_ref()
         .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
@@ -2732,5 +2728,19 @@ mod tests {
         let a: CollectionAccess = serde_json::from_value(input.clone()).unwrap();
         assert_eq!(a.publish, Some(Rule::Role(vec!["editor".into()])));
         assert_eq!(serde_json::to_value(&a).unwrap(), input);
+    }
+
+    #[test]
+    fn field_read_rules_cover_drafts_and_versions() {
+        let f: Field = serde_json::from_value(
+            json!({"name": "secret", "type": "text", "access": {"read": {"role": "editor"}}}),
+        )
+        .unwrap();
+        let author = signed_in("author");
+        for action in [Action::Read, Action::ReadDrafts, Action::ReadVersions] {
+            assert!(!field_allows(&f, action, &author), "{action:?}");
+            assert!(field_allows(&f, action, &signed_in("editor")), "{action:?}");
+        }
+        assert!(field_allows(&f, Action::Publish, &author));
     }
 }
