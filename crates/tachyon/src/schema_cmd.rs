@@ -84,6 +84,7 @@ fn changes(p: &Preview) -> String {
             Change::OptionsChanged { path } => format!("update options on {path}"),
             Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::CollectionOptionsChanged => "update collection options".to_owned(),
+            Change::VersionsChanged { .. } => "update versions and drafts".to_owned(),
             Change::VirtualRemoved { path } => format!("remove {path} (it stored nothing)"),
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")

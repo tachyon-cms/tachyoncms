@@ -37,6 +37,11 @@ pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core:
             "access: rules on users aren't enforced yet, so they can't be saved; rules on its fields are".into(),
         ));
     }
+    if schema.versions.is_some() {
+        return Err(SchemaError::InvalidOption(
+            "versions: accounts change through their own routes, so users can't have versions or drafts".into(),
+        ));
+    }
     if let Some(f) = schema
         .data()
         .iter()
@@ -864,4 +869,25 @@ pub async fn rotate_api_key(
     .map_err(crate::map_unique)?;
     tx.commit().await?;
     Ok(Some(new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn users_refuse_versions() {
+        let users = |versions: Value| -> CollectionSchema {
+            serde_json::from_value(json!({"slug": "users", "versions": versions,
+                "fields": [{"name": "name", "type": "text"}]}))
+            .unwrap()
+        };
+        assert_eq!(check_users_schema(&users(Value::Null)), Ok(()));
+        assert_eq!(
+            check_users_schema(&users(json!({"drafts": true})))
+                .unwrap_err()
+                .to_string(),
+            "versions: accounts change through their own routes, so users can't have versions or drafts"
+        );
+    }
 }

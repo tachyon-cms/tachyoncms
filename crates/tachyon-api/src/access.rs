@@ -434,6 +434,9 @@ impl Access {
             Action::Create => a.create.as_ref(),
             Action::Update | Action::UpdateGlobal => a.update.as_ref(),
             Action::Delete => a.delete.as_ref(),
+            Action::ReadDrafts => a.read_drafts.as_ref(),
+            Action::ReadVersions => a.read_versions.as_ref(),
+            Action::Publish => a.publish.as_ref(),
             Action::Schemas | Action::Users => None,
         }
     }

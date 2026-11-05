@@ -3162,14 +3162,14 @@ async fn bad_rules_are_refused_when_saved(pool: PgPool) {
         (
             rule_schema(true, |s| s["access"] = json!({"delete": true})),
             422,
-            "access.delete: globals have only read and update rules",
+            "access.delete: a global is one document that always exists, so it takes no create or delete rule",
         ),
         (
             rule_schema(true, |s| {
                 s["access"] = json!({"create": {"role": "editor"}})
             }),
             422,
-            "access.create: globals have only read and update rules",
+            "access.create: a global is one document that always exists, so it takes no create or delete rule",
         ),
         (
             {

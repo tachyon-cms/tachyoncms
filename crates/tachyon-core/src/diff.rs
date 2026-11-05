@@ -46,6 +46,12 @@ pub enum Change {
     LayoutChanged,
     /// A collection-wide option such as `defaultPopulate` changed; stored data is untouched.
     CollectionOptionsChanged,
+    /// `versions` changed: drafts off or on, and how many versions each document keeps
+    /// (0 when versions are off, as well as when every one is kept; see `versioned`).
+    VersionsChanged {
+        drafts: (bool, bool),
+        max_versions: (u32, u32),
+    },
     /// A virtual field went. It stored nothing, so nothing is lost.
     VirtualRemoved {
         path: String,
@@ -150,6 +156,13 @@ pub fn diff(
         || old.labels != new.labels
     {
         changes.push(Change::CollectionOptionsChanged);
+    }
+    if old.versions != new.versions {
+        let max = |s: &CollectionSchema| s.versions.as_ref().map_or(0, |v| v.max_versions);
+        changes.push(Change::VersionsChanged {
+            drafts: (old.drafts(), new.drafts()),
+            max_versions: (max(old), max(new)),
+        });
     }
     Ok(SchemaDiff { changes, links })
 }
@@ -923,6 +936,53 @@ mod tests {
         let d = diff(&old, &new, &Renames::new()).unwrap();
         assert_eq!(d.changes, vec![Change::CollectionOptionsChanged]);
         assert!(!d.is_destructive());
+    }
+
+    #[test]
+    fn versions_change_is_reported() {
+        let with = |versions: Value| {
+            schema(json!({"slug": "posts", "versions": versions,
+                          "fields": [{"name": "title", "type": "text"}]}))
+        };
+        let changes = |old: Value, new: Value| {
+            diff(&with(old), &with(new), &Renames::new())
+                .unwrap()
+                .changes
+        };
+        assert_eq!(
+            changes(json!(null), json!({"drafts": true})),
+            vec![Change::VersionsChanged {
+                drafts: (false, true),
+                max_versions: (0, 100)
+            }]
+        );
+        assert_eq!(
+            changes(json!({"drafts": true}), json!({"maxVersions": 5})),
+            vec![Change::VersionsChanged {
+                drafts: (true, false),
+                max_versions: (100, 5)
+            }]
+        );
+        assert_eq!(
+            changes(
+                json!({"drafts": true}),
+                json!({"drafts": {"autosave": {"interval": 500}}})
+            ),
+            vec![Change::VersionsChanged {
+                drafts: (true, true),
+                max_versions: (100, 100)
+            }]
+        );
+        assert_eq!(changes(json!({}), json!({"maxVersions": 100})), vec![]);
+        let d = diff(&with(json!(null)), &with(json!({})), &Renames::new()).unwrap();
+        assert!(
+            !d.is_destructive(),
+            "Task 2 decides when pruning needs confirm"
+        );
+        assert_eq!(
+            serde_json::to_value(&d.changes).unwrap(),
+            json!([{"type": "versionsChanged", "drafts": [false, false], "maxVersions": [0, 100]}])
+        );
     }
 
     #[test]

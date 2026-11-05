@@ -33,6 +33,10 @@ pub struct CollectionSchema {
     /// rendered rich text points at. `{field}` is a top-level text or slug field's value.
     #[serde(default)]
     pub url: Option<String>,
+    /// Keep past versions of each document, and with `drafts`, a working copy apart from
+    /// the published one.
+    #[serde(default)]
+    pub versions: Option<Versions>,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -49,6 +53,7 @@ impl PartialEq for CollectionSchema {
             &self.access,
             &self.labels,
             &self.url,
+            &self.versions,
         ) == (
             &other.slug,
             other.kind,
@@ -57,7 +62,63 @@ impl PartialEq for CollectionSchema {
             &other.access,
             &other.labels,
             &other.url,
+            &other.versions,
         )
+    }
+}
+
+/// `versions` on a collection or global: `{"drafts": true, "maxVersions": 100}`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Versions {
+    /// `true`, `false` or `{"autosave": {"interval": 2000}}`; written back the same way.
+    #[serde(default, with = "drafts_flag")]
+    pub drafts: Option<Drafts>,
+    /// How many versions each document keeps, oldest dropped first; 0 keeps every one.
+    #[serde(default = "default_max_versions")]
+    pub max_versions: u32,
+}
+
+fn default_max_versions() -> u32 {
+    100
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct Drafts {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub autosave: Option<Autosave>,
+}
+
+/// How often the admin saves a draft while someone types.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct Autosave {
+    /// Milliseconds, 100 to 600000.
+    pub interval: u32,
+}
+
+/// `drafts` as a flag, or as options that mean on.
+mod drafts_flag {
+    use super::Drafts;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use serde_json::Value;
+
+    pub fn serialize<S: Serializer>(d: &Option<Drafts>, s: S) -> Result<S::Ok, S::Error> {
+        match d {
+            None => s.serialize_bool(false),
+            Some(Drafts { autosave: None }) => s.serialize_bool(true),
+            Some(d) => d.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Drafts>, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Null | Value::Bool(false) => Ok(None),
+            Value::Bool(true) => Ok(Some(Drafts::default())),
+            v @ Value::Object(_) => Drafts::deserialize(v).map(Some).map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "drafts is true, false or {\"autosave\": {\"interval\": 2000}}",
+            )),
+        }
     }
 }
 
@@ -1102,6 +1163,16 @@ impl Field {
 }
 
 impl CollectionSchema {
+    /// Documents keep a draft apart from their published copy.
+    pub fn drafts(&self) -> bool {
+        self.versions.as_ref().is_some_and(|v| v.drafts.is_some())
+    }
+
+    /// Documents keep past versions.
+    pub fn versioned(&self) -> bool {
+        self.versions.is_some()
+    }
+
     /// The data shape (see `data_fields`), worked out once per schema.
     pub fn data(&self) -> &[Field] {
         self.data
@@ -1118,6 +1189,7 @@ impl CollectionSchema {
             access: self.access.clone(),
             labels: self.labels.clone(),
             url: self.url.clone(),
+            versions: self.versions.clone(),
             data: OnceLock::new(),
         }
     }
@@ -1402,6 +1474,11 @@ impl CollectionSchema {
         }
         let data = self.data();
         if self.kind == CollectionKind::Block {
+            if self.versions.is_some() {
+                return Err(SchemaError::InvalidOption(
+                    "versions: a shared block has no documents, so it has no versions".into(),
+                ));
+            }
             if self.access.is_some() {
                 return Err(SchemaError::InvalidOption(
                     "access: a shared block has no documents, so it takes no access rules; put rules on its fields".into(),
@@ -1442,6 +1519,14 @@ impl CollectionSchema {
         }
         if let Some(url) = &self.url {
             self.check_url(url)?;
+        }
+        if let Some(Drafts { autosave: Some(a) }) =
+            self.versions.as_ref().and_then(|v| v.drafts.as_ref())
+            && !(100..=600_000).contains(&a.interval)
+        {
+            return Err(SchemaError::InvalidOption(
+                "versions.drafts.autosave.interval: must be from 100 to 600000 milliseconds".into(),
+            ));
         }
         Ok(())
     }
@@ -1583,6 +1668,9 @@ impl CollectionSchema {
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
         let known = serde_json::to_value(self).expect("schemas always serialize");
         unknown_key(input, &known, "")?;
+        if let Some(v) = input.get("versions") {
+            unknown_deep(v, &known["versions"], "versions")?;
+        }
         unknown_in_fields(&self.fields, input.get("fields"), "fields")
     }
 }
@@ -1595,6 +1683,24 @@ fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaEr
             field: field.into(),
             option: option.clone(),
         });
+    }
+    Ok(())
+}
+
+/// `unknown_key` at every depth. Where `known` holds a flag for an object given as input
+/// (`"drafts": true` for `{}`), that object's keys are all unknown.
+fn unknown_deep(input: &Value, known: &Value, field: &str) -> Result<(), SchemaError> {
+    let Value::Object(input) = input else {
+        return Ok(());
+    };
+    for (k, v) in input.iter().filter(|(_, v)| !v.is_null()) {
+        let Some(known) = known.get(k) else {
+            return Err(SchemaError::UnknownOption {
+                field: field.into(),
+                option: k.clone(),
+            });
+        };
+        unknown_deep(v, known, &format!("{field}.{k}"))?;
     }
     Ok(())
 }
@@ -3733,5 +3839,84 @@ mod tests {
             deep.check().unwrap_err().to_string(),
             "field `author`: maxDepth can be at most 5"
         );
+    }
+
+    #[test]
+    fn versions_option_parses_and_round_trips() {
+        let on = json!({"slug": "posts", "versions": {"drafts": true}, "fields": []});
+        let s = schema(on.clone());
+        assert_eq!(
+            s.versions,
+            Some(Versions {
+                drafts: Some(Drafts { autosave: None }),
+                max_versions: 100
+            })
+        );
+        assert!(s.drafts() && s.versioned());
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&on), Ok(()));
+        assert_eq!(
+            serde_json::to_value(&s).unwrap()["versions"]["drafts"],
+            json!(true)
+        );
+
+        let auto = json!({"slug": "posts", "fields": [], "versions":
+            {"drafts": {"autosave": {"interval": 2000}}, "maxVersions": 0}});
+        let s = schema(auto.clone());
+        assert_eq!(
+            s.versions,
+            Some(Versions {
+                drafts: Some(Drafts {
+                    autosave: Some(Autosave { interval: 2000 })
+                }),
+                max_versions: 0
+            })
+        );
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(s.reject_unknown_options(&auto), Ok(()));
+        let again: CollectionSchema =
+            serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
+        assert_eq!(again, s);
+        assert_eq!(schema(s.to_compact_json()), s);
+
+        let plain = schema(json!({"slug": "posts", "versions": {"drafts": false}, "fields": []}));
+        assert!(plain.versioned() && !plain.drafts());
+        assert!(!schema(json!({"slug": "posts", "fields": []})).versioned());
+        assert_ne!(plain, schema(json!({"slug": "posts", "fields": []})));
+
+        for interval in [99, 600_001] {
+            let bad = schema(json!({"slug": "posts", "fields": [], "versions":
+                {"drafts": {"autosave": {"interval": interval}}}}));
+            assert_eq!(
+                bad.check().unwrap_err().to_string(),
+                "versions.drafts.autosave.interval: must be from 100 to 600000 milliseconds"
+            );
+        }
+        for (input, field, option) in [
+            (
+                json!({"drafts": true, "maxVersion": 5}),
+                "versions",
+                "maxVersion",
+            ),
+            (
+                json!({"drafts": {"autosav": {}}}),
+                "versions.drafts",
+                "autosav",
+            ),
+            (
+                json!({"drafts": {"autosave": {"interval": 500, "x": 1}}}),
+                "versions.drafts.autosave",
+                "x",
+            ),
+        ] {
+            let input = json!({"slug": "posts", "fields": [], "versions": input});
+            assert_eq!(
+                schema(input.clone()).reject_unknown_options(&input),
+                Err(SchemaError::UnknownOption {
+                    field: field.into(),
+                    option: option.into()
+                })
+            );
+        }
     }
 }

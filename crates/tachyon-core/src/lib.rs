@@ -12,9 +12,9 @@ pub mod validate;
 pub mod virtuals;
 
 pub use schema::{
-    Admin, BlockDef, BlockSource, CollectionKind, CollectionSchema, Condition, ConditionTest,
-    Field, FieldKind, Labels, Position, RelationTo, SchemaError, SelectOption, Tab, data_fields,
-    explain_parse_error,
+    Admin, Autosave, BlockDef, BlockSource, CollectionKind, CollectionSchema, Condition,
+    ConditionTest, Drafts, Field, FieldKind, Labels, Position, RelationTo, SchemaError,
+    SelectOption, Tab, Versions, data_fields, explain_parse_error,
 };
 pub use validate::{
     FieldError, RelationRef, defaults, is_email, map_relations, merged, normalize_date_time,
