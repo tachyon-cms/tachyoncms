@@ -424,14 +424,41 @@ pub(crate) fn list_params(
     c: &Collection,
     access: &Access,
 ) -> Result<ListParams, ApiError> {
-    let schemas = access.schemas();
-    let params = params(
+    list_params_of(
         raw,
+        c,
+        access,
         &[
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
             "joins", "format", "draft",
         ],
-    )?;
+    )
+}
+
+/// `list_params` for the trash, which reads at depth 0 and pages by number:
+/// `limit`, `page`, `where`, `sort` and `select` only.
+pub(crate) fn trash_params(
+    raw: Option<&str>,
+    c: &Collection,
+    access: &Access,
+) -> Result<ListParams, ApiError> {
+    list_params_of(
+        raw,
+        c,
+        access,
+        &["limit", "page", "where", "sort", "select"],
+    )
+}
+
+/// `list_params`, taking only the parameters in `allowed`.
+fn list_params_of(
+    raw: Option<&str>,
+    c: &Collection,
+    access: &Access,
+    allowed: &[&str],
+) -> Result<ListParams, ApiError> {
+    let schemas = access.schemas();
+    let params = params(raw, allowed)?;
     draft(&params, c, access)?;
     let fields = c.schema.data();
 

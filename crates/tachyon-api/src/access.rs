@@ -905,6 +905,33 @@ impl Access {
         }
     }
 
+    /// How the caller reaches `c`'s trash, where everything takes `delete` (plan call 9):
+    /// the copy a delete judges (the draft, with drafts, which makes the request one that
+    /// works on drafts), the read filter (and `readDrafts`) with the delete filter, and
+    /// only what they created when either right is own-only. The trash shows a document
+    /// only this way, so one it doesn't reach is a 404.
+    pub(crate) fn trash_readable(&self, c: &Collection) -> Result<Readable, ApiError> {
+        self.may_write(Action::Delete, c)?;
+        let (read, delete) = self
+            .write_rules(Action::Delete, c)
+            .map_err(|_| self.refuse())?;
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            // `may_write` refused a drafts collection whose drafts they can't read.
+            None => Readable::published(read),
+        };
+        self.write_copy(c)?;
+        let owner = match self.own_only(Action::Delete, c) {
+            true => Some(self.user_id().ok_or_else(|| self.refuse())?),
+            false => read.owner,
+        };
+        Ok(Readable {
+            filter: both(read.filter, delete),
+            owner,
+            ..read
+        })
+    }
+
     /// What publishing or unpublishing document `id` of `c` runs under, judged on its draft
     /// once locked: the read, `readDrafts` and `publish` rules, and the creator for an
     /// own-only `readDrafts`. A key needs only the `:publish` scope (Ruling T1-2): its

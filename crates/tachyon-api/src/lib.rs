@@ -13,6 +13,7 @@ mod populate;
 mod request_id;
 mod schedule;
 mod schemas;
+mod trash;
 mod versions;
 
 use std::sync::Arc;
@@ -24,7 +25,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -131,6 +132,12 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/{collection}",
             get(documents::list).post(documents::create),
         )
+        .route(
+            "/api/{collection}/trash",
+            get(trash::list).delete(trash::empty),
+        )
+        .route("/api/{collection}/trash/{id}", delete(trash::purge))
+        .route("/api/{collection}/trash/{id}/restore", post(trash::restore))
         .route(
             "/api/{collection}/{id}",
             get(documents::get)

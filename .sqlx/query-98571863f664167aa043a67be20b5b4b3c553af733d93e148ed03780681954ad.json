@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE documents\n           SET published = NULL, status = 'draft', published_at = NULL,\n               updated_at = now(), updated_by = COALESCE($4, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at,\n                     draft AS \"data!: Json<Map<String, Value>>\"",
+  "query": "UPDATE documents\n           SET published = NULL, status = 'draft', published_at = NULL,\n               updated_at = now(), updated_by = COALESCE($4, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at, deleted_at,\n                     draft AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -84,8 +95,9 @@
       false,
       false,
       true,
+      true,
       true
     ]
   },
-  "hash": "9bef1827a8f45f926a9c52eb47ab591844c2eb96f100c615fdb87669c1e3755f"
+  "hash": "98571863f664167aa043a67be20b5b4b3c553af733d93e148ed03780681954ad"
 }

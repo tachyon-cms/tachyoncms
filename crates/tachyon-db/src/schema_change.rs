@@ -867,8 +867,8 @@ async fn seed_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(),
 }
 
 /// Pass 2 for one part: rewrites both copies of every document, deleted ones included so
-/// Trash restores cleanly, and every version, then builds its new unique indexes. Returns
-/// a unique field whose index found duplicate values.
+/// a restore starts from the new fields, and every version, then builds its new unique
+/// indexes. Returns a unique field whose index found duplicate values.
 async fn rewrite(
     conn: &mut PgConnection,
     part: &Part,
@@ -894,7 +894,7 @@ async fn rewrite(
                 .execute(&mut *conn)
                 .await?;
             }
-            // Deleted documents keep their old link rows; they re-sync when restored and saved (M4).
+            // Trashed documents keep their old link rows; a restore re-syncs both copies.
             if row.live {
                 for (copy, data) in [(DocCopy::Published, &published), (DocCopy::Draft, &draft)] {
                     // Without drafts there are no draft rows to clear: skip the DELETE.

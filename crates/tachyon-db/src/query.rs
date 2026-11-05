@@ -617,21 +617,23 @@ fn order_by_in(base: &Base, sort: Option<&Sort>) -> String {
     }
 }
 
-/// Where one collection's live documents are read in `copy`, by `owner` when given, and
-/// matching `filter`.
+/// Where one collection's live documents (its trashed ones, with `trashed`) are read in
+/// `copy`, by `owner` when given, and matching `filter`.
 struct Scope<'a> {
     collection_id: Uuid,
     copy: DocCopy,
     owner: Option<Uuid>,
     filter: Option<&'a Filter>,
+    trashed: bool,
 }
 
 fn push_where(qb: &mut QueryBuilder<Postgres>, s: &Scope<'_>) {
     qb.push(" WHERE tenant_id = ").push_bind(DEFAULT_TENANT);
     // A literal (not a bind) so the planner can match per-collection partial indexes.
     qb.push(format!(
-        " AND collection_id = '{}' AND deleted_at IS NULL",
-        s.collection_id
+        " AND collection_id = '{}' AND deleted_at IS {}NULL",
+        s.collection_id,
+        if s.trashed { "NOT " } else { "" }
     ));
     push_copy(qb, "", s.copy, s.owner);
     if let Some(f) = s.filter {
@@ -641,6 +643,28 @@ fn push_where(qb: &mut QueryBuilder<Postgres>, s: &Scope<'_>) {
 }
 
 pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Result<Page, DbError> {
+    list_from(pool, collection_id, q, false).await
+}
+
+/// `list`, of the collection's trash: most recently deleted first unless `q` sorts, each
+/// with its `deleted_at`. It pages by number only.
+pub async fn list_trash(
+    pool: &PgPool,
+    collection_id: Uuid,
+    q: &ListQuery<'_>,
+) -> Result<Page, DbError> {
+    if q.after.is_some() {
+        return Err(DbError::InvalidQuery("the trash pages by number only"));
+    }
+    list_from(pool, collection_id, q, true).await
+}
+
+async fn list_from(
+    pool: &PgPool,
+    collection_id: Uuid,
+    q: &ListQuery<'_>,
+    trashed: bool,
+) -> Result<Page, DbError> {
     let (sort_expr, descending) = match q.sort {
         Some(s) => (expr(q.copy, &s.target), s.descending),
         None => ("id".to_owned(), true),
@@ -664,9 +688,11 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         copy: q.copy,
         owner: q.owner,
         filter: q.filter,
+        trashed,
     };
     let mut qb = QueryBuilder::<Postgres>::new(format!(
-        "SELECT id, status, created_at, updated_at, {PUBLISHED_AT}, {} AS data FROM documents",
+        "SELECT id, status, created_at, updated_at, {PUBLISHED_AT}, deleted_at, {} AS data \
+         FROM documents",
         q.copy.as_str()
     ));
     push_where(&mut qb, &scope);
@@ -679,6 +705,9 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
             qb.push(" ORDER BY ");
             push_distance(&mut qb, q.copy.as_str(), path, lng, lat);
             qb.push(" ASC NULLS LAST, id DESC LIMIT ");
+        }
+        None if trashed && q.sort.is_none() => {
+            qb.push(" ORDER BY deleted_at DESC, id DESC LIMIT ");
         }
         None => {
             qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.copy, q.sort)));
@@ -977,6 +1006,36 @@ pub(crate) async fn matches(
     push_filter(&mut qb, copy, filter);
     qb.push(")");
     Ok(qb.build_query_scalar().fetch_one(conn).await?)
+}
+
+/// Locks the trashed documents of `collection_id` that `read` reaches (its copy, owner and
+/// filter; no fallback), or only `id` among them, for a restore or a purge inside `conn`'s
+/// transaction, and returns their IDs. The collection is locked first, as every write
+/// locks it, and must still be at `schema_version`.
+pub async fn lock_trash_in(
+    conn: &mut sqlx::PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+    read: &Readable,
+    id: Option<Uuid>,
+) -> Result<Vec<Uuid>, DbError> {
+    crate::documents::check_schema(&mut *conn, collection_id, schema_version).await?;
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT id FROM documents");
+    push_where(
+        &mut qb,
+        &Scope {
+            collection_id,
+            copy: read.copy,
+            owner: read.owner,
+            filter: read.filter.as_ref(),
+            trashed: true,
+        },
+    );
+    if let Some(id) = id {
+        qb.push(" AND id = ").push_bind(id);
+    }
+    qb.push(" ORDER BY id FOR UPDATE");
+    Ok(qb.build_query_scalar().fetch_all(conn).await?)
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.

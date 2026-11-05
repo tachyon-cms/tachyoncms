@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM documents\n         WHERE tenant_id = $1 AND collection_id = $2 AND id = ANY($3) AND deleted_at IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "f3a0dc98dd969d30c01320f479e0cfcaf9c8a589c937da35dddf65f3f4b3c22e"
+}

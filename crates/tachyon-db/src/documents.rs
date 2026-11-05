@@ -31,6 +31,13 @@ pub struct Document {
         skip_serializing_if = "Option::is_none"
     )]
     pub published_at: Option<OffsetDateTime>,
+    /// When it went to the trash; only trash listings read it, so it's `None` elsewhere.
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    #[sqlx(default)]
+    pub deleted_at: Option<OffsetDateTime>,
     #[serde(flatten)]
     pub data: Json<Map<String, Value>>,
 }
@@ -133,7 +140,7 @@ pub async fn insert_in(
                    CASE WHEN $6 THEN NULL ELSE $4::jsonb END, CASE WHEN $6 THEN $4::jsonb END,
                    CASE WHEN $6 THEN NULL ELSE now() END, $5, $5)
            RETURNING id, status, created_at, updated_at,
-                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
+                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
                      CASE WHEN $6 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>""#,
         id.unwrap_or_else(Uuid::now_v7),
         DEFAULT_TENANT,
@@ -151,7 +158,7 @@ pub async fn insert_in(
 
 /// Locks the collection row for the rest of the transaction (shared with other writers,
 /// exclusive with schema changes) and confirms nobody changed its fields meanwhile.
-async fn check_schema(
+pub(crate) async fn check_schema(
     conn: &mut PgConnection,
     collection_id: Uuid,
     schema_version: i32,
@@ -180,7 +187,7 @@ pub async fn get(
     sqlx::query_as!(
         Document,
         r#"SELECT id, status, created_at, updated_at,
-                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
+                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
                   CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
@@ -219,6 +226,7 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document
                 created_at: r.created_at,
                 updated_at: r.updated_at,
                 published_at: r.published_at,
+                deleted_at: None,
                 data: r.data,
             };
             (r.collection_id, doc)
@@ -313,7 +321,7 @@ pub async fn update_in<E: From<DbError>>(
                updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
            RETURNING id, status, created_at, updated_at,
-                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
+                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
                      CASE WHEN $6 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         collection_id,
@@ -386,7 +394,7 @@ pub async fn publish_in(
                published_at = now(), updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND draft IS NOT NULL
-           RETURNING id, status, created_at, updated_at, published_at,
+           RETURNING id, status, created_at, updated_at, published_at, deleted_at,
                      published AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         c.id,
@@ -452,7 +460,7 @@ pub async fn unpublish_in(
                updated_at = now(), updated_by = COALESCE($4, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND draft IS NOT NULL
-           RETURNING id, status, created_at, updated_at, published_at,
+           RETURNING id, status, created_at, updated_at, published_at, deleted_at,
                      draft AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         c.id,
@@ -471,7 +479,8 @@ pub async fn unpublish_in(
     Ok(draft)
 }
 
-/// Soft delete. Refused while other live documents link here. Restoring from Trash arrives in M4.
+/// Soft delete, to the trash (`restore_in`, `purge_in`). Refused while other live
+/// documents link here.
 pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), DbError> {
     delete_as(pool, collection_id, id, None, None, DocCopy::Published).await
 }
@@ -533,6 +542,108 @@ pub async fn delete_as(
     }
     tx.commit().await?;
     Ok(())
+}
+
+/// Both stored copies of trashed document `id` of `collection_id`, the draft then the
+/// published copy. The caller has locked it (`query::lock_trash_in`).
+pub async fn trashed_in(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+    id: Uuid,
+) -> Result<(Option<Map<String, Value>>, Option<Map<String, Value>>), DbError> {
+    let row = sqlx::query!(
+        r#"SELECT draft AS "draft: Json<Map<String, Value>>",
+                  published AS "published: Json<Map<String, Value>>"
+           FROM documents
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NOT NULL"#,
+        DEFAULT_TENANT,
+        collection_id,
+        id,
+    )
+    .fetch_optional(&mut *conn)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    Ok((row.draft.map(|d| d.0), row.published.map(|d| d.0)))
+}
+
+/// Takes trashed document `id` of `c` out of the trash inside `tx`: each of `prepared`,
+/// validated against the current schema, replaces its copy and re-syncs that copy's links,
+/// so a link to a document that's gone or in the trash is a `Validation` error at its path.
+/// A unique clash with a live document is a `UniqueViolation`. The caller has locked it
+/// (`query::lock_trash_in`) and passes every copy it has. Returns the copy a write to `c`
+/// changes: the draft, with drafts.
+pub async fn restore_in(
+    tx: &mut PgConnection,
+    c: &Collection,
+    id: Uuid,
+    prepared: &[(DocCopy, Prepared)],
+    by: Option<Uuid>,
+) -> Result<Document, DbError> {
+    let data = |copy| {
+        prepared
+            .iter()
+            .find(|(c, _)| *c == copy)
+            .map(|(_, p)| Json(&p.data))
+    };
+    let doc = sqlx::query_as!(
+        Document,
+        r#"UPDATE documents
+           SET published = COALESCE($4::jsonb, published), draft = COALESCE($5::jsonb, draft),
+               deleted_at = NULL, updated_by = COALESCE($6, updated_by)
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NOT NULL
+           RETURNING id, status, created_at, updated_at,
+                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
+                     CASE WHEN $7 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>""#,
+        DEFAULT_TENANT,
+        c.id,
+        id,
+        data(DocCopy::Published) as _,
+        data(DocCopy::Draft) as _,
+        by,
+        c.schema.drafts(),
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_unique)?
+    .ok_or(DbError::NotFound)?;
+    for (copy, p) in prepared {
+        sync_relations(&mut *tx, id, *copy, &p.relations).await?;
+    }
+    Ok(doc)
+}
+
+/// Deletes the trashed documents of `collection_id` among `ids` for good inside `tx`,
+/// with their versions and jobs, and returns how many went. Links to them from other
+/// trashed documents go first; a restore of those then says the link's target is gone.
+/// The caller has locked them (`query::lock_trash_in`).
+pub async fn purge_in(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    ids: &[Uuid],
+) -> Result<u64, DbError> {
+    // Only trashed documents' links: a live one can't link here (`sync_relations` refuses
+    // a trashed target), and if one somehow did, its link's foreign key stops the purge.
+    sqlx::query!(
+        "DELETE FROM relations r USING documents d, documents f
+         WHERE r.to_doc = d.id AND d.tenant_id = $1 AND d.collection_id = $2
+           AND d.id = ANY($3) AND d.deleted_at IS NOT NULL
+           AND f.id = r.from_doc AND f.deleted_at IS NOT NULL",
+        DEFAULT_TENANT,
+        collection_id,
+        ids,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(sqlx::query!(
+        "DELETE FROM documents
+         WHERE tenant_id = $1 AND collection_id = $2 AND id = ANY($3) AND deleted_at IS NOT NULL",
+        DEFAULT_TENANT,
+        collection_id,
+        ids,
+    )
+    .execute(&mut *tx)
+    .await?
+    .rows_affected())
 }
 
 /// Refuses the write unless the locked document's `copy` matches `guard`.

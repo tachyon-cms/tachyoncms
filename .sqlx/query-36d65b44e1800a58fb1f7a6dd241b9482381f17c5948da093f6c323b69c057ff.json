@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, status, created_at, updated_at,\n                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,\n                  CASE WHEN $4 THEN draft ELSE published END AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND CASE WHEN $4 THEN draft IS NOT NULL ELSE published IS NOT NULL END",
+  "query": "UPDATE documents\n           SET published = COALESCE($4::jsonb, draft), status = 'published',\n               published_at = now(), updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at, deleted_at,\n                     published AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -51,13 +51,34 @@
         "ordinal": 4,
         "name": "published_at",
         "type_info": "Timestamptz",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_at"
+          }
+        }
       },
       {
         "ordinal": 5,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published"
+          }
+        }
       }
     ],
     "parameters": {
@@ -65,7 +86,8 @@
         "Uuid",
         "Uuid",
         "Uuid",
-        "Bool"
+        "Jsonb",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -73,9 +95,10 @@
       false,
       false,
       false,
-      null,
-      null
+      true,
+      true,
+      true
     ]
   },
-  "hash": "fe52356c3c894fa20bd07f0183741c7db2d3e58367010cad9f838b9d85814bb4"
+  "hash": "36d65b44e1800a58fb1f7a6dd241b9482381f17c5948da093f6c323b69c057ff"
 }
