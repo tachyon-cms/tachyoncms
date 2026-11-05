@@ -140,7 +140,19 @@ fn web_url(text: &str) -> Option<url::Url> {
 /// One that has them would never match a request's `Origin`, so writes from that site would be
 /// refused.
 fn check_origin(origin: &str) -> Result<(), String> {
-    let ok = web_url(origin).is_some_and(|u| {
+    let url = web_url(origin);
+    // url accepts `*` in a host, but origins are matched exactly, so `https://*.example.com`
+    // would match nothing rather than every subdomain.
+    if url
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .is_some_and(|h| h.contains('*'))
+    {
+        return Err(format!(
+            "auth.allowed_origins: `{origin}` uses a wildcard, which isn't supported; list each origin, like https://www.example.com"
+        ));
+    }
+    let ok = url.is_some_and(|u| {
         u.username().is_empty()
             && u.password().is_none()
             && u.path() == "/"
@@ -364,6 +376,21 @@ mod tests {
                     "auth.allowed_origins: `{bad}` isn't an origin; use a scheme and host, like https://www.example.com"
                 ),
                 "{bad}"
+            );
+        }
+        for wildcard in [
+            "https://*.example.com",
+            "https://www.*.com",
+            "http://*:8080",
+        ] {
+            assert_eq!(
+                load(&format!("[auth]\nallowed_origins = [\"{wildcard}\"]"))
+                    .auth_config()
+                    .unwrap_err(),
+                format!(
+                    "auth.allowed_origins: `{wildcard}` uses a wildcard, which isn't supported; list each origin, like https://www.example.com"
+                ),
+                "{wildcard}"
             );
         }
         let ok = load(
