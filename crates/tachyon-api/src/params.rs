@@ -152,6 +152,33 @@ pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())
 }
 
+/// `?limit&page` for a list without filters, such as a document's versions.
+pub(crate) fn page_params(raw: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let params = params(raw, &["limit", "page"])?;
+    let limit = number(&params, "limit")?.unwrap_or(DEFAULT_LIMIT);
+    if limit < 1 {
+        return Err(bad("limit must be at least 1"));
+    }
+    let page = number(&params, "page")?.unwrap_or(1);
+    if page < 1 {
+        return Err(bad("page must be at least 1"));
+    }
+    Ok((limit.min(MAX_LIMIT), page))
+}
+
+/// `?from&to` for a diff, both required.
+pub(crate) fn diff_params(raw: Option<&str>) -> Result<(String, String), ApiError> {
+    let params = params(raw, &["from", "to"])?;
+    let side = |name: &str| {
+        single(&params, name)?.map(str::to_owned).ok_or_else(|| {
+            bad(format!(
+                "`{name}` is required: a version ID, `draft` or `published`"
+            ))
+        })
+    };
+    Ok((side("from")?, side("to")?))
+}
+
 /// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
 /// that turns autosave on.
 pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {

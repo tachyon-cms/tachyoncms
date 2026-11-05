@@ -25,7 +25,7 @@ use crate::populate::{
 };
 use crate::{ApiError, AppState};
 
-fn global(
+pub(crate) fn global(
     state: &AppState,
     path: Result<Path<String>, PathRejection>,
 ) -> Result<Arc<Collection>, ApiError> {
@@ -37,7 +37,7 @@ fn global(
         .ok_or(ApiError::NotFound)
 }
 
-async fn respond(
+pub(crate) async fn respond(
     state: &AppState,
     access: &Access,
     c: Arc<Collection>,

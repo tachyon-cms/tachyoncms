@@ -11,6 +11,7 @@ mod params;
 mod populate;
 mod request_id;
 mod schemas;
+mod versions;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -96,6 +97,24 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             get(globals::get).patch(globals::update),
         )
         .route(
+            "/api/globals/{slug}/publish",
+            post(versions::publish_global),
+        )
+        .route(
+            "/api/globals/{slug}/unpublish",
+            post(versions::unpublish_global),
+        )
+        .route("/api/globals/{slug}/versions", get(versions::list_global))
+        .route(
+            "/api/globals/{slug}/versions/{vid}",
+            get(versions::get_global),
+        )
+        .route(
+            "/api/globals/{slug}/versions/{vid}/restore",
+            post(versions::restore_global),
+        )
+        .route("/api/globals/{slug}/diff", get(versions::diff_global))
+        .route(
             "/api/{collection}",
             get(documents::list).post(documents::create),
         )
@@ -109,6 +128,18 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/{collection}/{id}/references",
             get(documents::references),
         )
+        .route("/api/{collection}/{id}/publish", post(versions::publish))
+        .route(
+            "/api/{collection}/{id}/unpublish",
+            post(versions::unpublish),
+        )
+        .route("/api/{collection}/{id}/versions", get(versions::list))
+        .route("/api/{collection}/{id}/versions/{vid}", get(versions::get))
+        .route(
+            "/api/{collection}/{id}/versions/{vid}/restore",
+            post(versions::restore),
+        )
+        .route("/api/{collection}/{id}/diff", get(versions::diff))
         .merge(auth::routes())
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed });
     let state = AppState {

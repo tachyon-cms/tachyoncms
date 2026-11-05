@@ -275,6 +275,33 @@ pub(crate) async fn check_links(
     Ok(vouched)
 }
 
+/// Refuses every link in `next`, about to be published, to a document with no published
+/// copy the caller may read: a draft may link to drafts, what's published may not. A
+/// hidden target and a missing one get the same error.
+pub(crate) async fn published_links(
+    state: &AppState,
+    access: &Access,
+    next: &Prepared,
+) -> Result<(), ApiError> {
+    let mut ids: Vec<Uuid> = next.relations.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Any existing user may be linked, as `check_links` explains.
+    let mut linkable = access.publishable();
+    if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
+        linkable.insert(users.id, Readable::published(None));
+    }
+    let vouched = get_many_readable(&state.pool, &ids, &linkable)
+        .await?
+        .into_iter()
+        .map(|(collection_id, doc)| (doc.id, collection_id))
+        .collect();
+    vouched_links(next, &[], &vouched)
+}
+
 /// `check_links`' answer applied to the document as locked for the write: a link added
 /// since the check (relative to `before`) that it didn't vouch for is refused the same way.
 pub(crate) fn vouched_links(

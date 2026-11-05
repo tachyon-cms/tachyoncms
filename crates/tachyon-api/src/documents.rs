@@ -95,7 +95,7 @@ pub(crate) async fn record(
 }
 
 /// A malformed ID can't match any document, so it's a 404 rather than a 400.
-fn parse_id(id: &str) -> Result<Uuid, ApiError> {
+pub(crate) fn parse_id(id: &str) -> Result<Uuid, ApiError> {
     id.parse().map_err(|_| ApiError::NotFound)
 }
 
@@ -200,7 +200,7 @@ pub(crate) fn shaped(mut value: Value, select: Option<&Select>) -> Value {
 /// The document just written, as the `copy` written, in JSON with its relationships
 /// populated to `depth` as far as the caller may read them; only its ID when they can't
 /// read that copy.
-async fn respond(
+pub(crate) async fn respond(
     state: &AppState,
     access: &Access,
     c: Arc<Collection>,
