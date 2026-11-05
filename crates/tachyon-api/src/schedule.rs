@@ -173,8 +173,9 @@ async fn put_schedule(
         access.scope(Action::Publish, &c.schema.slug)?;
     }
     no_params(raw.as_deref())?;
-    let (publish, unpublish) = sides(&json_body(body)?)?;
+    // Rights before the body, so a caller who may not schedule hears that first.
     let guard = access.publish_guard(&state.pool, c, d.id).await?;
+    let (publish, unpublish) = sides(&json_body(body)?)?;
     let targets = link_targets(state, c).await?;
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     // Locked as a publish locks it, so the rights are judged on the draft snapshotted, and
@@ -229,11 +230,14 @@ async fn get_schedule(
         .can_read(&state.pool, c, d.id, DocCopy::Draft)
         .await?
     {
-        // A global's existence isn't secret; one never saved has nothing scheduled.
+        // A global's existence isn't secret, so one a rule limits is refused, saved or not,
+        // as its history is; only a never-saved one nothing limits is missing.
+        let limited = access.readable_of(c).is_some_and(|r| r.filter.is_some());
         let known = d.global()
-            && documents::get(&state.pool, c.id, d.id, DocCopy::Draft)
-                .await
-                .is_ok();
+            && (limited
+                || documents::get(&state.pool, c.id, d.id, DocCopy::Draft)
+                    .await
+                    .is_ok());
         return Err(match known {
             true => access.refuse(),
             false => ApiError::NotFound,
@@ -301,8 +305,21 @@ fn db(e: DbError) -> JobError {
     }
 }
 
-/// Why the scheduler's rights refuse the run now.
+/// `db`, for what publishing ran into: a unique clash says which field.
+fn published(c: &Collection, e: DbError) -> JobError {
+    match e {
+        DbError::UniqueViolation(_) => why(unique_error(c, e.into())),
+        e => db(e),
+    }
+}
+
+/// Why the scheduler's rights refuse the run now. The run has seen the document is there,
+/// so a 404 means they can no longer read it.
 fn refused(e: ApiError) -> JobError {
+    let e = match e {
+        ApiError::NotFound => ApiError::Forbidden("they can no longer read it".into()),
+        e => e,
+    };
     match why(e) {
         JobError::Permanent(d) => {
             JobError::Permanent(format!("whoever scheduled it can't publish it now: {d}"))
@@ -422,7 +439,7 @@ pub(crate) async fn run(state: &AppState, job: &Job) -> Result<(), JobError> {
         Some(p) => documents::publish_in(&mut tx, &c, id, Some(p), Some(user))
             .await
             .map(drop)
-            .map_err(|e| why(unique_error(&c, e.into())))?,
+            .map_err(|e| published(&c, e))?,
         None => documents::unpublish_in(&mut tx, &c, id, Some(user))
             .await
             .map(drop)
@@ -497,4 +514,27 @@ pub async fn delete_global(
 ) -> Result<StatusCode, ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     delete_schedule(&state, &access, of_global(&state, slug)?, raw).await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn database_faults_and_schema_changes_run_again() {
+        for e in [
+            DbError::SchemaChanged,
+            DbError::Sqlx(sqlx::Error::PoolTimedOut),
+        ] {
+            assert!(matches!(db(e), JobError::Retry(_)));
+        }
+        assert!(matches!(
+            db(DbError::Refused("`x` isn't published".into())),
+            JobError::Permanent(d) if d == "`x` isn't published"
+        ));
+        assert!(matches!(
+            refused(ApiError::NotFound),
+            JobError::Permanent(d) if d.contains("can no longer read it")
+        ));
+    }
 }

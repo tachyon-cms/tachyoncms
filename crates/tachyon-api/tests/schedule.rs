@@ -38,16 +38,28 @@ fn at(hours: i64) -> String {
         .unwrap()
 }
 
-/// `posts`, with drafts, keeping 2 versions.
+/// `authors`, and `posts` linking to them, both with drafts; posts keep 2 versions.
 async fn blog(pool: &PgPool) -> Router {
     let admin = admin_app(pool.clone()).await;
     ok(
         &admin,
         "POST",
         "/api/admin/collections",
+        Some(json!({"slug": "authors", "versions": {"drafts": true},
+                    "fields": [{"name": "name", "type": "text"}]})),
+    )
+    .await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
         Some(
             json!({"slug": "posts", "versions": {"drafts": true, "maxVersions": 2},
-                    "fields": [{"name": "title", "type": "text", "required": true}]}),
+            "fields": [
+                {"name": "title", "type": "text", "required": true},
+                {"name": "slug", "type": "slug"},
+                {"name": "author", "type": "relationship", "relationTo": "authors"}
+            ]}),
         ),
     )
     .await;
@@ -80,6 +92,11 @@ async fn run_due(pool: &PgPool) {
         .await
         .unwrap();
     for _ in 0..200 {
+        // A run that's to try again later counts as due now too.
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE state = 'queued'")
+            .execute(pool)
+            .await
+            .unwrap();
         let pending: i64 =
             sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state IN ('queued', 'running')")
                 .fetch_one(pool)
@@ -390,6 +407,9 @@ async fn schedule_needs_publish_right(pool: PgPool) {
     let schedule = format!("/api/posts/{id}/schedule");
     let body = json!({"publishAt": at(1)});
     assert_problem(&call(&author, "PUT", &schedule, Some(body)).await, 403);
+    // Refused before anything about the body.
+    let bad = json!({"publishAt": "whenever", "other": 1});
+    assert_problem(&call(&author, "PUT", &schedule, Some(bad)).await, 403);
     assert_problem(&call(&author, "DELETE", &schedule, None).await, 403);
     // Reading it takes readDrafts, which an Author has for their own.
     assert_eq!(
@@ -449,4 +469,313 @@ async fn trashing_cancels_schedule(pool: PgPool) {
         jobs(&pool, &id).await,
         [job("publish", "cancelled"), job("unpublish", "cancelled")]
     );
+}
+
+/// `id`'s one job failed, with a reason containing `why`.
+async fn failed_with(pool: &PgPool, id: &str, why: &str) {
+    let ran = jobs(pool, id).await;
+    assert_eq!(ran.len(), 1, "{ran:?}");
+    assert_eq!(ran[0].1, "failed", "{ran:?}");
+    assert!(ran[0].2.as_deref().unwrap().contains(why), "{ran:?}");
+}
+
+async fn new_key(app: &Router, scopes: &[&str]) -> (String, String) {
+    let key = ok(
+        app,
+        "POST",
+        "/api/auth/keys",
+        Some(json!({"name": "k", "scopes": scopes})),
+    )
+    .await;
+    (
+        key["id"].as_str().unwrap().to_owned(),
+        key["key"].as_str().unwrap().to_owned(),
+    )
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_scheduler_who_lost_their_rights_fails_the_job(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let anon = tachyon_api::router(pool.clone()).await.unwrap();
+    let editor_id = add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(
+        tachyon_api::router(pool.clone()).await.unwrap(),
+        "editor@example.com",
+    )
+    .await;
+    let _worker = worker(&pool).await;
+    let schedule = async |key: &str, id: &str| {
+        let res = with_key(
+            &editor,
+            key,
+            "PUT",
+            &format!("/api/posts/{id}/schedule"),
+            json!({"publishAt": at(1)}),
+        )
+        .await;
+        assert_eq!(res.status, 200, "{}", res.json);
+    };
+
+    // A key whose scopes no longer reach publishing.
+    let (_, rescoped) = new_key(&editor, &["posts:publish"]).await;
+    let a = post(&admin, "Rescoped").await;
+    schedule(&rescoped, &a).await;
+    sqlx::query("UPDATE api_keys SET scopes = '{posts:read}'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    // A key rotated since: the old one is revoked (Ruling T7-1).
+    let (old, rotated) = new_key(&editor, &["posts:publish"]).await;
+    let b = post(&admin, "Rotated").await;
+    schedule(&rotated, &b).await;
+    ok(
+        &editor,
+        "POST",
+        &format!("/api/auth/keys/{old}/rotate"),
+        None,
+    )
+    .await;
+    run_due(&pool).await;
+    failed_with(&pool, &a, "can't publish it now").await;
+    failed_with(&pool, &b, "revoked").await;
+
+    // A user removed since.
+    let c = post(&admin, "Removed").await;
+    ok(
+        &editor,
+        "PUT",
+        &format!("/api/posts/{c}/schedule"),
+        Some(json!({"publishAt": at(1)})),
+    )
+    .await;
+    let res = call(&admin, "DELETE", &format!("/api/users/{editor_id}"), None).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    run_due(&pool).await;
+    failed_with(&pool, &c, "was removed").await;
+    for id in [a, b, c] {
+        assert_problem(
+            &call(&anon, "GET", &format!("/api/posts/{id}"), None).await,
+            404,
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_hidden_document_and_a_deleted_one_fail_for_their_own_reasons(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "notes", "versions": {"drafts": true},
+                    "access": {"read": {"title": {"not_equals": "Hidden"}}},
+                    "fields": [{"name": "title", "type": "text"}]})),
+    )
+    .await;
+    add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(
+        tachyon_api::router(pool.clone()).await.unwrap(),
+        "editor@example.com",
+    )
+    .await;
+    let _worker = worker(&pool).await;
+    let mut ids = Vec::new();
+    for title in ["Fine", "Gone"] {
+        let id = ok(&admin, "POST", "/api/notes", Some(json!({"title": title}))).await["id"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        ok(
+            &editor,
+            "PUT",
+            &format!("/api/notes/{id}/schedule"),
+            Some(json!({"publishAt": at(1)})),
+        )
+        .await;
+        ids.push(id);
+    }
+    // The Editor can no longer read the first; the second is gone without its jobs being
+    // cancelled, as a trash would.
+    let first = format!("/api/notes/{}", ids[0]);
+    ok(&admin, "PATCH", &first, Some(json!({"title": "Hidden"}))).await;
+    sqlx::query("UPDATE documents SET deleted_at = now() WHERE id = $1")
+        .bind(ids[1].parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    run_due(&pool).await;
+    failed_with(&pool, &ids[0], "can no longer read it").await;
+    failed_with(&pool, &ids[1], "document deleted").await;
+    let draft = ok(&admin, "GET", &format!("{first}?draft=true"), None).await;
+    assert_eq!(draft["status"], "draft", "nothing was published");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_snapshot_checks_links_and_unique_values_when_it_runs(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let anon = tachyon_api::router(pool.clone()).await.unwrap();
+    let _worker = worker(&pool).await;
+    // Links to an author who's only a draft when it runs.
+    let author = ok(&admin, "POST", "/api/authors", Some(json!({"name": "D"}))).await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let linked = ok(
+        &admin,
+        "POST",
+        "/api/posts",
+        Some(json!({"title": "Linked", "author": author})),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // Shares a slug with a post published since it was scheduled.
+    let twin = ok(
+        &admin,
+        "POST",
+        "/api/posts",
+        Some(json!({"title": "Twin", "slug": "same"})),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    for id in [&linked, &twin] {
+        ok(
+            &admin,
+            "PUT",
+            &format!("/api/posts/{id}/schedule"),
+            Some(json!({"publishAt": at(1)})),
+        )
+        .await;
+    }
+    let first = ok(
+        &admin,
+        "POST",
+        "/api/posts",
+        Some(json!({"title": "First", "slug": "same"})),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    ok(&admin, "POST", &format!("/api/posts/{first}/publish"), None).await;
+    run_due(&pool).await;
+    failed_with(&pool, &linked, "author").await;
+    failed_with(&pool, &twin, "slug: must be unique").await;
+    for id in [linked, twin] {
+        assert_problem(
+            &call(&anon, "GET", &format!("/api/posts/{id}"), None).await,
+            404,
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_clash_enqueue_cant_retry_past_is_a_409(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let id = post(&admin, "Busy").await;
+    // Every insert clashes, as if more schedulers than enqueue retries for got in first.
+    sqlx::raw_sql(
+        "CREATE FUNCTION clash() RETURNS trigger LANGUAGE plpgsql AS $$ BEGIN
+             RAISE unique_violation USING CONSTRAINT = 'jobs_one_pending';
+         END $$;
+         CREATE TRIGGER clash BEFORE INSERT ON jobs FOR EACH ROW EXECUTE FUNCTION clash();",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let res = call(
+        &admin,
+        "PUT",
+        &format!("/api/posts/{id}/schedule"),
+        Some(json!({"publishAt": at(1)})),
+    )
+    .await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "the schedule changed at the same time; try again"
+    );
+    let versions: i64 = sqlx::query_scalar("SELECT count(*) FROM versions WHERE document_id = $1")
+        .bind(id.parse::<Uuid>().unwrap())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(versions, 1, "the snapshot rolled back with it");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn another_authors_schedule_reads_as_missing(pool: PgPool) {
+    let _admin = blog(&pool).await;
+    let mut authors = Vec::new();
+    for email in ["one@example.com", "two@example.com"] {
+        add_user(&pool, email, "author").await;
+        authors.push(signed_in(tachyon_api::router(pool.clone()).await.unwrap(), email).await);
+    }
+    let theirs = ok(
+        &authors[0],
+        "POST",
+        "/api/posts",
+        Some(json!({"title": "Mine"})),
+    )
+    .await["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let mut answers = Vec::new();
+    for id in [theirs, Uuid::now_v7().to_string()] {
+        let res = call(
+            &authors[1],
+            "GET",
+            &format!("/api/posts/{id}/schedule"),
+            None,
+        )
+        .await;
+        assert_problem(&res, 404);
+        answers.push((res.json["title"].clone(), res.json.get("detail").cloned()));
+    }
+    assert_eq!(answers[0], answers[1]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_global_refuses_its_schedule_with_a_403(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(
+            json!({"slug": "site", "kind": "global", "versions": {"drafts": true},
+                    "access": {"readDrafts": {"name": "Open"}},
+                    "fields": [{"name": "name", "type": "text"}]}),
+        ),
+    )
+    .await;
+    add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(
+        tachyon_api::router(pool.clone()).await.unwrap(),
+        "editor@example.com",
+    )
+    .await;
+    let uri = "/api/globals/site/schedule";
+    // Never saved: refused, as when the rule fails.
+    assert_problem(&call(&editor, "GET", uri, None).await, 403);
+    ok(
+        &admin,
+        "PATCH",
+        "/api/globals/site",
+        Some(json!({"name": "Shut"})),
+    )
+    .await;
+    assert_problem(&call(&editor, "GET", uri, None).await, 403);
+    ok(
+        &admin,
+        "PATCH",
+        "/api/globals/site",
+        Some(json!({"name": "Open"})),
+    )
+    .await;
+    ok(&editor, "GET", uri, None).await;
 }

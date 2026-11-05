@@ -6,9 +6,11 @@
 //! complete, fail or extend the job, and its transaction rolls back.
 //!
 //! A run is one of two shapes, never both:
-//! - Short and transactional: `complete_in` first, then the work, in one transaction. The
-//!   row lock keeps any other worker off the job until the transaction ends. It must never
-//!   `heartbeat`, which runs on another connection and would wait on that lock forever.
+//! - Short and transactional, all in one transaction: first lock the domain rows the work
+//!   will change (a document before its jobs, the order every write takes them), then
+//!   `complete_in`, then the work. The job's row lock keeps any other worker off the job
+//!   until the transaction ends. It must never `heartbeat`, which runs on another
+//!   connection and would wait on that lock forever.
 //! - Long: `heartbeat` at least every third of the lease, stopping when it returns false,
 //!   and `complete_in` only at the end.
 //!
@@ -177,9 +179,11 @@ pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool
 
 /// Marks `job` done in the caller's transaction, which holds the job's effects. False when
 /// this run no longer holds the job; the caller must roll back, which is what makes a job's
-/// effects commit once even when two workers ran it. Called before the work, it also locks
-/// the row, so no other worker can take the job over until the transaction ends; such a
-/// run must not `heartbeat` afterwards. A long run calls it at the end instead.
+/// effects commit once even when two workers ran it. A short run calls it after locking
+/// the domain rows it will change and before its work: it locks the job's row, so no other
+/// worker can take the job over until the transaction ends, and taking the domain rows
+/// first keeps it from deadlocking with a write that locks a document, then its jobs. Such
+/// a run must never `heartbeat`. A long run calls it at the end instead.
 pub async fn complete_in(tx: &mut PgConnection, job: &Job) -> Result<bool, DbError> {
     let done = sqlx::query!(
         r#"UPDATE jobs SET state = 'done', locked_until = NULL, finished_at = clock_timestamp()
