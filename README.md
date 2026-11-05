@@ -379,7 +379,7 @@ Next, in this order, with no dates:
 1. Drafts, versions and scheduled publishing (in progress)
 2. Media library and image processing
 3. Live preview
-4. Authoring tools: Markdown in and out, bulk import
+4. Authoring tools: push and pull content as Markdown files, bulk import
 5. The admin, as easy as WordPress for the people who publish
 
 After that: localization and full-text search, GraphQL and OpenAPI, passkeys, two-factor and single sign-on, WebAssembly plugins and webhooks, a WordPress importer, a Helm chart and published benchmarks. [Discussion #35](https://github.com/tachyon-cms/tachyoncms/discussions/35) has the reasoning, and the polls in [#38](https://github.com/tachyon-cms/tachyoncms/discussions/38) and [#39](https://github.com/tachyon-cms/tachyoncms/discussions/39) can change the order.
