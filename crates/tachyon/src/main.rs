@@ -76,11 +76,13 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
-    // A schema file that isn't there should say so at once, not after the database answers.
-    let schema_text = match &cli.command {
+    // A missing schema file or a bad --rename should say so at once, not after the database
+    // answers.
+    let schema_input = match &cli.command {
         Command::Schema {
-            command: SchemaCommand::Diff { file, .. } | SchemaCommand::Apply { file, .. },
-        } => Some(read_schema(file)?),
+            command:
+                SchemaCommand::Diff { file, renames } | SchemaCommand::Apply { file, renames, .. },
+        } => Some((read_schema(file)?, schema_cmd::parse_renames(renames)?)),
         _ => None,
     };
     let pool = PgPool::connect(&config.database_url)
@@ -121,14 +123,12 @@ async fn main() -> anyhow::Result<()> {
                     None => print!("{json}"),
                 }
             }
-            SchemaCommand::Diff { renames, .. } => {
-                let text = schema_text.unwrap_or_default();
-                let renames = schema_cmd::parse_renames(&renames)?;
+            SchemaCommand::Diff { .. } => {
+                let (text, renames) = schema_input.expect("read before connecting");
                 println!("{}", schema_cmd::run(&pool, &text, &renames, None).await?);
             }
-            SchemaCommand::Apply { renames, yes, .. } => {
-                let text = schema_text.unwrap_or_default();
-                let renames = schema_cmd::parse_renames(&renames)?;
+            SchemaCommand::Apply { yes, .. } => {
+                let (text, renames) = schema_input.expect("read before connecting");
                 println!(
                     "{}",
                     schema_cmd::run(&pool, &text, &renames, Some(yes)).await?
