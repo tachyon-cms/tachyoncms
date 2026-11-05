@@ -95,11 +95,12 @@ fn versions_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Versio
         v @ Value::Object(_) => Versions::deserialize(v)
             .map(Some)
             .map_err(serde::de::Error::custom),
-        _ => Err(serde::de::Error::custom(
-            "versions is true, false or {\"drafts\": true, \"maxVersions\": 100}",
-        )),
+        _ => Err(serde::de::Error::custom(VERSIONS_SHAPE)),
     }
 }
+
+const VERSIONS_SHAPE: &str =
+    "versions: must be true, false or {\"drafts\": true, \"maxVersions\": 100}";
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct Drafts {
@@ -1683,6 +1684,15 @@ impl CollectionSchema {
     /// Rejects keys in the original JSON that parsing would silently drop, such as a
     /// misspelt `maxLenght`. Every option this model understands survives a round trip,
     /// so anything missing after re-serialising is unknown.
+    /// Refuses option values of a type parsing would reject with a bare serde message, so
+    /// they're named like any other bad option. Run it before parsing `input`.
+    pub fn check_option_types(input: &Value) -> Result<(), SchemaError> {
+        match input.get("versions") {
+            None | Some(Value::Null | Value::Bool(_) | Value::Object(_)) => Ok(()),
+            Some(_) => Err(SchemaError::InvalidOption(VERSIONS_SHAPE.into())),
+        }
+    }
+
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
         let known = serde_json::to_value(self).expect("schemas always serialize");
         unknown_key(input, &known, "")?;

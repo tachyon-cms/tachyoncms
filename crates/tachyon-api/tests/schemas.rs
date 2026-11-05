@@ -106,3 +106,22 @@ async fn the_access_slug_is_reserved(pool: PgPool) {
         );
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn versions_of_the_wrong_type_is_named(pool: PgPool) {
+    let app = common::admin_app(pool).await;
+    for versions in [
+        serde_json::json!(5),
+        serde_json::json!("yes"),
+        serde_json::json!([]),
+    ] {
+        let body =
+            serde_json::json!({"slug": "posts", "versions": versions, "fields": []}).to_string();
+        let res = send(&app, "POST", "/api/admin/collections", Some(&body)).await;
+        common::assert_problem(&res, 422);
+        assert_eq!(
+            res.json["errors"][0]["message"],
+            "versions: must be true, false or {\"drafts\": true, \"maxVersions\": 100}"
+        );
+    }
+}

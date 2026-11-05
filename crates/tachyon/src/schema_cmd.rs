@@ -56,6 +56,7 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
         .iter()
         .map(|item| {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
+            CollectionSchema::check_option_types(item).with_context(|| slug.to_owned())?;
             let schema = CollectionSchema::deserialize(item)
                 .map_err(|e| anyhow!("{slug}: {}", explain_parse_error(item, &e)))?;
             schema
