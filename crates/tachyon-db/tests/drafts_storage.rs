@@ -923,6 +923,21 @@ async fn only_drafts_collections_report_a_publish_time(pool: PgPool) {
     .await
     .unwrap();
     assert!(page.docs.iter().all(|d| d.published_at.is_none()));
+
+    // A post with drafts that has been published says when.
+    let live = post(&pool, &s, "Live", s.ann).await;
+    set_draft(&pool, live, Some(json!({"title": "Live"}))).await;
+    let read = documents::get(&pool, s.posts, live, DocCopy::Published)
+        .await
+        .unwrap();
+    assert!(
+        read.published_at
+            .is_some_and(|at| at <= time::OffsetDateTime::now_utc()),
+        "{:?}",
+        read.published_at
+    );
+    let json = serde_json::to_value(&read).unwrap();
+    assert!(json["publishedAt"].is_string(), "{json}");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -956,4 +971,245 @@ async fn draft_reads_skip_a_missing_draft(pool: PgPool) {
         let q = list_query(Some(&f), DocCopy::Published, None);
         assert_eq!(listed(&pool, notes, &q, "label").await.0, want);
     }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn draft_writes_leave_the_published_copy_alone(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let by_ann = |title: &str, author: Uuid| Prepared {
+        data: json!({"title": title, "author": author.to_string()})
+            .as_object()
+            .unwrap()
+            .clone(),
+        relations: vec![Relation {
+            path: "author".into(),
+            at: "author".into(),
+            collection_id: s.authors,
+            id: author,
+        }],
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let doc = documents::insert_in(
+        &mut tx,
+        s.posts,
+        1,
+        None,
+        DocCopy::Draft,
+        &by_ann("First", s.ann),
+        None,
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(doc.status, "draft");
+    assert_eq!(doc.data.0["title"], "First", "the copy written comes back");
+    assert_eq!(doc.published_at, None);
+    let (published, draft) = copies(&pool, doc.id).await;
+    assert_eq!(published, None);
+    assert_eq!(draft.unwrap()["title"], "First");
+    assert_eq!(
+        links(&pool, doc.id).await,
+        [("draft".into(), "author".into(), s.ann)]
+    );
+
+    // An update reads and writes the draft, and its guard judges the draft.
+    let title_is = |t: &str| {
+        let schema = posts(json!({"drafts": true}), fields(json!("authors")));
+        let lookup = |_: &str| None;
+        parse_filter_with(
+            &schema.fields,
+            &parse_query(&format!("where[title][equals]={t}")).unwrap()["where"],
+            &lookup,
+        )
+        .unwrap()
+    };
+    let mut tx = pool.begin().await.unwrap();
+    let refused = documents::update_in(
+        &mut tx,
+        s.posts,
+        1,
+        doc.id,
+        DocCopy::Draft,
+        None,
+        Some(&title_is("Other")),
+        |_| Ok::<_, DbError>(by_ann("Never", s.bob)),
+    )
+    .await;
+    assert!(matches!(refused, Err(DbError::Forbidden)));
+    drop(tx);
+    let mut tx = pool.begin().await.unwrap();
+    let updated = documents::update_in(
+        &mut tx,
+        s.posts,
+        1,
+        doc.id,
+        DocCopy::Draft,
+        None,
+        Some(&title_is("First")),
+        |current| {
+            assert_eq!(current["title"], "First");
+            Ok::<_, DbError>(by_ann("Second", s.bob))
+        },
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(updated.data.0["title"], "Second");
+    assert_eq!(copies(&pool, doc.id).await.0, None, "still unpublished");
+    assert_eq!(
+        links(&pool, doc.id).await,
+        [("draft".into(), "author".into(), s.bob)]
+    );
+
+    // A published document's draft is written beside what's live.
+    let live = post(&pool, &s, "Live", s.ann).await;
+    set_draft(&pool, live, Some(json!({"title": "Live"}))).await;
+    let mut tx = pool.begin().await.unwrap();
+    documents::update_in(
+        &mut tx,
+        s.posts,
+        1,
+        live,
+        DocCopy::Draft,
+        None,
+        None,
+        |_| Ok::<_, DbError>(by_ann("Edited", s.bob)),
+    )
+    .await
+    .unwrap();
+    tx.commit().await.unwrap();
+    let (published, draft) = copies(&pool, live).await;
+    assert_eq!(published.unwrap()["title"], "Live");
+    assert_eq!(draft.unwrap()["title"], "Edited");
+    assert_eq!(
+        links(&pool, live).await,
+        [
+            ("draft".into(), "author".into(), s.bob),
+            ("published".into(), "author".into(), s.ann)
+        ]
+    );
+
+    // A delete's guard judges the draft too.
+    let refused = documents::delete_as(
+        &pool,
+        s.posts,
+        live,
+        None,
+        Some(&title_is("Live")),
+        DocCopy::Draft,
+    )
+    .await;
+    assert!(matches!(refused, Err(DbError::Forbidden)));
+    documents::delete_as(
+        &pool,
+        s.posts,
+        live,
+        None,
+        Some(&title_is("Edited")),
+        DocCopy::Draft,
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn recorded_versions_are_pruned_but_never_a_held_one(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true, "maxVersions": 2})).await;
+    let posts = collections::get_by_slug(&pool, "posts").await.unwrap();
+    let a = post(&pool, &s, "A", s.ann).await;
+    let by = Some(Uuid::now_v7());
+    let record = |n: i64| {
+        let (pool, posts) = (pool.clone(), posts.clone());
+        async move {
+            let mut conn = pool.acquire().await.unwrap();
+            let data = json!({"title": n}).as_object().unwrap().clone();
+            tachyon_db::versions::record_version(&mut conn, a, &posts, DocCopy::Draft, &data, by)
+                .await
+                .unwrap()
+        }
+    };
+    let first = record(1).await;
+    let (collection, kind, created_by): (Uuid, String, Option<Uuid>) =
+        sqlx::query_as("SELECT collection_id, kind, created_by FROM versions WHERE id = $1")
+            .bind(first)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (collection, kind.as_str(), created_by),
+        (s.posts, "draft", by)
+    );
+    record(2).await;
+    record(3).await;
+    let kept: Vec<Value> = versions_of(&pool, a)
+        .await
+        .into_iter()
+        .map(|v| v.1)
+        .collect();
+    assert_eq!(
+        kept,
+        [json!({"title": 2}), json!({"title": 3})],
+        "the newest 2"
+    );
+
+    // A version a pending job holds outlives its turn.
+    let held = versions_of(&pool, a).await[0].0;
+    sqlx::query(
+        "INSERT INTO jobs (id, tenant_id, kind, collection_id, document_id, payload, run_at, state)
+         VALUES ($1, $2, 'publish', $3, $4, $5, now(), 'queued')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(DEFAULT_TENANT)
+    .bind(s.posts)
+    .bind(a)
+    .bind(json!({"version": held.to_string()}))
+    .execute(&pool)
+    .await
+    .unwrap();
+    record(4).await;
+    let kept: Vec<Value> = versions_of(&pool, a)
+        .await
+        .into_iter()
+        .map(|v| v.1)
+        .collect();
+    assert_eq!(
+        kept,
+        [
+            json!({"title": 2}),
+            json!({"title": 3}),
+            json!({"title": 4})
+        ],
+        "ranked as any other, and kept"
+    );
+
+    // `maxVersions: 0` keeps every one.
+    let all = seed_unlimited(&pool).await;
+    let unlimited = collections::get_by_slug(&pool, "diary").await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    for _ in 0..3 {
+        tachyon_db::versions::record_version(
+            &mut conn,
+            all,
+            &unlimited,
+            DocCopy::Published,
+            &Default::default(),
+            None,
+        )
+        .await
+        .unwrap();
+    }
+    assert_eq!(versions_of(&pool, all).await.len(), 3);
+}
+
+/// A `diary` that keeps every version, holding one entry.
+async fn seed_unlimited(pool: &PgPool) -> Uuid {
+    let diary: CollectionSchema = serde_json::from_value(
+        json!({"slug": "diary", "versions": {"maxVersions": 0}, "fields": []}),
+    )
+    .unwrap();
+    let diary = collections::create(pool, &diary).await.unwrap().id;
+    documents::insert(pool, diary, 1, None, &Prepared::plain(Default::default()))
+        .await
+        .unwrap()
+        .id
 }

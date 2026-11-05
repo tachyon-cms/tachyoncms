@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM versions WHERE id IN (\n                   SELECT id FROM versions\n                   WHERE tenant_id = $1 AND document_id = $2\n                   ORDER BY created_at DESC, id DESC OFFSET $3\n               ) AND NOT EXISTS (\n                   SELECT 1 FROM jobs j\n                   WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')\n                     AND j.payload->>'version' = versions.id::text)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "61f3201108af3e5e98ef6fd9bc2d17fc0213d1f711e6712e4ee2fd5a619f7c63"
+}

@@ -383,6 +383,7 @@ pub(crate) async fn update(
             users.id,
             users.schema_version,
             id,
+            DocCopy::Published,
             who,
             None,
             |current| {
@@ -432,6 +433,6 @@ pub(crate) async fn delete(
     authorize(&principal, Action::Users, "users")?;
     let users = any_collection(&state, auth::USERS)?;
     let who = actor(&principal, Decision::Allow);
-    documents::delete_as(&state.pool, users.id, id, who, None).await?;
+    documents::delete_as(&state.pool, users.id, id, who, None, DocCopy::Published).await?;
     Ok(StatusCode::NO_CONTENT)
 }

@@ -529,7 +529,8 @@ async fn write_guards_are_checked_in_the_transaction(pool: PgPool) {
     let other = filter("where[author][equals]=someone-else");
     let refused = documents::update_as(&pool, posts, 1, a, None, Some(&other), rename).await;
     assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
-    let refused = documents::delete_as(&pool, posts, a, None, Some(&other)).await;
+    let refused =
+        documents::delete_as(&pool, posts, a, None, Some(&other), DocCopy::Published).await;
     assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
     assert_eq!(
         documents::get(&pool, posts, a, DocCopy::Published)
@@ -556,7 +557,8 @@ async fn write_guards_are_checked_in_the_transaction(pool: PgPool) {
             let (pool, mine) = (pool.clone(), mine.clone());
             tokio::spawn(async move {
                 if delete {
-                    documents::delete_as(&pool, posts, id, None, Some(&mine)).await
+                    documents::delete_as(&pool, posts, id, None, Some(&mine), DocCopy::Published)
+                        .await
                 } else {
                     documents::update_as(&pool, posts, 1, id, None, Some(&mine), rename)
                         .await

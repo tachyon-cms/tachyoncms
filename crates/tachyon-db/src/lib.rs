@@ -6,6 +6,7 @@ pub mod documents;
 pub mod indexes;
 pub mod query;
 pub mod schema_change;
+pub mod versions;
 
 pub use documents::DocCopy;
 pub use sqlx::PgPool;

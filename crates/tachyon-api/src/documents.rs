@@ -359,6 +359,7 @@ pub async fn delete(
         id,
         access.actor(Action::Delete, &c),
         guard.as_ref(),
+        DocCopy::Published,
     )
     .await
     .map_err(|e| match e {
