@@ -26,6 +26,25 @@ pub struct Document {
     pub data: Json<Map<String, Value>>,
 }
 
+/// One of a document's two copies: what's live, or the working draft beside it (drafts on).
+/// Each keeps its own links.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, sqlx::Type)]
+#[serde(rename_all = "lowercase")]
+#[sqlx(type_name = "text", rename_all = "lowercase")]
+pub enum DocCopy {
+    Published,
+    Draft,
+}
+
+impl DocCopy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Draft => "draft",
+        }
+    }
+}
+
 /// A link to store alongside a document.
 #[derive(Debug, Clone)]
 pub struct Relation {
@@ -57,6 +76,8 @@ pub struct Reference {
     pub collection: String,
     pub id: Uuid,
     pub path: String,
+    /// The copy holding the link.
+    pub copy: DocCopy,
 }
 
 pub async fn insert(
@@ -101,7 +122,7 @@ pub async fn insert_as(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_unique)?;
-    sync_relations(&mut tx, created.id, &doc.relations).await?;
+    sync_relations(&mut tx, created.id, DocCopy::Published, &doc.relations).await?;
     tx.commit().await?;
     Ok(created)
 }
@@ -253,7 +274,7 @@ pub async fn update_in<E: From<DbError>>(
     .fetch_one(&mut *tx)
     .await
     .map_err(map_unique)?;
-    sync_relations(&mut *tx, id, &next.relations).await?;
+    sync_relations(&mut *tx, id, DocCopy::Published, &next.relations).await?;
     Ok(doc)
 }
 
@@ -292,6 +313,7 @@ pub async fn delete_as(
         return Err(DbError::NotOwner);
     }
     check_guard(&mut tx, id, guard).await?;
+    // A link from either copy counts: a draft may be published later.
     let linked = sqlx::query_scalar!(
         r#"SELECT count(DISTINCT r.from_doc) AS "n!" FROM relations r
            JOIN documents d ON d.id = r.from_doc
@@ -327,18 +349,18 @@ async fn check_guard(
     }
 }
 
-/// Live documents that link to `id`. A rich text link's index in `path`
-/// (`layout.0.intro.1`) counts links the caller can't see too: a change that hides their
-/// bare IDs must renumber it.
+/// Live documents that link to `id`, once for each copy holding the link. A rich text
+/// link's index in `path` (`layout.0.intro.1`) counts links the caller can't see too: a
+/// change that hides their bare IDs must renumber it.
 pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbError> {
     Ok(sqlx::query_as!(
         Reference,
-        r#"SELECT c.slug AS collection, d.id, r.field_path AS path
+        r#"SELECT c.slug AS collection, d.id, r.field_path AS path, r.copy AS "copy: DocCopy"
            FROM relations r
            JOIN documents d ON d.id = r.from_doc
            JOIN collections c ON c.id = d.collection_id
            WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL
-           ORDER BY d.id DESC, r.field_path"#,
+           ORDER BY d.id DESC, r.field_path, r.copy"#,
         id,
     )
     .fetch_all(pool)
@@ -349,17 +371,23 @@ pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbErr
 pub const MISSING_LINK: &str = "doesn't match any document in the related collection";
 
 /// Checks every link points at a live document in the expected collection, then replaces
-/// the document's rows in `relations`. Targets are key-share locked: that blocks a
-/// concurrent delete (which takes FOR UPDATE) but not an ordinary save (FOR NO KEY UPDATE),
-/// so two documents linking to each other can be saved at the same time without deadlock.
+/// the document's rows in `relations` for `copy`. Targets are key-share locked: that blocks
+/// a concurrent delete (which takes FOR UPDATE) but not an ordinary save (FOR NO KEY
+/// UPDATE), so two documents linking to each other can be saved at the same time without
+/// deadlock.
 pub(crate) async fn sync_relations(
     conn: &mut PgConnection,
     from_doc: Uuid,
+    copy: DocCopy,
     relations: &[Relation],
 ) -> Result<(), DbError> {
-    sqlx::query!("DELETE FROM relations WHERE from_doc = $1", from_doc)
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query!(
+        "DELETE FROM relations WHERE from_doc = $1 AND copy = $2",
+        from_doc,
+        copy.as_str(),
+    )
+    .execute(&mut *conn)
+    .await?;
     if relations.is_empty() {
         return Ok(());
     }
@@ -396,10 +424,11 @@ pub(crate) async fn sync_relations(
     }
     let paths: Vec<String> = relations.iter().map(|r| r.path.clone()).collect();
     sqlx::query!(
-        "INSERT INTO relations (tenant_id, from_doc, field_path, to_doc)
-         SELECT $1, $2, path, id FROM unnest($3::text[], $4::uuid[]) AS t(path, id)",
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         SELECT $1, $2, $3, path, id FROM unnest($4::text[], $5::uuid[]) AS t(path, id)",
         DEFAULT_TENANT,
         from_doc,
+        copy.as_str(),
         &paths,
         &ids,
     )

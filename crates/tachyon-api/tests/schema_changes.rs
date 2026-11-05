@@ -262,3 +262,98 @@ async fn startup_doesnt_wait_for_another_servers_index_build(pool: PgPool) {
         .await
         .unwrap();
 }
+
+fn versioned(versions: Value, extra: Value) -> String {
+    let fields =
+        json!([{"name": "title", "type": "text"}, {"name": "summary", "type": "textarea"}]);
+    let mut body = json!({"schema": {"slug": "posts", "versions": versions, "fields": fields}});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    body.to_string()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn drafts_off_is_refused_while_drafts_are_pending(pool: PgPool) {
+    let (app, url) = app(pool.clone()).await;
+    let put = |body: String| {
+        let app = app.clone();
+        async move { send(&app, "PUT", "/api/admin/collections/posts", Some(&body)).await }
+    };
+    let res = put(versioned(json!({"drafts": true}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let id = url.rsplit('/').next().unwrap().to_owned();
+    sqlx::query("UPDATE documents SET draft = '{\"title\": \"Edited\"}' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // `confirm` can't override it.
+    let res = put(versioned(
+        json!({"drafts": false}),
+        json!({"confirm": true}),
+    ))
+    .await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "1 document has an unpublished draft (0 in trash); publish or delete it first"
+    );
+    sqlx::query("UPDATE documents SET draft = published WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let res = put(versioned(json!({"drafts": false}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn pruning_versions_needs_confirmation(pool: PgPool) {
+    let (app, url) = app(pool.clone()).await;
+    let put = |body: String| {
+        let app = app.clone();
+        async move { send(&app, "PUT", "/api/admin/collections/posts", Some(&body)).await }
+    };
+    let res = put(versioned(json!({"maxVersions": 3}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let id = url.rsplit('/').next().unwrap().to_owned();
+    for _ in 0..3 {
+        sqlx::query(
+            "INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data)
+             SELECT gen_random_uuid(), tenant_id, collection_id, id, 'published', published
+             FROM documents WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    let res = put(versioned(json!({"maxVersions": 1}), json!({}))).await;
+    assert_problem(&res, 409);
+    assert_eq!(res.json["preview"]["pruned"], 2);
+    assert_eq!(res.json["preview"]["needsConfirmation"], true);
+    assert_eq!(count().await, 3);
+    let res = put(versioned(
+        json!({"maxVersions": 1}),
+        json!({"confirm": true}),
+    ))
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(count().await, 1);
+
+    let res = put(versioned(json!(false), json!({}))).await;
+    assert_problem(&res, 409);
+    assert_eq!(res.json["preview"]["pruned"], 1);
+    let res = put(versioned(json!(false), json!({"confirm": true}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(count().await, 0);
+}

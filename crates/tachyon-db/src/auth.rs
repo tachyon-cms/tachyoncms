@@ -251,7 +251,13 @@ pub async fn create_account_with(
     )
     .execute(&mut *tx)
     .await?;
-    crate::documents::sync_relations(&mut tx, id, &profile.relations).await?;
+    crate::documents::sync_relations(
+        &mut tx,
+        id,
+        crate::documents::DocCopy::Published,
+        &profile.relations,
+    )
+    .await?;
     sqlx::query!(
         "INSERT INTO accounts (user_id, tenant_id, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)",
         id,

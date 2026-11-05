@@ -7,6 +7,7 @@ pub mod indexes;
 pub mod query;
 pub mod schema_change;
 
+pub use documents::DocCopy;
 pub use sqlx::PgPool;
 use uuid::Uuid;
 
