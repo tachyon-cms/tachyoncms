@@ -5,8 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
-use tachyon_core::query::parse_filter;
+use serde_json::{Map, Value};
 use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::validate::markdown_inputs;
@@ -17,10 +16,10 @@ use tachyon_core::{
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
-use tachyon_db::query::{self, ListQuery, Readable, get_many_readable};
+use tachyon_db::query::{self, Readable, get_many_readable};
 use uuid::Uuid;
 
-use crate::access::{Access, both};
+use crate::access::Access;
 use crate::params::Format;
 use crate::{ApiError, AppState};
 
@@ -130,7 +129,7 @@ pub(crate) async fn from_markdown(
             .unwrap_or_default()
             .to_owned()
     };
-    // Each lookup is a query per 100 slugs, so a write may name only so many.
+    // Each slug is a lookup of its own, so a write may name only so many.
     let mut named: HashMap<String, HashSet<String>> = HashMap::new();
     let mut count = 0;
     for (path, kind) in &paths {
@@ -206,15 +205,15 @@ fn clipped(s: &str) -> String {
 }
 
 /// The IDs of the documents of collection `to` the caller may read whose slug is one of
-/// `slugs`, by slug: more than one where drafts share it. None when they can't read the
-/// collection or its slug field.
+/// `slugs`, by slug: two where drafts share it, since no more are looked for. None when
+/// they can't read the collection or its slug field.
 async fn by_slug(
     state: &AppState,
     access: &Access,
     to: &str,
     slugs: Vec<String>,
 ) -> Result<HashMap<String, HashSet<Uuid>>, ApiError> {
-    let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
+    let out = HashMap::new();
     let Some(c) = state
         .schemas
         .get(to)
@@ -229,49 +228,8 @@ async fn by_slug(
     let Some(read) = access.linked_of(&c) else {
         return Ok(out);
     };
-    for (way, unless) in [(read.alone(), None)].into_iter().chain(
-        read.otherwise
-            .as_deref()
-            .map(|o| (o.clone(), Some(read.alone()))),
-    ) {
-        // A filter's `in` takes 100 values at most.
-        for chunk in slugs.chunks(100) {
-            let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
-                .map_err(|e| ApiError::Internal(e.to_string()))?;
-            let filter = both(Some(named), way.filter.clone());
-            // Every match, not one per slug: drafts may share a slug, and each is counted.
-            let q = ListQuery {
-                filter: filter.as_ref(),
-                sort: None,
-                limit: i64::MAX,
-                offset: 0,
-                after: None,
-                count: false,
-                copy: way.copy,
-                owner: way.owner,
-            };
-            let docs = query::list(&state.pool, c.id, &q).await?.docs;
-            // A document read as its draft is found by its draft's slug only.
-            let skip: HashSet<Uuid> = match &unless {
-                None => HashSet::new(),
-                Some(first) => {
-                    let ids: Vec<Uuid> = docs.iter().map(|d| d.id).collect();
-                    let one = HashMap::from([(c.id, first.clone())]);
-                    get_many_readable(&state.pool, &ids, &one)
-                        .await?
-                        .into_iter()
-                        .map(|(_, d)| d.id)
-                        .collect()
-                }
-            };
-            for doc in docs.iter().filter(|d| !skip.contains(&d.id)) {
-                if let Some(slug) = c.schema.slug_of(&doc.data) {
-                    out.entry(slug).or_default().insert(doc.id);
-                }
-            }
-        }
-    }
-    Ok(out)
+    // Two per slug at most: a second match already makes the link ambiguous.
+    Ok(query::by_slug(&state.pool, c.id, &field.name, &slugs, &read).await?)
 }
 
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.

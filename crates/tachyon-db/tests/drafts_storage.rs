@@ -1428,3 +1428,58 @@ async fn a_draft_rule_on_a_missing_value_falls_back_to_what_is_live(pool: PgPool
     seen.sort();
     assert_eq!(seen, ["Bare", "Kept draft"]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn slug_lookups_stop_at_two_matches(pool: PgPool) {
+    let pages: CollectionSchema = serde_json::from_value(json!({
+        "slug": "pages", "versions": {"drafts": true},
+        "fields": [{"name": "slug", "type": "slug"}]
+    }))
+    .unwrap();
+    let pages = collections::create(&pool, &pages).await.unwrap().id;
+    let draft = |slug: &str| Prepared::plain(json!({"slug": slug}).as_object().unwrap().clone());
+    let mut tx = pool.begin().await.unwrap();
+    let mut a = Vec::new();
+    for _ in 0..3 {
+        let doc = documents::insert_in(&mut tx, pages, 1, None, DocCopy::Draft, &draft("a"), None)
+            .await
+            .unwrap();
+        a.push(doc.id);
+    }
+    // Published as `live`, with a draft renamed `b`: read as its draft, it's `b` only.
+    let b = documents::insert_in(&mut tx, pages, 1, None, DocCopy::Draft, &draft("b"), None)
+        .await
+        .unwrap()
+        .id;
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE documents SET published = '{\"slug\": \"live\"}' WHERE id = $1")
+        .bind(b)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mixed = Readable {
+        otherwise: Some(Box::new(Readable::published(None))),
+        ..Readable {
+            filter: None,
+            copy: DocCopy::Draft,
+            owner: None,
+            otherwise: None,
+        }
+    };
+    let slugs: Vec<String> = ["a", "b", "live", "none"].map(String::from).to_vec();
+    let found = query::by_slug(&pool, pages, "slug", &slugs, &mixed)
+        .await
+        .unwrap();
+    let mut counts: Vec<(String, usize)> = found
+        .iter()
+        .map(|(slug, ids)| (slug.clone(), ids.len()))
+        .collect();
+    counts.sort();
+    assert_eq!(counts, [("a".into(), 2), ("b".into(), 1)]);
+    assert!(found["a"].iter().all(|id| a.contains(id)));
+    // Published only, the same document is found by its published slug.
+    let live = query::by_slug(&pool, pages, "slug", &slugs, &Readable::published(None))
+        .await
+        .unwrap();
+    assert_eq!(live.keys().collect::<Vec<_>>(), ["live"]);
+}

@@ -919,6 +919,46 @@ pub async fn get_many_readable(
     Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
 }
 
+/// The IDs of up to two live documents of `collection_id` readable as `read` (its
+/// fallback too) whose top-level text field `field`, in the copy each is read in, is one of
+/// `slugs`, by slug. Two settles that a slug is ambiguous, so no more are looked for, and
+/// only IDs come back.
+pub async fn by_slug(
+    pool: &PgPool,
+    collection_id: Uuid,
+    field: &str,
+    slugs: &[String],
+    read: &Readable,
+) -> Result<HashMap<String, std::collections::HashSet<Uuid>>, DbError> {
+    let path = [field.to_owned()];
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT s.want, m.id FROM unnest(");
+    qb.push_bind(slugs.to_vec())
+        .push(
+            "::text[]) AS s(want) CROSS JOIN LATERAL (SELECT id FROM documents WHERE tenant_id = ",
+        )
+        .push_bind(DEFAULT_TENANT)
+        .push(" AND collection_id = ")
+        .push_bind(collection_id)
+        .push(" AND deleted_at IS NULL AND (FALSE");
+    for (way, unless) in ways(read) {
+        qb.push(" OR (");
+        qb.push(field_expr_for(way.copy, &path, ValueKind::Text))
+            .push(" = s.want");
+        if let Some(first) = unless {
+            push_unreadable(&mut qb, "", 0, first);
+        }
+        push_readable(&mut qb, "", 0, way);
+        qb.push(")");
+    }
+    qb.push(") LIMIT 2) m");
+    let rows: Vec<(String, Uuid)> = qb.build_query_as().fetch_all(pool).await?;
+    let mut out: HashMap<String, std::collections::HashSet<Uuid>> = HashMap::new();
+    for (slug, id) in rows {
+        out.entry(slug).or_default().insert(id);
+    }
+    Ok(out)
+}
+
 /// Whether live document `id`'s `copy` matches `filter`. Run after locking the row, this
 /// judges the version the rest of the transaction writes over.
 pub(crate) async fn matches(
