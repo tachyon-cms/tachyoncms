@@ -298,7 +298,7 @@ async fn drafts_off_is_refused_while_drafts_are_pending(pool: PgPool) {
     assert_problem(&res, 409);
     assert_eq!(
         res.json["detail"],
-        "1 document has an unpublished draft (0 in trash); publish or delete it first"
+        "1 document has an unpublished draft; publish or delete it first"
     );
     sqlx::query("UPDATE documents SET draft = published WHERE id = $1::uuid")
         .bind(&id)

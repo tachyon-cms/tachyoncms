@@ -770,15 +770,17 @@ async fn check_no_pending_drafts(
     )
     .fetch_one(&mut *conn)
     .await?;
+    let trashed = match row.trashed {
+        0 => String::new(),
+        m => format!(" ({m} in trash)"),
+    };
     match row.n {
         0 => Ok(()),
         1 => Err(ChangeError::PendingDrafts(format!(
-            "1 document has an unpublished draft ({} in trash); publish or delete it first",
-            row.trashed
+            "1 document has an unpublished draft{trashed}; publish or delete it first"
         ))),
         n => Err(ChangeError::PendingDrafts(format!(
-            "{n} documents have unpublished drafts ({} in trash); publish or delete them first",
-            row.trashed
+            "{n} documents have unpublished drafts{trashed}; publish or delete them first"
         ))),
     }
 }
@@ -876,6 +878,10 @@ async fn rewrite(
             // Deleted documents keep their old link rows; they re-sync when restored and saved (M4).
             if row.live {
                 for (copy, data) in [(DocCopy::Published, &published), (DocCopy::Draft, &draft)] {
+                    // Without drafts there are no draft rows to clear: skip the DELETE.
+                    if copy == DocCopy::Draft && data.is_none() && !new.drafts() {
+                        continue;
+                    }
                     let links: Vec<Relation> = data
                         .iter()
                         .flat_map(|d| relations(new.data(), d))

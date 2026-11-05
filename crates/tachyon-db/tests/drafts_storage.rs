@@ -433,3 +433,37 @@ async fn pruning_versions_needs_confirm(pool: PgPool) {
     assert_eq!(versions_of(&pool, a).await.len(), 1);
     assert_eq!(versions_of(&pool, b).await.len(), 0);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn versions_and_jobs_stay_in_their_documents_collection(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let a = post(&pool, &s, "A", s.ann).await;
+    let version = sqlx::query(
+        "INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data)
+         VALUES ($1, $2, $3, $4, 'draft', '{}')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(DEFAULT_TENANT)
+    .bind(s.authors)
+    .bind(a)
+    .execute(&pool)
+    .await;
+    let job = sqlx::query(
+        "INSERT INTO jobs (id, tenant_id, kind, collection_id, document_id, run_at, state)
+         VALUES ($1, $2, 'publish', $3, $4, now(), 'queued')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(DEFAULT_TENANT)
+    .bind(s.authors)
+    .bind(a)
+    .execute(&pool)
+    .await;
+    for refused in [version, job] {
+        let e = refused.unwrap_err();
+        assert!(
+            e.as_database_error()
+                .is_some_and(|e| e.is_foreign_key_violation()),
+            "{e}"
+        );
+    }
+}

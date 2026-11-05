@@ -99,6 +99,9 @@ fn versions_flag<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Option<Versio
     }
 }
 
+const AUTOSAVE_INTERVAL: &str =
+    "versions.drafts.autosave.interval: must be from 100 to 600000 milliseconds";
+
 const VERSIONS_SHAPE: &str =
     "versions: must be true, false or {\"drafts\": true, \"maxVersions\": 100}";
 
@@ -1543,9 +1546,7 @@ impl CollectionSchema {
             self.versions.as_ref().and_then(|v| v.drafts.as_ref())
             && !(100..=600_000).contains(&a.interval)
         {
-            return Err(SchemaError::InvalidOption(
-                "versions.drafts.autosave.interval: must be from 100 to 600000 milliseconds".into(),
-            ));
+            return Err(SchemaError::InvalidOption(AUTOSAVE_INTERVAL.into()));
         }
         Ok(())
     }
@@ -1681,18 +1682,47 @@ impl CollectionSchema {
         Ok((self.with_fields(fields), placed))
     }
 
-    /// Rejects keys in the original JSON that parsing would silently drop, such as a
-    /// misspelt `maxLenght`. Every option this model understands survives a round trip,
-    /// so anything missing after re-serialising is unknown.
     /// Refuses option values of a type parsing would reject with a bare serde message, so
-    /// they're named like any other bad option. Run it before parsing `input`.
+    /// they're named like any other bad option, by path (`versions.maxVersions`). Run it
+    /// before parsing `input`; unknown keys are left to `reject_unknown_options`.
     pub fn check_option_types(input: &Value) -> Result<(), SchemaError> {
-        match input.get("versions") {
-            None | Some(Value::Null | Value::Bool(_) | Value::Object(_)) => Ok(()),
-            Some(_) => Err(SchemaError::InvalidOption(VERSIONS_SHAPE.into())),
+        let bad = |m: &str| Err(SchemaError::InvalidOption(m.into()));
+        let versions = match input.get("versions") {
+            None | Some(Value::Null | Value::Bool(_)) => return Ok(()),
+            Some(Value::Object(v)) => v,
+            Some(_) => return bad(VERSIONS_SHAPE),
+        };
+        if let Some(max) = versions.get("maxVersions")
+            && !max.as_u64().is_some_and(|n| u32::try_from(n).is_ok())
+        {
+            return bad("versions.maxVersions: must be a whole number, 0 to keep every version");
+        }
+        let drafts = match versions.get("drafts") {
+            None | Some(Value::Null | Value::Bool(_)) => return Ok(()),
+            Some(Value::Object(d)) => d,
+            Some(_) => {
+                return bad(
+                    "versions.drafts: must be true, false or {\"autosave\": {\"interval\": 2000}}",
+                );
+            }
+        };
+        match drafts.get("autosave") {
+            None | Some(Value::Null) => Ok(()),
+            Some(Value::Object(a))
+                if a.get("interval")
+                    .and_then(Value::as_u64)
+                    .is_some_and(|n| u32::try_from(n).is_ok()) =>
+            {
+                Ok(())
+            }
+            Some(Value::Object(_)) => bad(AUTOSAVE_INTERVAL),
+            Some(_) => bad("versions.drafts.autosave: must be {\"interval\": 2000}"),
         }
     }
 
+    /// Rejects keys in the original JSON that parsing would silently drop, such as a
+    /// misspelt `maxLenght`. Every option this model understands survives a round trip,
+    /// so anything missing after re-serialising is unknown.
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
         let known = serde_json::to_value(self).expect("schemas always serialize");
         unknown_key(input, &known, "")?;
@@ -3902,6 +3932,14 @@ mod tests {
         );
         assert_eq!(s.check(), Ok(()));
         assert_eq!(s.reject_unknown_options(&auto), Ok(()));
+        for ok in [
+            &on,
+            &auto,
+            &json!({"versions": true}),
+            &json!({"versions": null}),
+        ] {
+            assert_eq!(CollectionSchema::check_option_types(ok), Ok(()), "{ok}");
+        }
         let again: CollectionSchema =
             serde_json::from_value(serde_json::to_value(&s).unwrap()).unwrap();
         assert_eq!(again, s);

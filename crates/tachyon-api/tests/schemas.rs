@@ -109,19 +109,33 @@ async fn the_access_slug_is_reserved(pool: PgPool) {
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn versions_of_the_wrong_type_is_named(pool: PgPool) {
+    use serde_json::json;
     let app = common::admin_app(pool).await;
-    for versions in [
-        serde_json::json!(5),
-        serde_json::json!("yes"),
-        serde_json::json!([]),
+    let top = "versions: must be true, false or {\"drafts\": true, \"maxVersions\": 100}";
+    let drafts = "versions.drafts: must be true, false or {\"autosave\": {\"interval\": 2000}}";
+    let max = "versions.maxVersions: must be a whole number, 0 to keep every version";
+    let autosave = "versions.drafts.autosave: must be {\"interval\": 2000}";
+    let interval = "versions.drafts.autosave.interval: must be from 100 to 600000 milliseconds";
+    for (versions, message) in [
+        (json!(5), top),
+        (json!("yes"), top),
+        (json!([]), top),
+        (json!({"drafts": 5}), drafts),
+        (json!({"drafts": "yes"}), drafts),
+        (json!({"maxVersions": "x"}), max),
+        (json!({"maxVersions": -1}), max),
+        (json!({"maxVersions": 1.5}), max),
+        (json!({"maxVersions": null}), max),
+        (json!({"drafts": {"autosave": true}}), autosave),
+        (json!({"drafts": {"autosave": {}}}), interval),
+        (
+            json!({"drafts": {"autosave": {"interval": "2s"}}}),
+            interval,
+        ),
     ] {
-        let body =
-            serde_json::json!({"slug": "posts", "versions": versions, "fields": []}).to_string();
+        let body = json!({"slug": "posts", "versions": versions, "fields": []}).to_string();
         let res = send(&app, "POST", "/api/admin/collections", Some(&body)).await;
         common::assert_problem(&res, 422);
-        assert_eq!(
-            res.json["errors"][0]["message"],
-            "versions: must be true, false or {\"drafts\": true, \"maxVersions\": 100}"
-        );
+        assert_eq!(res.json["errors"][0]["message"], message, "{versions}");
     }
 }
