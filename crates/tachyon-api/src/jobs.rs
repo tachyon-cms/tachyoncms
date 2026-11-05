@@ -32,29 +32,33 @@ pub struct JobsConfig {
 }
 
 /// The jobs some workers are in the middle of, such as to name the ones a shutdown cut
-/// off. Clones share one set.
+/// off. Clones share one set. Each run is noted by its job and attempt, so a run that
+/// ends after this server took its job over doesn't hide the run that took it.
 #[derive(Debug, Clone, Default)]
-pub struct RunningJobs(Arc<Mutex<BTreeSet<Uuid>>>);
+pub struct RunningJobs(Arc<Mutex<BTreeSet<(Uuid, i32)>>>);
 
 impl RunningJobs {
     pub fn ids(&self) -> Vec<Uuid> {
-        self.lock().iter().copied().collect()
+        let mut ids: Vec<Uuid> = self.lock().iter().map(|(id, _)| *id).collect();
+        ids.dedup();
+        ids
     }
 
-    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<Uuid>> {
+    fn lock(&self) -> std::sync::MutexGuard<'_, BTreeSet<(Uuid, i32)>> {
         self.0.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Notes `id` until the returned guard drops, even when the run's future is dropped.
-    fn start(&self, id: Uuid) -> impl Drop {
-        struct Started(RunningJobs, Uuid);
+    /// Notes `job`'s run until the returned guard drops.
+    fn start(&self, job: &Job) -> impl Drop + Send + 'static {
+        struct Started(RunningJobs, (Uuid, i32));
         impl Drop for Started {
             fn drop(&mut self) {
                 self.0.lock().remove(&self.1);
             }
         }
-        self.lock().insert(id);
-        Started(self.clone(), id)
+        let run = (job.id, job.attempts);
+        self.lock().insert(run);
+        Started(self.clone(), run)
     }
 }
 
@@ -98,11 +102,17 @@ async fn idle(state: &AppState) {
 }
 
 /// Runs `job` in a task of its own, so a handler that panics fails its run, not the worker.
+/// The task holds the note in `running`: dropping this future leaves the handler running,
+/// and it stays listed until it ends.
 async fn run(state: &AppState, running: &RunningJobs, job: Job) {
+    let started = running.start(&job);
     let outcome = {
-        let _running = running.start(job.id);
         let (state, job) = (state.clone(), job.clone());
-        tokio::spawn(async move { dispatch(&state, &job).await }).await
+        tokio::spawn(async move {
+            let _running = started;
+            dispatch(&state, &job).await
+        })
+        .await
     };
     let (error, retry) = match outcome {
         Ok(Ok(())) => return,
@@ -198,8 +208,33 @@ mod tests {
         assert!(!running.ids().contains(&panics));
     }
 
+    #[test]
+    fn a_run_taken_over_in_this_process_leaves_the_new_one_listed() {
+        let running = RunningJobs::default();
+        let mut job = Job {
+            id: Uuid::now_v7(),
+            kind: "test".into(),
+            document_id: None,
+            collection_id: None,
+            payload: json!({}),
+            attempts: 1,
+            max_attempts: 5,
+            created_by: None,
+            key_id: None,
+            run_at: OffsetDateTime::now_utc(),
+        };
+        let first = running.start(&job);
+        job.attempts = 2;
+        let second = running.start(&job);
+        assert_eq!(running.ids(), [job.id]);
+        drop(first);
+        assert_eq!(running.ids(), [job.id], "the takeover is still running");
+        drop(second);
+        assert!(running.ids().is_empty());
+    }
+
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-    async fn a_dropped_run_forgets_its_job(pool: PgPool) {
+    async fn a_dropped_run_leaves_its_handler_listed(pool: PgPool) {
         let id = add(&pool, "test-hang", OffsetDateTime::now_utc()).await;
         let state = AppState {
             pool: pool.clone(),
@@ -221,9 +256,6 @@ mod tests {
         assert_eq!(running.ids(), [id]);
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
-        assert!(
-            running.ids().is_empty(),
-            "the dropped run left its job behind"
-        );
+        assert_eq!(running.ids(), [id], "its handler is still running");
     }
 }
