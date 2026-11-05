@@ -490,3 +490,26 @@ async fn a_job_about_a_document_names_its_collection(pool: PgPool) {
         "{refused}"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn pruning_preview_only_reads(pool: PgPool) {
+    let s = seed(&pool, json!({"maxVersions": 5})).await;
+    let a = post(&pool, &s, "A", s.ann).await;
+    for n in 0..3 {
+        add_version(&pool, &s, a, json!({"title": format!("a{n}")})).await;
+    }
+    // A replica, or any read-only transaction, can still preview.
+    let options = (*pool.connect_options())
+        .clone()
+        .options([("default_transaction_read_only", "on")]);
+    let replica = sqlx::postgres::PgPoolOptions::new()
+        .connect_with(options)
+        .await
+        .unwrap();
+    let two = posts(json!({"maxVersions": 2}), fields(json!("authors")));
+    let p = tachyon_db::schema_change::preview(&replica, "posts", &two, &Renames::new())
+        .await
+        .unwrap();
+    assert_eq!(p.pruned, 1);
+    assert_eq!(versions_of(&pool, a).await.len(), 3);
+}

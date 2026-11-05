@@ -729,9 +729,32 @@ async fn prune(
     let Some(keep) = keep else {
         return Ok(0);
     };
-    let n = sqlx::query_scalar!(
-        r#"WITH extra AS (
-               SELECT id FROM (
+    // The same rows either way; counting stays a plain SELECT, so a preview runs on a
+    // read-only transaction or a replica.
+    let n = if delete {
+        sqlx::query!(
+            r#"DELETE FROM versions WHERE id IN (
+                   SELECT id FROM (
+                       SELECT id, row_number() OVER (
+                           PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n
+                       FROM versions WHERE tenant_id = $1 AND collection_id = $2
+                   ) ranked
+                   WHERE n > $3 AND NOT EXISTS (
+                       SELECT 1 FROM jobs j
+                       WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
+                         AND j.payload->>'version' = ranked.id::text))"#,
+            DEFAULT_TENANT,
+            collection_id,
+            keep,
+        )
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX)
+    } else {
+        sqlx::query_scalar!(
+            r#"SELECT count(*) AS "n!" FROM (
                    SELECT id, row_number() OVER (
                        PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n
                    FROM versions WHERE tenant_id = $1 AND collection_id = $2
@@ -739,18 +762,14 @@ async fn prune(
                WHERE n > $3 AND NOT EXISTS (
                    SELECT 1 FROM jobs j
                    WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
-                     AND j.payload->>'version' = ranked.id::text)
-           ),
-           gone AS (DELETE FROM versions WHERE $4 AND id IN (SELECT id FROM extra) RETURNING 1)
-           SELECT CASE WHEN $4 THEN (SELECT count(*) FROM gone)
-                       ELSE (SELECT count(*) FROM extra) END AS "n!""#,
-        DEFAULT_TENANT,
-        collection_id,
-        keep,
-        delete,
-    )
-    .fetch_one(&mut *conn)
-    .await?;
+                     AND j.payload->>'version' = ranked.id::text)"#,
+            DEFAULT_TENANT,
+            collection_id,
+            keep,
+        )
+        .fetch_one(&mut *conn)
+        .await?
+    };
     Ok(n)
 }
 
