@@ -359,11 +359,13 @@ Without drafts, saving is publishing. Fix a typo in a live post and the fix is l
 
 `"versions": true` keeps history and nothing more: every update goes live, and every update is recorded. `"drafts": true` adds the draft copy. The `autosave` form also allows `PATCH ?autosave=true`, which saves the draft without recording a version, so an editor that saves every couple of seconds doesn't bury your history; `interval` is kept with the schema, in milliseconds, for that editor to use. `maxVersions` is how many versions each document keeps, oldest dropped first. It's 100 unless you say otherwise, and 0 keeps every one. Globals take the same option.
 
-**Writing a draft.** In a collection with drafts, every create and update writes the draft. `required` waits until you publish, so a post without a title yet still saves; every other check runs as usual. You get the draft back, with `"status": "draft"`.
+#### Writing a draft
+
+In a collection with drafts, every create and update writes the draft. `required` waits until you publish, so a post without a title yet still saves; every other check runs as usual. You get the draft back, with `"status": "draft"`.
 
 Reads stay on what's published. `GET /api/posts` never shows a draft, and neither does `GET /api/posts/{id}`. Add `?draft=true` to a list, a single read or a global to read drafts instead. That list holds the documents whose drafts you may read, which for an Author means their own. Links follow along: each linked document shows as its draft where you may read that draft, and as what's published where you may not. Populated links, virtual fields, joins, filters through relationships and `?format=` all work this way. Ask for drafts where there are none and it's a 400; ask without the right to read them and it's a 403.
 
-**Publishing.**
+#### Publishing
 
 ```bash
 curl -X POST localhost:3000/api/posts/$ID/publish -H "authorization: Bearer $TOKEN"
@@ -374,7 +376,9 @@ Publishing copies the draft over what's live, and this is where the full validat
 
 A published copy carries `publishedAt`. That makes it a reserved name in collections with drafts: a schema that turns drafts on while it has a top-level `publishedAt` field of its own gets a 422 naming it. Collections without drafts keep any `publishedAt` field they already had.
 
-**Scheduling.** Want the post out at nine on Monday and gone at the end of the month?
+#### Scheduling
+
+Want the post out at nine on Monday and gone at the end of the month?
 
 ```bash
 curl -X PUT localhost:3000/api/posts/$ID/schedule \
@@ -387,7 +391,9 @@ Each side takes an RFC 3339 time within the next 10 years. Leave one out and it 
 
 Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). At most 16, fewer than the database pool's connections, and 0 turns them off. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key.
 
-**History.** Every publish records a version, and so does every draft save that isn't an autosave. With `versions` on and drafts off, every update records one.
+#### History
+
+Every publish records a version, and so does every draft save that isn't an autosave. With `versions` on and drafts off, every update records one.
 
 - `GET /api/posts/{id}/versions` lists them, newest first, without their data. Page with `limit` and `page`.
 - `GET /api/posts/{id}/versions/{vid}` shows one. Links stay IDs, and fields you can't read aren't there.
@@ -398,7 +404,9 @@ Globals have the same routes under `/api/globals/{slug}`.
 
 History is data too, so the schema guards it. Removing `versions`, or lowering `maxVersions` below what documents already hold, deletes versions: it's a 409 with a preview and goes through when you send it again with `"confirm": true`. Turning drafts off is refused with a 409 while any document, trashed ones included, has a draft that isn't what's published. There's no `confirm` for that one, because the only ways through are publishing work nobody reviewed or throwing it away. The message says how many documents are in the way; publish or delete them first.
 
-**The trash.** A deleted document has always been kept, out of every read. Now you can see it and act on it.
+#### The trash
+
+A deleted document has always been kept, out of every read. Now you can see it and act on it.
 
 - `GET /api/posts/trash` lists it, most recently deleted first, each document with `deletedAt`. It takes `limit`, `page`, `count`, `where`, `sort` and `select`. `sort=deletedAt` means when it was deleted, even when your schema has a field with that name.
 - `POST /api/posts/trash/{id}/restore` brings one back. It has to validate against the schema as it is today, its unique values have to be free, and every link has to reach a document that's there and that you can read. Anything else is a 422; in a collection with drafts, each error says whether it's about the draft or the published copy.
@@ -406,7 +414,9 @@ History is data too, so the schema guards it. Removing `versions`, or lowering `
 
 All of it takes the `delete` right, so an Author sees, restores and empties only what they created. A collection you can't read at all is a 403. Globals have no trash, and `users` isn't in it yet.
 
-**Who may do what.** Drafts come with three more rights:
+#### Who may do what
+
+Drafts come with three more rights:
 
 | Right | Admin, Editor | Author | Viewer, signed out |
 |---|---|---|---|
@@ -422,7 +432,9 @@ API keys have a third kind of scope. `posts:read` reads what's published and not
 
 `GET /api/access` answers `readDrafts` and `publish` for each collection and global with drafts, and `readVersions` for each with versions, as `true`, `false` or `"conditional"`, like every other answer there.
 
-**Also changed since v0.2.0.** `POST`, `PATCH` and `DELETE` on documents now refuse query parameters they don't take, with a 400 that names the parameter. v0.2.0 ignored them, so a client that sends extra ones will start getting errors. And a write that collides with another one in the database (a deadlock or a serialization failure) is a 409 that asks you to try again; nothing was saved, so retrying is safe.
+#### Also changed since v0.2.0
+
+`POST`, `PATCH` and `DELETE` on documents now refuse query parameters they don't take, with a 400 that names the parameter. v0.2.0 ignored them, so a client that sends extra ones will start getting errors. And a write that collides with another one in the database (a deadlock or a serialization failure) is a 409 that asks you to try again; nothing was saved, so retrying is safe.
 
 ### Putting it online
 

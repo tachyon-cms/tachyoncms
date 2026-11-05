@@ -4,8 +4,7 @@
 mod common;
 
 use axum::Router;
-use axum::http::Request;
-use common::{Res, add_user, admin_app, send, signed_in};
+use common::{Res, add_user, admin_app, assert_problem, send, signed_in, with_key};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use time::OffsetDateTime;
@@ -37,21 +36,6 @@ fn links_to(authors: &[&str]) -> Value {
         })
         .collect();
     json!({"type": "doc", "content": content})
-}
-
-/// The app sending `key` as its bearer token on every request.
-fn with_key(app: Router, key: &str) -> Router {
-    let bearer = format!("Bearer {key}");
-    app.layer(axum::middleware::map_request(
-        move |mut req: Request<axum::body::Body>| {
-            let bearer = bearer.clone();
-            async move {
-                let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
-                req.headers_mut().insert("authorization", value);
-                req
-            }
-        },
-    ))
 }
 
 /// What a list answers, without what differs between requests (a problem's request ID).
@@ -199,6 +183,11 @@ fn probes(ghost: &str) -> Vec<(String, String)> {
         ("author.id", ghost, missing.as_str()),
         ("author", ghost, missing.as_str()),
         ("authorName", "Ghost", nothing),
+        // `mine`, the other Author's own draft, links Ann as `author`: only her draft
+        // matches these, and they may read only what's published of her.
+        ("author.name", "SECRET%20name", nothing),
+        ("author.slug", "secret-slug", nothing),
+        ("authorName", "SECRET%20name", nothing),
         ("coauthor.name", "SECRET%20name", nothing),
         ("coauthor.slug", "secret-slug", nothing),
         ("coauthorName", "SECRET%20name", nothing),
@@ -320,31 +309,85 @@ async fn drafts_never_leak(pool: PgPool) {
         );
     }
 
+    // The Admin sees every draft link to Ann, `mine`'s among them, and her draft joins
+    // both posts' drafts, so the checks below have something to miss.
+    let all_refs = ok(
+        &s.admin,
+        "GET",
+        &format!("/api/authors/{ann}/references"),
+        None,
+    )
+    .await["docs"]
+        .clone();
+    let mine_refs: Vec<Value> = all_refs
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|r| r["id"] == mine.as_str())
+        .cloned()
+        .collect();
+    let mine_refs = Value::Array(mine_refs);
+    assert_eq!(mine_refs.as_array().unwrap().len(), 2, "{all_refs}");
+    assert!(all_refs.as_array().unwrap().len() > 2, "{all_refs}");
+    let draft_ann = ok(
+        &s.admin,
+        "GET",
+        &format!("/api/authors/{ann}?draft=true"),
+        None,
+    )
+    .await;
+    let joined_ids = |join: &str| -> Vec<String> {
+        draft_ann[join]["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| {
+                d["id"]
+                    .as_str()
+                    .unwrap_or_else(|| d.as_str().unwrap())
+                    .to_owned()
+            })
+            .collect()
+    };
+    assert_eq!(joined_ids("posts"), [mine.as_str()], "{draft_ann}");
+    assert_eq!(joined_ids("coposts"), [post.as_str()], "{draft_ann}");
+
     for (who, app) in &callers {
         for url in &reads {
             let res = call(app, "GET", url, None).await;
             let body = res.json.to_string();
             assert_eq!(leaks(&body), None, "{who}: {url}: {} {body}", res.status);
         }
-        // A link from a draft they can't read is no reference of theirs: Ann's only other
-        // one is from the other Author's own draft.
+        // A link from a draft they can't read is no reference of theirs. The other Author
+        // sees their own draft's links to Ann, exactly those, and nothing else.
         let refs = call(app, "GET", &format!("/api/authors/{ann}/references"), None).await;
-        let docs = refs.json["docs"].as_array().unwrap();
-        assert!(
-            docs.iter().all(|r| r["id"] == mine.as_str()),
-            "{who}: {}",
-            refs.json
-        );
-        // Nor is it a joined document.
+        assert_eq!(refs.status, 200, "{who}: {}", refs.json);
+        let want = match *who {
+            "other author" => mine_refs.clone(),
+            _ => json!([]),
+        };
+        assert_eq!(refs.json["docs"], want, "{who}");
+        // Nor is it a joined document: Ann's published copy joins published posts only,
+        // and no post links her there.
         let joined = call(app, "GET", &format!("/api/authors/{ann}"), None).await;
         assert_eq!(joined.status, 200, "{who}: {}", joined.json);
-        assert_eq!(
-            joined.json["coposts"]["docs"],
-            json!([]),
-            "{who}: {}",
-            joined.json
-        );
+        for join in ["posts", "coposts"] {
+            assert_eq!(
+                joined.json[join]["docs"],
+                json!([]),
+                "{who}: {join}: {}",
+                joined.json
+            );
+        }
         assert_eq!(joined.json["name"], "Ann", "{who}");
+        // A schedule is for those who may read the draft: refused outright without the
+        // right, and as missing for a document that isn't theirs.
+        let schedule = call(app, "GET", &format!("/api/posts/{post}/schedule"), None).await;
+        let status = match *who {
+            "other author" => 404,
+            _ => 403,
+        };
+        assert_problem(&schedule, status);
         for (hit, miss) in probes(ghost) {
             let (a, b) = (
                 call(app, "GET", &hit, None).await,

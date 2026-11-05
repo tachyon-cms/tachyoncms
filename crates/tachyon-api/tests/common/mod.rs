@@ -128,3 +128,17 @@ pub async fn app_as(pool: &PgPool, email: &str, role: &str) -> Router {
     let app = tachyon_api::router(pool.clone()).await.unwrap();
     signed_in(app, email).await
 }
+
+/// `app` with `key` as the bearer token on every request.
+pub fn with_key(app: Router, key: &str) -> Router {
+    let bearer = HeaderValue::from_str(&format!("Bearer {key}")).unwrap();
+    app.layer(axum::middleware::map_request(
+        move |mut req: Request<Body>| {
+            let bearer = bearer.clone();
+            async move {
+                req.headers_mut().insert("authorization", bearer);
+                req
+            }
+        },
+    ))
+}

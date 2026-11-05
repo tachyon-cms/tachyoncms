@@ -4,7 +4,9 @@ mod common;
 
 use axum::Router;
 use axum::http::Request;
-use common::{Res, add_user, admin_app, app_as, assert_problem, send, send_with, signed_in};
+use common::{
+    Res, add_user, admin_app, app_as, assert_problem, send, send_with, signed_in, with_key,
+};
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 
@@ -2597,17 +2599,7 @@ async fn callers(
         json!({"name": "k", "scopes": scopes}),
     )
     .await;
-    let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
-    let key = visitor(pool).await.layer(axum::middleware::map_request(
-        move |mut req: Request<axum::body::Body>| {
-            let bearer = bearer.clone();
-            async move {
-                let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
-                req.headers_mut().insert("authorization", value);
-                req
-            }
-        },
-    ));
+    let key = with_key(visitor(pool).await, made["key"].as_str().unwrap());
     let mut callers = vec![("anonymous", visitor(pool).await, None)];
     for role in ["viewer", "author", "editor"] {
         let email = format!("{role}@example.com");
@@ -3922,17 +3914,7 @@ async fn access_answers_cover_drafts_versions_and_publishing(pool: PgPool) {
             json!({"name": who, "scopes": scopes}),
         )
         .await;
-        let bearer = format!("Bearer {}", made["key"].as_str().unwrap());
-        let key = visitor(&pool).await.layer(axum::middleware::map_request(
-            move |mut req: Request<axum::body::Body>| {
-                let bearer = bearer.clone();
-                async move {
-                    let value = axum::http::HeaderValue::from_str(&bearer).unwrap();
-                    req.headers_mut().insert("authorization", value);
-                    req
-                }
-            },
-        ));
+        let key = with_key(visitor(&pool).await, made["key"].as_str().unwrap());
         callers.push((who, key, None));
     }
 
