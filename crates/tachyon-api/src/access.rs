@@ -445,9 +445,9 @@ impl Access {
         match &self.principal {
             Principal::Anonymous => decide_anonymous(action),
             Principal::User { identity, .. } => decide(&identity.abilities, None, action, slug),
-            Principal::Key { identity, scopes } => {
-                decide(&identity.abilities, scoped.then_some(scopes), action, slug)
-            }
+            Principal::Key {
+                identity, scopes, ..
+            } => decide(&identity.abilities, scoped.then_some(scopes), action, slug),
         }
     }
 
@@ -1049,6 +1049,14 @@ impl Access {
     /// Who the caller acts for, as versions and publishing record them.
     pub(crate) fn user_id(&self) -> Option<Uuid> {
         self.principal.identity().map(|i| i.user_id)
+    }
+
+    /// The API key the caller came with, if any, which a job they schedule acts as.
+    pub(crate) fn key_id(&self) -> Option<Uuid> {
+        match &self.principal {
+            Principal::Key { key, .. } => Some(*key),
+            _ => None,
+        }
     }
 
     /// The guard a global's update runs under (see `write_guard`); a global's existence

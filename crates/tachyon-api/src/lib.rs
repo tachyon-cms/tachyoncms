@@ -11,6 +11,7 @@ mod joins;
 mod params;
 mod populate;
 mod request_id;
+mod schedule;
 mod schemas;
 mod versions;
 
@@ -23,7 +24,7 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{get, post, put};
 use sqlx::PgPool;
 use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
@@ -121,6 +122,12 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         )
         .route("/api/globals/{slug}/diff", get(versions::diff_global))
         .route(
+            "/api/globals/{slug}/schedule",
+            put(schedule::put_global)
+                .get(schedule::get_global)
+                .delete(schedule::delete_global),
+        )
+        .route(
             "/api/{collection}",
             get(documents::list).post(documents::create),
         )
@@ -146,6 +153,12 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             post(versions::restore),
         )
         .route("/api/{collection}/{id}/diff", get(versions::diff))
+        .route(
+            "/api/{collection}/{id}/schedule",
+            put(schedule::put)
+                .get(schedule::get)
+                .delete(schedule::delete),
+        )
         .merge(auth::routes())
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed });
     let state = AppState {

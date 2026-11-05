@@ -1,8 +1,10 @@
 //! Workers that run queued jobs, such as scheduled publishes.
 //!
-//! A short handler that changes the database calls `jobs::complete_in` first, then does
-//! its work, in one transaction, rolling back when `complete_in` returns false: another
-//! worker took the job over, and its run is the one that counts. It must never call
+//! A short handler that changes the database calls `jobs::complete_in` before its work, in
+//! one transaction, rolling back when `complete_in` returns false: another worker took the
+//! job over, and its run is the one that counts. Rows the work locks are locked first, in
+//! the order every write takes them (a document before its jobs), so a write waiting on
+//! the document can't deadlock with the job's row. It must never call
 //! `jobs::heartbeat`, which would wait forever on the row `complete_in` locked.
 //! A long handler calls `jobs::heartbeat` at least every third of `LEASE`, stops when that
 //! returns false, and calls `jobs::complete_in` only at the end.
@@ -65,7 +67,6 @@ impl RunningJobs {
 /// Why a run failed. A `Retry` runs again later, until the job is out of attempts.
 #[derive(Debug)]
 pub(crate) enum JobError {
-    #[expect(dead_code, reason = "no handler retries yet")]
     Retry(String),
     Permanent(String),
 }
@@ -127,8 +128,9 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
     }
 }
 
-async fn dispatch(_state: &AppState, job: &Job) -> Result<(), JobError> {
+async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
     match job.kind.as_str() {
+        "publish" | "unpublish" => crate::schedule::run(state, job).await,
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]

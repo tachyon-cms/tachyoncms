@@ -29,13 +29,13 @@ use crate::populate::{
 use crate::{ApiError, AppState};
 
 /// The document a route names: one of a collection, or a global's own.
-struct Doc {
-    c: Arc<Collection>,
-    id: Uuid,
+pub(crate) struct Doc {
+    pub(crate) c: Arc<Collection>,
+    pub(crate) id: Uuid,
 }
 
 impl Doc {
-    fn global(&self) -> bool {
+    pub(crate) fn global(&self) -> bool {
         self.c.schema.kind == CollectionKind::Global
     }
 
@@ -49,7 +49,7 @@ impl Doc {
 }
 
 /// A collection's document, with a key's 403 for `action` coming before a bad ID's 404.
-fn in_collection(
+pub(crate) fn in_collection(
     state: &AppState,
     access: &Access,
     action: Action,
@@ -65,7 +65,7 @@ fn in_collection(
 }
 
 /// A global's document.
-fn of_global(state: &AppState, slug: String) -> Result<Doc, ApiError> {
+pub(crate) fn of_global(state: &AppState, slug: String) -> Result<Doc, ApiError> {
     let c = global(state, Ok(Path(slug)))?;
     Ok(Doc { id: c.id, c })
 }
@@ -370,9 +370,9 @@ async fn diff_doc(
     Ok(Json(json!({ "from": from, "to": to, "changes": changes })))
 }
 
-type DocPath = Result<Path<(String, String)>, PathRejection>;
+pub(crate) type DocPath = Result<Path<(String, String)>, PathRejection>;
 type VersionPath = Result<Path<(String, String, String)>, PathRejection>;
-type GlobalPath = Result<Path<String>, PathRejection>;
+pub(crate) type GlobalPath = Result<Path<String>, PathRejection>;
 type GlobalVersionPath = Result<Path<(String, String)>, PathRejection>;
 
 pub async fn publish(

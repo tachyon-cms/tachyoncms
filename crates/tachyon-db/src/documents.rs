@@ -478,7 +478,7 @@ pub async fn delete(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<(), 
 
 /// `delete`, as `actor` and under `guard` (see `update_as`), which judges `copy`. Deleting
 /// a user also ends their sessions and keys, and is refused when they're the last Admin,
-/// all in the same transaction.
+/// and any scheduled publish or unpublish of it is cancelled, all in the same transaction.
 pub async fn delete_as(
     pool: &PgPool,
     collection_id: Uuid,
@@ -527,6 +527,10 @@ pub async fn delete_as(
     )
     .execute(&mut *tx)
     .await?;
+    // Nothing scheduled for it runs from the trash; the jobs' cascade only covers a purge.
+    for kind in ["publish", "unpublish"] {
+        crate::jobs::cancel(&mut tx, &format!("{kind}:{id}")).await?;
+    }
     tx.commit().await?;
     Ok(())
 }

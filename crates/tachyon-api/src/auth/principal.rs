@@ -29,6 +29,8 @@ pub(crate) enum Principal {
     /// An API key acting for its owner, narrowed by its scopes.
     Key {
         identity: Identity,
+        /// The key's ID, so a job it schedules acts as the key does when it runs.
+        key: Uuid,
         scopes: Vec<Scope>,
     },
 }
@@ -47,12 +49,47 @@ impl Principal {
     pub(crate) fn require(&self) -> Result<&Identity, ApiError> {
         match self {
             Self::User { identity, .. } => Ok(identity),
-            Self::Key { identity, scopes } if scopes.contains(&Scope::Admin) => Ok(identity),
+            Self::Key {
+                identity, scopes, ..
+            } if scopes.contains(&Scope::Admin) => Ok(identity),
             Self::Key { .. } => Err(ApiError::Forbidden(
                 "This API key can't do that; it needs the admin scope.".into(),
             )),
             Self::Anonymous => Err(ApiError::Unauthorized("Sign in first.".into())),
         }
+    }
+}
+
+impl Principal {
+    /// Who scheduled a job, as they are now: user `user`, or their key `key` with its
+    /// scopes today. `None` when the user was deleted, or the key revoked or expired. A
+    /// user acts as a session would, with no session behind it: only a job's own checks
+    /// see this principal, and no route reads its session.
+    pub(crate) async fn for_job(
+        state: &AppState,
+        user: Uuid,
+        key: Option<Uuid>,
+    ) -> Result<Option<Principal>, ApiError> {
+        let Some(key) = key else {
+            return Ok(auth::identity(&state.pool, user)
+                .await?
+                .map(|identity| Principal::User {
+                    identity,
+                    session: Uuid::nil(),
+                    cookie: false,
+                }));
+        };
+        let Some((row, identity)) = auth::api_key_by_id(&state.pool, key, user).await? else {
+            return Ok(None);
+        };
+        // As `key` does: scopes were checked when the key was made.
+        let scopes = parse_scopes(&row.scopes)
+            .map_err(|e| ApiError::Internal(format!("key {key} has bad scopes: {e:?}")))?;
+        Ok(Some(Principal::Key {
+            identity,
+            key: row.id,
+            scopes,
+        }))
     }
 }
 
@@ -180,7 +217,11 @@ async fn key(state: &AppState, rest: &str) -> Result<Principal, ApiError> {
     auth::touch_api_key(&state.pool, row.id).await?;
     // Scopes were checked when the key was made, so this only fails on a hand-edited row.
     let scopes = parse_scopes(&row.scopes).map_err(|_| refused())?;
-    Ok(Principal::Key { identity, scopes })
+    Ok(Principal::Key {
+        identity,
+        key: row.id,
+        scopes,
+    })
 }
 
 fn session_cookie(headers: &HeaderMap) -> Option<String> {
