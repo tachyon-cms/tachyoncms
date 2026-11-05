@@ -121,6 +121,10 @@ fn push_distance(qb: &mut QueryBuilder<Postgres>, base: &str, path: &[String], l
     qb.push(") / 2)), 2)))))");
 }
 
+/// When the document was published, reported only where drafts are on (only there is the
+/// draft never NULL), so a collection without drafts may have a field of that name.
+const PUBLISHED_AT: &str = "CASE WHEN draft IS NOT NULL THEN published_at END AS published_at";
+
 /// What a condition reads from: the document's own JSON (the copy read) and columns at the
 /// top, a linked document's (`t1.published`, `t1.id`) or a list row's (`r1.v`) further in.
 /// `depth` keeps each nested alias distinct.
@@ -145,12 +149,10 @@ fn expr(copy: DocCopy, target: &Target) -> String {
 }
 
 /// ` AND` the row (columns prefixed with `columns`) has `copy` to read and, with an
-/// `owner`, was created by them. A draft is always there when drafts are on, and a
-/// collection without drafts is only ever read as published.
+/// `owner`, was created by them.
 fn push_copy(qb: &mut QueryBuilder<Postgres>, columns: &str, copy: DocCopy, owner: Option<Uuid>) {
-    if copy == DocCopy::Published {
-        qb.push(format!(" AND {columns}published IS NOT NULL"));
-    }
+    // A guard as well as a filter: a row without the copy must never reach decoding.
+    qb.push(format!(" AND {columns}{} IS NOT NULL", copy.as_str()));
     if let Some(owner) = owner {
         qb.push(format!(" AND {columns}created_by = "))
             .push_bind(owner);
@@ -621,7 +623,7 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         filter: q.filter,
     };
     let mut qb = QueryBuilder::<Postgres>::new(format!(
-        "SELECT id, status, created_at, updated_at, published_at, {} AS data FROM documents",
+        "SELECT id, status, created_at, updated_at, {PUBLISHED_AT}, {} AS data FROM documents",
         q.copy.as_str()
     ));
     push_where(&mut qb, &scope);
@@ -751,7 +753,7 @@ pub async fn joined(
     qb.push_bind(parents.to_vec())
         .push(format!(
             "::uuid[]) AS p(parent) CROSS JOIN LATERAL (SELECT id, status, created_at, \
-             updated_at, published_at, {} AS data, ",
+             updated_at, {PUBLISHED_AT}, {} AS data, ",
             q.copy.as_str()
         ))
         .push(format!(
@@ -817,9 +819,9 @@ pub async fn get_many_readable(
         .filter(|(_, r)| r.copy == DocCopy::Draft)
         .map(|(id, _)| **id)
         .collect();
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT id, collection_id, status, created_at, updated_at, published_at, ",
-    );
+    let mut qb = QueryBuilder::<Postgres>::new(format!(
+        "SELECT id, collection_id, status, created_at, updated_at, {PUBLISHED_AT}, "
+    ));
     if drafts.is_empty() {
         qb.push("published");
     } else {
@@ -923,6 +925,54 @@ fn sort_value(sort: Option<&Sort>, doc: &Document) -> Option<Scalar> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn matches_judges_the_copy_named(pool: PgPool) {
+        let schema: tachyon_core::CollectionSchema = serde_json::from_value(json!({
+            "slug": "posts", "versions": {"drafts": true},
+            "fields": [{"name": "title", "type": "text"}]
+        }))
+        .unwrap();
+        let c = crate::collections::create(&pool, &schema).await.unwrap().id;
+        let data = json!({"title": "Live"}).as_object().unwrap().clone();
+        let id =
+            crate::documents::insert(&pool, c, 1, None, &crate::documents::Prepared::plain(data))
+                .await
+                .unwrap()
+                .id;
+        sqlx::query("UPDATE documents SET draft = '{\"title\": \"Edited\"}' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let title = |t: &str| {
+            let raw =
+                tachyon_core::query::parse_query(&format!("where[title][equals]={t}")).unwrap();
+            tachyon_core::query::parse_filter(&schema.fields, &raw["where"]).unwrap()
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        for (copy, yes, no) in [
+            (DocCopy::Draft, "Edited", "Live"),
+            (DocCopy::Published, "Live", "Edited"),
+        ] {
+            assert!(
+                matches(&mut conn, id, copy, &title(yes)).await.unwrap(),
+                "{copy:?}"
+            );
+            assert!(
+                !matches(&mut conn, id, copy, &title(no)).await.unwrap(),
+                "{copy:?}"
+            );
+        }
+        // A copy that isn't there matches nothing.
+        sqlx::query("UPDATE documents SET draft = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let any = Filter::All(Vec::new());
+        assert!(!matches(&mut conn, id, DocCopy::Draft, &any).await.unwrap());
+    }
 
     #[test]
     fn built_in_sorts_match_their_indexes() {

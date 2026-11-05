@@ -2031,7 +2031,7 @@ mod tests {
         assert_eq!(doc["layout"][0]["items"][1]["author"]["name"], "Bee");
 
         let params = crate::query::parse_query("select[layout][items][title]=true").unwrap();
-        let select = crate::select::parse_select(&f, &params["select"], "select").unwrap();
+        let select = crate::select::parse_select(&f, false, &params["select"], "select").unwrap();
         let mut shaped = doc.clone();
         crate::select::project(&select, &mut shaped);
         let rows = &shaped["layout"][0];

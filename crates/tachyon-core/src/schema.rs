@@ -6,8 +6,9 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Keys the API adds to every document, so top-level fields can't use them.
-pub const RESERVED_FIELD_NAMES: &[&str] =
-    &["id", "createdAt", "updatedAt", "publishedAt", "status"];
+pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "status"];
+/// Reserved too on collections with drafts, whose documents report when they were published.
+pub const DRAFTS_RESERVED_FIELD_NAME: &str = "publishedAt";
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
@@ -1496,6 +1497,11 @@ impl CollectionSchema {
             ));
         }
         let data = self.data();
+        if self.drafts()
+            && let Some(f) = data.iter().find(|f| f.name == DRAFTS_RESERVED_FIELD_NAME)
+        {
+            return Err(SchemaError::ReservedFieldName(f.name.clone()));
+        }
         if self.kind == CollectionKind::Block {
             if self.versions.is_some() {
                 return Err(SchemaError::InvalidOption(
@@ -1537,8 +1543,13 @@ impl CollectionSchema {
             ));
         }
         if let Some(dp) = &self.default_populate {
-            crate::select::parse_select(data, &Value::Object(dp.clone()), "defaultPopulate")
-                .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;
+            crate::select::parse_select(
+                data,
+                self.drafts(),
+                &Value::Object(dp.clone()),
+                "defaultPopulate",
+            )
+            .map_err(|e| SchemaError::InvalidOption(e.to_string()))?;
         }
         if let Some(url) = &self.url {
             self.check_url(url)?;
@@ -2829,14 +2840,23 @@ mod tests {
     }
 
     #[test]
-    fn published_at_is_reserved() {
-        // Every document read carries it beside its fields.
-        let top =
-            schema(json!({"slug": "posts", "fields": [{"name": "publishedAt", "type": "date"}]}));
+    fn published_at_is_reserved_with_drafts() {
+        // Only documents with drafts report a publish time beside their fields.
+        let fields = json!([{"name": "publishedAt", "type": "date"}]);
+        let plain = schema(json!({"slug": "posts", "fields": fields}));
+        assert_eq!(plain.check(), Ok(()));
+        let drafts =
+            schema(json!({"slug": "posts", "versions": {"drafts": true}, "fields": fields}));
         assert_eq!(
-            top.check(),
+            drafts.check(),
             Err(SchemaError::ReservedFieldName("publishedAt".into()))
         );
+        let nested = schema(
+            json!({"slug": "posts", "versions": {"drafts": true}, "fields": [
+                {"name": "meta", "type": "group", "fields": fields}
+            ]}),
+        );
+        assert_eq!(nested.check(), Ok(()));
     }
 
     #[test]

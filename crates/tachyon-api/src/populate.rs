@@ -379,6 +379,7 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     // Checked when the schema was saved, so this only fails on a hand-edited row.
     parse_select(
         c.schema.data(),
+        c.schema.drafts(),
         &Value::Object(dp.clone()),
         "defaultPopulate",
     )

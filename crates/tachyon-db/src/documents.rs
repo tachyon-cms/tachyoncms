@@ -22,7 +22,8 @@ pub struct Document {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
-    /// When the published copy was last published; `None` while it never has been.
+    /// When the published copy was last published, on collections with drafts; `None`
+    /// while it never has been, and always on collections without drafts.
     #[serde(
         with = "time::serde::rfc3339::option",
         skip_serializing_if = "Option::is_none"
@@ -101,7 +102,8 @@ pub async fn insert_as(
         Document,
         r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by, updated_by)
            VALUES ($1, $2, $3, 'published', $4, now(), $5, $5)
-           RETURNING id, status, created_at, updated_at, published_at, published AS "data!: Json<Map<String, Value>>""#,
+           RETURNING id, status, created_at, updated_at,
+                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, published AS "data!: Json<Map<String, Value>>""#,
         id.unwrap_or_else(Uuid::now_v7),
         DEFAULT_TENANT,
         collection_id,
@@ -146,11 +148,12 @@ pub async fn get(
 ) -> Result<Document, DbError> {
     sqlx::query_as!(
         Document,
-        r#"SELECT id, status, created_at, updated_at, published_at,
+        r#"SELECT id, status, created_at, updated_at,
+                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
                   CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
-             AND ($4 OR published IS NOT NULL)"#,
+             AND CASE WHEN $4 THEN draft IS NOT NULL ELSE published IS NOT NULL END"#,
         DEFAULT_TENANT,
         collection_id,
         id,
@@ -165,7 +168,8 @@ pub async fn get(
 /// collection ID.
 pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document)>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT id, collection_id, status, created_at, updated_at, published_at,
+        r#"SELECT id, collection_id, status, created_at, updated_at,
+                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
                   published AS "data!: Json<Map<String, Value>>"
            FROM documents
            WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL
@@ -265,7 +269,8 @@ pub async fn update_in<E: From<DbError>>(
         Document,
         r#"UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
-           RETURNING id, status, created_at, updated_at, published_at, published AS "data!: Json<Map<String, Value>>""#,
+           RETURNING id, status, created_at, updated_at,
+                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, published AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         collection_id,
         id,
@@ -374,19 +379,20 @@ pub async fn references(
     )
     .fetch_all(pool)
     .await?;
-    Ok(rows
-        .into_iter()
-        .map(|r| Reference {
-            collection: r.collection,
-            id: r.id,
-            path: r.path,
-            copy: if r.copy == "draft" {
-                DocCopy::Draft
-            } else {
-                DocCopy::Published
-            },
+    rows.into_iter()
+        .map(|r| {
+            Ok(Reference {
+                collection: r.collection,
+                id: r.id,
+                path: r.path,
+                copy: DocCopy::parse(&r.copy).ok_or_else(|| {
+                    DbError::Sqlx(sqlx::Error::Decode(
+                        format!("unknown document copy `{}`", r.copy).into(),
+                    ))
+                })?,
+            })
         })
-        .collect())
+        .collect()
 }
 
 /// What a link to no document (in its collection) is told.

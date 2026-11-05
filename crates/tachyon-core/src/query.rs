@@ -114,6 +114,13 @@ impl DocCopy {
             Self::Draft => "draft",
         }
     }
+
+    /// The copy `as_str` names, or `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Published, Self::Draft]
+            .into_iter()
+            .find(|c| c.as_str() == s)
+    }
 }
 
 /// How a caller may read one collection: which copy, narrowed by a read filter (`None`:
@@ -1176,6 +1183,15 @@ impl Cursor {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn doc_copies_parse_only_their_own_names() {
+        for copy in [DocCopy::Published, DocCopy::Draft] {
+            assert_eq!(DocCopy::parse(copy.as_str()), Some(copy));
+        }
+        assert_eq!(DocCopy::parse("Draft"), None);
+        assert_eq!(DocCopy::parse(""), None);
+    }
     use crate::Field;
     use serde_json::json;
 

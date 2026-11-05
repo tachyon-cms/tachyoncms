@@ -139,3 +139,62 @@ async fn versions_of_the_wrong_type_is_named(pool: PgPool) {
         assert_eq!(res.json["errors"][0]["message"], message, "{versions}");
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn published_at_is_reserved_only_where_drafts_are_on(pool: PgPool) {
+    use serde_json::json;
+    let app = common::admin_app(pool).await;
+    let fields =
+        json!([{"name": "title", "type": "text"}, {"name": "publishedAt", "type": "text"}]);
+    let schema = |versions: serde_json::Value| json!({"slug": "events", "versions": versions, "fields": fields});
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema(json!(null)).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+
+    // Without drafts there's no built-in publish time, so the field is the document's own.
+    let body = json!({"title": "Launch", "publishedAt": "next week"}).to_string();
+    let res = send(&app, "POST", "/api/events", Some(&body)).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["publishedAt"], "next week");
+    let url = format!("/api/events/{}", res.json["id"].as_str().unwrap());
+    let res = send(
+        &app,
+        "GET",
+        &format!("{url}?select[publishedAt]=true"),
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json,
+        json!({"id": res.json["id"], "publishedAt": "next week"})
+    );
+
+    // Turning drafts on, or creating a drafts collection with it, is refused.
+    let body = json!({"schema": schema(json!({"drafts": true}))}).to_string();
+    let res = send(&app, "PUT", "/api/admin/collections/events", Some(&body)).await;
+    common::assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "field name `publishedAt` is reserved"
+    );
+    let mut other = schema(json!({"drafts": true}));
+    other["slug"] = json!("launches");
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&other.to_string()),
+    )
+    .await;
+    common::assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "field name `publishedAt` is reserved"
+    );
+}

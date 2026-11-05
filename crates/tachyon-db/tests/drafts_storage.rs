@@ -902,3 +902,58 @@ async fn owner_narrows_reads(pool: PgPool) {
         assert_eq!(listed(&pool, notes, &q, "label").await.0, ["to-u"]);
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn only_drafts_collections_report_a_publish_time(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    // Authors have no drafts: a field of theirs may be named publishedAt.
+    let ann = documents::get(&pool, s.authors, s.ann, DocCopy::Published)
+        .await
+        .unwrap();
+    assert_eq!(ann.published_at, None);
+    let mut doc = ann.clone();
+    doc.data.0.insert("publishedAt".into(), json!("their own"));
+    let json = serde_json::to_string(&doc).unwrap();
+    assert_eq!(json.matches("publishedAt").count(), 1, "{json}");
+    let page = query::list(
+        &pool,
+        s.authors,
+        &list_query(None, DocCopy::Published, None),
+    )
+    .await
+    .unwrap();
+    assert!(page.docs.iter().all(|d| d.published_at.is_none()));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn draft_reads_skip_a_missing_draft(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let with = post(&pool, &s, "With", s.ann).await;
+    let without = post(&pool, &s, "Without", s.ann).await;
+    set_draft(&pool, with, Some(json!({"title": "With"}))).await;
+
+    let draft = list_query(None, DocCopy::Draft, None);
+    assert_eq!(
+        listed(&pool, s.posts, &draft, "title").await,
+        (vec!["With".into()], 1)
+    );
+    assert!(matches!(
+        documents::get(&pool, s.posts, without, DocCopy::Draft).await,
+        Err(DbError::NotFound)
+    ));
+    let read = HashMap::from([(s.posts, readable(DocCopy::Draft, None))]);
+    let found = query::get_many_readable(&pool, &[with, without], &read)
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&found), ["With"]);
+    let (notes, schema) = notes(&pool, &s, &[("to-with", with), ("to-without", without)]).await;
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let lookup = |slug: &str| (slug == "posts").then(|| posts_schema.clone());
+    let guards = [("posts", readable(DocCopy::Draft, None))];
+    for (id, want) in [(with, vec!["to-with"]), (without, vec![])] {
+        let qs = format!("where[post.id][equals]={id}");
+        let f = guarded(&schema.fields, &qs, &lookup, &guards);
+        let q = list_query(Some(&f), DocCopy::Published, None);
+        assert_eq!(listed(&pool, notes, &q, "label").await.0, want);
+    }
+}

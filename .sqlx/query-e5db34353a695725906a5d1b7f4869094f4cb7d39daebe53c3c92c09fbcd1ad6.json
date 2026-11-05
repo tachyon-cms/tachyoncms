@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3\n           RETURNING id, status, created_at, updated_at, published_at, published AS \"data!: Json<Map<String, Value>>\"",
+  "query": "INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by, updated_by)\n           VALUES ($1, $2, $3, 'published', $4, now(), $5, $5)\n           RETURNING id, status, created_at, updated_at,\n                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, published AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -51,12 +51,7 @@
         "ordinal": 4,
         "name": "published_at",
         "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "published_at"
-          }
-        }
+        "origin": "Expression"
       },
       {
         "ordinal": 5,
@@ -84,9 +79,9 @@
       false,
       false,
       false,
-      true,
+      null,
       true
     ]
   },
-  "hash": "619bae616d422cdcb97725aa50a63e0b02f3801368fe42b969177cb3a6ed6a81"
+  "hash": "e5db34353a695725906a5d1b7f4869094f4cb7d39daebe53c3c92c09fbcd1ad6"
 }

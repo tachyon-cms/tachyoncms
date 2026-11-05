@@ -140,10 +140,14 @@ fn number(params: &Map<String, Value>, name: &str) -> Result<Option<i64>, ApiErr
         .transpose()
 }
 
-fn select(params: &Map<String, Value>, fields: &[Field]) -> Result<Option<Select>, ApiError> {
+fn select(
+    params: &Map<String, Value>,
+    fields: &[Field],
+    drafts: bool,
+) -> Result<Option<Select>, ApiError> {
     params
         .get("select")
-        .map(|s| parse_select(fields, s, "select"))
+        .map(|s| parse_select(fields, drafts, s, "select"))
         .transpose()
         .map_err(|e| bad(e.to_string()))
 }
@@ -168,8 +172,13 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
                 "populate[{slug}]: expected populate[{slug}][field]=true"
             )));
         }
-        let select = parse_select(c.schema.data(), tree, &format!("populate[{slug}]"))
-            .map_err(|e| bad(e.to_string()))?;
+        let select = parse_select(
+            c.schema.data(),
+            c.schema.drafts(),
+            tree,
+            &format!("populate[{slug}]"),
+        )
+        .map_err(|e| bad(e.to_string()))?;
         out.insert(slug.clone(), select);
     }
     Ok(out)
@@ -404,7 +413,7 @@ pub(crate) fn list_params(
         after,
         count,
         depth: depth(&params)?,
-        select: select(&params, fields)?,
+        select: select(&params, fields, c.schema.drafts())?,
         populate: populate(&params, schemas)?,
         joins: joins(&params, c, access)?,
         format: format(&params)?,
@@ -421,7 +430,7 @@ pub(crate) fn read_params(
     let params = params(raw, &["depth", "select", "populate", "joins", "format"])?;
     Ok(ReadParams {
         depth: depth(&params)?,
-        select: select(&params, c.schema.data())?,
+        select: select(&params, c.schema.data(), c.schema.drafts())?,
         populate: populate(&params, access.schemas())?,
         joins: joins(&params, c, access)?,
         format: format(&params)?,

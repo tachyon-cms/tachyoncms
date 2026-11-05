@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, collection_id, status, created_at, updated_at, published_at,\n                  published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL\n             AND published IS NOT NULL",
+  "query": "UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3\n           RETURNING id, status, created_at, updated_at,\n                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, published AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -16,17 +16,6 @@
       },
       {
         "ordinal": 1,
-        "name": "collection_id",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "collection_id"
-          }
-        }
-      },
-      {
-        "ordinal": 2,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -59,18 +48,13 @@
         }
       },
       {
-        "ordinal": 5,
+        "ordinal": 4,
         "name": "published_at",
         "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "published_at"
-          }
-        }
+        "origin": "Expression"
       },
       {
-        "ordinal": 6,
+        "ordinal": 5,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -84,7 +68,10 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "UuidArray"
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -92,10 +79,9 @@
       false,
       false,
       false,
-      false,
-      true,
+      null,
       true
     ]
   },
-  "hash": "66fcf33c553ebf64c0185f3135f6ed646a626bd14ae2b4c9d09be0b185d7c8f9"
+  "hash": "cbe0e0b37d96ddeb593acd6e4ed7bade5a8022526f91061545aa0c49801dec66"
 }

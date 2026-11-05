@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, status, created_at, updated_at, published_at,\n                  CASE WHEN $4 THEN draft ELSE published END AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND ($4 OR published IS NOT NULL)",
+  "query": "SELECT id, status, created_at, updated_at,\n                  CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,\n                  CASE WHEN $4 THEN draft ELSE published END AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND CASE WHEN $4 THEN draft IS NOT NULL ELSE published IS NOT NULL END",
   "describe": {
     "columns": [
       {
@@ -51,12 +51,7 @@
         "ordinal": 4,
         "name": "published_at",
         "type_info": "Timestamptz",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "published_at"
-          }
-        }
+        "origin": "Expression"
       },
       {
         "ordinal": 5,
@@ -78,9 +73,9 @@
       false,
       false,
       false,
-      true,
+      null,
       null
     ]
   },
-  "hash": "6ced5a14719ed27cc296b334c400dbccdea3e618c324c64bdd913fc8f661f8f0"
+  "hash": "fe52356c3c894fa20bd07f0183741c7db2d3e58367010cad9f838b9d85814bb4"
 }
