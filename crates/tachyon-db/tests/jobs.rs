@@ -396,27 +396,71 @@ async fn cancelling_a_run_ends_its_lease(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn concurrent_enqueues_on_one_key_leave_the_later(pool: PgPool) {
+async fn concurrent_enqueues_on_one_key_leave_one(pool: PgPool) {
     let later = now() + time::Duration::hours(1);
     let mut first = pool.begin().await.unwrap();
     let a = jobs::enqueue(&mut first, &job(later, Some("k")))
         .await
         .unwrap();
-    // The second waits on the first's uncommitted row, then finds it taken.
-    let second = {
-        let pool = pool.clone();
-        tokio::spawn(async move {
-            let mut tx = pool.begin().await.unwrap();
-            let id = jobs::enqueue(&mut tx, &job(later, Some("k"))).await?;
-            tx.commit().await.unwrap();
-            Ok::<_, DbError>(id)
+    // The others wait on the first's uncommitted row, then all find it taken at once.
+    let others: Vec<_> = (0..4)
+        .map(|n| {
+            let pool = pool.clone();
+            tokio::spawn(async move {
+                let mut tx = pool.begin().await.unwrap();
+                let new = NewJob {
+                    payload: json!({"caller": n}),
+                    ..job(later, Some("k"))
+                };
+                let id = jobs::enqueue(&mut tx, &new).await?;
+                tx.commit().await.unwrap();
+                Ok::<_, DbError>(id)
+            })
         })
-    };
+        .collect();
     tokio::time::sleep(Duration::from_millis(300)).await;
     first.commit().await.unwrap();
-    let b = second.await.unwrap().expect("the later enqueue replaces");
-    assert_eq!(state(&pool, a).await.0, "cancelled");
-    assert_eq!(state(&pool, b).await.0, "queued");
+    let mut ids = vec![a];
+    for t in others {
+        ids.push(t.await.unwrap().expect("no caller gets an error"));
+    }
+    let pending: Vec<(Uuid,)> =
+        sqlx::query_as("SELECT id FROM jobs WHERE dedupe_key = 'k' AND state = 'queued'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(pending.len(), 1, "one pending job per key");
+    assert!(ids.contains(&pending[0].0), "a caller's job");
+    let cancelled: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE dedupe_key = 'k' AND state = 'cancelled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(cancelled, 4);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn dedupe_keys_belong_to_a_tenant(pool: PgPool) {
+    let other = Uuid::from_u128(2);
+    sqlx::query("INSERT INTO tenants (id, name) VALUES ($1, 'other')")
+        .bind(other)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let theirs = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, tenant_id, kind, run_at, state, dedupe_key)
+         VALUES ($1, $2, 'test', now(), 'queued', 'k')",
+    )
+    .bind(theirs)
+    .bind(other)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let ours = add(&pool, &job(now(), Some("k"))).await;
+    assert_eq!(state(&pool, theirs).await.0, "queued", "left alone");
+    assert_eq!(state(&pool, ours).await.0, "queued");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

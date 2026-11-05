@@ -56,25 +56,27 @@ pub struct Job {
 
 /// Adds `job`, first cancelling any pending job with its `dedupe_key`, on `conn` so a
 /// caller's transaction takes both or neither. A running job cancelled this way can't
-/// complete, since completing is fenced on `running`. When another caller adds a job of
-/// the same key at the same moment, the later one wins: it tries once more, which cancels
-/// the one that got in first.
+/// complete, since completing is fenced on `running`. When other callers add a job of the
+/// same key at the same moment, the last one wins: a caller whose insert clashes tries
+/// again, which cancels the one that got in first.
 pub async fn enqueue(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbError> {
-    // A savepoint (or a transaction, outside one), so a clash leaves the caller's open.
-    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-    match enqueue_once(&mut tx, job).await {
-        Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
-            tx.rollback().await?;
-            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
-            let id = enqueue_once(&mut tx, job).await?;
-            tx.commit().await?;
-            Ok(id)
+    // Each clash means another caller committed in between; this many is far past real use.
+    const TRIES: usize = 5;
+    let mut tried = 0;
+    loop {
+        tried += 1;
+        // A savepoint (or a transaction, outside one), so a clash leaves the caller's open.
+        let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+        match enqueue_once(&mut tx, job).await {
+            Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" && tried < TRIES => {
+                tx.rollback().await?;
+            }
+            Ok(id) => {
+                tx.commit().await?;
+                return Ok(id);
+            }
+            Err(e) => return Err(e),
         }
-        Ok(id) => {
-            tx.commit().await?;
-            Ok(id)
-        }
-        Err(e) => Err(e),
     }
 }
 

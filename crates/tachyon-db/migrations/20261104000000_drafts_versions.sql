@@ -55,7 +55,8 @@ CREATE TABLE jobs (
     CHECK (document_id IS NULL OR collection_id IS NOT NULL)
 );
 
-CREATE UNIQUE INDEX jobs_one_pending ON jobs (dedupe_key) WHERE state IN ('queued', 'running');
+CREATE UNIQUE INDEX jobs_one_pending ON jobs (tenant_id, dedupe_key)
+    WHERE state IN ('queued', 'running');
 CREATE INDEX jobs_due ON jobs (run_at) WHERE state = 'queued';
 CREATE INDEX jobs_leased ON jobs (locked_until) WHERE state = 'running';
 -- Pruning keeps any version a pending job holds.

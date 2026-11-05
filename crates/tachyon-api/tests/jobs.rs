@@ -9,7 +9,10 @@ use uuid::Uuid;
 
 async fn app(pool: &PgPool, workers: usize) -> axum::Router {
     let options = Options {
-        jobs: JobsConfig { workers },
+        jobs: JobsConfig {
+            workers,
+            ..JobsConfig::default()
+        },
         ..Options::default()
     };
     tachyon_api::router_with(pool.clone(), options)

@@ -270,7 +270,10 @@ impl Config {
                 "jobs.workers is {workers}, but the database pool has {pool_connections} connections; use fewer than {pool_connections} so requests still get one"
             ));
         }
-        Ok(JobsConfig { workers })
+        Ok(JobsConfig {
+            workers,
+            ..JobsConfig::default()
+        })
     }
 
     /// Defaults, then the TOML file, then `TACHYON_*` environment variables. With no

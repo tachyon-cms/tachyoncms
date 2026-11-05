@@ -29,7 +29,7 @@ use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
-pub use jobs::{JobsConfig, running_jobs};
+pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;
 
 #[derive(Clone)]
