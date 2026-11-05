@@ -12,6 +12,7 @@ use tachyon_core::query::Filter;
 use time::OffsetDateTime;
 use uuid::Uuid;
 
+use crate::collections::Collection;
 use crate::{DEFAULT_TENANT, DbError, map_unique};
 
 #[derive(Debug, Clone, Serialize, sqlx::FromRow)]
@@ -326,6 +327,134 @@ pub async fn update_in<E: From<DbError>>(
     .map_err(map_unique)?;
     sync_relations(&mut *tx, id, copy, &next.relations).await?;
     Ok(doc)
+}
+
+/// Locks live document `id` of collection `collection_id` for a write inside `tx`, and
+/// returns its `copy`: `NotFound` without that copy, `Forbidden` unless that copy matches
+/// `guard` and, with an `owner`, they created it. The collection is locked first, as every
+/// write locks it, and must still be at `schema_version`. Publishing locks the draft this
+/// way.
+pub async fn lock_in(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+    id: Uuid,
+    copy: DocCopy,
+    guard: Option<&Filter>,
+    owner: Option<Uuid>,
+) -> Result<Map<String, Value>, DbError> {
+    check_schema(&mut *tx, collection_id, schema_version).await?;
+    let row = sqlx::query!(
+        r#"SELECT CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>",
+                  created_by
+           FROM documents
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+             AND CASE WHEN $4 THEN draft ELSE published END IS NOT NULL
+           FOR NO KEY UPDATE"#,
+        DEFAULT_TENANT,
+        collection_id,
+        id,
+        copy == DocCopy::Draft,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    if owner.is_some_and(|o| row.created_by != Some(o)) {
+        return Err(DbError::Forbidden);
+    }
+    check_guard(&mut *tx, id, copy, guard).await?;
+    Ok(row.data.0)
+}
+
+/// Publishes document `id` of `c`, a collection with drafts, inside `tx`: `doc` (the
+/// stored draft and its links when `None`) becomes the published copy, the status
+/// `published` and `published_at` now, and a `published` version is recorded. The caller
+/// has locked the row (`lock_in`) and validated what's published. A unique clash is a
+/// `UniqueViolation`; a link to a document that's gone, a `Validation` error.
+pub async fn publish_in(
+    tx: &mut PgConnection,
+    c: &Collection,
+    id: Uuid,
+    doc: Option<&Prepared>,
+    by: Option<Uuid>,
+) -> Result<Document, DbError> {
+    check_schema(&mut *tx, c.id, c.schema_version).await?;
+    let published = sqlx::query_as!(
+        Document,
+        r#"UPDATE documents
+           SET published = COALESCE($4::jsonb, draft), status = 'published',
+               published_at = now(), updated_at = now(), updated_by = COALESCE($5, updated_by)
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+             AND draft IS NOT NULL
+           RETURNING id, status, created_at, updated_at, published_at,
+                     published AS "data!: Json<Map<String, Value>>""#,
+        DEFAULT_TENANT,
+        c.id,
+        id,
+        doc.map(|d| Json(&d.data)) as _,
+        by,
+    )
+    .fetch_optional(&mut *tx)
+    .await
+    .map_err(map_unique)?
+    .ok_or(DbError::NotFound)?;
+    match doc {
+        Some(doc) => sync_relations(&mut *tx, id, DocCopy::Published, &doc.relations).await?,
+        None => {
+            sqlx::query!(
+                "DELETE FROM relations WHERE from_doc = $1 AND copy = 'published'",
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+            sqlx::query!(
+                "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+                 SELECT tenant_id, from_doc, 'published', field_path, to_doc FROM relations
+                 WHERE from_doc = $1 AND copy = 'draft'",
+                id
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+    }
+    crate::versions::record_version(tx, id, c, DocCopy::Published, &published.data.0, by).await?;
+    Ok(published)
+}
+
+/// Takes document `id` of `c` off the site inside `tx`: no published copy or links, status
+/// `draft`, never published as far as reads tell. The draft stays as it is, and documents
+/// that link here keep their links. The caller has locked the row (`lock_in`). Returns the
+/// draft.
+pub async fn unpublish_in(
+    tx: &mut PgConnection,
+    c: &Collection,
+    id: Uuid,
+    by: Option<Uuid>,
+) -> Result<Document, DbError> {
+    let draft = sqlx::query_as!(
+        Document,
+        r#"UPDATE documents
+           SET published = NULL, status = 'draft', published_at = NULL,
+               updated_at = now(), updated_by = COALESCE($4, updated_by)
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+             AND draft IS NOT NULL
+           RETURNING id, status, created_at, updated_at, published_at,
+                     draft AS "data!: Json<Map<String, Value>>""#,
+        DEFAULT_TENANT,
+        c.id,
+        id,
+        by,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    sqlx::query!(
+        "DELETE FROM relations WHERE from_doc = $1 AND copy = 'published'",
+        id
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(draft)
 }
 
 /// Soft delete. Refused while other live documents link here. Restoring from Trash arrives in M4.

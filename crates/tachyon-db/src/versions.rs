@@ -1,8 +1,10 @@
 //! Past copies of documents.
 
+use serde::Serialize;
 use serde_json::{Map, Value};
-use sqlx::PgConnection;
 use sqlx::types::Json;
+use sqlx::{PgConnection, PgPool};
+use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::collections::Collection;
@@ -59,4 +61,77 @@ pub async fn record_version(
         .await?;
     }
     Ok(id)
+}
+
+/// A past copy of a document.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Version {
+    pub id: Uuid,
+    /// The copy it was: `draft` or `published`.
+    pub kind: String,
+    #[serde(with = "time::serde::rfc3339")]
+    pub created_at: OffsetDateTime,
+    pub created_by: Option<Uuid>,
+    /// Left out of lists.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Map<String, Value>>,
+}
+
+/// Up to `limit` versions of live document `doc`, newest first, after skipping `offset`,
+/// without their data.
+pub async fn list(
+    pool: &PgPool,
+    doc: Uuid,
+    limit: i64,
+    offset: i64,
+) -> Result<Vec<Version>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT v.id, v.kind, v.created_at, v.created_by FROM versions v
+           JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id
+           WHERE v.tenant_id = $1 AND v.document_id = $2 AND d.deleted_at IS NULL
+           ORDER BY v.created_at DESC, v.id DESC
+           LIMIT $3 OFFSET $4"#,
+        DEFAULT_TENANT,
+        doc,
+        limit,
+        offset,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Version {
+            id: r.id,
+            kind: r.kind,
+            created_at: r.created_at,
+            created_by: r.created_by,
+            data: None,
+        })
+        .collect())
+}
+
+/// Version `id` of live document `doc`, with its data.
+pub async fn get(pool: &PgPool, doc: Uuid, id: Uuid) -> Result<Version, DbError> {
+    let r = sqlx::query!(
+        r#"SELECT v.id, v.kind, v.created_at, v.created_by,
+                  v.data AS "data!: Json<Map<String, Value>>"
+           FROM versions v
+           JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id
+           WHERE v.tenant_id = $1 AND v.document_id = $2 AND v.id = $3
+             AND d.deleted_at IS NULL"#,
+        DEFAULT_TENANT,
+        doc,
+        id,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    Ok(Version {
+        id: r.id,
+        kind: r.kind,
+        created_at: r.created_at,
+        created_by: r.created_by,
+        data: Some(r.data.0),
+    })
 }

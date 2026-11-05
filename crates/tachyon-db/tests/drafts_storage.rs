@@ -1483,3 +1483,103 @@ async fn slug_lookups_stop_at_two_matches(pool: PgPool) {
         .unwrap();
     assert_eq!(live.keys().collect::<Vec<_>>(), ["live"]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn publishing_copies_the_draft_and_its_links(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let c = collections::get_by_slug(&pool, "posts").await.unwrap();
+    // Live with Bob; the draft has moved on to Ann.
+    let id = post(&pool, &s, "Live", s.bob).await;
+    set_draft(
+        &pool,
+        id,
+        Some(json!({"title": "Next", "author": s.ann.to_string()})),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         VALUES ($1, $2, 'draft', 'author', $3)",
+    )
+    .bind(DEFAULT_TENANT)
+    .bind(id)
+    .bind(s.ann)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    // The lock judges the draft, and its creator when asked to.
+    let mut tx = pool.begin().await.unwrap();
+    let next = parse_filter_with(
+        &c.schema.fields,
+        &json!({"title": {"equals": "Next"}}),
+        &|_| None,
+    )
+    .unwrap();
+    let live = parse_filter_with(
+        &c.schema.fields,
+        &json!({"title": {"equals": "Live"}}),
+        &|_| None,
+    )
+    .unwrap();
+    let draft = documents::lock_in(
+        &mut tx,
+        c.id,
+        c.schema_version,
+        id,
+        DocCopy::Draft,
+        Some(&next),
+        None,
+    )
+    .await
+    .unwrap();
+    assert_eq!(draft["title"], "Next");
+    for (guard, owner) in [(Some(&live), None), (None, Some(Uuid::now_v7()))] {
+        let refused = documents::lock_in(
+            &mut tx,
+            c.id,
+            c.schema_version,
+            id,
+            DocCopy::Draft,
+            guard,
+            owner,
+        )
+        .await;
+        assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
+    }
+
+    let published = documents::publish_in(&mut tx, &c, id, None, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(published.status, "published");
+    assert_eq!(published.data["title"], "Next");
+    assert!(published.published_at.is_some());
+    let (live, draft) = copies(&pool, id).await;
+    assert_eq!(live, draft);
+    assert_eq!(
+        links(&pool, id).await,
+        [
+            ("draft".into(), "author".into(), s.ann),
+            ("published".into(), "author".into(), s.ann)
+        ]
+    );
+    let kinds: Vec<String> = sqlx::query_scalar("SELECT kind FROM versions WHERE document_id = $1")
+        .bind(id)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(kinds, ["published"]);
+
+    let mut tx = pool.begin().await.unwrap();
+    let draft = documents::unpublish_in(&mut tx, &c, id, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!((draft.status.as_str(), draft.published_at), ("draft", None));
+    assert_eq!(draft.data["title"], "Next");
+    assert_eq!(copies(&pool, id).await.0, None);
+    assert_eq!(
+        links(&pool, id).await,
+        [("draft".into(), "author".into(), s.ann)]
+    );
+}
