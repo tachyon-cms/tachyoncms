@@ -1,0 +1,23 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,\n                             state, dedupe_key, created_by, key_id)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Timestamptz",
+        "Text",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ecec3c5db413bda2f10f43b6e36bca93f346abc501ff2b771da0dd182eafac99"
+}
