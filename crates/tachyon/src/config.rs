@@ -61,11 +61,12 @@ pub struct JobsSettings {
 
 impl Default for JobsSettings {
     fn default() -> Self {
-        Self {
-            workers: JobsConfig::default().workers,
-        }
+        Self { workers: 2 }
     }
 }
+
+/// More workers than this would mostly wait on each other's database connections.
+const MAX_WORKERS: usize = 16;
 
 /// `15m`, `12h`, `7d`: a whole number and a unit.
 fn duration(name: &str, text: &str) -> Result<Duration, String> {
@@ -255,11 +256,21 @@ impl Config {
         })
     }
 
-    /// The job workers the API runs with.
-    pub fn jobs_config(&self) -> JobsConfig {
-        JobsConfig {
-            workers: self.jobs.workers,
+    /// The job workers the API runs with, given the database pool's size. Each worker can
+    /// hold a connection, so they must leave at least one for requests.
+    pub fn jobs_config(&self, pool_connections: u32) -> Result<JobsConfig, String> {
+        let workers = self.jobs.workers;
+        if workers > MAX_WORKERS {
+            return Err(format!(
+                "jobs.workers is {workers}; it can be at most {MAX_WORKERS}"
+            ));
         }
+        if workers >= pool_connections as usize {
+            return Err(format!(
+                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; use fewer than {pool_connections} so requests still get one"
+            ));
+        }
+        Ok(JobsConfig { workers })
     }
 
     /// Defaults, then the TOML file, then `TACHYON_*` environment variables. With no
@@ -535,8 +546,11 @@ mod tests {
 
     #[test]
     fn jobs_run_two_workers_unless_told_otherwise() {
-        assert_eq!(load("").jobs_config().workers, 2);
-        assert_eq!(load("[jobs]\nworkers = 0").jobs_config().workers, 0);
+        assert_eq!(load("").jobs_config(10).unwrap().workers, 2);
+        assert_eq!(
+            load("[jobs]\nworkers = 0").jobs_config(10).unwrap().workers,
+            0
+        );
         Jail::expect_with(|jail| {
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
             jail.create_file("tachyon.toml", "[jobs]\nwokers = 4\n")?;
@@ -546,9 +560,25 @@ mod tests {
             assert!(Config::load(None).is_err(), "a negative count");
             jail.create_file("tachyon.toml", "[jobs]\nworkers = 4\n")?;
             jail.set_env("TACHYON_JOBS__WORKERS", "1");
-            assert_eq!(Config::load(None)?.jobs_config().workers, 1);
+            assert_eq!(Config::load(None)?.jobs_config(10).unwrap().workers, 1);
             Ok(())
         });
+    }
+
+    #[test]
+    fn jobs_workers_fit_the_pool_and_the_cap() {
+        let at = |n: usize, pool: u32| load(&format!("[jobs]\nworkers = {n}")).jobs_config(pool);
+        assert_eq!(at(16, 40).unwrap().workers, 16);
+        assert_eq!(
+            at(17, 40).unwrap_err(),
+            "jobs.workers is 17; it can be at most 16"
+        );
+        assert_eq!(at(9, 10).unwrap().workers, 9);
+        assert_eq!(
+            at(10, 10).unwrap_err(),
+            "jobs.workers is 10, but the database pool has 10 connections; use fewer than 10 so requests still get one"
+        );
+        assert!(at(0, 1).is_ok(), "no workers fit any pool");
     }
 
     #[test]

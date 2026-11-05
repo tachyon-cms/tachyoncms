@@ -4,6 +4,16 @@
 //! A lease that runs out lets another worker claim the job again, so every write that ends
 //! a run is fenced on the attempt it claimed: the run whose lease was taken over can't
 //! complete, fail or extend the job, and its transaction rolls back.
+//!
+//! A run is one of two shapes, never both:
+//! - Short and transactional: `complete_in` first, then the work, in one transaction. The
+//!   row lock keeps any other worker off the job until the transaction ends. It must never
+//!   `heartbeat`, which runs on another connection and would wait on that lock forever.
+//! - Long: `heartbeat` at least every third of the lease, stopping when it returns false,
+//!   and `complete_in` only at the end.
+//!
+//! Finish times use `clock_timestamp()`, the moment of the write, not the start of the
+//! transaction, which for a short run is when its work began.
 
 use std::time::Duration;
 
@@ -46,8 +56,29 @@ pub struct Job {
 
 /// Adds `job`, first cancelling any pending job with its `dedupe_key`, on `conn` so a
 /// caller's transaction takes both or neither. A running job cancelled this way can't
-/// complete, since completing is fenced on `running`.
+/// complete, since completing is fenced on `running`. When another caller adds a job of
+/// the same key at the same moment, the later one wins: it tries once more, which cancels
+/// the one that got in first.
 pub async fn enqueue(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbError> {
+    // A savepoint (or a transaction, outside one), so a clash leaves the caller's open.
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    match enqueue_once(&mut tx, job).await {
+        Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
+            tx.rollback().await?;
+            let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+            let id = enqueue_once(&mut tx, job).await?;
+            tx.commit().await?;
+            Ok(id)
+        }
+        Ok(id) => {
+            tx.commit().await?;
+            Ok(id)
+        }
+        Err(e) => Err(e),
+    }
+}
+
+async fn enqueue_once(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbError> {
     if let Some(key) = &job.dedupe_key {
         cancel(conn, key).await?;
     }
@@ -76,7 +107,7 @@ pub async fn enqueue(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, 
 /// Cancels the pending (queued or running) job with `dedupe_key`. False when there was none.
 pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, DbError> {
     let done = sqlx::query!(
-        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = now()
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
            WHERE tenant_id = $1 AND dedupe_key = $2 AND state IN ('queued', 'running')"#,
         DEFAULT_TENANT,
         dedupe_key,
@@ -87,15 +118,18 @@ pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, D
 }
 
 /// Leases one job for `lease`: a queued one that's due, or a running one whose lease ran
-/// out. Rows another worker is claiming are skipped, not waited for. A job that lost its
-/// lease on its last attempt fails here instead, so one that kills its worker every time
-/// stops being retried.
+/// out. Rows another worker holds are skipped, not waited for. A job that lost its lease
+/// on its last attempt fails here instead, so one that kills its worker every time stops
+/// being retried; one whose run still holds its row is left to that run.
 pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
     sqlx::query!(
-        r#"UPDATE jobs SET state = 'failed', locked_until = NULL, finished_at = now(),
+        r#"UPDATE jobs SET state = 'failed', locked_until = NULL, finished_at = clock_timestamp(),
                last_error = 'its lease ran out on the last attempt'
-           WHERE tenant_id = $1 AND state = 'running' AND locked_until < now()
-             AND attempts >= max_attempts"#,
+           WHERE id IN (
+               SELECT id FROM jobs
+               WHERE tenant_id = $1 AND state = 'running' AND locked_until < now()
+                 AND attempts >= max_attempts
+               FOR UPDATE SKIP LOCKED)"#,
         DEFAULT_TENANT,
     )
     .execute(pool)
@@ -108,7 +142,8 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
                SELECT id FROM jobs
                WHERE tenant_id = $1
                  AND ((state = 'queued' AND run_at <= now())
-                      OR (state = 'running' AND locked_until < now()))
+                      OR (state = 'running' AND locked_until < now()
+                          AND attempts < max_attempts))
                ORDER BY run_at, id
                LIMIT 1
                FOR UPDATE SKIP LOCKED)
@@ -123,7 +158,8 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
 }
 
 /// Extends `job`'s lease to `lease` from now. False when the lease was lost: another worker
-/// took the job over, or it was cancelled. The caller should stop.
+/// took the job over, or it was cancelled. The caller should stop. Only for long runs: a
+/// run that called `complete_in` holds the row, and this would wait on it forever.
 pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool, DbError> {
     let done = sqlx::query!(
         r#"UPDATE jobs SET locked_until = now() + make_interval(secs => $3)
@@ -140,10 +176,11 @@ pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool
 /// Marks `job` done in the caller's transaction, which holds the job's effects. False when
 /// this run no longer holds the job; the caller must roll back, which is what makes a job's
 /// effects commit once even when two workers ran it. Called before the work, it also locks
-/// the row, so no other worker can take the job over until the transaction ends.
+/// the row, so no other worker can take the job over until the transaction ends; such a
+/// run must not `heartbeat` afterwards. A long run calls it at the end instead.
 pub async fn complete_in(tx: &mut PgConnection, job: &Job) -> Result<bool, DbError> {
     let done = sqlx::query!(
-        r#"UPDATE jobs SET state = 'done', locked_until = NULL, finished_at = now()
+        r#"UPDATE jobs SET state = 'done', locked_until = NULL, finished_at = clock_timestamp()
            WHERE id = $1 AND attempts = $2 AND state = 'running'"#,
         job.id,
         job.attempts,
@@ -163,7 +200,7 @@ pub async fn fail(pool: &PgPool, job: &Job, error: &str, retry: bool) -> Result<
                run_at = CASE WHEN $4 AND attempts < max_attempts
                              THEN now() + make_interval(secs => 10 * attempts * attempts)
                              ELSE run_at END,
-               finished_at = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE now() END,
+               finished_at = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE clock_timestamp() END,
                locked_until = NULL,
                last_error = $3
            WHERE id = $1 AND attempts = $2 AND state = 'running'"#,

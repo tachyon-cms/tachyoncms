@@ -29,7 +29,7 @@ use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
-pub use jobs::JobsConfig;
+pub use jobs::{JobsConfig, running_jobs};
 use schemas::Schemas;
 
 #[derive(Clone)]
@@ -62,6 +62,9 @@ pub async fn router(pool: PgPool) -> Result<Router, StartError> {
     router_with(pool, Options::default()).await
 }
 
+/// The API with `options`. It also starts `options.jobs.workers` job workers, which run until
+/// `pool` closes: dropping the router doesn't stop them, and a second router on the same pool
+/// starts as many again.
 pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
