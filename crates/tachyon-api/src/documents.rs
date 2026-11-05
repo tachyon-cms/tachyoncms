@@ -24,7 +24,7 @@ use uuid::Uuid;
 
 use crate::access::{Access, both};
 use crate::joins::fill_joins;
-use crate::params::{Format, Joins, autosave_param, list_params, read_params};
+use crate::params::{Format, Joins, autosave_param, list_params, no_params, read_params};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
     to_value, vouched_links,
@@ -237,15 +237,17 @@ pub async fn create(
     State(state): State<AppState>,
     access: Access,
     path: Result<Path<String>, PathRejection>,
+    RawQuery(raw): RawQuery,
     body: Result<Json<Value>, JsonRejection>,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
+    no_params(raw.as_deref())?;
     access.scope(Action::Create, &c.schema.slug)?;
     if !access.may_create(&c) {
         return Err(access.refuse());
     }
-    let copy = access.write_copy(&c);
+    let copy = access.write_copy(&c)?;
     let mut body = json_body(body)?;
     from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
@@ -325,7 +327,7 @@ pub async fn update(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     let autosave = autosave_param(raw.as_deref(), &c)?;
-    let copy = access.write_copy(&c);
+    let copy = access.write_copy(&c)?;
     let guard = access
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
@@ -377,13 +379,15 @@ pub async fn delete(
     State(state): State<AppState>,
     access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
+    RawQuery(raw): RawQuery,
 ) -> Result<StatusCode, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     // Checked again later; here so a key's 403 comes before a malformed ID's 404.
     access.scope(Action::Delete, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
-    let copy = access.write_copy(&c);
+    no_params(raw.as_deref())?;
+    let copy = access.write_copy(&c)?;
     let guard = access
         .write_guard(&state.pool, Action::Delete, &c, id)
         .await?;

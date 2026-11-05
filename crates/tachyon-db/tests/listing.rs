@@ -570,6 +570,13 @@ mod joins {
     use tachyon_db::documents::Relation;
     use tachyon_db::query::{JoinQuery, joined};
 
+    static PUBLISHED: Readable = Readable {
+        filter: None,
+        copy: DocCopy::Published,
+        owner: None,
+        otherwise: None,
+    };
+
     struct Fixture {
         posts: Uuid,
         categories: Uuid,
@@ -647,8 +654,7 @@ mod joins {
             limit: 10,
             offset: 0,
             count: false,
-            copy: DocCopy::Published,
-            owner: None,
+            read: &PUBLISHED,
         }
     }
 

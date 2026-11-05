@@ -124,12 +124,15 @@ impl DocCopy {
 }
 
 /// How a caller may read one collection: which copy, narrowed by a read filter (`None`:
-/// all of it) and, for own-only rights, to the documents `owner` created.
+/// all of it) and, for own-only rights, to the documents `owner` created. With `otherwise`,
+/// a document that can't be read this way is read that way instead: a draft where the
+/// caller may read it, else what's published where they may read that.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Readable {
     pub filter: Option<Filter>,
     pub copy: DocCopy,
     pub owner: Option<Uuid>,
+    pub otherwise: Option<Box<Readable>>,
 }
 
 impl Readable {
@@ -139,6 +142,15 @@ impl Readable {
             filter,
             copy: DocCopy::Published,
             owner: None,
+            otherwise: None,
+        }
+    }
+
+    /// This, with nothing to fall back to.
+    pub fn alone(&self) -> Self {
+        Self {
+            otherwise: None,
+            ..self.clone()
         }
     }
 }

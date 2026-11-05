@@ -6,7 +6,6 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::ops::Deref;
-use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use axum::Json;
@@ -41,11 +40,12 @@ pub(crate) struct Access {
     user: Option<Map<String, Value>>,
     schemas: Arc<Schemas>,
     /// Whether the request works on drafts: asked for with `?draft=true`, or a write to a
-    /// collection with drafts. Each collection is then read in its draft where the caller
-    /// may read drafts there, and in its published copy elsewhere.
-    drafts: AtomicBool,
-    /// `readable_for(false)` and `readable_for(true)`, each worked out once per request.
-    readable: [OnceLock<HashMap<Uuid, Readable>>; 2],
+    /// collection with drafts. Each linked document is then read as its draft where the
+    /// caller may read that draft, else as what's published. Set once, before anything is
+    /// read: the first read fixes it.
+    drafts: OnceLock<bool>,
+    /// `linked()`, worked out once per request.
+    linked: OnceLock<HashMap<Uuid, Readable>>,
     /// Each collection (by ID and schema version) as the caller can read it, worked out
     /// once per request.
     visible: Mutex<HashMap<(Uuid, i32), Shape>>,
@@ -333,8 +333,8 @@ impl Access {
             principal,
             user,
             schemas: state.schemas.clone(),
-            drafts: AtomicBool::new(false),
-            readable: [OnceLock::new(), OnceLock::new()],
+            drafts: OnceLock::new(),
+            linked: OnceLock::new(),
             visible: Mutex::new(HashMap::new()),
         })
     }
@@ -539,24 +539,34 @@ impl Access {
         })
     }
 
-    /// Whether the request works on drafts (see `drafts`).
+    /// Whether the request works on drafts (see `drafts`). Asking fixes the answer.
     pub(crate) fn drafts(&self) -> bool {
-        self.drafts.load(Ordering::Relaxed)
+        *self.drafts.get_or_init(|| false)
     }
 
-    /// From here on the request works on drafts: a write to a collection with drafts.
-    pub(crate) fn use_drafts(&self) {
-        self.drafts.store(true, Ordering::Relaxed);
+    /// Makes the request one that works on drafts. Refused once anything has been read
+    /// without them, since what was read then would no longer match.
+    fn use_drafts(&self) -> Result<(), ApiError> {
+        match self.drafts.set(true) {
+            Ok(()) => Ok(()),
+            Err(_) if self.drafts() => Ok(()),
+            Err(_) => {
+                debug_assert!(false, "drafts turned on after a published read");
+                Err(ApiError::Internal(
+                    "drafts were asked for after reading began".into(),
+                ))
+            }
+        }
     }
 
     /// The copy a write to `c` changes: its draft when it has drafts, which makes the
     /// request one that works on drafts.
-    pub(crate) fn write_copy(&self, c: &Collection) -> DocCopy {
+    pub(crate) fn write_copy(&self, c: &Collection) -> Result<DocCopy, ApiError> {
         if c.schema.drafts() {
-            self.use_drafts();
-            DocCopy::Draft
+            self.use_drafts()?;
+            Ok(DocCopy::Draft)
         } else {
-            DocCopy::Published
+            Ok(DocCopy::Published)
         }
     }
 
@@ -582,11 +592,33 @@ impl Access {
             filter: both(read, drafts),
             copy: DocCopy::Draft,
             owner,
+            otherwise: None,
         })
     }
 
+    /// How the caller reads a document of `c` that something links to: with `drafts`, as
+    /// its draft where they may read that draft, else as what's published where they may
+    /// read that. Filters through links, joins, populate, virtuals, rendering, link checks
+    /// and slug lookups all read linked documents this way.
+    fn linked_in(&self, c: &Collection, drafts: bool) -> Option<Readable> {
+        let read = self.readable_in(c, false)?;
+        match self.readable_in(c, drafts) {
+            Some(draft) if draft.copy == DocCopy::Draft => Some(Readable {
+                otherwise: Some(Box::new(read)),
+                ..draft
+            }),
+            _ => Some(read),
+        }
+    }
+
+    /// How the caller reads documents of `c` that this request links to (see `linked_in`).
+    pub(crate) fn linked_of(&self, c: &Collection) -> Option<Readable> {
+        self.linked_in(c, self.drafts())
+    }
+
     /// How the caller reads `c`, its draft when `drafts` and they may read it there, else
-    /// its published copy; `None` when they can't read `c`.
+    /// its published copy; `None` when they can't read `c`. Never both: a document asked
+    /// for itself is read in one copy.
     fn readable_in(&self, c: &Collection, drafts: bool) -> Option<Readable> {
         let read = match self.allows(Action::Read, c) {
             Compiled::Deny => return None,
@@ -600,7 +632,8 @@ impl Access {
         .or(Some(Readable::published(read)))
     }
 
-    /// How the caller reads `c` in this request (see `drafts`).
+    /// How the caller reads `c` in this request (see `drafts`), for documents asked for
+    /// themselves (a list, a get): one copy, no fallback. Links use `linked_of`.
     pub(crate) fn readable_of(&self, c: &Collection) -> Option<Readable> {
         self.readable_in(c, self.drafts())
     }
@@ -626,7 +659,7 @@ impl Access {
                 "`draft`: you don't have permission to read the drafts of `{slug}`"
             )));
         }
-        self.use_drafts();
+        self.use_drafts()?;
         Ok(DocCopy::Draft)
     }
 
@@ -664,29 +697,27 @@ impl Access {
         }
     }
 
-    /// Each collection the caller may read, and how: in their drafts (`drafts`) where they
-    /// may read drafts, else published. Globals are left out: nothing links to them.
-    pub(crate) fn readable_for(&self, drafts: bool) -> &HashMap<Uuid, Readable> {
-        self.readable[usize::from(drafts)].get_or_init(|| {
-            self.read_filters(|c| c.schema.kind == CollectionKind::Collection, drafts)
+    /// How the caller reads each collection's documents that this request links to (see
+    /// `linked_in`). Globals are left out: nothing links to them.
+    pub(crate) fn linked(&self) -> &HashMap<Uuid, Readable> {
+        let drafts = self.drafts();
+        self.linked.get_or_init(|| {
+            self.schemas
+                .all()
+                .iter()
+                .filter(|c| c.schema.kind == CollectionKind::Collection)
+                .filter_map(|c| Some((c.id, self.linked_in(c, drafts)?)))
+                .collect()
         })
     }
 
-    /// `readable_for`, with globals too: a global can link to a document, so it can be one
-    /// of that document's references.
+    /// Each collection, globals too, as the caller reads it in one copy: drafts where they
+    /// may read them there (`drafts`), else published. A global can link to a document, so
+    /// it can be one of that document's references.
     pub(crate) fn readable_with_globals(&self, drafts: bool) -> HashMap<Uuid, Readable> {
-        self.read_filters(|_| true, drafts)
-    }
-
-    fn read_filters(
-        &self,
-        which: impl Fn(&Collection) -> bool,
-        drafts: bool,
-    ) -> HashMap<Uuid, Readable> {
         self.schemas
             .all()
             .iter()
-            .filter(|c| which(c))
             .filter_map(|c| Some((c.id, self.readable_in(c, drafts)?)))
             .collect()
     }
@@ -741,6 +772,20 @@ impl Access {
             .ok_or(ApiError::NotFound)
     }
 
+    /// Whether the caller may read the published copy of document `id` of `c`.
+    async fn sees_published(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let Some(read) = self.readable_in(c, false) else {
+            return Ok(false);
+        };
+        let one = HashMap::from([(c.id, read)]);
+        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
+    }
+
     /// Whether the caller may read either copy of document `id` of `c`.
     pub(crate) async fn sees(
         &self,
@@ -790,11 +835,15 @@ impl Access {
         };
         // Checked first so a hidden document is a 404; the guard checks it again under the
         // lock, so a change in between can only turn this into a 403. The owner never
-        // changes, so it needn't be.
+        // changes, so it needn't be. A draft the caller can't read, of a document whose
+        // published copy they can, is theirs to know about: a 403.
         if read.filter.is_some() || read.owner.is_some() {
             let one = HashMap::from([(c.id, read.clone())]);
             if get_many_readable(pool, &[id], &one).await?.is_empty() {
-                return Err(ApiError::NotFound);
+                return Err(match read.copy {
+                    DocCopy::Draft if self.sees_published(pool, c, id).await? => self.refuse(),
+                    _ => ApiError::NotFound,
+                });
             }
         }
         Ok(both(read.filter, write))
@@ -844,7 +893,7 @@ impl Access {
                             .schemas
                             .get(slug)
                             .filter(|c| c.schema.kind == CollectionKind::Collection)
-                            .and_then(|c| self.readable_of(&c));
+                            .and_then(|c| self.linked_of(&c));
                         let guard = read.unwrap_or_else(|| Readable::published(Some(nothing())));
                         (slug.clone(), guard)
                     })

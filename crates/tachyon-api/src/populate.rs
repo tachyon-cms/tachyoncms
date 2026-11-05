@@ -92,42 +92,14 @@ pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
         .collect()
 }
 
-/// Documents with these IDs, from any collection, as the caller may read them: through each
-/// of `reads` in turn, for the IDs the ones before it didn't find.
-async fn readable_through(
-    state: &AppState,
-    ids: &[Uuid],
-    reads: &[&HashMap<Uuid, Readable>],
-) -> Result<Vec<(Uuid, Document)>, ApiError> {
-    let mut found: Vec<(Uuid, Document)> = Vec::new();
-    for read in reads {
-        let rest: Vec<Uuid> = ids
-            .iter()
-            .filter(|id| !found.iter().any(|(_, d)| d.id == **id))
-            .copied()
-            .collect();
-        if rest.is_empty() {
-            break;
-        }
-        found.extend(get_many_readable(&state.pool, &rest, read).await?);
-    }
-    Ok(found)
-}
-
-/// Documents with these IDs, from any collection, as this request reads them. One working
-/// on drafts reads each one's draft where the caller may read it, and its published copy
-/// where they may not (another Author's, or one a `readDrafts` rule hides), so a draft's
-/// links show what the caller may see of them.
+/// Documents with these IDs, from any collection, as this request reads what it links to
+/// (see `Access::linked`).
 pub(crate) async fn readable_docs(
     state: &AppState,
     access: &Access,
     ids: &[Uuid],
 ) -> Result<Vec<(Uuid, Document)>, ApiError> {
-    let published = access.readable_for(false);
-    match access.drafts() {
-        true => readable_through(state, ids, &[access.readable_for(true), published]).await,
-        false => readable_through(state, ids, &[published]).await,
-    }
+    Ok(get_many_readable(&state.pool, ids, access.linked()).await?)
 }
 
 /// The most documents one write may name by slug.
@@ -241,26 +213,20 @@ async fn by_slug(
     let Some(field) = c.schema.slug_field().filter(|f| access.reads(&c, &f.name)) else {
         return Ok(out);
     };
-    // Drafts the caller may read first, when the request works on them, as for links.
-    let modes: &[bool] = if access.drafts() {
-        &[true, false]
-    } else {
-        &[false]
+    // As links are read: a draft the caller may read, else what's published.
+    let Some(read) = access.linked_of(&c) else {
+        return Ok(out);
     };
-    let mut reads: Vec<Readable> = Vec::new();
-    for &drafts in modes {
-        if let Some(r) = access.readable_for(drafts).get(&c.id)
-            && !reads.contains(r)
-        {
-            reads.push(r.clone());
-        }
-    }
-    for read in reads {
+    for (way, unless) in [(read.alone(), None)].into_iter().chain(
+        read.otherwise
+            .as_deref()
+            .map(|o| (o.clone(), Some(read.alone()))),
+    ) {
         // A filter's `in` takes 100 values at most.
         for chunk in slugs.chunks(100) {
             let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
-            let filter = both(Some(named), read.filter.clone());
+            let filter = both(Some(named), way.filter.clone());
             let q = ListQuery {
                 filter: filter.as_ref(),
                 sort: None,
@@ -268,10 +234,24 @@ async fn by_slug(
                 offset: 0,
                 after: None,
                 count: false,
-                copy: read.copy,
-                owner: read.owner,
+                copy: way.copy,
+                owner: way.owner,
             };
-            for doc in query::list(&state.pool, c.id, &q).await?.docs {
+            let docs = query::list(&state.pool, c.id, &q).await?.docs;
+            // A document read as its draft is found by its draft's slug only.
+            let skip: HashSet<Uuid> = match &unless {
+                None => HashSet::new(),
+                Some(first) => {
+                    let ids: Vec<Uuid> = docs.iter().map(|d| d.id).collect();
+                    let one = HashMap::from([(c.id, first.clone())]);
+                    get_many_readable(&state.pool, &ids, &one)
+                        .await?
+                        .into_iter()
+                        .map(|(_, d)| d.id)
+                        .collect()
+                }
+            };
+            for doc in docs.iter().filter(|d| !skip.contains(&d.id)) {
                 if let Some(slug) = c.schema.slug_of(&doc.data) {
                     out.entry(slug).or_insert(doc.id);
                 }
@@ -311,18 +291,11 @@ pub(crate) async fn check_links(
     // read like content, so `readable()` already holds users for most callers; this keeps
     // it true for an API key whose scopes don't cover reading users, which may still link
     // any existing user it holds the ID of.
-    let linkable = |drafts: bool| {
-        let mut read = access.readable_for(drafts).clone();
-        if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
-            read.insert(users.id, Readable::published(None));
-        }
-        read
-    };
-    let published = linkable(false);
-    let found = match access.drafts() {
-        true => readable_through(state, &ids, &[&linkable(true), &published]).await?,
-        false => readable_through(state, &ids, &[&published]).await?,
-    };
+    let mut linkable = access.linked().clone();
+    if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
+        linkable.insert(users.id, Readable::published(None));
+    }
+    let found = get_many_readable(&state.pool, &ids, &linkable).await?;
     let vouched = found
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))

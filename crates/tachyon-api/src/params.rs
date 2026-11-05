@@ -147,6 +147,11 @@ fn draft(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
     access.copy_for(c, draft).map(|_| ())
 }
 
+/// Refuses any query parameter, for a write that takes none.
+pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
+    params(raw, &[]).map(|_| ())
+}
+
 /// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
 /// that turns autosave on.
 pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {

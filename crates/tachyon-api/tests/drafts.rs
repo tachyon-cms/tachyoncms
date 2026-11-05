@@ -299,9 +299,15 @@ async fn rules_follow_the_copy_read(pool: PgPool) {
     let list = ok(&editor, "GET", "/api/posts?draft=true", None).await;
     assert_eq!(list["docs"].as_array().unwrap().len(), 1, "{list}");
     assert_eq!(list["docs"][0]["id"], private_live);
-    // A write is guarded by the draft it changes.
-    let res = call(&editor, "PATCH", &one, Some(json!({"title": "U"}))).await;
-    assert_problem(&res, 404);
+    // A write is guarded by the draft it changes: refused when only what's live can be
+    // read, and hidden when neither can.
+    let neither = id_of(&ok(&admin, "POST", "/api/posts", Some(post("private"))).await);
+    publish(&pool, &neither).await;
+    let neither = format!("/api/posts/{neither}");
+    for (method, body) in [("PATCH", Some(json!({"title": "U"}))), ("DELETE", None)] {
+        assert_problem(&call(&editor, method, &one, body.clone()).await, 403);
+        assert_problem(&call(&editor, method, &neither, body).await, 404);
+    }
     ok(&editor, "PATCH", &other, Some(json!({"title": "U"}))).await;
 }
 
@@ -484,8 +490,229 @@ async fn references_show_drafts_to_those_who_may_read_them(pool: PgPool) {
     assert_eq!(refs(&author).await, draft_ref);
     assert_eq!(refs(&other).await, json!([]));
     assert_eq!(refs(&viewer).await, json!([]));
+    // A `:read` key sees published content only; an `admin` key sees what an Admin does.
+    let anon = tachyon_api::router(pool.clone()).await.unwrap();
+    for (scopes, want) in [
+        (json!(["authors:read", "posts:read"]), json!([])),
+        (json!(["admin"]), draft_ref.clone()),
+    ] {
+        let key = ok(
+            &admin,
+            "POST",
+            "/api/auth/keys",
+            Some(json!({"name": "k", "scopes": scopes})),
+        )
+        .await["key"]
+            .as_str()
+            .unwrap()
+            .to_owned();
+        let res = with_key(&anon, &key, &refs_uri).await;
+        assert_eq!(res.status, 200, "{}", res.json);
+        assert_eq!(res.json["docs"], want, "{scopes}");
+    }
     let res = call(&admin, "DELETE", &format!("/api/authors/{ann}"), None).await;
     assert_problem(&res, 409);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn writes_take_only_their_own_parameters(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let id = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "A"}))).await);
+    for (method, uri, body) in [
+        ("POST", "/api/posts?draft=true".to_owned(), Some(json!({}))),
+        (
+            "POST",
+            "/api/posts?autosave=true".to_owned(),
+            Some(json!({})),
+        ),
+        (
+            "POST",
+            "/api/notes?depth=0".to_owned(),
+            Some(json!({"title": "N"})),
+        ),
+        ("DELETE", format!("/api/posts/{id}?draft=true"), None),
+        (
+            "PATCH",
+            format!("/api/posts/{id}?draft=true"),
+            Some(json!({})),
+        ),
+    ] {
+        let res = call(&admin, method, &uri, body).await;
+        assert_problem(&res, 400);
+        assert!(
+            res.json["detail"]
+                .as_str()
+                .unwrap()
+                .contains("unknown query parameter"),
+            "{method} {uri}: {}",
+            res.json
+        );
+    }
+    ok(&admin, "GET", &format!("/api/posts/{id}?draft=true"), None).await;
+}
+
+/// The user who created document `id`.
+async fn creator(pool: &PgPool, id: &str) -> Uuid {
+    sqlx::query_scalar("SELECT created_by FROM documents WHERE id = $1")
+        .bind(id.parse::<Uuid>().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+/// Makes `by` the creator of document `id`.
+async fn hand_to(pool: &PgPool, id: &str, by: Uuid) {
+    sqlx::query("UPDATE documents SET created_by = $2 WHERE id = $1")
+        .bind(id.parse::<Uuid>().unwrap())
+        .bind(by)
+        .execute(pool)
+        .await
+        .unwrap();
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn own_only_draft_reads_agree_everywhere(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let categories = |join: bool| {
+        let mut fields =
+            json!([{"name": "name", "type": "text"}, {"name": "slug", "type": "slug"}]);
+        if join {
+            fields.as_array_mut().unwrap().push(
+                json!({"name": "posts", "type": "join", "collection": "posts", "on": "category"}),
+            );
+        }
+        json!({"slug": "categories", "versions": {"drafts": true}, "url": "/c/{slug}",
+               "fields": fields})
+    };
+    collection(&admin, categories(false)).await;
+    collection(
+        &admin,
+        json!({"slug": "posts", "versions": {"drafts": true}, "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "category", "type": "relationship", "relationTo": "categories"},
+            {"name": "categoryName", "type": "text", "virtual": "category.name"},
+            {"name": "body", "type": "richText", "relationTo": ["categories"]}
+        ]}),
+    )
+    .await;
+    let schema = json!({"schema": categories(true)});
+    ok(
+        &admin,
+        "PUT",
+        "/api/admin/collections/categories",
+        Some(schema),
+    )
+    .await;
+    let me = app_as(&pool, "me@example.com", "author").await;
+    let them = app_as(&pool, "them@example.com", "author").await;
+    let category = |app: &Router, name: &str, slug: &str| {
+        let (app, body) = (app.clone(), json!({"name": name, "slug": slug}));
+        async move { id_of(&ok(&app, "POST", "/api/categories", Some(body)).await) }
+    };
+    // (a) my own draft, (b) their published one with a draft of its own, and (c) their
+    // draft, never published.
+    let own = category(&me, "Own", "own").await;
+    let live = category(&them, "Live", "live").await;
+    publish(&pool, &live).await;
+    ok(
+        &them,
+        "PATCH",
+        &format!("/api/categories/{live}"),
+        Some(json!({"name": "Live draft", "slug": "live-draft"})),
+    )
+    .await;
+    let hidden = category(&them, "Hidden", "hidden").await;
+    let (my_id, their_id) = (creator(&pool, &own).await, creator(&pool, &live).await);
+
+    let post = |app: &Router, body: Value| {
+        let app = app.clone();
+        async move { id_of(&ok(&app, "POST", "/api/posts", Some(body)).await) }
+    };
+    let to_own = post(&me, json!({"title": "to-own", "category": own})).await;
+    let to_live = post(&me, json!({"title": "to-live", "category": live})).await;
+    // Mine too, though I couldn't have linked them myself.
+    let to_hidden = post(&admin, json!({"title": "to-hidden", "category": hidden})).await;
+    hand_to(&pool, &to_hidden, my_id).await;
+    let link = |id: &str| {
+        json!({"type": "paragraph", "content": [{"type": "text", "text": "see", "marks": [
+            {"type": "link", "attrs": {"doc": {"relationTo": "categories", "value": id}}}
+        ]}]})
+    };
+    let body = json!({"type": "doc", "content": [link(&own), link(&live), link(&hidden)]});
+    let links = post(&admin, json!({"title": "links", "body": body})).await;
+    hand_to(&pool, &links, my_id).await;
+    // Theirs, linking my category: one published, one never.
+    let their_live = post(&admin, json!({"title": "their-live", "category": own})).await;
+    hand_to(&pool, &their_live, their_id).await;
+    publish(&pool, &their_live).await;
+    let their_draft = post(&admin, json!({"title": "their-draft", "category": own})).await;
+    hand_to(&pool, &their_draft, their_id).await;
+
+    // Filters through the link.
+    let titles = |res: Value| -> Vec<String> {
+        let mut t: Vec<String> = res["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["title"].as_str().unwrap().to_owned())
+            .collect();
+        t.sort();
+        t
+    };
+    for (name, want) in [
+        ("Own", vec!["to-own"]),
+        ("Live", vec!["to-live"]),
+        ("Live%20draft", vec![]),
+        ("Hidden", vec![]),
+        ("Nothing", vec![]),
+    ] {
+        let uri = format!("/api/posts?draft=true&where[category.name][equals]={name}");
+        assert_eq!(titles(ok(&me, "GET", &uri, None).await), want, "{name}");
+    }
+    // Populate and virtuals.
+    for (id, want) in [
+        (&to_own, Some("Own")),
+        (&to_live, Some("Live")),
+        (&to_hidden, None),
+    ] {
+        let read = ok(&me, "GET", &format!("/api/posts/{id}?draft=true"), None).await;
+        let cat = &read["category"];
+        assert_eq!(cat["name"].as_str(), want, "{read}");
+        assert_eq!(read["categoryName"].as_str(), want, "{read}");
+        if want.is_none() {
+            assert!(cat.is_string(), "a link I can't read stays an ID: {read}");
+            assert!(!read.to_string().contains("Hidden"), "{read}");
+        }
+    }
+    // Rendered links.
+    let html = ok(
+        &me,
+        "GET",
+        &format!("/api/posts/{links}?draft=true&format=html"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        html["body"],
+        concat!(
+            "<p><a href=\"/c/own\">see</a></p>",
+            "<p><a href=\"/c/live\">see</a></p>",
+            "<p>see</p>"
+        )
+    );
+    // Joins: my category lists my draft and their published post, never their draft.
+    let read = ok(
+        &me,
+        "GET",
+        &format!("/api/categories/{own}?draft=true"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        titles(read["posts"].clone()),
+        ["their-live", "to-own"],
+        "{read}"
+    );
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

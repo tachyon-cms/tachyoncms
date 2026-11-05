@@ -120,8 +120,8 @@ pub async fn update(
     let c = global(&state, path)?;
     access.scope(Action::UpdateGlobal, &c.schema.slug)?;
     let autosave = autosave_param(raw.as_deref(), &c)?;
+    let copy = access.write_copy(&c)?;
     let guard = access.global_guard(&c)?;
-    let copy = access.write_copy(&c);
     let who = access.actor(Action::UpdateGlobal, &c);
     let by = who.map(|a| a.id);
     let mut patch = json_body(body)?;

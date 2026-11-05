@@ -525,6 +525,7 @@ fn readable(copy: DocCopy, owner: Option<Uuid>) -> Readable {
         filter: None,
         copy,
         owner,
+        otherwise: None,
     }
 }
 
@@ -776,8 +777,7 @@ async fn draft_reads_follow_draft_links(pool: PgPool) {
             limit: 10,
             offset: 0,
             count: true,
-            copy,
-            owner: None,
+            read: &readable(copy, None),
         };
         let (ann, bob) = if linked == "Ann" { (1, 0) } else { (0, 1) };
         let pages = query::joined(&pool, &[s.ann, s.bob], &q).await.unwrap();
@@ -877,8 +877,7 @@ async fn owner_narrows_reads(pool: PgPool) {
             limit: 10,
             offset: 0,
             count: true,
-            copy,
-            owner: Some(u),
+            read: &readable(copy, Some(u)),
         };
         let pages = query::joined(&pool, &[s.ann], &q).await.unwrap();
         assert_eq!(pages[&s.ann].docs.len(), 1);
@@ -1212,4 +1211,121 @@ async fn seed_unlimited(pool: &PgPool) -> Uuid {
         .await
         .unwrap()
         .id
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_draft_read_falls_back_to_what_is_live(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let (u, v) = (Uuid::now_v7(), Uuid::now_v7());
+    // u's own draft, never published; v's published post with a draft of its own; and v's
+    // draft, never published.
+    let own = post(&pool, &s, "Own", s.ann).await;
+    let live = post(&pool, &s, "Live", s.ann).await;
+    let hidden = post(&pool, &s, "Hidden", s.ann).await;
+    for (id, by, draft, unpublished) in [
+        (own, u, "Own", true),
+        (live, v, "Live draft", false),
+        (hidden, v, "Hidden", true),
+    ] {
+        sqlx::query(
+            "UPDATE documents SET created_by = $2,
+                 draft = jsonb_build_object('title', $3::text, 'author', published->'author'),
+                 published = CASE WHEN $4 THEN NULL ELSE published END
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(by)
+        .bind(draft)
+        .bind(unpublished)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+             SELECT tenant_id, from_doc, 'draft', field_path, to_doc FROM relations
+             WHERE from_doc = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        if unpublished {
+            sqlx::query("DELETE FROM relations WHERE from_doc = $1 AND copy = 'published'")
+                .bind(id)
+                .execute(&pool)
+                .await
+                .unwrap();
+        }
+    }
+    let mixed = Readable {
+        otherwise: Some(Box::new(readable(DocCopy::Published, None))),
+        ..readable(DocCopy::Draft, Some(u))
+    };
+
+    // Each document as its draft where u may read it, else as what's live.
+    let read = HashMap::from([(s.posts, mixed.clone())]);
+    let found = query::get_many_readable(&pool, &[own, live, hidden], &read)
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&found), ["Live", "Own"]);
+
+    // A `where` through a link agrees, and finds nothing of v's draft.
+    let (notes, schema) = notes(
+        &pool,
+        &s,
+        &[("to-own", own), ("to-live", live), ("to-hidden", hidden)],
+    )
+    .await;
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let lookup = |slug: &str| (slug == "posts").then(|| posts_schema.clone());
+    let guards = [("posts", mixed.clone())];
+    for (title, want) in [
+        ("Own", vec!["to-own"]),
+        ("Live", vec!["to-live"]),
+        ("Live%20draft", vec![]),
+        ("Hidden", vec![]),
+        ("Nothing", vec![]),
+    ] {
+        let qs = format!("where[post.title][equals]={title}");
+        let f = guarded(&schema.fields, &qs, &lookup, &guards);
+        let q = list_query(Some(&f), DocCopy::Published, None);
+        assert_eq!(listed(&pool, notes, &q, "label").await.0, want, "{title}");
+    }
+
+    // So does a join, through the links of the copy each document is read in.
+    let title_is = |t: &str| {
+        let qs = format!("where[title][equals]={t}");
+        parse_filter_with(
+            &posts_schema.fields,
+            &parse_query(&qs).unwrap()["where"],
+            &lookup,
+        )
+        .unwrap()
+    };
+    for (filter, want) in [
+        (None, vec!["Live", "Own"]),
+        (Some(title_is("Live")), vec!["Live"]),
+        (Some(title_is("Live%20draft")), vec![]),
+        (Some(title_is("Hidden")), vec![]),
+    ] {
+        let q = JoinQuery {
+            collection_id: s.posts,
+            pattern: "^author$",
+            filter: filter.as_ref(),
+            sort: None,
+            limit: 10,
+            offset: 0,
+            count: true,
+            read: &mixed,
+        };
+        let pages = query::joined(&pool, &[s.ann], &q).await.unwrap();
+        let mut seen: Vec<&str> = pages[&s.ann]
+            .docs
+            .iter()
+            .map(|d| d.data.0["title"].as_str().unwrap())
+            .collect();
+        seen.sort();
+        assert_eq!(seen, want, "{filter:?}");
+        assert_eq!(pages[&s.ann].total, Some(want.len() as i64));
+    }
 }

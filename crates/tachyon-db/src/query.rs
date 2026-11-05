@@ -159,6 +159,45 @@ fn push_copy(qb: &mut QueryBuilder<Postgres>, columns: &str, copy: DocCopy, owne
     }
 }
 
+/// Where a row's `copy` is read: its JSON and columns, `columns` naming the row.
+fn copy_base(columns: &str, depth: u8, copy: DocCopy) -> Base {
+    Base {
+        json: format!("{columns}{}", copy.as_str()),
+        columns: columns.into(),
+        depth,
+    }
+}
+
+/// ` AND` the row (columns prefixed with `columns`) can be read as `read` says: its copy,
+/// owner and filter. Not `read.otherwise`, which callers add.
+fn push_readable(qb: &mut QueryBuilder<Postgres>, columns: &str, depth: u8, read: &Readable) {
+    push_copy(qb, columns, read.copy, read.owner);
+    if let Some(f) = &read.filter {
+        qb.push(" AND ");
+        push_filter_in(qb, f, &copy_base(columns, depth, read.copy));
+    }
+}
+
+/// ` AND` the row can't be read as `read` says. A filter that comes to NULL (a missing
+/// value) means it can't, so the row falls through to what it's read as otherwise.
+fn push_unreadable(qb: &mut QueryBuilder<Postgres>, columns: &str, depth: u8, read: &Readable) {
+    qb.push(" AND NOT COALESCE((TRUE");
+    push_readable(qb, columns, depth, read);
+    qb.push("), FALSE)");
+}
+
+/// Each way a row of a collection read as `read` may be read: `read` itself, then its
+/// `otherwise` for rows `read` can't reach. One level: a fallback has no fallback.
+fn ways(read: &Readable) -> impl Iterator<Item = (&Readable, Option<&Readable>)> {
+    debug_assert!(
+        read.otherwise
+            .as_ref()
+            .is_none_or(|o| o.otherwise.is_none()),
+        "a fallback has no fallback"
+    );
+    std::iter::once((read, None)).chain(read.otherwise.as_deref().map(|o| (o, Some(read))))
+}
+
 fn expr_in(target: &Target, base: &Base) -> String {
     let columns = &base.columns;
     match target {
@@ -428,8 +467,8 @@ fn push_inner(
     }
 }
 
-/// `(…)`: linked document `alias` has the copy `read` names, passes its filter and owner,
-/// and matches `inner` there.
+/// `(…)`: linked document `alias` can be read as `read` says (or else as its
+/// `otherwise`), and matches `inner` in the copy it's read in.
 fn push_linked_copy(
     qb: &mut QueryBuilder<Postgres>,
     alias: &str,
@@ -439,19 +478,18 @@ fn push_linked_copy(
     value: &Operand,
     read: &Readable,
 ) {
-    let linked = Base {
-        json: format!("{alias}.{}", read.copy.as_str()),
-        columns: format!("{alias}."),
-        depth,
-    };
-    qb.push("(TRUE");
-    push_copy(qb, &linked.columns, read.copy, read.owner);
-    if let Some(f) = &read.filter {
+    let columns = format!("{alias}.");
+    qb.push("(FALSE");
+    for (way, unless) in ways(read) {
+        qb.push(" OR (TRUE");
+        if let Some(first) = unless {
+            push_unreadable(qb, &columns, depth, first);
+        }
+        push_readable(qb, &columns, depth, way);
         qb.push(" AND ");
-        push_filter_in(qb, f, &linked);
+        push_inner(qb, inner, op, value, &copy_base(&columns, depth, way.copy));
+        qb.push(")");
     }
-    qb.push(" AND ");
-    push_inner(qb, inner, op, value, &linked);
     qb.push(")");
 }
 
@@ -562,11 +600,16 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
 
 /// Built-in columns are NOT NULL, so they skip NULLS LAST and can use the plain indexes.
 fn order_by(copy: DocCopy, sort: Option<&Sort>) -> String {
+    order_by_in(&Base::top(copy), sort)
+}
+
+/// `order_by`, of the JSON `base` names.
+fn order_by_in(base: &Base, sort: Option<&Sort>) -> String {
     let Some(s) = sort else {
         return "id DESC".into();
     };
     let direction = if s.descending { "DESC" } else { "ASC" };
-    let e = expr(copy, &s.target);
+    let e = expr_in(&s.target, base);
     match &s.target {
         Target::Id => format!("id {direction}"),
         Target::Field { .. } => format!("{e} {direction} NULLS LAST, id DESC"),
@@ -685,10 +728,9 @@ pub struct JoinQuery<'a> {
     pub limit: i64,
     pub offset: i64,
     pub count: bool,
-    /// The copy of the linking documents read, and whose links are followed.
-    pub copy: DocCopy,
-    /// Only linking documents this user created (own-only rights).
-    pub owner: Option<Uuid>,
+    /// How the linking documents are read: the copy (each one's own, with a fallback),
+    /// whose links are followed and `filter` judges, and who must have created them.
+    pub read: &'a Readable,
 }
 
 #[derive(sqlx::FromRow)]
@@ -698,18 +740,54 @@ struct JoinedRow {
     doc: Document,
 }
 
-/// ` AND` the document's `copy` links to `p.parent` through a path `pattern` matches.
-/// `EXISTS`, so a document linking twice still counts once.
-fn push_linked(qb: &mut QueryBuilder<Postgres>, copy: DocCopy, pattern: &str) {
-    qb.push(format!(
+/// ` AND` the copy each document is read in links to `p.parent` through a path `pattern`
+/// matches. `EXISTS`, so a document linking twice still counts once.
+fn push_linked(qb: &mut QueryBuilder<Postgres>, pattern: &str) {
+    qb.push(
         " AND EXISTS (SELECT 1 FROM relations r WHERE r.from_doc = documents.id \
-         AND r.to_doc = p.parent AND r.copy = '{}' AND r.tenant_id = ",
-        copy.as_str()
-    ))
+         AND r.to_doc = p.parent AND r.copy = documents.copy AND r.tenant_id = ",
+    )
     .push_bind(DEFAULT_TENANT)
     .push(" AND r.field_path ~ ")
     .push_bind(pattern.to_owned())
     .push(")");
+}
+
+/// `(…) AS documents`: the live documents of `collection_id` as `read` reads them, each
+/// with its `data` (the copy read) and `copy` (which one, whose links count).
+fn push_source(qb: &mut QueryBuilder<Postgres>, collection_id: Uuid, read: &Readable) {
+    qb.push("(");
+    for (i, (way, unless)) in ways(read).enumerate() {
+        if i > 0 {
+            qb.push(" UNION ALL ");
+        }
+        let copy = way.copy.as_str();
+        qb.push(format!(
+            "SELECT id, status, created_at, updated_at, published_at, draft, \
+             {copy} AS data, '{copy}'::text AS copy FROM documents WHERE tenant_id = "
+        ))
+        .push_bind(DEFAULT_TENANT)
+        // A literal (not a bind) so the planner can match per-collection partial indexes.
+        .push(format!(
+            " AND collection_id = '{collection_id}' AND deleted_at IS NULL"
+        ));
+        if let Some(first) = unless {
+            push_unreadable(qb, "", 0, first);
+        }
+        push_readable(qb, "", 0, way);
+    }
+    qb.push(") AS documents");
+}
+
+/// ` WHERE` a joined document matches the join's filter, in the copy it's read in, and
+/// links to the parent.
+fn push_join_where(qb: &mut QueryBuilder<Postgres>, q: &JoinQuery<'_>, data: &Base) {
+    qb.push(" WHERE TRUE");
+    if let Some(f) = q.filter {
+        qb.push(" AND ");
+        push_filter_in(qb, f, data);
+    }
+    push_linked(qb, q.pattern);
 }
 
 /// One page of linking documents for every parent, in one query: a `LATERAL` subquery
@@ -739,13 +817,12 @@ pub async fn joined(
     if parents.is_empty() {
         return Ok(out);
     }
-    let order = order_by(q.copy, q.sort);
-    let scope = Scope {
-        collection_id: q.collection_id,
-        copy: q.copy,
-        owner: q.owner,
-        filter: q.filter,
+    let data = Base {
+        json: "data".into(),
+        columns: String::new(),
+        depth: 0,
     };
+    let order = order_by_in(&data, q.sort);
     let mut qb = QueryBuilder::<Postgres>::new(
         "SELECT p.parent, d.id, d.status, d.created_at, d.updated_at, d.published_at, d.data \
          FROM unnest(",
@@ -753,14 +830,11 @@ pub async fn joined(
     qb.push_bind(parents.to_vec())
         .push(format!(
             "::uuid[]) AS p(parent) CROSS JOIN LATERAL (SELECT id, status, created_at, \
-             updated_at, {PUBLISHED_AT}, {} AS data, ",
-            q.copy.as_str()
+             updated_at, {PUBLISHED_AT}, data, "
         ))
-        .push(format!(
-            "row_number() OVER (ORDER BY {order}) AS n FROM documents"
-        ));
-    push_where(&mut qb, &scope);
-    push_linked(&mut qb, q.copy, q.pattern);
+        .push(format!("row_number() OVER (ORDER BY {order}) AS n FROM "));
+    push_source(&mut qb, q.collection_id, q.read);
+    push_join_where(&mut qb, q, &data);
     qb.push(format!(" ORDER BY {order} LIMIT "))
         .push_bind(q.limit.saturating_add(1))
         .push(" OFFSET ")
@@ -779,10 +853,9 @@ pub async fn joined(
     }
 
     if q.count {
-        let mut qb =
-            QueryBuilder::<Postgres>::new("SELECT p.parent, (SELECT count(*) FROM documents");
-        push_where(&mut qb, &scope);
-        push_linked(&mut qb, q.copy, q.pattern);
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT p.parent, (SELECT count(*) FROM ");
+        push_source(&mut qb, q.collection_id, q.read);
+        push_join_where(&mut qb, q, &data);
         qb.push(") FROM unnest(")
             .push_bind(parents.to_vec())
             .push("::uuid[]) AS p(parent)");
@@ -814,36 +887,34 @@ pub async fn get_many_readable(
     // Sorted, so the same map always builds the same SQL text (and reuses its statement).
     let mut read: Vec<_> = read.iter().collect();
     read.sort_unstable_by_key(|(id, _)| **id);
-    let drafts: Vec<Uuid> = read
-        .iter()
-        .filter(|(_, r)| r.copy == DocCopy::Draft)
-        .map(|(id, _)| **id)
-        .collect();
-    let mut qb = QueryBuilder::<Postgres>::new(format!(
-        "SELECT id, collection_id, status, created_at, updated_at, {PUBLISHED_AT}, "
-    ));
-    if drafts.is_empty() {
-        qb.push("published");
-    } else {
-        qb.push("CASE WHEN collection_id = ANY(")
-            .push_bind(drafts)
-            .push(") THEN draft ELSE published END");
-    }
-    qb.push(" AS data FROM documents WHERE tenant_id = ")
+    // One half per copy, each row in exactly one: a fallback only takes rows the way
+    // before it can't read.
+    let mut qb = QueryBuilder::<Postgres>::new("");
+    for (i, copy) in [DocCopy::Published, DocCopy::Draft].into_iter().enumerate() {
+        if i > 0 {
+            qb.push(" UNION ALL ");
+        }
+        qb.push(format!(
+            "SELECT id, collection_id, status, created_at, updated_at, {PUBLISHED_AT}, \
+             {} AS data FROM documents WHERE tenant_id = ",
+            copy.as_str()
+        ))
         .push_bind(DEFAULT_TENANT)
         .push(" AND id = ANY(")
         .push_bind(ids.to_vec())
         .push(") AND deleted_at IS NULL AND (FALSE");
-    for (collection_id, r) in read {
-        qb.push(" OR (collection_id = ").push_bind(*collection_id);
-        push_copy(&mut qb, "", r.copy, r.owner);
-        if let Some(f) = &r.filter {
-            qb.push(" AND ");
-            push_filter(&mut qb, r.copy, f);
+        for (collection_id, r) in &read {
+            for (way, unless) in ways(r).filter(|(way, _)| way.copy == copy) {
+                qb.push(" OR (collection_id = ").push_bind(**collection_id);
+                if let Some(first) = unless {
+                    push_unreadable(&mut qb, "", 0, first);
+                }
+                push_readable(&mut qb, "", 0, way);
+                qb.push(")");
+            }
         }
         qb.push(")");
     }
-    qb.push(")");
     let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
 }
