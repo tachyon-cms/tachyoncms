@@ -14,9 +14,10 @@ use config::Config;
 #[derive(Parser)]
 #[command(name = "tachyon", version, about = "TachyonCMS server")]
 struct Cli {
-    /// Config file. Every setting can also come from a TACHYON_* environment variable.
-    #[arg(long, global = true, default_value = "tachyon.toml")]
-    config: String,
+    /// Config file. Without it, tachyon.toml is read if it exists. Every setting can also come
+    /// from a TACHYON_* environment variable.
+    #[arg(long, global = true)]
+    config: Option<String>,
     #[command(subcommand)]
     command: Command,
 }
@@ -72,7 +73,7 @@ async fn main() -> anyhow::Result<()> {
         .init();
 
     let cli = Cli::parse();
-    let config = Config::load(&cli.config)?;
+    let config = Config::load(cli.config.as_deref())?;
     let pool = PgPool::connect(&config.database_url).await?;
     tachyon_db::MIGRATOR.run(&pool).await?;
 

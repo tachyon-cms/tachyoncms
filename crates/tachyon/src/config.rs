@@ -74,6 +74,61 @@ fn duration(name: &str, text: &str) -> Result<Duration, String> {
     Ok(Duration::from_secs(secs))
 }
 
+/// Read when `--config` isn't given, and only if it exists.
+const DEFAULT_CONFIG: &str = "tachyon.toml";
+
+/// A misspelt key in the file would otherwise be dropped and its default used. Only the file
+/// is checked: `TACHYON_*` variables that aren't settings are left alone.
+#[allow(clippy::result_large_err)]
+fn check_file_keys(path: &str) -> Result<(), figment::Error> {
+    let known = field_names::<Config>();
+    let keys: figment::value::Dict = Figment::from(Toml::file(path)).extract()?;
+    match keys.keys().find(|k| !known.contains(&k.as_str())) {
+        Some(key) => Err(format!(
+            "unknown key `{key}` in {path}; the top-level keys are {}",
+            known.join(", ")
+        )
+        .into()),
+        None => Ok(()),
+    }
+}
+
+/// A struct's field names, as its derived `Deserialize` hands them to `deserialize_struct`,
+/// so a field added to `Config` is a known key without being listed anywhere else.
+fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
+    use serde::de::{Error, Visitor, value};
+
+    struct Names<'a>(&'a mut &'static [&'static str]);
+
+    impl<'de> serde::Deserializer<'de> for Names<'_> {
+        type Error = value::Error;
+
+        fn deserialize_struct<V: Visitor<'de>>(
+            self,
+            _name: &'static str,
+            fields: &'static [&'static str],
+            _visitor: V,
+        ) -> Result<V::Value, value::Error> {
+            *self.0 = fields;
+            Err(value::Error::custom("only reading the field names"))
+        }
+
+        fn deserialize_any<V: Visitor<'de>>(self, _visitor: V) -> Result<V::Value, value::Error> {
+            Err(value::Error::custom("not a struct"))
+        }
+
+        serde::forward_to_deserialize_any! {
+            bool i8 i16 i32 i64 i128 u8 u16 u32 u64 u128 f32 f64 char str string bytes
+            byte_buf option unit unit_struct newtype_struct seq tuple tuple_struct map enum
+            identifier ignored_any
+        }
+    }
+
+    let mut names: &'static [&'static str] = &[];
+    let _ = T::deserialize(Names(&mut names));
+    names
+}
+
 /// While no account exists the API is waiting for its first Admin; say how to make one.
 pub fn setup_warning(has_accounts: bool) -> Option<&'static str> {
     (!has_accounts).then_some(
@@ -125,10 +180,16 @@ impl Config {
         })
     }
 
-    /// Defaults, then the TOML file if it exists, then `TACHYON_*` environment variables.
+    /// Defaults, then the TOML file, then `TACHYON_*` environment variables. With no
+    /// `--config`, `tachyon.toml` is read if it exists; a file named with `--config` must exist.
     // figment's own error type; this runs once at startup.
     #[allow(clippy::result_large_err)]
-    pub fn load(path: &str) -> Result<Self, figment::Error> {
+    pub fn load(named: Option<&str>) -> Result<Self, figment::Error> {
+        let path = named.unwrap_or(DEFAULT_CONFIG);
+        if named.is_some() && !std::path::Path::new(path).exists() {
+            return Err(format!("the config file {path} doesn't exist").into());
+        }
+        check_file_keys(path)?;
         let config: Self = Figment::new()
             .merge(Serialized::default("listen", "127.0.0.1:3000"))
             .merge(Toml::file(path))
@@ -153,7 +214,7 @@ mod tests {
         Jail::expect_with(|jail| {
             jail.create_file("tachyon.toml", toml)?;
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
-            out = Some(Config::load("tachyon.toml")?);
+            out = Some(Config::load(None)?);
             Ok(())
         });
         out.unwrap()
@@ -257,7 +318,7 @@ mod tests {
                 "database_url = \"postgres://file\"\nlisten = \"0.0.0.0:8080\"\n",
             )?;
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
-            let config = Config::load("tachyon.toml")?;
+            let config = Config::load(Some("tachyon.toml"))?;
             assert_eq!(config.database_url, "postgres://env");
             assert_eq!(config.listen, "0.0.0.0:8080".parse().unwrap());
             Ok(())
@@ -268,8 +329,56 @@ mod tests {
     fn listens_on_localhost_by_default_and_file_is_optional() {
         Jail::expect_with(|jail| {
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
-            let config = Config::load("missing.toml")?;
+            let config = Config::load(None)?;
             assert_eq!(config.listen, "127.0.0.1:3000".parse().unwrap());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_known_keys_come_from_the_struct() {
+        #[derive(serde::Deserialize)]
+        #[allow(dead_code)]
+        struct Two {
+            one: u8,
+            #[serde(rename = "second_one")]
+            two: Option<String>,
+        }
+        assert_eq!(super::field_names::<Two>(), ["one", "second_one"]);
+        let config = super::field_names::<Config>();
+        assert!(config.contains(&"database_url") && config.contains(&"auth"));
+    }
+
+    #[test]
+    fn a_named_config_file_must_exist() {
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            let err = Config::load(Some("/etc/tachyon/prod.toml")).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "the config file /etc/tachyon/prod.toml doesn't exist"
+            );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn unknown_keys_in_the_file_are_errors_but_not_in_the_environment() {
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.create_file("tachyon.toml", "publc_url = \"https://cms.example.com\"\n")?;
+            let err = Config::load(None).unwrap_err();
+            assert_eq!(
+                err.to_string(),
+                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth"
+            );
+            // A variable that isn't a setting, such as one for another tool, is left alone.
+            jail.create_file(
+                "tachyon.toml",
+                "database_url = \"postgres://file\"\nlisten = \"127.0.0.1:3000\"\npublic_url = \"https://cms.example.com\"\n[auth]\nbreach_check = false\n",
+            )?;
+            jail.set_env("TACHYON_SOMETHING_ELSE", "1");
+            assert!(Config::load(None)?.public_url.is_some());
             Ok(())
         });
     }
@@ -279,7 +388,7 @@ mod tests {
         Jail::expect_with(|jail| {
             // Clearing the whole environment would race with tests that need DATABASE_URL.
             jail.set_env("TACHYON_DATABASE_URL", "");
-            assert!(Config::load("missing.toml").is_err());
+            assert!(Config::load(None).is_err());
             Ok(())
         });
     }
