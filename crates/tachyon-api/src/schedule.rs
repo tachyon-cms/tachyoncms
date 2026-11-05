@@ -537,4 +537,38 @@ mod tests {
             JobError::Permanent(d) if d.contains("can no longer read it")
         ));
     }
+
+    #[test]
+    fn a_unique_clash_at_publish_names_its_field_and_stops() {
+        use tachyon_core::query::{ValueKind, value_kind};
+        use tachyon_db::indexes::{IndexKind, index_name};
+
+        let schema: tachyon_core::CollectionSchema = serde_json::from_value(json!({
+            "slug": "posts",
+            "fields": [{"name": "slug", "type": "text", "unique": true}],
+        }))
+        .unwrap();
+        let c = Collection {
+            id: Uuid::now_v7(),
+            schema: sqlx::types::Json(schema),
+            schema_version: 1,
+            created_at: OffsetDateTime::now_utc(),
+            updated_at: OffsetDateTime::now_utc(),
+        };
+        let kind = value_kind(&c.schema.data()[0].kind).unwrap();
+        assert_eq!(kind, ValueKind::Text);
+        let constraint = index_name(c.id, "slug", IndexKind::Unique, kind);
+        assert!(matches!(
+            published(&c, DbError::UniqueViolation(constraint)),
+            JobError::Permanent(d) if d == "slug: must be unique; another document already uses this value"
+        ));
+        assert!(matches!(
+            published(&c, DbError::Sqlx(sqlx::Error::PoolTimedOut)),
+            JobError::Retry(_)
+        ));
+        assert!(matches!(
+            published(&c, DbError::SchemaChanged),
+            JobError::Retry(_)
+        ));
+    }
 }
