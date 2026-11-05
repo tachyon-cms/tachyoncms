@@ -129,6 +129,45 @@ fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
     names
 }
 
+/// An `http` or `https` address with a host, as `public_url` and each allowed origin must be.
+fn web_url(text: &str) -> Option<url::Url> {
+    url::Url::parse(text).ok().filter(|u| {
+        matches!(u.scheme(), "http" | "https") && u.host_str().is_some_and(|h| !h.is_empty())
+    })
+}
+
+/// An origin is a scheme, host and optional port: no user, password, path, query or fragment.
+/// One that has them would never match a request's `Origin`, so writes from that site would be
+/// refused.
+fn check_origin(origin: &str) -> Result<(), String> {
+    let url = web_url(origin);
+    // url accepts `*` in a host, but origins are matched exactly, so `https://*.example.com`
+    // would match nothing rather than every subdomain.
+    if url
+        .as_ref()
+        .and_then(|u| u.host_str())
+        .is_some_and(|h| h.contains('*'))
+    {
+        return Err(format!(
+            "auth.allowed_origins: `{origin}` uses a wildcard, which isn't supported; list each origin, like https://www.example.com"
+        ));
+    }
+    let ok = url.is_some_and(|u| {
+        u.username().is_empty()
+            && u.password().is_none()
+            && u.path() == "/"
+            && u.query().is_none()
+            && u.fragment().is_none()
+    });
+    if ok {
+        Ok(())
+    } else {
+        Err(format!(
+            "auth.allowed_origins: `{origin}` isn't an origin; use a scheme and host, like https://www.example.com"
+        ))
+    }
+}
+
 /// While no account exists the API is waiting for its first Admin; say how to make one.
 pub fn setup_warning(has_accounts: bool) -> Option<&'static str> {
     (!has_accounts).then_some(
@@ -140,16 +179,14 @@ impl Config {
     /// Serving beyond this machine needs a public URL: cookie-signed writes are only accepted
     /// from it, so without one nobody could sign in from a browser.
     pub fn check_serve(&self) -> Result<(), String> {
-        if let Some(url) = &self.public_url {
-            let ok = url::Url::parse(url).is_ok_and(|u| {
-                matches!(u.scheme(), "http" | "https")
-                    && u.host_str().is_some_and(|h| !h.is_empty())
-            });
-            if !ok {
-                return Err(
-                    "public_url must be a full web address, like https://cms.example.com".into(),
-                );
-            }
+        if self
+            .public_url
+            .as_deref()
+            .is_some_and(|url| web_url(url).is_none())
+        {
+            return Err(
+                "public_url must be a full web address, like https://cms.example.com".into(),
+            );
         }
         if self.public_url.is_none() && !self.listen.ip().to_canonical().is_loopback() {
             return Err(
@@ -163,14 +200,33 @@ impl Config {
     /// The sign-in settings the API runs with.
     pub fn auth_config(&self) -> Result<AuthConfig, String> {
         let a = &self.auth;
+        for origin in &a.allowed_origins {
+            check_origin(origin)?;
+        }
+        // Zero would lock an account on its first wrong password, so anyone could lock out
+        // anyone.
+        if a.lockout_attempts < 1 {
+            return Err(format!(
+                "auth.lockout_attempts is {}; it has to be at least 1",
+                a.lockout_attempts
+            ));
+        }
+        let session_idle = duration("session_idle", &a.session_idle)?;
+        let session_absolute = duration("session_absolute", &a.session_absolute)?;
+        if session_absolute < session_idle {
+            return Err(format!(
+                "auth.session_absolute ({}) is shorter than auth.session_idle ({}), so the idle limit would never apply",
+                a.session_absolute, a.session_idle
+            ));
+        }
         Ok(AuthConfig {
             public_url: self
                 .public_url
                 .clone()
                 .unwrap_or_else(|| format!("http://localhost:{}", self.listen.port())),
             allowed_origins: a.allowed_origins.clone(),
-            session_idle: duration("session_idle", &a.session_idle)?,
-            session_absolute: duration("session_absolute", &a.session_absolute)?,
+            session_idle,
+            session_absolute,
             lockout_attempts: a.lockout_attempts,
             lockout_window: duration("lockout_window", &a.lockout_window)?,
             lockout_duration: duration("lockout_duration", &a.lockout_duration)?,
@@ -297,6 +353,74 @@ mod tests {
                 .auth_config()
                 .unwrap_err(),
             "auth.session_idle: `soon` isn't a duration; use a number and s, m, h or d, like 15m or 7d"
+        );
+    }
+
+    #[test]
+    fn auth_settings_that_could_never_work_stop_startup() {
+        for bad in [
+            "www.example.com",
+            "ftp://www.example.com",
+            "https://www.example.com/admin",
+            "https://www.example.com/?x=1",
+            "https://www.example.com/#top",
+            "https://user@www.example.com",
+            "https://user:secret@www.example.com",
+            "https://",
+        ] {
+            assert_eq!(
+                load(&format!("[auth]\nallowed_origins = [\"{bad}\"]"))
+                    .auth_config()
+                    .unwrap_err(),
+                format!(
+                    "auth.allowed_origins: `{bad}` isn't an origin; use a scheme and host, like https://www.example.com"
+                ),
+                "{bad}"
+            );
+        }
+        for wildcard in [
+            "https://*.example.com",
+            "https://www.*.com",
+            "http://*:8080",
+        ] {
+            assert_eq!(
+                load(&format!("[auth]\nallowed_origins = [\"{wildcard}\"]"))
+                    .auth_config()
+                    .unwrap_err(),
+                format!(
+                    "auth.allowed_origins: `{wildcard}` uses a wildcard, which isn't supported; list each origin, like https://www.example.com"
+                ),
+                "{wildcard}"
+            );
+        }
+        let ok = load(
+            "[auth]\nallowed_origins = [\"https://www.example.com\", \"http://localhost:4321\", \"https://shop.example.com/\"]",
+        )
+        .auth_config()
+        .unwrap();
+        assert_eq!(ok.allowed_origins.len(), 3);
+
+        for attempts in [0, -1] {
+            assert_eq!(
+                load(&format!("[auth]\nlockout_attempts = {attempts}"))
+                    .auth_config()
+                    .unwrap_err(),
+                format!("auth.lockout_attempts is {attempts}; it has to be at least 1")
+            );
+        }
+        assert!(load("[auth]\nlockout_attempts = 1").auth_config().is_ok());
+
+        assert_eq!(
+            load("[auth]\nsession_idle = \"7d\"\nsession_absolute = \"1d\"")
+                .auth_config()
+                .unwrap_err(),
+            "auth.session_absolute (1d) is shorter than auth.session_idle (7d), so the idle limit would never apply"
+        );
+        assert!(
+            load("[auth]\nsession_idle = \"1d\"\nsession_absolute = \"1d\"")
+                .auth_config()
+                .is_ok(),
+            "the same length is fine"
         );
     }
 
