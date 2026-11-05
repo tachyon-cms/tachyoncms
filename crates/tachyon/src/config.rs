@@ -4,6 +4,7 @@ use std::time::Duration;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
+use tachyon_api::JobsConfig;
 use tachyon_api::auth::AuthConfig;
 
 #[derive(Debug, Deserialize)]
@@ -15,6 +16,8 @@ pub struct Config {
     pub public_url: Option<String>,
     #[serde(default)]
     pub auth: AuthSettings,
+    #[serde(default)]
+    pub jobs: JobsSettings,
 }
 
 /// `[auth]` in the config file (or `TACHYON_AUTH__*` in the environment).
@@ -44,6 +47,22 @@ impl Default for AuthSettings {
             breach_check: true,
             breach_check_url: "https://api.pwnedpasswords.com".into(),
             allowed_origins: Vec::new(),
+        }
+    }
+}
+
+/// `[jobs]` in the config file (or `TACHYON_JOBS__*` in the environment).
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsSettings {
+    /// Workers running scheduled work on this server; 0 leaves it to other servers.
+    pub workers: usize,
+}
+
+impl Default for JobsSettings {
+    fn default() -> Self {
+        Self {
+            workers: JobsConfig::default().workers,
         }
     }
 }
@@ -234,6 +253,13 @@ impl Config {
             breach_check: a.breach_check,
             breach_check_url: a.breach_check_url.clone(),
         })
+    }
+
+    /// The job workers the API runs with.
+    pub fn jobs_config(&self) -> JobsConfig {
+        JobsConfig {
+            workers: self.jobs.workers,
+        }
     }
 
     /// Defaults, then the TOML file, then `TACHYON_*` environment variables. With no
@@ -494,7 +520,7 @@ mod tests {
             let err = Config::load(None).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth"
+                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth, jobs"
             );
             // A variable that isn't a setting, such as one for another tool, is left alone.
             jail.create_file(
@@ -503,6 +529,24 @@ mod tests {
             )?;
             jail.set_env("TACHYON_SOMETHING_ELSE", "1");
             assert!(Config::load(None)?.public_url.is_some());
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn jobs_run_two_workers_unless_told_otherwise() {
+        assert_eq!(load("").jobs_config().workers, 2);
+        assert_eq!(load("[jobs]\nworkers = 0").jobs_config().workers, 0);
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.create_file("tachyon.toml", "[jobs]\nwokers = 4\n")?;
+            let err = Config::load(None).unwrap_err().to_string();
+            assert!(err.contains("unknown field: found `wokers`"), "{err}");
+            jail.create_file("tachyon.toml", "[jobs]\nworkers = -1\n")?;
+            assert!(Config::load(None).is_err(), "a negative count");
+            jail.create_file("tachyon.toml", "[jobs]\nworkers = 4\n")?;
+            jail.set_env("TACHYON_JOBS__WORKERS", "1");
+            assert_eq!(Config::load(None)?.jobs_config().workers, 1);
             Ok(())
         });
     }

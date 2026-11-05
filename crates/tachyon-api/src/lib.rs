@@ -6,6 +6,7 @@ mod collections;
 mod documents;
 mod error;
 mod globals;
+mod jobs;
 mod joins;
 mod params;
 mod populate;
@@ -28,6 +29,7 @@ use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
+pub use jobs::JobsConfig;
 use schemas::Schemas;
 
 #[derive(Clone)]
@@ -41,6 +43,7 @@ pub(crate) struct AppState {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub auth: auth::AuthConfig,
+    pub jobs: JobsConfig,
 }
 
 /// Why the API couldn't start.
@@ -151,6 +154,7 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         state.clone(),
         auth::principal::resolve,
     ));
+    jobs::spawn_workers(state.clone(), &options.jobs);
     Ok(layers(routes, Duration::from_secs(30)).with_state(state))
 }
 

@@ -100,6 +100,7 @@ async fn main() -> anyhow::Result<()> {
             config.check_serve().map_err(anyhow::Error::msg)?;
             let options = tachyon_api::Options {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
+                jobs: config.jobs_config(),
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -112,6 +113,8 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            // Waits for the job workers to finish what they're running; they stop with it.
+            pool.close().await;
         }
         Command::Migrate => {}
         Command::Schema { command } => match command {
