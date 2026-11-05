@@ -1,8 +1,12 @@
+use std::collections::HashMap;
+
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::diff::Renames;
+use tachyon_core::query::{Filter, Target, parse_filter_with, parse_query};
 use tachyon_db::documents::{self, Prepared, Relation};
+use tachyon_db::query::{self, JoinQuery, ListQuery, Readable};
 use tachyon_db::schema_change::{ChangeError, apply};
 use tachyon_db::{DEFAULT_TENANT, DbError, DocCopy, collections};
 use uuid::Uuid;
@@ -153,7 +157,9 @@ async fn relations_are_kept_per_copy(pool: PgPool) {
             ("published".into(), "author".into(), s.ann)
         ]
     );
-    let refs = documents::references(&pool, s.ann).await.unwrap();
+    let refs = documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
+        .await
+        .unwrap();
     let seen: Vec<(Uuid, &str, DocCopy)> = refs
         .iter()
         .map(|r| (r.id, r.path.as_str(), r.copy))
@@ -512,4 +518,387 @@ async fn pruning_preview_only_reads(pool: PgPool) {
         .unwrap();
     assert_eq!(p.pruned, 1);
     assert_eq!(versions_of(&pool, a).await.len(), 3);
+}
+
+fn readable(copy: DocCopy, owner: Option<Uuid>) -> Readable {
+    Readable {
+        filter: None,
+        copy,
+        owner,
+    }
+}
+
+fn list_query(filter: Option<&Filter>, copy: DocCopy, owner: Option<Uuid>) -> ListQuery<'_> {
+    ListQuery {
+        filter,
+        sort: None,
+        limit: 100,
+        offset: 0,
+        after: None,
+        count: true,
+        copy,
+        owner,
+    }
+}
+
+/// Each title, sorted, and the count the page reports.
+async fn listed(pool: &PgPool, c: Uuid, q: &ListQuery<'_>, key: &str) -> (Vec<String>, i64) {
+    let page = query::list(pool, c, q).await.unwrap();
+    let mut seen: Vec<String> = page
+        .docs
+        .iter()
+        .map(|d| d.data.0[key].as_str().unwrap().to_owned())
+        .collect();
+    seen.sort();
+    (seen, page.total.unwrap())
+}
+
+fn titles_of(found: &[(Uuid, documents::Document)]) -> Vec<String> {
+    let mut t: Vec<String> = found
+        .iter()
+        .map(|(_, d)| d.data.0["title"].as_str().unwrap().to_owned())
+        .collect();
+    t.sort();
+    t
+}
+
+/// `notes`, each linking to one post.
+async fn notes(pool: &PgPool, s: &Seed, links: &[(&str, Uuid)]) -> (Uuid, CollectionSchema) {
+    let schema: CollectionSchema = serde_json::from_value(json!({"slug": "notes", "fields": [
+        {"name": "label", "type": "text"},
+        {"name": "post", "type": "relationship", "relationTo": "posts"}
+    ]}))
+    .unwrap();
+    let c = collections::create(pool, &schema).await.unwrap().id;
+    for (label, to) in links {
+        let data = json!({"label": label, "post": to.to_string()})
+            .as_object()
+            .unwrap()
+            .clone();
+        let relations = vec![Relation {
+            path: "post".into(),
+            at: "post".into(),
+            collection_id: s.posts,
+            id: *to,
+        }];
+        documents::insert(pool, c, 1, None, &Prepared { data, relations })
+            .await
+            .unwrap();
+    }
+    (c, schema)
+}
+
+/// `qs` on `fields`, with every relationship it crosses guarded by `guards`.
+fn guarded(
+    fields: &[tachyon_core::Field],
+    qs: &str,
+    lookup: &dyn Fn(&str) -> Option<CollectionSchema>,
+    guards: &[(&str, Readable)],
+) -> Filter {
+    fn target(t: Target, guards: &[(&str, Readable)]) -> Target {
+        match t {
+            Target::Via {
+                link,
+                many,
+                polymorphic,
+                collections,
+                inner,
+                ..
+            } => Target::Via {
+                link,
+                many,
+                polymorphic,
+                collections,
+                inner: Box::new(target(*inner, guards)),
+                guards: guards
+                    .iter()
+                    .map(|(slug, r)| ((*slug).to_owned(), r.clone()))
+                    .collect(),
+            },
+            other => other,
+        }
+    }
+    let f = parse_filter_with(fields, &parse_query(qs).unwrap()["where"], lookup).unwrap();
+    match f {
+        Filter::Cond(mut c) => {
+            c.target = target(c.target, guards);
+            Filter::Cond(c)
+        }
+        other => panic!("one condition expected, got {other:?}"),
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn published_reads_skip_unpublished(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let live = post(&pool, &s, "Live", s.ann).await;
+    let hidden = post(&pool, &s, "Hidden", s.ann).await;
+    sqlx::query("UPDATE documents SET draft = published WHERE collection_id = $1")
+        .bind(s.posts)
+        .execute(&pool)
+        .await
+        .unwrap();
+    // Never published: its work lives in the draft only.
+    sqlx::query(
+        "UPDATE documents SET published = NULL, published_at = NULL, status = 'draft' WHERE id = $1",
+    )
+    .bind(hidden)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    let published = list_query(None, DocCopy::Published, None);
+    assert_eq!(
+        listed(&pool, s.posts, &published, "title").await,
+        (vec!["Live".into()], 1)
+    );
+    let draft = list_query(None, DocCopy::Draft, None);
+    assert_eq!(
+        listed(&pool, s.posts, &draft, "title").await,
+        (vec!["Hidden".into(), "Live".into()], 2)
+    );
+
+    assert!(matches!(
+        documents::get(&pool, s.posts, hidden, DocCopy::Published).await,
+        Err(DbError::NotFound)
+    ));
+    let got = documents::get(&pool, s.posts, hidden, DocCopy::Draft)
+        .await
+        .unwrap();
+    assert_eq!(got.data.0["title"], "Hidden");
+    assert_eq!(got.published_at, None);
+    assert!(
+        serde_json::to_value(&got)
+            .unwrap()
+            .get("publishedAt")
+            .is_none()
+    );
+    let live_doc = documents::get(&pool, s.posts, live, DocCopy::Published)
+        .await
+        .unwrap();
+    assert!(live_doc.published_at.is_some());
+    assert!(serde_json::to_value(&live_doc).unwrap()["publishedAt"].is_string());
+    let many = documents::get_many(&pool, &[live, hidden]).await.unwrap();
+    assert_eq!(titles_of(&many), ["Live"]);
+
+    let ids = [live, hidden];
+    let read = HashMap::from([(s.posts, readable(DocCopy::Published, None))]);
+    let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
+    assert_eq!(titles_of(&found), ["Live"]);
+    let read = HashMap::from([(s.posts, readable(DocCopy::Draft, None))]);
+    let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
+    assert_eq!(titles_of(&found), ["Hidden", "Live"]);
+
+    // Through a link: guarded or not, an unpublished post never matches a published read.
+    let (notes, schema) = notes(&pool, &s, &[("to-live", live), ("to-hidden", hidden)]).await;
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let lookup = |slug: &str| (slug == "posts").then(|| posts_schema.clone());
+    let qs = "where[post.title][exists]=true";
+    for (guards, want) in [
+        (vec![], vec!["to-live"]),
+        (
+            vec![("posts", readable(DocCopy::Published, None))],
+            vec!["to-live"],
+        ),
+        (
+            vec![("posts", readable(DocCopy::Draft, None))],
+            vec!["to-hidden", "to-live"],
+        ),
+    ] {
+        let f = guarded(&schema.fields, qs, &lookup, &guards);
+        let q = list_query(Some(&f), DocCopy::Published, None);
+        assert_eq!(
+            listed(&pool, notes, &q, "label").await.0,
+            want,
+            "{guards:?}"
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn draft_reads_follow_draft_links(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    // The published copy links to Bob; the draft has moved on to Ann.
+    let a = post(&pool, &s, "A", s.bob).await;
+    set_draft(
+        &pool,
+        a,
+        Some(json!({"title": "A", "author": s.ann.to_string(), "summary": "S"})),
+    )
+    .await;
+    sqlx::query(
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         VALUES ($1, $2, 'draft', 'author', $3)",
+    )
+    .bind(DEFAULT_TENANT)
+    .bind(a)
+    .bind(s.ann)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let authors = HashMap::from([(s.authors, readable(DocCopy::Published, None))]);
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let authors_schema: CollectionSchema = serde_json::from_value(
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+    )
+    .unwrap();
+    let lookup = |slug: &str| (slug == "authors").then(|| authors_schema.clone());
+
+    for (copy, linked, other) in [
+        (DocCopy::Draft, "Ann", "Bob"),
+        (DocCopy::Published, "Bob", "Ann"),
+    ] {
+        // Populate: the copy read names the link, and the link is what gets fetched.
+        let doc = documents::get(&pool, s.posts, a, copy).await.unwrap();
+        let to = Uuid::parse_str(doc.data.0["author"].as_str().unwrap()).unwrap();
+        let found = query::get_many_readable(&pool, &[to], &authors)
+            .await
+            .unwrap();
+        assert_eq!(found[0].1.data.0["name"], linked, "{copy:?}");
+
+        // A `where` through the link follows the same copy, guarded or not.
+        let guards = [("authors", readable(DocCopy::Published, None))];
+        for guards in [&guards[..], &[]] {
+            for (name, want) in [(linked, vec!["A".to_owned()]), (other, vec![])] {
+                let qs = format!("where[author.name][equals]={name}");
+                let f = guarded(&posts_schema.fields, &qs, &lookup, guards);
+                let q = list_query(Some(&f), copy, None);
+                assert_eq!(listed(&pool, s.posts, &q, "title").await.0, want);
+            }
+        }
+
+        // Joins follow the copy's links too.
+        let q = JoinQuery {
+            collection_id: s.posts,
+            pattern: "^author$",
+            filter: None,
+            sort: None,
+            limit: 10,
+            offset: 0,
+            count: true,
+            copy,
+            owner: None,
+        };
+        let (ann, bob) = if linked == "Ann" { (1, 0) } else { (0, 1) };
+        let pages = query::joined(&pool, &[s.ann, s.bob], &q).await.unwrap();
+        assert_eq!(pages[&s.ann].docs.len(), ann, "{copy:?}");
+        assert_eq!(pages[&s.ann].total, Some(ann as i64));
+        assert_eq!(pages[&s.bob].docs.len(), bob, "{copy:?}");
+        assert_eq!(pages[&s.bob].total, Some(bob as i64));
+        if let Some(d) = pages[&s.ann].docs.first().or(pages[&s.bob].docs.first()) {
+            assert_eq!(d.data.0["author"], doc.data.0["author"]);
+        }
+    }
+
+    // References list both copies, or only those asked for.
+    let both = [DocCopy::Published, DocCopy::Draft];
+    let seen = |refs: Vec<documents::Reference>| -> Vec<(Uuid, DocCopy)> {
+        refs.iter().map(|r| (r.id, r.copy)).collect()
+    };
+    assert_eq!(
+        seen(documents::references(&pool, s.ann, &both).await.unwrap()),
+        vec![(a, DocCopy::Draft)]
+    );
+    assert_eq!(
+        seen(documents::references(&pool, s.bob, &both).await.unwrap()),
+        vec![(a, DocCopy::Published)]
+    );
+    assert!(
+        documents::references(&pool, s.ann, &[DocCopy::Published])
+            .await
+            .unwrap()
+            .is_empty()
+    );
+    // Delete protection still counts the draft's link.
+    assert!(matches!(
+        documents::delete(&pool, s.authors, s.ann).await,
+        Err(DbError::Referenced(1))
+    ));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn owner_narrows_reads(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    let (u, v) = (Uuid::now_v7(), Uuid::now_v7());
+    let mut mine = Vec::new();
+    for (title, by) in [("by-u", u), ("by-v", v)] {
+        let data = json!({"title": title, "author": s.ann.to_string(), "summary": "S"})
+            .as_object()
+            .unwrap()
+            .clone();
+        let relations = vec![Relation {
+            path: "author".into(),
+            at: "author".into(),
+            collection_id: s.authors,
+            id: s.ann,
+        }];
+        let doc = documents::insert_as(
+            &pool,
+            s.posts,
+            1,
+            None,
+            &Prepared { data, relations },
+            Some(by),
+        )
+        .await
+        .unwrap();
+        mine.push(doc.id);
+    }
+    sqlx::query("UPDATE documents SET draft = published WHERE collection_id = $1")
+        .bind(s.posts)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         SELECT tenant_id, from_doc, 'draft', field_path, to_doc FROM relations
+         WHERE from_doc = ANY($1)",
+    )
+    .bind(&mine)
+    .execute(&pool)
+    .await
+    .unwrap();
+
+    for copy in [DocCopy::Published, DocCopy::Draft] {
+        let q = list_query(None, copy, Some(u));
+        assert_eq!(
+            listed(&pool, s.posts, &q, "title").await,
+            (vec!["by-u".into()], 1)
+        );
+        let read = HashMap::from([(s.posts, readable(copy, Some(u)))]);
+        let found = query::get_many_readable(&pool, &mine, &read).await.unwrap();
+        assert_eq!(titles_of(&found), ["by-u"]);
+
+        let q = JoinQuery {
+            collection_id: s.posts,
+            pattern: "^author$",
+            filter: None,
+            sort: None,
+            limit: 10,
+            offset: 0,
+            count: true,
+            copy,
+            owner: Some(u),
+        };
+        let pages = query::joined(&pool, &[s.ann], &q).await.unwrap();
+        assert_eq!(pages[&s.ann].docs.len(), 1);
+        assert_eq!(pages[&s.ann].docs[0].data.0["title"], "by-u");
+        assert_eq!(pages[&s.ann].total, Some(1));
+    }
+
+    // Through a link, the guard's owner narrows what can match.
+    let (notes, schema) = notes(&pool, &s, &[("to-u", mine[0]), ("to-v", mine[1])]).await;
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let lookup = |slug: &str| (slug == "posts").then(|| posts_schema.clone());
+    for copy in [DocCopy::Published, DocCopy::Draft] {
+        let guards = [("posts", readable(copy, Some(u)))];
+        let f = guarded(
+            &schema.fields,
+            "where[post.title][exists]=true",
+            &lookup,
+            &guards,
+        );
+        let q = list_query(Some(&f), DocCopy::Published, None);
+        assert_eq!(listed(&pool, notes, &q, "label").await.0, ["to-u"]);
+    }
 }

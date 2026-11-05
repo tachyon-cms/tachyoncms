@@ -13,6 +13,7 @@ use tachyon_core::query::value_kind;
 use tachyon_core::select::{Select, project};
 use tachyon_core::{CollectionKind, FieldError, merged, validate_document};
 use tachyon_db::DbError;
+use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
 use tachyon_db::indexes::{IndexKind, index_name};
@@ -117,6 +118,8 @@ pub(crate) async fn list_in(
         offset: if p.after.is_some() { 0 } else { offset },
         after: p.after.as_ref(),
         count: p.count,
+        copy: DocCopy::Published,
+        owner: None,
     };
     let found = query::list(&state.pool, c.id, &q).await?;
     let mut docs = found
@@ -299,7 +302,10 @@ pub async fn update(
     let mut patch = json_body(body)?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one.
-    let stored = documents::get(&state.pool, c.id, id).await?.data.0;
+    let stored = documents::get(&state.pool, c.id, id, DocCopy::Published)
+        .await?
+        .data
+        .0;
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     let targets = link_targets(&state, &c).await?;
@@ -377,7 +383,14 @@ pub async fn references(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     access.read_one(&state.pool, &c, id).await?;
-    let mut refs = documents::references(&state.pool, id).await?;
+    // A draft's links are only an unscoped Admin's to see until drafts have their own read
+    // right: a `:read` key sees published content only.
+    let copies: &[DocCopy] = if access.unscoped_admin() {
+        &[DocCopy::Published, DocCopy::Draft]
+    } else {
+        &[DocCopy::Published]
+    };
+    let mut refs = documents::references(&state.pool, id, copies).await?;
     if !refs.is_empty() {
         let ids: Vec<Uuid> = refs.iter().map(|r| r.id).collect();
         let readable: HashSet<Uuid> =

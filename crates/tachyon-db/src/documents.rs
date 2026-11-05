@@ -1,6 +1,6 @@
 //! Documents repository.
 //!
-//! No drafts yet: every write goes straight to `published`.
+//! Reads take the copy they read. Every write still goes straight to `published`.
 
 use serde::Serialize;
 use serde_json::{Map, Value};
@@ -22,28 +22,17 @@ pub struct Document {
     pub created_at: OffsetDateTime,
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
+    /// When the published copy was last published; `None` while it never has been.
+    #[serde(
+        with = "time::serde::rfc3339::option",
+        skip_serializing_if = "Option::is_none"
+    )]
+    pub published_at: Option<OffsetDateTime>,
     #[serde(flatten)]
     pub data: Json<Map<String, Value>>,
 }
 
-/// One of a document's two copies: what's live, or the working draft beside it (drafts on).
-/// Each keeps its own links.
-#[derive(Clone, Copy, PartialEq, Eq, Debug, Serialize, sqlx::Type)]
-#[serde(rename_all = "lowercase")]
-#[sqlx(type_name = "text", rename_all = "lowercase")]
-pub enum DocCopy {
-    Published,
-    Draft,
-}
-
-impl DocCopy {
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Published => "published",
-            Self::Draft => "draft",
-        }
-    }
-}
+pub use tachyon_core::query::DocCopy;
 
 /// A link to store alongside a document.
 #[derive(Debug, Clone)]
@@ -112,7 +101,7 @@ pub async fn insert_as(
         Document,
         r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, published_at, created_by, updated_by)
            VALUES ($1, $2, $3, 'published', $4, now(), $5, $5)
-           RETURNING id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>""#,
+           RETURNING id, status, created_at, updated_at, published_at, published AS "data!: Json<Map<String, Value>>""#,
         id.unwrap_or_else(Uuid::now_v7),
         DEFAULT_TENANT,
         collection_id,
@@ -148,28 +137,39 @@ async fn check_schema(
     }
 }
 
-pub async fn get(pool: &PgPool, collection_id: Uuid, id: Uuid) -> Result<Document, DbError> {
+/// Live document `id`, as its `copy`. A published read never finds one that's unpublished.
+pub async fn get(
+    pool: &PgPool,
+    collection_id: Uuid,
+    id: Uuid,
+    copy: DocCopy,
+) -> Result<Document, DbError> {
     sqlx::query_as!(
         Document,
-        r#"SELECT id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>"
+        r#"SELECT id, status, created_at, updated_at, published_at,
+                  CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
            FROM documents
-           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL"#,
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+             AND ($4 OR published IS NOT NULL)"#,
         DEFAULT_TENANT,
         collection_id,
         id,
+        copy == DocCopy::Draft,
     )
     .fetch_optional(pool)
     .await?
     .ok_or(DbError::NotFound)
 }
 
-/// Live documents with these IDs, from any collection, paired with their collection ID.
+/// Live published documents with these IDs, from any collection, paired with their
+/// collection ID.
 pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document)>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT id, collection_id, status, created_at, updated_at,
+        r#"SELECT id, collection_id, status, created_at, updated_at, published_at,
                   published AS "data!: Json<Map<String, Value>>"
            FROM documents
-           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL"#,
+           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL
+             AND published IS NOT NULL"#,
         DEFAULT_TENANT,
         ids,
     )
@@ -183,6 +183,7 @@ pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document
                 status: r.status,
                 created_at: r.created_at,
                 updated_at: r.updated_at,
+                published_at: r.published_at,
                 data: r.data,
             };
             (r.collection_id, doc)
@@ -264,7 +265,7 @@ pub async fn update_in<E: From<DbError>>(
         Document,
         r#"UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
-           RETURNING id, status, created_at, updated_at, published AS "data!: Json<Map<String, Value>>""#,
+           RETURNING id, status, created_at, updated_at, published_at, published AS "data!: Json<Map<String, Value>>""#,
         DEFAULT_TENANT,
         collection_id,
         id,
@@ -344,27 +345,48 @@ async fn check_guard(
     guard: Option<&Filter>,
 ) -> Result<(), DbError> {
     match guard {
-        Some(f) if !crate::query::matches(conn, id, f).await? => Err(DbError::Forbidden),
+        Some(f) if !crate::query::matches(conn, id, DocCopy::Published, f).await? => {
+            Err(DbError::Forbidden)
+        }
         _ => Ok(()),
     }
 }
 
-/// Live documents that link to `id`, once for each copy holding the link. A rich text
-/// link's index in `path` (`layout.0.intro.1`) counts links the caller can't see too: a
-/// change that hides their bare IDs must renumber it.
-pub async fn references(pool: &PgPool, id: Uuid) -> Result<Vec<Reference>, DbError> {
-    Ok(sqlx::query_as!(
-        Reference,
-        r#"SELECT c.slug AS collection, d.id, r.field_path AS path, r.copy AS "copy: DocCopy"
+/// Live documents that link to `id`, once for each of `copies` holding the link. A rich
+/// text link's index in `path` (`layout.0.intro.1`) counts links the caller can't see too:
+/// a change that hides their bare IDs must renumber it.
+pub async fn references(
+    pool: &PgPool,
+    id: Uuid,
+    copies: &[DocCopy],
+) -> Result<Vec<Reference>, DbError> {
+    let copies: Vec<&str> = copies.iter().map(|c| c.as_str()).collect();
+    let rows = sqlx::query!(
+        r#"SELECT c.slug AS collection, d.id, r.field_path AS path, r.copy
            FROM relations r
            JOIN documents d ON d.id = r.from_doc
            JOIN collections c ON c.id = d.collection_id
            WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL
+             AND r.copy = ANY($2::text[])
            ORDER BY d.id DESC, r.field_path, r.copy"#,
         id,
+        &copies as &[&str],
     )
     .fetch_all(pool)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| Reference {
+            collection: r.collection,
+            id: r.id,
+            path: r.path,
+            copy: if r.copy == "draft" {
+                DocCopy::Draft
+            } else {
+                DocCopy::Published
+            },
+        })
+        .collect())
 }
 
 /// What a link to no document (in its collection) is told.

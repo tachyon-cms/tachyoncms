@@ -628,3 +628,31 @@ async fn populate_without_fields_names_the_collection(pool: PgPool) {
         "populate[authors]: expected populate[authors][field]=true"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_drafts_links_are_listed_to_admins_only(pool: PgPool) {
+    let app = app(pool.clone()).await;
+    let bob = create(&app, "/api/authors", json!({"name": "Bob"})).await;
+    let post = create(&app, "/api/posts", json!({"title": "Hi"})).await;
+    // The post's draft links Bob; its published copy doesn't.
+    sqlx::query(
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         SELECT tenant_id, id, 'draft', 'author', $2 FROM documents WHERE id = $1",
+    )
+    .bind(uuid::Uuid::parse_str(post["id"].as_str().unwrap()).unwrap())
+    .bind(uuid::Uuid::parse_str(bob["id"].as_str().unwrap()).unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let url = format!("/api/authors/{}/references", bob["id"].as_str().unwrap());
+
+    let refs = send(&app, "GET", &url, None).await.json;
+    assert_eq!(
+        refs["docs"],
+        json!([{"collection": "posts", "id": post["id"], "path": "author", "copy": "draft"}])
+    );
+    let viewer = common::app_as(&pool, "viewer@example.test", "viewer").await;
+    let res = send(&viewer, "GET", &url, None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["docs"], json!([]));
+}

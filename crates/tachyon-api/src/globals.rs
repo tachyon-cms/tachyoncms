@@ -11,9 +11,10 @@ use serde_json::{Map, Value};
 use tachyon_core::auth::Action;
 use tachyon_core::{CollectionKind, defaults, merged, validate_document};
 use tachyon_db::DbError;
+use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document};
-use tachyon_db::query::get_many_readable;
+use tachyon_db::query::{Readable, get_many_readable};
 
 use crate::access::{Access, both};
 use crate::documents::{json_body, shaped, unique_error};
@@ -71,14 +72,14 @@ pub async fn get(
     let p = read_params(raw.as_deref(), &c, &access)?;
     let mut value = match read {
         Some(filter) => {
-            let one = HashMap::from([(c.id, Some(filter))]);
+            let one = HashMap::from([(c.id, Readable::published(Some(filter)))]);
             let (_, doc) = get_many_readable(&state.pool, &[c.id], &one)
                 .await?
                 .pop()
                 .ok_or(ApiError::NotFound)?;
             to_value(&doc)?
         }
-        None => match documents::get(&state.pool, c.id, c.id).await {
+        None => match documents::get(&state.pool, c.id, c.id, DocCopy::Published).await {
             Ok(doc) => to_value(&doc)?,
             Err(DbError::NotFound) => Value::Object(defaults(c.schema.data())),
             Err(e) => return Err(e.into()),
@@ -121,7 +122,7 @@ pub async fn update(
     };
     let who = access.actor(Action::UpdateGlobal, &c);
     let mut patch = json_body(body)?;
-    let stored = match documents::get(&state.pool, c.id, c.id).await {
+    let stored = match documents::get(&state.pool, c.id, c.id, DocCopy::Published).await {
         Ok(doc) => Some(doc.data.0),
         Err(DbError::NotFound) => None,
         Err(e) => return Err(e.into()),

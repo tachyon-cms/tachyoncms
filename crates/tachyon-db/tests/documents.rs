@@ -1,8 +1,9 @@
 use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
+use tachyon_db::DocCopy;
 use tachyon_db::documents::{Prepared, Relation};
-use tachyon_db::query::{self, ListQuery};
+use tachyon_db::query::{self, ListQuery, Readable};
 use tachyon_db::{DbError, collections, documents};
 use uuid::Uuid;
 
@@ -25,7 +26,9 @@ async fn insert_then_get(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(doc.status, "published");
-    let found = documents::get(&pool, c, doc.id).await.unwrap();
+    let found = documents::get(&pool, c, doc.id, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(found.data.0, data("Hello"));
 
     let json = serde_json::to_value(&found).unwrap();
@@ -42,7 +45,7 @@ async fn documents_are_scoped_to_their_collection(pool: PgPool) {
         .await
         .unwrap();
     assert!(matches!(
-        documents::get(&pool, pages, doc.id).await,
+        documents::get(&pool, pages, doc.id, DocCopy::Published).await,
         Err(DbError::NotFound)
     ));
 }
@@ -65,6 +68,8 @@ async fn list_pages_newest_first(pool: PgPool) {
             offset: 0,
             after: None,
             count: true,
+            copy: DocCopy::Published,
+            owner: None,
         },
     )
     .await
@@ -87,6 +92,8 @@ async fn list_pages_newest_first(pool: PgPool) {
             offset: 2,
             after: None,
             count: false,
+            copy: DocCopy::Published,
+            owner: None,
         },
     )
     .await
@@ -129,7 +136,7 @@ async fn delete_hides_the_document(pool: PgPool) {
         .unwrap();
     documents::delete(&pool, c, doc.id).await.unwrap();
     assert!(matches!(
-        documents::get(&pool, c, doc.id).await,
+        documents::get(&pool, c, doc.id, DocCopy::Published).await,
         Err(DbError::NotFound)
     ));
     assert!(
@@ -142,7 +149,9 @@ async fn delete_hides_the_document(pool: PgPool) {
                 limit: 10,
                 offset: 0,
                 after: None,
-                count: false
+                count: false,
+                copy: DocCopy::Published,
+                owner: None,
             }
         )
         .await
@@ -234,7 +243,9 @@ async fn linked_documents_cannot_be_deleted_until_unlinked(pool: PgPool) {
         Err(DbError::Referenced(1))
     ));
 
-    let refs = documents::references(&pool, ann.id).await.unwrap();
+    let refs = documents::references(&pool, ann.id, &[DocCopy::Published, DocCopy::Draft])
+        .await
+        .unwrap();
     assert_eq!(refs.len(), 1);
     assert_eq!(
         (
@@ -460,15 +471,21 @@ async fn read_filters_apply_to_get_many_by_collection(pool: PgPool) {
 
     // posts by filter, pages whole, notes not at all (missing from the map).
     let read = HashMap::from([
-        (posts, Some(filter("where[title][equals]=open"))),
-        (pages, None),
+        (
+            posts,
+            Readable::published(Some(filter("where[title][equals]=open"))),
+        ),
+        (pages, Readable::published(None)),
     ]);
     let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
     assert!(found.iter().all(|(c, _)| *c == posts || *c == pages));
     assert_eq!(titles(found), ["open", "page"]);
 
     // A filter that matches nothing hides the whole collection; no map hides everything.
-    let read = HashMap::from([(posts, Some(Filter::Any(Vec::new()))), (pages, None)]);
+    let read = HashMap::from([
+        (posts, Readable::published(Some(Filter::Any(Vec::new())))),
+        (pages, Readable::published(None)),
+    ]);
     let found = query::get_many_readable(&pool, &ids, &read).await.unwrap();
     assert_eq!(titles(found), ["page"]);
     let found = query::get_many_readable(&pool, &ids, &HashMap::new())
@@ -515,7 +532,11 @@ async fn write_guards_are_checked_in_the_transaction(pool: PgPool) {
     let refused = documents::delete_as(&pool, posts, a, None, Some(&other)).await;
     assert!(matches!(refused, Err(DbError::Forbidden)), "{refused:?}");
     assert_eq!(
-        documents::get(&pool, posts, a).await.unwrap().data.0["title"],
+        documents::get(&pool, posts, a, DocCopy::Published)
+            .await
+            .unwrap()
+            .data
+            .0["title"],
         "renamed"
     );
 
@@ -564,7 +585,9 @@ async fn write_guards_are_checked_in_the_transaction(pool: PgPool) {
         other_tx.commit().await.unwrap();
         let result = write.await.unwrap();
         assert!(matches!(result, Err(DbError::Forbidden)), "{result:?}");
-        let stored = documents::get(&pool, posts, id).await.unwrap();
+        let stored = documents::get(&pool, posts, id, DocCopy::Published)
+            .await
+            .unwrap();
         assert_eq!(stored.data.0["title"], "b");
         assert_eq!(stored.data.0["author"], "thief");
     }

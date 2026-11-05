@@ -98,6 +98,44 @@ impl Filter {
     }
 }
 
+/// One of a document's two copies: what's live, or the working draft beside it (drafts on).
+/// Each keeps its own links.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocCopy {
+    Published,
+    Draft,
+}
+
+impl DocCopy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Draft => "draft",
+        }
+    }
+}
+
+/// How a caller may read one collection: which copy, narrowed by a read filter (`None`:
+/// all of it) and, for own-only rights, to the documents `owner` created.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Readable {
+    pub filter: Option<Filter>,
+    pub copy: DocCopy,
+    pub owner: Option<Uuid>,
+}
+
+impl Readable {
+    /// The published copy, under `filter`.
+    pub fn published(filter: Option<Filter>) -> Self {
+        Self {
+            filter,
+            copy: DocCopy::Published,
+            owner: None,
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cond {
     pub target: Target,
@@ -123,10 +161,11 @@ pub enum Target {
         polymorphic: bool,
         collections: Vec<String>,
         inner: Box<Target>,
-        /// The read filter of each linked collection the caller may read (`None`: all of
-        /// it), so hidden documents never match. Empty means unguarded. Otherwise a
-        /// collection missing from the list is unreadable, and nothing in it matches.
-        guards: Vec<(String, Option<Box<Filter>>)>,
+        /// How the caller may read each linked collection, so hidden documents never match
+        /// and each is read in its own copy. Empty means unguarded, reading published
+        /// copies. Otherwise a collection missing from the list is unreadable, and nothing
+        /// in it matches.
+        guards: Vec<(String, Readable)>,
     },
     /// Some row of the list at `list` matches `inner`, whose path is relative to the row.
     Row {

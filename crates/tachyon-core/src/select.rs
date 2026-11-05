@@ -8,7 +8,7 @@ use crate::query::FilterError;
 use crate::schema::{BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, data_fields};
 
 /// Keys every document carries besides its fields. `id` always comes back.
-const BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "status"];
+const BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "publishedAt", "status"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Select {
@@ -267,6 +267,14 @@ mod tests {
             shaped("select[title]=true&select[createdAt]=true"),
             json!({"id": "1", "title": "T", "createdAt": "c"})
         );
+    }
+
+    #[test]
+    fn select_names_published_at() {
+        let mut d = doc();
+        d.insert("publishedAt".into(), json!("p"));
+        project(&select("select[publishedAt]=true").unwrap(), &mut d);
+        assert_eq!(Value::Object(d), json!({"id": "1", "publishedAt": "p"}));
     }
 
     #[test]

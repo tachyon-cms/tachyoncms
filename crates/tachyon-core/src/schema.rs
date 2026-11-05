@@ -6,7 +6,8 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
 /// Keys the API adds to every document, so top-level fields can't use them.
-pub const RESERVED_FIELD_NAMES: &[&str] = &["id", "createdAt", "updatedAt", "status"];
+pub const RESERVED_FIELD_NAMES: &[&str] =
+    &["id", "createdAt", "updatedAt", "publishedAt", "status"];
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
@@ -2825,6 +2826,17 @@ mod tests {
             {"name": "meta", "type": "group", "fields": [{"name": "id", "type": "text"}]}
         ]}));
         assert_eq!(nested.check(), Ok(()));
+    }
+
+    #[test]
+    fn published_at_is_reserved() {
+        // Every document read carries it beside its fields.
+        let top =
+            schema(json!({"slug": "posts", "fields": [{"name": "publishedAt", "type": "date"}]}));
+        assert_eq!(
+            top.check(),
+            Err(SchemaError::ReservedFieldName("publishedAt".into()))
+        );
     }
 
     #[test]

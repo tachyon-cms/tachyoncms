@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, collection_id, status, created_at, updated_at,\n                  published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+  "query": "SELECT id, collection_id, status, created_at, updated_at, published_at,\n                  published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL\n             AND published IS NOT NULL",
   "describe": {
     "columns": [
       {
@@ -60,6 +60,17 @@
       },
       {
         "ordinal": 5,
+        "name": "published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -82,8 +93,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "d8d19061ecd1d56a52ebe8925d37dd82d33efe9ce7f6698974a28da2b88de936"
+  "hash": "66fcf33c553ebf64c0185f3135f6ed646a626bd14ae2b4c9d09be0b185d7c8f9"
 }

@@ -10,6 +10,7 @@ use tachyon_core::auth::Action;
 use tachyon_core::joins::{JoinField, on_pattern};
 use tachyon_core::query::{Filter, parse_filter_with, parse_sort};
 use tachyon_core::select::{Select, project};
+use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::query::{self, JoinQuery};
 use uuid::Uuid;
@@ -158,6 +159,8 @@ pub(crate) async fn fill_joins(
                 limit,
                 offset,
                 count,
+                copy: DocCopy::Published,
+                owner: None,
             };
             #[cfg(test)]
             let _ = JOIN_QUERIES.try_with(|n| n.set(n.get() + 1));

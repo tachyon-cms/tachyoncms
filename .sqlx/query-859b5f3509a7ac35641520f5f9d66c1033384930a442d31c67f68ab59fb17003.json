@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT c.slug AS collection, d.id, r.field_path AS path, r.copy AS \"copy: DocCopy\"\n           FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           JOIN collections c ON c.id = d.collection_id\n           WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL\n           ORDER BY d.id DESC, r.field_path, r.copy",
+  "query": "SELECT c.slug AS collection, d.id, r.field_path AS path, r.copy\n           FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           JOIN collections c ON c.id = d.collection_id\n           WHERE r.to_doc = $1 AND r.from_doc <> $1 AND d.deleted_at IS NULL\n             AND r.copy = ANY($2::text[])\n           ORDER BY d.id DESC, r.field_path, r.copy",
   "describe": {
     "columns": [
       {
@@ -38,7 +38,7 @@
       },
       {
         "ordinal": 3,
-        "name": "copy: DocCopy",
+        "name": "copy",
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -50,7 +50,8 @@
     ],
     "parameters": {
       "Left": [
-        "Uuid"
+        "Uuid",
+        "TextArray"
       ]
     },
     "nullable": [
@@ -60,5 +61,5 @@
       false
     ]
   },
-  "hash": "47194626f66d1ec8244f5786a82efb23fdd10145282e68bb992c399a4b6af195"
+  "hash": "859b5f3509a7ac35641520f5f9d66c1033384930a442d31c67f68ab59fb17003"
 }

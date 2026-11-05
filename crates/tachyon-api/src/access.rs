@@ -18,7 +18,7 @@ use tachyon_core::access::{
     readable_rows, strip_to, unwritable, visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
-use tachyon_core::query::{Filter, Target};
+use tachyon_core::query::{DocCopy, Filter, Readable, Target};
 use tachyon_core::{CollectionKind, CollectionSchema, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
@@ -40,7 +40,7 @@ pub(crate) struct Access {
     user: Option<Map<String, Value>>,
     schemas: Arc<Schemas>,
     /// `readable()`, worked out once per request.
-    readable: OnceLock<HashMap<Uuid, Option<Filter>>>,
+    readable: OnceLock<HashMap<Uuid, Readable>>,
     /// Each collection (by ID and schema version) as the caller can read it, worked out
     /// once per request.
     visible: Mutex<HashMap<(Uuid, i32), Shape>>,
@@ -296,7 +296,14 @@ impl Access {
                     && needs_profile(&state.schemas, &reach)
                     && let Some(users) = state.schemas.get(USERS)
                 {
-                    match documents::get(&state.pool, users.id, identity.user_id).await {
+                    match documents::get(
+                        &state.pool,
+                        users.id,
+                        identity.user_id,
+                        DocCopy::Published,
+                    )
+                    .await
+                    {
                         Ok(doc) => user = doc.data.0,
                         Err(DbError::NotFound) => {}
                         Err(e) => return Err(e.into()),
@@ -547,25 +554,25 @@ impl Access {
 
     /// Each collection the caller may read, with its read filter (`None`: all of it).
     /// Globals are left out: nothing links to them.
-    pub(crate) fn readable(&self) -> &HashMap<Uuid, Option<Filter>> {
+    pub(crate) fn readable(&self) -> &HashMap<Uuid, Readable> {
         self.readable
             .get_or_init(|| self.read_filters(|c| c.schema.kind == CollectionKind::Collection))
     }
 
     /// `readable`, with globals too: a global can link to a document, so it can be one of
     /// that document's references.
-    pub(crate) fn readable_with_globals(&self) -> HashMap<Uuid, Option<Filter>> {
+    pub(crate) fn readable_with_globals(&self) -> HashMap<Uuid, Readable> {
         self.read_filters(|_| true)
     }
 
-    fn read_filters(&self, which: impl Fn(&Collection) -> bool) -> HashMap<Uuid, Option<Filter>> {
+    fn read_filters(&self, which: impl Fn(&Collection) -> bool) -> HashMap<Uuid, Readable> {
         self.schemas
             .all()
             .iter()
             .filter(|c| which(c))
             .filter_map(|c| match self.allows(Action::Read, c) {
-                Compiled::Allow => Some((c.id, None)),
-                Compiled::Filter(f) => Some((c.id, Some(f))),
+                Compiled::Allow => Some((c.id, Readable::published(None))),
+                Compiled::Filter(f) => Some((c.id, Readable::published(Some(f)))),
                 Compiled::Deny => None,
             })
             .collect()
@@ -593,7 +600,7 @@ impl Access {
             Compiled::Allow => true,
             Compiled::Deny => false,
             Compiled::Filter(f) => {
-                let one = HashMap::from([(c.id, Some(f))]);
+                let one = HashMap::from([(c.id, Readable::published(Some(f)))]);
                 !get_many_readable(pool, &[doc], &one).await?.is_empty()
             }
         })
@@ -609,10 +616,10 @@ impl Access {
         self.scope(Action::Read, &c.schema.slug)?;
         let filter = match self.allows(Action::Read, c) {
             Compiled::Deny => return Err(ApiError::NotFound),
-            Compiled::Allow => return Ok(documents::get(pool, c.id, id).await?),
+            Compiled::Allow => return Ok(documents::get(pool, c.id, id, DocCopy::Published).await?),
             Compiled::Filter(f) => f,
         };
-        let read = HashMap::from([(c.id, Some(filter))]);
+        let read = HashMap::from([(c.id, Readable::published(Some(filter)))]);
         get_many_readable(pool, &[id], &read)
             .await?
             .pop()
@@ -641,7 +648,7 @@ impl Access {
         // Checked first so a hidden document is a 404; the guard checks it again under the
         // lock, so a change in between can only turn this into a 403.
         if let Some(f) = &read {
-            let one = HashMap::from([(c.id, Some(f.clone()))]);
+            let one = HashMap::from([(c.id, Readable::published(Some(f.clone())))]);
             if get_many_readable(pool, &[id], &one).await?.is_empty() {
                 return Err(ApiError::NotFound);
             }
@@ -672,7 +679,7 @@ impl Access {
                 inner,
                 ..
             } => {
-                let mut guards: Vec<(String, Option<Box<Filter>>)> = collections
+                let mut guards: Vec<(String, Readable)> = collections
                     .iter()
                     .map(|slug| {
                         let read = self
@@ -682,15 +689,15 @@ impl Access {
                             .map_or(Compiled::Deny, |c| self.allows(Action::Read, &c));
                         let guard = match read {
                             Compiled::Allow => None,
-                            Compiled::Filter(f) => Some(Box::new(f)),
-                            Compiled::Deny => Some(Box::new(nothing())),
+                            Compiled::Filter(f) => Some(f),
+                            Compiled::Deny => Some(nothing()),
                         };
-                        (slug.clone(), guard)
+                        (slug.clone(), Readable::published(guard))
                     })
                     .collect();
                 // No guards would mean unguarded; with no collections nothing should match.
                 if guards.is_empty() {
-                    guards.push((String::new(), Some(Box::new(nothing()))));
+                    guards.push((String::new(), Readable::published(Some(nothing()))));
                 }
                 Target::Via {
                     link,

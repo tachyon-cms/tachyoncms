@@ -14,6 +14,7 @@ use tachyon_core::access::{Caller, strip_unreadable};
 use tachyon_core::auth::check_password;
 use tachyon_core::{FieldError, is_email};
 use tachyon_db::DbError;
+use tachyon_db::DocCopy;
 use tachyon_db::auth::{self, NewAccount};
 use tachyon_db::documents;
 use time::OffsetDateTime;
@@ -105,7 +106,7 @@ pub(crate) async fn user_json(
         .await?
         .ok_or(ApiError::NotFound)?;
     let users = auth::ensure_users_collection(&state.pool).await?;
-    let doc = documents::get(&state.pool, users.id, user_id).await?;
+    let doc = documents::get(&state.pool, users.id, user_id, DocCopy::Published).await?;
     let mut value = to_value(&doc)?;
     if let Value::Object(profile) = &mut value {
         strip_unreadable(users.schema.data(), profile, caller);

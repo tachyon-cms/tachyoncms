@@ -17,9 +17,10 @@ use tachyon_core::{
     CollectionKind, FieldError, FieldKind, map_relations, merged, relations, rich_texts_mut,
 };
 use tachyon_db::DbError;
+use tachyon_db::DocCopy;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
-use tachyon_db::query::{self, ListQuery, get_many_readable};
+use tachyon_db::query::{self, ListQuery, Readable, get_many_readable};
 use uuid::Uuid;
 
 use crate::access::{Access, both};
@@ -222,6 +223,8 @@ async fn by_slug(
             offset: 0,
             after: None,
             count: false,
+            copy: DocCopy::Published,
+            owner: None,
         };
         for doc in query::list(&state.pool, c.id, &q).await?.docs {
             if let Some(slug) = c.schema.slug_of(&doc.data) {
@@ -262,7 +265,7 @@ pub(crate) async fn check_links(
     // any existing user it holds the ID of.
     let mut linkable = access.readable().clone();
     if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
-        linkable.insert(users.id, None);
+        linkable.insert(users.id, Readable::published(None));
     }
     let vouched = get_many_readable(&state.pool, &ids, &linkable)
         .await?

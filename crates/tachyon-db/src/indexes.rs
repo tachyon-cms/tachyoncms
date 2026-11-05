@@ -78,6 +78,7 @@ pub(crate) fn wanted_indexes(collection_id: Uuid, schema: &CollectionSchema) -> 
         let Some(value) = value_kind(&f.kind) else {
             continue;
         };
+        // shortcut: filter/sort indexes cover the published copy only; draft reads scan the collection's live partial index. Add draft expression indexes if admin lists get slow.
         let expr = field_expr(std::slice::from_ref(&f.name), value);
         let mut want = |kind: IndexKind, definition: String| {
             out.push(Wanted {

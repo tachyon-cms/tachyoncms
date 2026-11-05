@@ -10,6 +10,7 @@ use axum::http::StatusCode;
 use serde_json::{Map, Value};
 use tachyon_core::auth::{Action, Decision, check_password};
 use tachyon_core::{FieldError, is_email, merged, validate_document};
+use tachyon_db::DocCopy;
 use tachyon_db::auth::{self, NewAccount};
 use tachyon_db::documents::{self, Actor};
 use uuid::Uuid;
@@ -277,7 +278,10 @@ pub(crate) async fn update(
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored profile, then again against the locked one.
     let stored = if profile.as_object().is_some_and(|p| !p.is_empty()) {
-        let stored = documents::get(&state.pool, users.id, id).await?.data.0;
+        let stored = documents::get(&state.pool, users.id, id, DocCopy::Published)
+            .await?
+            .data
+            .0;
         let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
         from_markdown(&state, &access, &users, &mut profile, Some(&stored)).await?;
         refuse_fields(&users, &profile, Action::Update, &caller, Some(&stored))?;
