@@ -772,3 +772,91 @@ async fn unpublishing_what_isnt_published_is_refused(pool: PgPool) {
         409,
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn restoring_a_draft_version_needs_read_drafts(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    // Editors may change pages and read their history, but no draft matches `readDrafts`.
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "pages", "versions": {"drafts": true},
+                    "access": {"readVersions": true, "readDrafts": {"title": "never"}},
+                    "fields": [{"name": "title", "type": "text"}]})),
+    )
+    .await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    let id = id_of(
+        &ok(
+            &admin,
+            "POST",
+            "/api/pages",
+            Some(json!({"title": "Secret"})),
+        )
+        .await,
+    );
+    let one = format!("/api/pages/{id}");
+    ok(&admin, "PATCH", &one, Some(json!({"title": "Live"}))).await;
+    ok(&admin, "POST", &format!("{one}/publish"), None).await;
+    let all = ok(&admin, "GET", &format!("{one}/versions"), None).await["docs"].clone();
+    let draft = all[2]["id"].as_str().unwrap().to_owned();
+    assert_eq!(all[2]["kind"], "draft");
+
+    let random = Uuid::now_v7().to_string();
+    let mut answers = Vec::new();
+    for vid in [draft, random] {
+        let res = call(
+            &editor,
+            "POST",
+            &format!("{one}/versions/{vid}/restore"),
+            None,
+        )
+        .await;
+        assert_problem(&res, 404);
+        assert!(!res.json.to_string().contains("Secret"), "{}", res.json);
+        answers.push((res.json["title"].clone(), res.json.get("detail").cloned()));
+    }
+    assert_eq!(
+        answers[0], answers[1],
+        "a draft's version reads as a random one"
+    );
+    let draft = ok(&admin, "GET", &format!("{one}?draft=true"), None).await;
+    assert_eq!(draft["title"], "Live", "nothing was restored");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_global_refuses_history_with_a_403(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(
+            json!({"slug": "site", "kind": "global", "versions": {"drafts": true},
+                    "access": {"readVersions": {"name": "Open"}},
+                    "fields": [{"name": "name", "type": "text"}]}),
+        ),
+    )
+    .await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    let uri = "/api/globals/site/versions";
+    // Never saved, so there's nothing for the rule to match: refused, as when it fails.
+    assert_problem(&call(&editor, "GET", uri, None).await, 403);
+    ok(
+        &admin,
+        "PATCH",
+        "/api/globals/site",
+        Some(json!({"name": "Shut"})),
+    )
+    .await;
+    assert_problem(&call(&editor, "GET", uri, None).await, 403);
+    ok(
+        &admin,
+        "PATCH",
+        "/api/globals/site",
+        Some(json!({"name": "Open"})),
+    )
+    .await;
+    ok(&editor, "GET", uri, None).await;
+}

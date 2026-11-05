@@ -960,7 +960,8 @@ impl Access {
     /// `readVersions` and read rules, judged on its current copy (the draft, with drafts),
     /// and the creator for an own-only right, which reaches no global. Refused and missing
     /// are both a 404 (W1-R14), as is a document in the trash; a global, whose existence
-    /// isn't secret, is refused with a 403. Answers whether they may also read the versions
+    /// isn't secret, is refused with a 403 (Ruling T5-5), even before it's saved when a rule
+    /// limits the caller. Answers whether they may also read the versions
     /// that were drafts, which takes `readDrafts` on the document too (Ruling T5-3).
     pub(crate) async fn versions_of(
         &self,
@@ -994,6 +995,9 @@ impl Access {
             true => DocCopy::Draft,
             false => DocCopy::Published,
         };
+        // A rule could refuse even what isn't saved yet, so a global it limits is refused,
+        // saved or not; only a global nothing limits can be missing, a 404.
+        let limited = filter.is_some();
         let versions = Readable {
             filter,
             copy,
@@ -1002,7 +1006,7 @@ impl Access {
         };
         let one = HashMap::from([(c.id, versions)]);
         if get_many_readable(pool, &[id], &one).await?.is_empty() {
-            let known = global && documents::get(pool, c.id, id, copy).await.is_ok();
+            let known = global && (limited || documents::get(pool, c.id, id, copy).await.is_ok());
             return Err(if known {
                 self.refuse()
             } else {
@@ -1013,6 +1017,12 @@ impl Access {
         let Some(drafts) = self.draft_readable(c, read) else {
             return Ok(!c.schema.drafts());
         };
+        // The draft was just found, so only a filter or an owner can still hide it. Not
+        // folded into the query above: each takes one readable per collection, and these
+        // two judge the same copy by different rules.
+        if drafts.filter.is_none() && drafts.owner.is_none() {
+            return Ok(true);
+        }
         let one = HashMap::from([(c.id, drafts)]);
         Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
     }
