@@ -755,3 +755,81 @@ async fn versions_doc(pool: &PgPool) -> String {
         .unwrap();
     id.to_string()
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_slug_links_one_document_or_says_why_not(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    collection(
+        &admin,
+        json!({"slug": "categories", "versions": {"drafts": true},
+               "fields": [{"name": "name", "type": "text"}, {"name": "slug", "type": "slug"}]}),
+    )
+    .await;
+    collection(
+        &admin,
+        json!({"slug": "posts", "versions": {"drafts": true},
+               "fields": [{"name": "body", "type": "richText", "relationTo": ["categories"]}]}),
+    )
+    .await;
+    // Drafts needn't have unique slugs: two say `a`, made last so they'd come first.
+    for (name, slug) in [("B", "b"), ("A", "a"), ("A again", "a")] {
+        let body = json!({"name": name, "slug": slug});
+        ok(&admin, "POST", "/api/categories", Some(body)).await;
+    }
+    let md = |src: &str| json!({"body": {"format": "markdown", "value": src}});
+    let res = call(
+        &admin,
+        "POST",
+        "/api/posts",
+        Some(md("[x](doc:categories/a)\n\n[y](doc:categories/b)")),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([{"path": "body.content.0.content.0.marks.0.attrs.doc",
+                "message": "line 1: `a` matches more than one document; link it by id"}]),
+        "b is found, and a is never a silent pick"
+    );
+    let res = call(
+        &admin,
+        "POST",
+        "/api/posts",
+        Some(md("[y](doc:categories/b)")),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn refusals_come_before_bad_parameters(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let id = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "A"}))).await);
+    publish(&pool, &id).await;
+    let key = ok(
+        &admin,
+        "POST",
+        "/api/auth/keys",
+        Some(json!({"name": "site", "scopes": ["posts:read"]})),
+    )
+    .await["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let anon = tachyon_api::router(pool.clone()).await.unwrap();
+    let one = format!("/api/posts/{id}");
+    for (method, uri, body) in [
+        ("POST", "/api/posts?stray=1".to_owned(), Some(json!({}))),
+        ("PATCH", format!("{one}?autosave=maybe"), Some(json!({}))),
+        ("DELETE", format!("{one}?stray=1"), None),
+    ] {
+        let body = body.map(|b| b.to_string());
+        assert_problem(&send(&viewer, method, &uri, body.as_deref()).await, 403);
+        let req = Request::builder()
+            .method(method)
+            .uri(&uri)
+            .header("authorization", format!("Bearer {key}"));
+        assert_problem(&send_with(&anon, req, body.as_deref()).await, 403);
+    }
+}

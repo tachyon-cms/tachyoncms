@@ -242,11 +242,11 @@ pub async fn create(
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
-    no_params(raw.as_deref())?;
     access.scope(Action::Create, &c.schema.slug)?;
     if !access.may_create(&c) {
         return Err(access.refuse());
     }
+    no_params(raw.as_deref())?;
     let copy = access.write_copy(&c)?;
     let mut body = json_body(body)?;
     from_markdown(&state, &access, &c, &mut body, None).await?;
@@ -326,6 +326,7 @@ pub async fn update(
     access.scope(Action::Update, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    access.may_write(Action::Update, &c)?;
     let autosave = autosave_param(raw.as_deref(), &c)?;
     let copy = access.write_copy(&c)?;
     let guard = access
@@ -386,6 +387,7 @@ pub async fn delete(
     access.scope(Action::Delete, &slug)?;
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
+    access.may_write(Action::Delete, &c)?;
     no_params(raw.as_deref())?;
     let copy = access.write_copy(&c)?;
     let guard = access

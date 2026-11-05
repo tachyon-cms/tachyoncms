@@ -1329,3 +1329,102 @@ async fn a_draft_read_falls_back_to_what_is_live(pool: PgPool) {
         assert_eq!(pages[&s.ann].total, Some(want.len() as i64));
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_draft_rule_on_a_missing_value_falls_back_to_what_is_live(pool: PgPool) {
+    let s = seed(&pool, json!({"drafts": true})).await;
+    // The `readDrafts` rule reads `summary`. One draft has it, one lacks it (the rule
+    // comes to NULL), and a draft that was never published lacks it too.
+    let kept = post(&pool, &s, "Kept", s.ann).await;
+    let bare = post(&pool, &s, "Bare", s.ann).await;
+    let never = post(&pool, &s, "Never", s.ann).await;
+    for (id, draft, unpublished) in [
+        (kept, json!({"title": "Kept draft", "summary": "S"}), false),
+        (bare, json!({"title": "Bare draft"}), false),
+        (never, json!({"title": "Never draft"}), true),
+    ] {
+        let mut draft = draft;
+        draft["author"] = s.ann.to_string().into();
+        sqlx::query(
+            "UPDATE documents SET draft = $2,
+                 published = CASE WHEN $3 THEN NULL ELSE published END
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(draft)
+        .bind(unpublished)
+        .execute(&pool)
+        .await
+        .unwrap();
+        sqlx::query(
+            "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+             SELECT tenant_id, from_doc, 'draft', field_path, to_doc FROM relations
+             WHERE from_doc = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let posts_schema = posts(json!({"drafts": true}), fields(json!("authors")));
+    let lookup = |slug: &str| (slug == "posts").then(|| posts_schema.clone());
+    let filter = |qs: &str| {
+        parse_filter_with(
+            &posts_schema.fields,
+            &parse_query(qs).unwrap()["where"],
+            &lookup,
+        )
+        .unwrap()
+    };
+    let mixed = Readable {
+        filter: Some(filter("where[summary][equals]=S")),
+        otherwise: Some(Box::new(readable(DocCopy::Published, None))),
+        ..readable(DocCopy::Draft, None)
+    };
+
+    let read = HashMap::from([(s.posts, mixed.clone())]);
+    let found = query::get_many_readable(&pool, &[kept, bare, never], &read)
+        .await
+        .unwrap();
+    assert_eq!(titles_of(&found), ["Bare", "Kept draft"]);
+
+    let (notes, schema) = notes(
+        &pool,
+        &s,
+        &[("to-kept", kept), ("to-bare", bare), ("to-never", never)],
+    )
+    .await;
+    let guards = [("posts", mixed.clone())];
+    for (title, want) in [
+        ("Kept%20draft", vec!["to-kept"]),
+        ("Kept", vec![]),
+        ("Bare", vec!["to-bare"]),
+        ("Bare%20draft", vec![]),
+        ("Never%20draft", vec![]),
+        ("Never", vec![]),
+    ] {
+        let qs = format!("where[post.title][equals]={title}");
+        let f = guarded(&schema.fields, &qs, &lookup, &guards);
+        let q = list_query(Some(&f), DocCopy::Published, None);
+        assert_eq!(listed(&pool, notes, &q, "label").await.0, want, "{title}");
+    }
+
+    let q = JoinQuery {
+        collection_id: s.posts,
+        pattern: "^author$",
+        filter: None,
+        sort: None,
+        limit: 10,
+        offset: 0,
+        count: true,
+        read: &mixed,
+    };
+    let pages = query::joined(&pool, &[s.ann], &q).await.unwrap();
+    let mut seen: Vec<&str> = pages[&s.ann]
+        .docs
+        .iter()
+        .map(|d| d.data.0["title"].as_str().unwrap())
+        .collect();
+    seen.sort();
+    assert_eq!(seen, ["Bare", "Kept draft"]);
+}

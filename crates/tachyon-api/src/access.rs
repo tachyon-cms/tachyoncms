@@ -819,7 +819,7 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<Option<Filter>, ApiError> {
-        self.scope(action, &c.schema.slug)?;
+        self.may_write(action, c)?;
         let (read, write) = match self.write_rules(action, c) {
             Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
             // Refused for the whole collection, so a 403 before the readability check is
@@ -847,6 +847,23 @@ impl Access {
             }
         }
         Ok(both(read.filter, write))
+    }
+
+    /// The refusals an update or delete (`action`) of `c` meets before any document is
+    /// looked at, as `write_guard` gives them: so a refused caller hears that first, before
+    /// anything about the request's parameters.
+    pub(crate) fn may_write(&self, action: Action, c: &Collection) -> Result<(), ApiError> {
+        self.scope(action, &c.schema.slug)?;
+        match self.write_rules(action, c) {
+            Err(WriteRefusal::Hidden) => Err(ApiError::NotFound),
+            Err(WriteRefusal::Refused) => Err(self.refuse()),
+            Ok((read, _))
+                if c.schema.drafts() && self.draft_readable(c, read.clone()).is_none() =>
+            {
+                Err(self.refuse())
+            }
+            Ok(_) => Ok(()),
+        }
     }
 
     /// The guard a global's update runs under (see `write_guard`); a global's existence

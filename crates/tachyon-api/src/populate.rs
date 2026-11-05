@@ -151,10 +151,10 @@ pub(crate) async fn from_markdown(
             ));
         }
     }
-    let mut found: HashMap<(String, String), Uuid> = HashMap::new();
+    let mut found: HashMap<(String, String), HashSet<Uuid>> = HashMap::new();
     for (to, slugs) in named {
-        for (slug, id) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
-            found.insert((to.clone(), slug), id);
+        for (slug, ids) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
+            found.insert((to.clone(), slug), ids);
         }
     }
     let mut errors = Vec::new();
@@ -163,13 +163,24 @@ pub(crate) async fn from_markdown(
             richtext::slug_refs_mut(text, kind, &mut |at, link| {
                 let (to, slug) = (get(link, "relationTo"), get(link, "slug"));
                 let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
-                match found.get(&(to.clone(), slug.clone())) {
-                    Some(id) => {
+                match found
+                    .get(&(to.clone(), slug.clone()))
+                    .map(|ids| (ids.len(), ids.iter().next()))
+                {
+                    // Drafts may share a slug: which one is meant is the writer's to say.
+                    Some((2.., _)) => errors.push(FieldError {
+                        path: format!("{path}.{at}"),
+                        message: format!(
+                            "line {line}: `{}` matches more than one document; link it by id",
+                            clipped(&slug)
+                        ),
+                    }),
+                    Some((_, Some(id))) => {
                         link.remove("slug");
                         link.remove("line");
                         link.insert("value".into(), id.to_string().into());
                     }
-                    None => errors.push(FieldError {
+                    _ => errors.push(FieldError {
                         path: format!("{path}.{at}"),
                         message: format!(
                             "line {line}: no `{to}` document you can read has the slug `{}`",
@@ -195,14 +206,15 @@ fn clipped(s: &str) -> String {
 }
 
 /// The IDs of the documents of collection `to` the caller may read whose slug is one of
-/// `slugs`, by slug. None when they can't read the collection or its slug field.
+/// `slugs`, by slug: more than one where drafts share it. None when they can't read the
+/// collection or its slug field.
 async fn by_slug(
     state: &AppState,
     access: &Access,
     to: &str,
     slugs: Vec<String>,
-) -> Result<HashMap<String, Uuid>, ApiError> {
-    let mut out = HashMap::new();
+) -> Result<HashMap<String, HashSet<Uuid>>, ApiError> {
+    let mut out: HashMap<String, HashSet<Uuid>> = HashMap::new();
     let Some(c) = state
         .schemas
         .get(to)
@@ -227,10 +239,11 @@ async fn by_slug(
             let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
                 .map_err(|e| ApiError::Internal(e.to_string()))?;
             let filter = both(Some(named), way.filter.clone());
+            // Every match, not one per slug: drafts may share a slug, and each is counted.
             let q = ListQuery {
                 filter: filter.as_ref(),
                 sort: None,
-                limit: chunk.len() as i64,
+                limit: i64::MAX,
                 offset: 0,
                 after: None,
                 count: false,
@@ -253,7 +266,7 @@ async fn by_slug(
             };
             for doc in docs.iter().filter(|d| !skip.contains(&d.id)) {
                 if let Some(slug) = c.schema.slug_of(&doc.data) {
-                    out.entry(slug).or_insert(doc.id);
+                    out.entry(slug).or_default().insert(doc.id);
                 }
             }
         }
