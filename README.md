@@ -342,7 +342,7 @@ Markdown can't say everything JSON can, so a few things change on the way throug
 
 A link to a document goes to its collection's `url`, here `/{slug}`; without one, it's the link text alone. Block fields become `data-*` attributes (`ctaLabel` is `data-cta-label`), and anything that isn't a plain value is written as JSON. A relationship node is a `<div data-relationship>` around the linked document's first text field. Text is escaped, every `href` is checked again on the way out, and `newTab` links get `target="_blank" rel="noopener noreferrer"`. As `text`, you get the words alone, the rich text inside block nodes included.
 
-What you can't read stays hidden in every format. A field you can't read isn't there, inside block nodes included. A link to a document you can't read is its text alone, and a relationship node pointing at one is left out entirely. In JSON that link stays a bare ID, whatever the `depth`.
+What you can't read stays hidden in every format. A field you can't read isn't there, inside block nodes included. A link to a document you can't read is its text alone, and a relationship node pointing at one is left out entirely. In JSON both stay as bare IDs, whatever the `depth`.
 
 ### Putting it online
 
