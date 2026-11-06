@@ -361,9 +361,9 @@ Without drafts, saving is publishing. Fix a typo in a live post and the fix is l
 
 #### Writing a draft
 
-In a collection with drafts, every create and update writes the draft. `required` waits until you publish, so a post without a title yet still saves; every other check runs as usual. You get the draft back, with `"status": "draft"`.
+In a collection with drafts, every create and update writes the draft. `required` waits until you publish, so a post without a title yet still saves; every other check runs as usual. You get the draft back. Its `status` tells you whether anything is live, not what the draft holds: `draft` until the first publish, then `published` until you unpublish, however far the draft has moved on.
 
-Reads stay on what's published. `GET /api/posts` never shows a draft, and neither does `GET /api/posts/{id}`. Add `?draft=true` to a list, a single read or a global to read drafts instead. That list holds the documents whose drafts you may read, which for an Author means their own. Links follow along: each linked document shows as its draft where you may read that draft, and as what's published where you may not. Populated links, virtual fields, joins, filters through relationships and `?format=` all work this way. Ask for drafts where there are none and it's a 400; ask without the right to read them and it's a 403.
+Reads stay on what's published. `GET /api/posts` never shows a draft, and neither does `GET /api/posts/{id}`. Add `?draft=true` to a list, a single read or a global to read drafts instead. That list holds the documents whose drafts you may read, which for an Author means their own. Links follow along: each linked document shows as its draft where you may read that draft, and as what's published where you may not. Populated links, virtual fields, joins, filters through relationships and `?format=` all work this way. Ask for drafts where there are none and it's a 400. Ask without the right to read them and it's a 403, or a 401 if you aren't signed in.
 
 #### Publishing
 
@@ -389,7 +389,7 @@ curl -X PUT localhost:3000/api/posts/$ID/schedule \
 
 Each side takes an RFC 3339 time within the next 10 years. Leave one out and it stays as it was; send `null` and it's cancelled. `GET` on the same path shows what's pending, and `DELETE` cancels both. What a scheduled publish ships is the draft as it stood when you scheduled it, so edits made since then wait for the next publish. A new time replaces the old one, and trashing the document cancels both. Globals schedule at `/api/globals/{slug}/schedule`.
 
-Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). At most 16, fewer than the database pool's connections, and 0 turns them off. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key.
+Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). At most 16, fewer than the database pool's connections, and 0 turns them off. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key. Finished jobs, whether they ran, failed or were cancelled, stay in the `jobs` table for 30 days so you can see what happened, and then the server clears them away.
 
 #### History
 
@@ -402,7 +402,7 @@ Every publish records a version, and so does every draft save that isn't an auto
 
 Globals have the same routes under `/api/globals/{slug}`.
 
-History is data too, so the schema guards it. Removing `versions`, or lowering `maxVersions` below what documents already hold, deletes versions: it's a 409 with a preview and goes through when you send it again with `"confirm": true`. Turning drafts off is refused with a 409 while any document, trashed ones included, has a draft that isn't what's published. There's no `confirm` for that one, because the only ways through are publishing work nobody reviewed or throwing it away. The message says how many documents are in the way; publish or delete them first.
+History is data too, so the schema guards it. Removing `versions`, or lowering `maxVersions` below what documents already hold, deletes versions: it's a 409 with a preview and goes through when you send it again with `"confirm": true`. Turning drafts off is refused with a 409 while any document, trashed ones included, has a draft that isn't what's published. There's no `confirm` for that one, because the only ways through are publishing work nobody reviewed or throwing it away. The message says how many documents are in the way; publish or delete them first. Once drafts do go, so does anything scheduled to publish or unpublish in that collection: with no draft left, there's nothing for it to ship.
 
 #### The trash
 
@@ -424,7 +424,7 @@ Drafts come with three more rights:
 | `readVersions` | every document | their own | no |
 | `publish` | every document | no | no |
 
-An Author's "own" means documents they created, which no global is. Each right takes a rule in `access`, exactly as `read` does, on collections and globals: `"readDrafts": {"role": ["editor", "reviewer"]}`. The read rule still applies on top, so a draft you may read is one both rules let through. A version that was a draft needs `readDrafts` as well as `readVersions`. Publishing, unpublishing and scheduling take `publish`; seeing a schedule takes `readDrafts`.
+An Author's "own" means documents they created, which no global is. Each right takes a rule in `access`, exactly as `read` does, on collections and globals: `"readDrafts": {"role": ["editor", "reviewer"]}`. The read rule still applies on top, so a draft you may read is one both rules let through. A version that was a draft needs `readDrafts` as well as `readVersions`. History also goes by the copy you can read. Without `readDrafts`, you see a document's versions only when you can read what's published of it, so a post that was never published has no history for you. Publishing, unpublishing and scheduling take `publish`; seeing a schedule takes `readDrafts`.
 
 Since every write to a collection with drafts lands on the draft, changing or deleting a document needs `readDrafts` as well as `update` or `delete`. Creating one doesn't, though if you can't read the draft you just made, the answer holds only its `id`. If you can read what's published but not the draft, a write is a 403: you already know the document exists. If you can read neither, it's a 404, like any document you can't read.
 
