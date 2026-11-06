@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, collection_id, status, created_at, updated_at,\n                  published AS \"data!: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL",
+  "query": "UPDATE documents\n           SET published = COALESCE($4::jsonb, draft), status = 'published',\n               published_at = now(), updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at, deleted_at,\n                     published AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -16,17 +16,6 @@
       },
       {
         "ordinal": 1,
-        "name": "collection_id",
-        "type_info": "Uuid",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "collection_id"
-          }
-        }
-      },
-      {
-        "ordinal": 2,
         "name": "status",
         "type_info": "Text",
         "origin": {
@@ -37,7 +26,7 @@
         }
       },
       {
-        "ordinal": 3,
+        "ordinal": 2,
         "name": "created_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -48,7 +37,7 @@
         }
       },
       {
-        "ordinal": 4,
+        "ordinal": 3,
         "name": "updated_at",
         "type_info": "Timestamptz",
         "origin": {
@@ -59,7 +48,29 @@
         }
       },
       {
+        "ordinal": 4,
+        "name": "published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_at"
+          }
+        }
+      },
+      {
         "ordinal": 5,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -73,7 +84,10 @@
     "parameters": {
       "Left": [
         "Uuid",
-        "UuidArray"
+        "Uuid",
+        "Uuid",
+        "Jsonb",
+        "Uuid"
       ]
     },
     "nullable": [
@@ -81,9 +95,10 @@
       false,
       false,
       false,
-      false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "d8d19061ecd1d56a52ebe8925d37dd82d33efe9ce7f6698974a28da2b88de936"
+  "hash": "36d65b44e1800a58fb1f7a6dd241b9482381f17c5948da093f6c323b69c057ff"
 }

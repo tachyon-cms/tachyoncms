@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT draft AS \"draft: Json<Map<String, Value>>\",\n                  published AS \"published: Json<Map<String, Value>>\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "draft"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "published: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "15e9d1470045c9dc9d9027dbc8cc8aa64e02b850bc5b26d7ef4256deb14f1d66"
+}

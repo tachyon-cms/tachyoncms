@@ -11,7 +11,7 @@
 A headless CMS written in Rust. One binary, one Postgres database, and an API generated from the content types you define.
 
 > [!WARNING]
-> TachyonCMS is pre-alpha. The core content API, sign-in and access rules work today. The admin UI, media, drafts and GraphQL don't exist yet, so don't put it on a public network. Watch the repo to follow along, or jump in.
+> TachyonCMS is pre-alpha. The core content API, sign-in, access rules, drafts and publishing work today. The admin UI, media and GraphQL don't exist yet, so don't put it on a public network. Watch the repo to follow along, or jump in.
 
 The full documentation, with a step-by-step tutorial and a complete API reference, is at **[docs.tachyoncms.com](https://docs.tachyoncms.com)**.
 
@@ -41,6 +41,7 @@ We think you can have both. Here's what we're building toward:
 - Virtual fields show a value from a linked document without storing it: a field with `"virtual": "author.name"` reads the author's name on every read, and you can filter on it like any other field.
 - Join fields list the documents that link to this one. Give a category `{"type": "join", "collection": "posts", "on": "category"}` and every read shows its posts, newest first. Page, sort, filter and count them per request with `joins[posts][limit]=5&joins[posts][sort]=-title`, or switch them off with `joins=false`. A join inside a group goes by its path, `joins[meta.recent]` or `joins[meta][recent]`.
 - Build pages from blocks, and write long-form text as rich text, in JSON or Markdown. Read it back as JSON, HTML, Markdown or plain text with `?format=`. [Pages and rich text](#pages-and-rich-text) shows how.
+- Write in drafts and publish when you're ready, now or at a set time. Every document can keep its history, show what changed between any two versions and go back to one, and a deleted document waits in the trash until you restore it or delete it for good. [Drafts, versions and publishing](#drafts-versions-and-publishing) shows how.
 
 ## Try it
 
@@ -344,6 +345,97 @@ A link to a document goes to its collection's `url`, here `/{slug}`; without one
 
 What you can't read stays hidden in every format. A field you can't read isn't there, inside block nodes included. A link to a document you can't read is its text alone, and a relationship node pointing at one is left out entirely. In JSON both stay as bare IDs, whatever the `depth`.
 
+### Drafts, versions and publishing
+
+Without drafts, saving is publishing. Fix a typo in a live post and the fix is live; start a new one and the half-written version is out there too. Turn on `versions` and each document keeps two copies instead: the published one everyone reads, and a draft that only the people who may read drafts ever see. Edit the draft as often as you like. Nothing changes on the site until someone publishes it.
+
+```json
+{
+  "slug": "posts",
+  "versions": {"drafts": {"autosave": {"interval": 2000}}, "maxVersions": 50},
+  "fields": [{"name": "title", "type": "text", "required": true}]
+}
+```
+
+`"versions": true` keeps history and nothing more: every update goes live, and every update is recorded. `"drafts": true` adds the draft copy. The `autosave` form also allows `PATCH ?autosave=true`, which saves the draft without recording a version, so an editor that saves every couple of seconds doesn't bury your history; `interval` is kept with the schema, in milliseconds, for that editor to use. `maxVersions` is how many versions each document keeps, oldest dropped first. It's 100 unless you say otherwise, and 0 keeps every one. Globals take the same option.
+
+#### Writing a draft
+
+In a collection with drafts, every create and update writes the draft. `required` waits until you publish, so a post without a title yet still saves; every other check runs as usual. You get the draft back. Its `status` tells you whether anything is live, not what the draft holds: `draft` until the first publish, then `published` until you unpublish, however far the draft has moved on.
+
+Reads stay on what's published. `GET /api/posts` never shows a draft, and neither does `GET /api/posts/{id}`. Add `?draft=true` to a list, a single read or a global to read drafts instead. That list holds the documents whose drafts you may read, which for an Author means their own. Links follow along: each linked document shows as its draft where you may read that draft, and as what's published where you may not. Populated links, virtual fields, joins, filters through relationships and `?format=` all work this way. Ask for drafts where there are none and it's a 400. Ask without the right to read them and it's a 403, or a 401 if you aren't signed in.
+
+#### Publishing
+
+```bash
+curl -X POST localhost:3000/api/posts/$ID/publish -H "authorization: Bearer $TOKEN"
+curl -X POST localhost:3000/api/posts/$ID/unpublish -H "authorization: Bearer $TOKEN"
+```
+
+Publishing copies the draft over what's live, and this is where the full validation happens. A missing required field is a 422 naming its path, and every link has to point at a published document you can read. Unique values are only compared between published copies, so two drafts can share a slug; the clash turns up when you publish the second, as a 422 at the field. Unpublishing takes a document off the site and leaves its draft as it was. Unpublishing something that was never published is a 409. A global publishes at `/api/globals/{slug}/publish`.
+
+A published copy carries `publishedAt`. That makes it a reserved name in collections with drafts: a schema that turns drafts on while it has a top-level `publishedAt` field of its own gets a 422 naming it. Collections without drafts keep any `publishedAt` field they already had.
+
+#### Scheduling
+
+Want the post out at nine on Monday and gone at the end of the month?
+
+```bash
+curl -X PUT localhost:3000/api/posts/$ID/schedule \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"publishAt": "2026-12-07T09:00:00Z", "unpublishAt": "2026-12-31T23:59:00Z"}'
+```
+
+Each side takes an RFC 3339 time within the next 10 years. Leave one out and it stays as it was; send `null` and it's cancelled. `GET` on the same path shows what's pending, and `DELETE` cancels both. What a scheduled publish ships is the draft as it stood when you scheduled it, so edits made since then wait for the next publish. A new time replaces the old one, and trashing the document cancels both. Globals schedule at `/api/globals/{slug}/schedule`.
+
+Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). At most 16, fewer than the database pool's connections, and 0 turns them off. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key. Finished jobs, whether they ran, failed or were cancelled, stay in the `jobs` table for 30 days so you can see what happened. After that, the workers clear them away as they go, so a server running with `workers = 0` leaves them be.
+
+#### History
+
+Every publish records a version, and so does every draft save that isn't an autosave. With `versions` on and drafts off, every update records one.
+
+- `GET /api/posts/{id}/versions` lists them, newest first, without their data. Page with `limit` and `page`.
+- `GET /api/posts/{id}/versions/{vid}` shows one. Links stay IDs, and fields you can't read aren't there.
+- `GET /api/posts/{id}/diff?from={vid}&to=draft` compares any two of a version ID, `draft` and `published`, field by field. Each change has a `path` (`seo.title`, `layout.1.heading`), an `op` (`added`, `removed` or `changed`) and the value `before` and `after`. List and block rows are matched by their `id`, so a row that only moved shows as a change of order, not as everything after it changing.
+- `POST /api/posts/{id}/versions/{vid}/restore` writes a version back into the draft (into what's live, without drafts). It never publishes, and a field you may not change keeps its current value.
+
+Globals have the same routes under `/api/globals/{slug}`.
+
+History is data too, so the schema guards it. Removing `versions`, or lowering `maxVersions` below what documents already hold, deletes versions: it's a 409 with a preview and goes through when you send it again with `"confirm": true`. Turning drafts off is refused with a 409 while any document, trashed ones included, has a draft that isn't what's published. There's no `confirm` for that one, because the only ways through are publishing work nobody reviewed or throwing it away. The message says how many documents are in the way; publish or delete them first. Once drafts do go, so does anything scheduled to publish or unpublish in that collection: with no draft left, there's nothing for it to ship.
+
+#### The trash
+
+A deleted document has always been kept, out of every read. Now you can see it and act on it.
+
+- `GET /api/posts/trash` lists it, most recently deleted first, each document with `deletedAt`. It takes `limit`, `page`, `count`, `where`, `sort` and `select`. `sort=deletedAt` means when it was deleted, even when your schema has a field with that name.
+- `POST /api/posts/trash/{id}/restore` brings one back. It has to validate against the schema as it is today, its unique values have to be free, and every link has to reach a document that's there and that you can read. Anything else is a 422; in a collection with drafts, each error says whether it's about the draft or the published copy.
+- `DELETE /api/posts/trash/{id}` deletes one for good, with its history. `DELETE /api/posts/trash` empties everything you may delete and tells you how many went: `{"deleted": 3}`.
+
+All of it takes the `delete` right, so an Author sees, restores and empties only what they created. A collection you can't read at all is a 403. Globals have no trash, and `users` isn't in it yet.
+
+#### Who may do what
+
+Drafts come with three more rights:
+
+| Right | Admin, Editor | Author | Viewer, signed out |
+|---|---|---|---|
+| `readDrafts` | every document | their own | no |
+| `readVersions` | every document | their own | no |
+| `publish` | every document | no | no |
+
+An Author's "own" means documents they created, which no global is. Each right takes a rule in `access`, exactly as `read` does, on collections and globals: `"readDrafts": {"role": ["editor", "reviewer"]}`. The read rule still applies on top, so a draft you may read is one both rules let through. A version that was a draft needs `readDrafts` as well as `readVersions`. History also goes by the copy you can read. Without `readDrafts`, you see a document's versions only when you can read what's published of it, so a post that was never published has no history for you. Publishing, unpublishing and scheduling take `publish`; seeing a schedule takes `readDrafts`.
+
+Since every write to a collection with drafts lands on the draft, changing or deleting a document needs `readDrafts` as well as `update` or `delete`. Creating one doesn't, though if you can't read the draft you just made, the answer holds only its `id`. If you can read what's published but not the draft, a write is a 403: you already know the document exists. If you can read neither, it's a 404, like any document you can't read.
+
+API keys have a third kind of scope. `posts:read` reads what's published and nothing else. `posts:write` adds drafts, versions, restoring and the trash, but it can't publish. That takes `posts:publish` (or `*:publish`, or `admin`), which can publish, unpublish and schedule, and nothing more: no reading, no writing. It checks what it publishes with its owner's rights, and its answers hold only the document's `id`. A deploy script that only ever presses the button is what it's for.
+
+`GET /api/access` answers `readDrafts` and `publish` for each collection and global with drafts, and `readVersions` for each with versions, as `true`, `false` or `"conditional"`, like every other answer there.
+
+#### Also changed since v0.2.0
+
+`POST`, `PATCH` and `DELETE` on documents now refuse query parameters they don't take, with a 400 that names the parameter. v0.2.0 ignored them, so a client that sends extra ones will start getting errors. And a write that collides with another one in the database (a deadlock or a serialization failure) is a 409 that asks you to try again; nothing was saved, so retrying is safe.
+
 ### Putting it online
 
 Set `public_url` to the address people use, such as `https://cms.example.com`, and serve it over HTTPS. Set it behind a reverse proxy too, even though the server itself listens on `127.0.0.1`: browser sign-ins compare against it. The server won't start on a public address without it, because browser sign-ins only accept changes coming from that address. Other settings live under `[auth]` in `tachyon.toml` (see `tachyon.example.toml`), or in the environment as `TACHYON_AUTH__SETTING`.
@@ -372,15 +464,14 @@ cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
 
 ## Roadmap
 
-Done: content types, validation and REST CRUD; filters, sorting, relationships and globals; sign-in, sessions, API keys and access rules; rich text and blocks. v0.2.0 ships all of it as signed binaries and a Docker image.
+Done: content types, validation and REST CRUD; filters, sorting, relationships and globals; sign-in, sessions, API keys and access rules; rich text and blocks. v0.2.0 ships all of it as signed binaries and a Docker image. Drafts, versions, scheduled publishing and the trash are done too, and come in the next release.
 
 Next, in this order, with no dates:
 
-1. Drafts, versions and scheduled publishing (in progress)
-2. Media library and image processing
-3. Live preview
-4. Authoring tools: push and pull content as Markdown files, bulk import
-5. The admin, as easy as WordPress for the people who publish
+1. Media library and image processing
+2. Live preview
+3. Authoring tools: push and pull content as Markdown files, bulk import
+4. The admin, as easy as WordPress for the people who publish
 
 After that: localization and full-text search, GraphQL and OpenAPI, passkeys, two-factor and single sign-on, WebAssembly plugins and webhooks, a WordPress importer, a Helm chart and published benchmarks. [Discussion #35](https://github.com/tachyon-cms/tachyoncms/discussions/35) has the reasoning, and the polls in [#38](https://github.com/tachyon-cms/tachyoncms/discussions/38) and [#39](https://github.com/tachyon-cms/tachyoncms/discussions/39) can change the order.
 

@@ -51,6 +51,14 @@ impl From<DbError> for ApiError {
             DbError::SchemaChanged => Self::Conflict(
                 "This collection's fields just changed. Reload and try again.".into(),
             ),
+            // Two writes that met each other's locks: Postgres undid one, which may run again.
+            DbError::Sqlx(sqlx::Error::Database(e))
+                if matches!(e.code().as_deref(), Some("40P01" | "40001")) =>
+            {
+                Self::Conflict(
+                    "Another change to the same documents got in the way; try again.".into(),
+                )
+            }
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
     }
@@ -135,5 +143,30 @@ impl IntoResponse for ApiError {
             body.to_string(),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_deadlock_says_try_again(pool: PgPool) {
+        sqlx::raw_sql("CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let lock = |id: i32| sqlx::query("SELECT id FROM t WHERE id = $1 FOR UPDATE").bind(id);
+        let (mut a, mut b) = (pool.begin().await.unwrap(), pool.begin().await.unwrap());
+        lock(1).execute(&mut *a).await.unwrap();
+        lock(2).execute(&mut *b).await.unwrap();
+        // Each now waits on the other's row; Postgres undoes one of them.
+        let (x, y) = tokio::join!(lock(2).execute(&mut *a), lock(1).execute(&mut *b));
+        let e = x.err().or(y.err()).expect("one of them deadlocked");
+        assert!(matches!(
+            ApiError::from(DbError::from(e)),
+            ApiError::Conflict(d) if d.contains("try again")
+        ));
     }
 }

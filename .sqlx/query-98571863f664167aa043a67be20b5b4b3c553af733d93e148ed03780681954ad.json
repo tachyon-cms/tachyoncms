@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE documents SET published = $4, updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3\n           RETURNING id, status, created_at, updated_at, published AS \"data!: Json<Map<String, Value>>\"",
+  "query": "UPDATE documents\n           SET published = NULL, status = 'draft', published_at = NULL,\n               updated_at = now(), updated_by = COALESCE($4, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at, deleted_at,\n                     draft AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -49,12 +49,34 @@
       },
       {
         "ordinal": 4,
+        "name": "published_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_at"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "deleted_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "deleted_at"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
           "Table": {
             "table": "documents",
-            "name": "published"
+            "name": "draft"
           }
         }
       }
@@ -64,7 +86,6 @@
         "Uuid",
         "Uuid",
         "Uuid",
-        "Jsonb",
         "Uuid"
       ]
     },
@@ -73,8 +94,10 @@
       false,
       false,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "8c9bfea0a2069cc8c7f5d43388b0fbab74798b802089e0334b403ec8135bc00a"
+  "hash": "98571863f664167aa043a67be20b5b4b3c553af733d93e148ed03780681954ad"
 }

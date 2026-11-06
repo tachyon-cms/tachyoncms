@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)\n         SELECT r.tenant_id, r.from_doc, 'draft', r.field_path, r.to_doc\n         FROM relations r JOIN documents d ON d.id = r.from_doc\n         WHERE r.copy = 'published' AND d.tenant_id = $1 AND d.collection_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "896d88a1ed7474501eea84024991a690adc8cf72200b8dc8862e273dd03e3c98"
+}

@@ -6,11 +6,15 @@ mod collections;
 mod documents;
 mod error;
 mod globals;
+mod jobs;
 mod joins;
 mod params;
 mod populate;
 mod request_id;
+mod schedule;
 mod schemas;
+mod trash;
+mod versions;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -21,12 +25,13 @@ use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
+pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;
 
 #[derive(Clone)]
@@ -40,6 +45,7 @@ pub(crate) struct AppState {
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub auth: auth::AuthConfig,
+    pub jobs: JobsConfig,
 }
 
 /// Why the API couldn't start.
@@ -58,6 +64,9 @@ pub async fn router(pool: PgPool) -> Result<Router, StartError> {
     router_with(pool, Options::default()).await
 }
 
+/// The API with `options`. It also starts `options.jobs.workers` job workers, which run until
+/// `pool` closes: dropping the router doesn't stop them, and a second router on the same pool
+/// starts as many again.
 pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
@@ -96,9 +105,39 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             get(globals::get).patch(globals::update),
         )
         .route(
+            "/api/globals/{slug}/publish",
+            post(versions::publish_global),
+        )
+        .route(
+            "/api/globals/{slug}/unpublish",
+            post(versions::unpublish_global),
+        )
+        .route("/api/globals/{slug}/versions", get(versions::list_global))
+        .route(
+            "/api/globals/{slug}/versions/{vid}",
+            get(versions::get_global),
+        )
+        .route(
+            "/api/globals/{slug}/versions/{vid}/restore",
+            post(versions::restore_global),
+        )
+        .route("/api/globals/{slug}/diff", get(versions::diff_global))
+        .route(
+            "/api/globals/{slug}/schedule",
+            put(schedule::put_global)
+                .get(schedule::get_global)
+                .delete(schedule::delete_global),
+        )
+        .route(
             "/api/{collection}",
             get(documents::list).post(documents::create),
         )
+        .route(
+            "/api/{collection}/trash",
+            get(trash::list).delete(trash::empty),
+        )
+        .route("/api/{collection}/trash/{id}", delete(trash::purge))
+        .route("/api/{collection}/trash/{id}/restore", post(trash::restore))
         .route(
             "/api/{collection}/{id}",
             get(documents::get)
@@ -108,6 +147,24 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         .route(
             "/api/{collection}/{id}/references",
             get(documents::references),
+        )
+        .route("/api/{collection}/{id}/publish", post(versions::publish))
+        .route(
+            "/api/{collection}/{id}/unpublish",
+            post(versions::unpublish),
+        )
+        .route("/api/{collection}/{id}/versions", get(versions::list))
+        .route("/api/{collection}/{id}/versions/{vid}", get(versions::get))
+        .route(
+            "/api/{collection}/{id}/versions/{vid}/restore",
+            post(versions::restore),
+        )
+        .route("/api/{collection}/{id}/diff", get(versions::diff))
+        .route(
+            "/api/{collection}/{id}/schedule",
+            put(schedule::put)
+                .get(schedule::get)
+                .delete(schedule::delete),
         )
         .merge(auth::routes())
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed });
@@ -120,6 +177,7 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         state.clone(),
         auth::principal::resolve,
     ));
+    jobs::spawn_workers(state.clone(), &options.jobs);
     Ok(layers(routes, Duration::from_secs(30)).with_state(state))
 }
 

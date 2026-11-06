@@ -306,6 +306,7 @@ async fn breached_passwords_are_refused_at_setup_and_change(pool: PgPool) {
             breach_check_url: url,
             ..Default::default()
         },
+        ..Default::default()
     };
     let app = tachyon_api::router_with(pool, options).await.unwrap();
     let body = json!({"email": "a@b.co", "name": "A", "password": "password1234567"});
@@ -405,6 +406,7 @@ async fn public_urls_with_a_path_and_extra_origins_match(pool: PgPool) {
             allowed_origins: vec!["https://www.example.com".into()],
             ..Default::default()
         },
+        ..Default::default()
     };
     let app = tachyon_api::router_with(pool, options).await.unwrap();
     setup(&app).await;

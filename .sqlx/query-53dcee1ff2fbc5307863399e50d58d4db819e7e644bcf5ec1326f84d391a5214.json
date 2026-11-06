@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM relations r USING documents d, documents f\n         WHERE r.to_doc = d.id AND d.tenant_id = $1 AND d.collection_id = $2\n           AND d.id = ANY($3) AND d.deleted_at IS NOT NULL\n           AND f.id = r.from_doc AND f.deleted_at IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "53dcee1ff2fbc5307863399e50d58d4db819e7e644bcf5ec1326f84d391a5214"
+}

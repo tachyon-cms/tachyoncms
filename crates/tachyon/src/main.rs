@@ -4,6 +4,7 @@ mod config;
 mod schema_cmd;
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use anyhow::Context;
 
@@ -98,8 +99,13 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Serve => {
             config.check_serve().map_err(anyhow::Error::msg)?;
+            let jobs = config
+                .jobs_config(pool.options().get_max_connections())
+                .map_err(anyhow::Error::msg)?;
+            let running = jobs.running.clone();
             let options = tachyon_api::Options {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
+                jobs,
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -112,6 +118,18 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            // Gives the job workers a while to finish what they're running; they stop with the
+            // pool. Cutting one off is safe: its transaction rolls back, its lease runs out,
+            // and the run that takes it over is the only one that can complete it.
+            if tokio::time::timeout(Duration::from_secs(30), pool.close())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    jobs = ?running.ids(),
+                    "stopped with jobs still running; they run again once their lease runs out"
+                );
+            }
         }
         Command::Migrate => {}
         Command::Schema { command } => match command {

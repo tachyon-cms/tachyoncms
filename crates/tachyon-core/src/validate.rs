@@ -19,6 +19,16 @@ pub struct FieldError {
     pub message: String,
 }
 
+/// How strictly a save is checked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum Mode {
+    /// A draft: everything is checked except `required`, so half-written work can be saved.
+    Draft,
+    /// Everything, as for what's published.
+    #[default]
+    Full,
+}
+
 /// Validates a document and returns what should be stored.
 ///
 /// With `existing = None` this is a create, and missing fields get their default.
@@ -26,6 +36,16 @@ pub struct FieldError {
 /// (lists, rows, `json` values) is replaced, and the merged result is validated as a whole.
 /// Either way `null` means "no value" at any depth, except inside `json` fields, where it's data.
 pub fn validate_document(
+    fields: &[Field],
+    input: &Value,
+    existing: Option<&Map<String, Value>>,
+) -> Result<Map<String, Value>, Vec<FieldError>> {
+    validate_document_in(Mode::Full, fields, input, existing)
+}
+
+/// `validate_document`, as strictly as `mode` asks.
+pub fn validate_document_in(
+    mode: Mode,
     fields: &[Field],
     input: &Value,
     existing: Option<&Map<String, Value>>,
@@ -51,7 +71,7 @@ pub fn validate_document(
         }
     }
     let mut errors = Vec::new();
-    check_object(fields, &doc, &[], "", &mut errors, None);
+    check_object(fields, &doc, &[], "", &mut errors, None, mode);
     // Postgres jsonb can't store U+0000, so catch it here as a field error instead of a 500,
     // unless the field's own rules already named it.
     for (key, value) in &doc {
@@ -434,7 +454,9 @@ pub(crate) fn check_object(
     prefix: &str,
     errors: &mut Vec<FieldError>,
     mut within: Option<&mut crate::richtext::Budget>,
+    mode: Mode,
 ) {
+    let required = |f: &Field| f.required && mode == Mode::Full;
     for key in obj.keys() {
         if !fields.iter().any(|f| &f.name == key) && !own.contains(&key.as_str()) {
             errors.push(error(join(prefix, key), "unknown field"));
@@ -461,23 +483,23 @@ pub(crate) fn check_object(
             continue;
         }
         match obj.get(&f.name) {
-            None | Some(Value::Null) if f.required => errors.push(error(path, "is required")),
+            None | Some(Value::Null) if required(f) => errors.push(error(path, "is required")),
             None | Some(Value::Null) => {}
             // Only a well-formed document can be told it's empty.
-            Some(text) if f.required && matches!(f.kind, FieldKind::RichText { .. }) => {
+            Some(text) if required(f) && matches!(f.kind, FieldKind::RichText { .. }) => {
                 let before = errors.len();
-                check_value(f, text, &path, errors, within.as_deref_mut());
+                check_value(f, text, &path, errors, within.as_deref_mut(), mode);
                 if errors.len() == before && crate::richtext::is_empty(text) {
                     errors.push(error(path, "is required"))
                 }
             }
-            Some(Value::String(s)) if f.required && s.trim().is_empty() => {
+            Some(Value::String(s)) if required(f) && s.trim().is_empty() => {
                 errors.push(error(path, "is required"))
             }
-            Some(Value::Array(items)) if f.required && items.is_empty() && is_list(&f.kind) => {
+            Some(Value::Array(items)) if required(f) && items.is_empty() && is_list(&f.kind) => {
                 errors.push(error(path, "is required"))
             }
-            Some(v) => check_value(f, v, &path, errors, within.as_deref_mut()),
+            Some(v) => check_value(f, v, &path, errors, within.as_deref_mut(), mode),
         }
     }
 }
@@ -502,6 +524,7 @@ pub(crate) fn check_value(
     path: &str,
     errors: &mut Vec<FieldError>,
     mut within: Option<&mut crate::richtext::Budget>,
+    mode: Mode,
 ) {
     match (&f.kind, v) {
         (
@@ -532,7 +555,7 @@ pub(crate) fn check_value(
             }
         }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
-            check_object(fields, obj, &[], path, errors, within)
+            check_object(fields, obj, &[], path, errors, within, mode)
         }
         (
             FieldKind::Array {
@@ -546,9 +569,15 @@ pub(crate) fn check_value(
             for (i, row) in rows.iter().enumerate() {
                 let row_path = format!("{path}.{i}");
                 match row {
-                    Value::Object(obj) => {
-                        check_object(fields, obj, &[], &row_path, errors, within.as_deref_mut())
-                    }
+                    Value::Object(obj) => check_object(
+                        fields,
+                        obj,
+                        &[],
+                        &row_path,
+                        errors,
+                        within.as_deref_mut(),
+                        mode,
+                    ),
                     _ => errors.push(error(row_path, "expected an object")),
                 }
             }
@@ -609,6 +638,7 @@ pub(crate) fn check_value(
                     &row_path,
                     errors,
                     within.as_deref_mut(),
+                    mode,
                 );
             }
         }
@@ -622,7 +652,12 @@ pub(crate) fn check_value(
         (FieldKind::RichText { .. }, text) => {
             let checked = match within {
                 Some(budget) => crate::richtext::validate_within(text, &f.kind, path, budget),
-                None => crate::richtext::validate(text, &f.kind, path),
+                None => crate::richtext::validate_within(
+                    text,
+                    &f.kind,
+                    path,
+                    &mut crate::richtext::Budget::new(mode),
+                ),
             };
             if let Err(e) = checked {
                 errors.extend(e);
@@ -1220,6 +1255,43 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"title": null})),
             vec![e("title", "is required")]
+        );
+    }
+
+    #[test]
+    fn drafts_skip_required_and_nothing_else() {
+        let f = fields(json!([
+            {"name": "title", "type": "text", "required": true, "maxLength": 3},
+            {"name": "seo", "type": "group", "fields": [
+                {"name": "title", "type": "text", "required": true}
+            ]},
+            {"name": "layout", "type": "blocks", "required": true, "blocks": [
+                {"slug": "hero", "fields": [{"name": "heading", "type": "text", "required": true}]}
+            ]},
+            {"name": "body", "type": "richText", "required": true, "blocks": [
+                {"slug": "note", "fields": [{"name": "text", "type": "text", "required": true}]}
+            ]}
+        ]));
+        let draft = |input: Value| validate_document_in(Mode::Draft, &f, &input, None);
+        let id = Uuid::now_v7().to_string();
+        let body = json!({"type": "doc", "content": [{"type": "block", "attrs":
+            {"id": id, "blockType": "note", "fields": {}}}]});
+        let half_written = json!({"seo": {}, "layout": [{"blockType": "hero"}], "body": body});
+        assert!(draft(json!({})).is_ok());
+        assert!(draft(half_written.clone()).is_ok());
+        assert!(
+            validate_document_in(Mode::Full, &f, &half_written, None).is_err(),
+            "a full save still needs them"
+        );
+        // Everything that isn't about a missing value is still checked.
+        let bad = draft(json!({"title": "long", "layout": [{}]})).unwrap_err();
+        let bad: Vec<_> = bad.into_iter().map(|e| (e.path, e.message)).collect();
+        assert_eq!(
+            bad,
+            vec![
+                e("title", "must be at most 3 characters"),
+                e("layout.0.blockType", "is required")
+            ]
         );
     }
 
@@ -2031,7 +2103,7 @@ mod tests {
         assert_eq!(doc["layout"][0]["items"][1]["author"]["name"], "Bee");
 
         let params = crate::query::parse_query("select[layout][items][title]=true").unwrap();
-        let select = crate::select::parse_select(&f, &params["select"], "select").unwrap();
+        let select = crate::select::parse_select(&f, false, &params["select"], "select").unwrap();
         let mut shaped = doc.clone();
         crate::select::project(&select, &mut shaped);
         let rows = &shaped["layout"][0];

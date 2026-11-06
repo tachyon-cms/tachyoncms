@@ -34,6 +34,7 @@ fn schema_error(e: SchemaError) -> ApiError {
 
 /// Parses a schema, refusing unknown keys. Check it with `saved`, once its shared blocks are in place.
 fn parse_schema(value: &Value) -> Result<CollectionSchema, ApiError> {
+    CollectionSchema::check_option_types(value).map_err(schema_error)?;
     let schema = CollectionSchema::deserialize(value)
         .map_err(|e| ApiError::BadRequest(explain_parse_error(value, &e)))?;
     schema.reject_unknown_options(value).map_err(schema_error)?;
@@ -231,6 +232,7 @@ fn change_error(e: ChangeError) -> ApiError {
                 .collect(),
         ),
         ChangeError::NeedsConfirmation(p) => ApiError::NeedsConfirmation(json!(*p)),
+        ChangeError::PendingDrafts(message) => ApiError::Conflict(message),
         ChangeError::Db(e) => e.into(),
     }
 }

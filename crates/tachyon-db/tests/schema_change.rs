@@ -4,6 +4,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::diff::Renames;
+use tachyon_db::DocCopy;
 use tachyon_db::collections;
 use tachyon_db::documents::{self, Prepared, Relation};
 use tachyon_db::schema_change::{ChangeError, apply, preview};
@@ -98,7 +99,9 @@ async fn preview_reports_without_touching_anything(pool: PgPool) {
     assert!(p.needs_confirmation);
     assert_eq!(p.diff.changes.len(), 3);
 
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(doc.data.0["title"], "Hello");
     assert_eq!(
         collections::get_by_slug(&pool, "posts")
@@ -124,12 +127,16 @@ async fn apply_carries_data_and_links_across(pool: PgPool) {
     assert_eq!(c.schema_version, 2);
     assert_eq!(c.schema.0, new);
 
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(
         Value::Object(doc.data.0),
         json!({"headline": "Hello", "writer": s.ann.to_string(), "summary": "S"})
     );
-    let refs = documents::references(&pool, s.ann).await.unwrap();
+    let refs = documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
+        .await
+        .unwrap();
     assert_eq!(refs[0].path, "writer");
 }
 
@@ -147,7 +154,11 @@ async fn destructive_changes_wait_for_confirmation(pool: PgPool) {
     };
     assert!(p.diff.is_destructive());
     assert_eq!(
-        documents::get(&pool, s.posts, s.post).await.unwrap().data.0["summary"],
+        documents::get(&pool, s.posts, s.post, DocCopy::Published)
+            .await
+            .unwrap()
+            .data
+            .0["summary"],
         "S"
     );
 
@@ -155,7 +166,7 @@ async fn destructive_changes_wait_for_confirmation(pool: PgPool) {
         .await
         .unwrap();
     assert!(
-        documents::get(&pool, s.posts, s.post)
+        documents::get(&pool, s.posts, s.post, DocCopy::Published)
             .await
             .unwrap()
             .data
@@ -206,7 +217,9 @@ async fn swapped_renames_keep_both_values(pool: PgPool) {
     .into_iter()
     .collect();
     apply(&pool, "posts", &same, &swap, true).await.unwrap();
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(
         (doc.data.0["title"].as_str(), doc.data.0["summary"].as_str()),
         (Some("S"), Some("Hello"))
@@ -261,10 +274,12 @@ async fn retargeting_a_link_clears_it_after_confirmation(pool: PgPool) {
     apply(&pool, "posts", &new, &Renames::new(), true)
         .await
         .unwrap();
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert!(doc.data.0.get("author").is_none());
     assert!(
-        documents::references(&pool, s.ann)
+        documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
             .await
             .unwrap()
             .is_empty()
@@ -308,13 +323,18 @@ async fn one_target_to_several_wraps_existing_links(pool: PgPool) {
         .await
         .unwrap();
     assert!(!p.needs_confirmation, "wrapping loses nothing");
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(
         doc.data.0["author"],
         json!({"relationTo": "authors", "value": s.ann.to_string()})
     );
     assert_eq!(
-        documents::references(&pool, s.ann).await.unwrap()[0].path,
+        documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
+            .await
+            .unwrap()[0]
+            .path,
         "author",
         "the link stays protected"
     );
@@ -332,10 +352,15 @@ async fn turning_a_link_into_a_list_keeps_it_protected(pool: PgPool) {
         .await
         .unwrap();
     assert!(!p.needs_confirmation && p.invalid == 0, "{p:?}");
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(doc.data.0["author"], json!([s.ann.to_string()]));
     assert_eq!(
-        documents::references(&pool, s.ann).await.unwrap()[0].path,
+        documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
+            .await
+            .unwrap()[0]
+            .path,
         "author.0"
     );
 }
@@ -353,7 +378,9 @@ async fn renaming_onto_a_removed_field_moves_the_data(pool: PgPool) {
     let p = preview(&pool, "posts", &new, &r).await.unwrap();
     assert!(p.needs_confirmation, "the old summary's data goes");
     apply(&pool, "posts", &new, &r, true).await.unwrap();
-    let doc = documents::get(&pool, s.posts, s.post).await.unwrap();
+    let doc = documents::get(&pool, s.posts, s.post, DocCopy::Published)
+        .await
+        .unwrap();
     assert_eq!(doc.data.0["summary"], "Hello");
     assert!(!doc.data.0.contains_key("title"));
 }
@@ -416,7 +443,7 @@ async fn removing_a_link_field_drops_its_links(pool: PgPool) {
         .await
         .unwrap();
     assert!(
-        documents::references(&pool, s.ann)
+        documents::references(&pool, s.ann, &[DocCopy::Published, DocCopy::Draft])
             .await
             .unwrap()
             .is_empty()

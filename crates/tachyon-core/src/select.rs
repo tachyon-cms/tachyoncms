@@ -9,6 +9,8 @@ use crate::schema::{BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, data_fields};
 
 /// Keys every document carries besides its fields. `id` always comes back.
 const BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "status"];
+/// `BUILT_INS` on a collection with drafts, whose documents report when they were published.
+const DRAFTS_BUILT_INS: &[&str] = &["id", "createdAt", "updatedAt", "publishedAt", "status"];
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Select {
@@ -23,8 +25,14 @@ pub enum Select {
 pub struct Tree(pub BTreeMap<String, Option<Tree>>);
 
 /// Reads `select` as `parse_query` nests it, such as `{"title": "true", "seo": {"title": "true"}}`.
-/// `param` names the parameter in errors (`select`, or `populate[authors]`).
-pub fn parse_select(fields: &[Field], input: &Value, param: &str) -> Result<Select, FilterError> {
+/// `param` names the parameter in errors (`select`, or `populate[authors]`). `drafts`: the
+/// collection keeps drafts, so its documents carry `publishedAt`.
+pub fn parse_select(
+    fields: &[Field],
+    drafts: bool,
+    input: &Value,
+    param: &str,
+) -> Result<Select, FilterError> {
     let err = |param: &str, message: &str| FilterError {
         param: param.to_owned(),
         message: message.to_owned(),
@@ -37,7 +45,8 @@ pub fn parse_select(fields: &[Field], input: &Value, param: &str) -> Result<Sele
     };
     let fields: &[Field] = &data_fields(fields);
     let mut modes = Vec::new();
-    let tree = parse_tree(&[fields], input, param, true, false, &mut modes)?;
+    let built_ins = if drafts { DRAFTS_BUILT_INS } else { BUILT_INS };
+    let tree = parse_tree(&[fields], input, param, built_ins, false, &mut modes)?;
     match (modes.contains(&true), modes.contains(&false)) {
         (true, true) => Err(err(param, "use either true or false throughout, not both")),
         (false, true) => Ok(Select::Exclude(tree)),
@@ -51,7 +60,8 @@ fn parse_tree(
     sets: &[&[Field]],
     input: &Map<String, Value>,
     param: &str,
-    top: bool,
+    // The keys besides fields allowed here: some at the top level, none further in.
+    built_ins: &[&str],
     block_rows: bool,
     modes: &mut Vec<bool>,
 ) -> Result<Tree, FilterError> {
@@ -68,7 +78,7 @@ fn parse_tree(
             .filter(|f| &f.name == name)
             .collect();
         let field = matches.first();
-        let built_in = top && BUILT_INS.contains(&name.as_str())
+        let built_in = built_ins.contains(&name.as_str())
             || block_rows && BLOCK_ROW_KEYS.contains(&name.as_str());
         if field.is_none() && !built_in {
             return Err(err("unknown field".into()));
@@ -116,7 +126,7 @@ fn parse_tree(
                         let blocks = matches
                             .iter()
                             .any(|f| matches!(f.kind, FieldKind::Blocks { .. }));
-                        Some(parse_tree(&inside, inner, &here, false, blocks, modes)?)
+                        Some(parse_tree(&inside, inner, &here, &[], blocks, modes)?)
                     }
                 }
             }
@@ -240,7 +250,7 @@ mod tests {
 
     fn select(qs: &str) -> Result<Select, String> {
         let params = parse_query(qs).unwrap();
-        parse_select(&fields(), &params["select"], "select").map_err(|e| e.to_string())
+        parse_select(&fields(), false, &params["select"], "select").map_err(|e| e.to_string())
     }
 
     fn doc() -> Map<String, Value> {
@@ -266,6 +276,22 @@ mod tests {
         assert_eq!(
             shaped("select[title]=true&select[createdAt]=true"),
             json!({"id": "1", "title": "T", "createdAt": "c"})
+        );
+    }
+
+    #[test]
+    fn select_names_published_at() {
+        let mut d = doc();
+        d.insert("publishedAt".into(), json!("p"));
+        let params = parse_query("select[publishedAt]=true").unwrap();
+        let drafts = parse_select(&fields(), true, &params["select"], "select").unwrap();
+        project(&drafts, &mut d);
+        assert_eq!(Value::Object(d), json!({"id": "1", "publishedAt": "p"}));
+        // Without drafts it's no built-in, only a field the collection may have.
+        let plain = parse_select(&fields(), false, &params["select"], "select");
+        assert_eq!(
+            plain.unwrap_err().to_string(),
+            "select[publishedAt]: unknown field"
         );
     }
 
@@ -311,7 +337,7 @@ mod tests {
         ]});
         let shaped = |qs: &str| {
             let params = parse_query(qs).unwrap();
-            let select = parse_select(&fields, &params["select"], "select")?;
+            let select = parse_select(&fields, false, &params["select"], "select")?;
             let mut d = doc.as_object().unwrap().clone();
             project(&select, &mut d);
             Ok::<_, FilterError>(Value::Object(d))

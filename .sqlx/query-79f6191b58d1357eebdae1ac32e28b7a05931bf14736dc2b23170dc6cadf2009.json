@@ -1,18 +1,13 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT published AS \"data!: Json<Map<String, Value>>\", created_by\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           FOR NO KEY UPDATE",
+  "query": "SELECT CASE WHEN $4 THEN draft ELSE published END AS \"data!: Json<Map<String, Value>>\",\n                  created_by\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND CASE WHEN $4 THEN draft ELSE published END IS NOT NULL\n           FOR NO KEY UPDATE",
   "describe": {
     "columns": [
       {
         "ordinal": 0,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
-        "origin": {
-          "Table": {
-            "table": "documents",
-            "name": "published"
-          }
-        }
+        "origin": "Expression"
       },
       {
         "ordinal": 1,
@@ -30,13 +25,14 @@
       "Left": [
         "Uuid",
         "Uuid",
-        "Uuid"
+        "Uuid",
+        "Bool"
       ]
     },
     "nullable": [
-      true,
+      null,
       true
     ]
   },
-  "hash": "5bdc7e5e919cb061eab4310ce0eaa2aaf0e67efef28e050e71fd47387672c081"
+  "hash": "79f6191b58d1357eebdae1ac32e28b7a05931bf14736dc2b23170dc6cadf2009"
 }

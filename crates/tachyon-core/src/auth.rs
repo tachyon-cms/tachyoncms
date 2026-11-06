@@ -51,8 +51,11 @@ pub fn builtin_roles() -> [(&'static str, &'static str, Abilities); 4] {
 pub enum Scope {
     /// `posts:read`, or `*:read` for every collection.
     Read(String),
-    /// `posts:write`: create, change and delete, which includes reading.
+    /// `posts:write`: create, change and delete, which includes reading, drafts and
+    /// versions too. Not publishing.
     Write(String),
+    /// `posts:publish`: publish and unpublish, and nothing else.
+    Publish(String),
     /// Schemas, users and roles.
     Admin,
 }
@@ -65,7 +68,7 @@ pub fn parse_scopes(scopes: &[String]) -> Result<Vec<Scope>, String> {
     scopes
         .iter()
         .map(|s| {
-            let bad = || format!("`{s}` isn't a scope; use collection:read, collection:write, *:read, *:write or admin");
+            let bad = || format!("`{s}` isn't a scope; use collection:read, collection:write, collection:publish (or * for every collection) or admin");
             if s == "admin" {
                 return Ok(Scope::Admin);
             }
@@ -79,6 +82,7 @@ pub fn parse_scopes(scopes: &[String]) -> Result<Vec<Scope>, String> {
             match (valid, verb) {
                 (true, "read") => Ok(Scope::Read(collection.to_owned())),
                 (true, "write") => Ok(Scope::Write(collection.to_owned())),
+                (true, "publish") => Ok(Scope::Publish(collection.to_owned())),
                 _ => Err(bad()),
             }
         })
@@ -95,6 +99,12 @@ pub enum Action {
     UpdateGlobal,
     Schemas,
     Users,
+    /// Read the working copy of a collection with drafts.
+    ReadDrafts,
+    /// Read past versions.
+    ReadVersions,
+    /// Publish, unpublish and schedule.
+    Publish,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -131,6 +141,10 @@ pub fn decide(
         (Create, _) => Decision::Allow,
         (UpdateGlobal, Content::All) => Decision::Allow,
         (UpdateGlobal, _) => Decision::Deny,
+        (ReadDrafts | ReadVersions, Content::All) => Decision::Allow,
+        (ReadDrafts | ReadVersions, Content::Own) => Decision::OwnOnly,
+        (Publish, Content::All) => Decision::Allow,
+        (Publish, Content::Own) => Decision::Deny,
         (Update | Delete, Content::All) => Decision::Allow,
         (Update | Delete, Content::Own) => Decision::OwnOnly,
     };
@@ -161,7 +175,10 @@ fn scope_allows(scope: &Scope, action: Action, collection: &str) -> bool {
         (_, Action::Schemas | Action::Users) => false,
         (Scope::Read(c), Action::Read) => covers(c),
         (Scope::Read(_), _) => false,
+        (Scope::Write(_), Action::Publish) => false,
         (Scope::Write(c), _) => covers(c),
+        (Scope::Publish(c), Action::Publish) => covers(c),
+        (Scope::Publish(_), _) => false,
     }
 }
 
@@ -372,5 +389,90 @@ mod tests {
             decide(&admin, Some(&admin_scope), Users, "posts"),
             Decision::Allow
         );
+    }
+
+    #[test]
+    fn role_defaults_for_new_rights() {
+        use Action::*;
+        use Decision::*;
+        let roles = builtin_roles();
+        let role = |slug: &str| roles.iter().find(|(s, _, _)| *s == slug).unwrap().2.clone();
+        let table = [
+            ("admin", [Allow, Allow, Allow]),
+            ("editor", [Allow, Allow, Allow]),
+            ("author", [OwnOnly, OwnOnly, Deny]),
+            ("viewer", [Deny, Deny, Deny]),
+        ];
+        let actions = [ReadDrafts, ReadVersions, Publish];
+        for (slug, expected) in table {
+            for (action, want) in actions.iter().zip(expected) {
+                assert_eq!(
+                    decide(&role(slug), None, *action, "posts"),
+                    want,
+                    "{slug} {action:?}"
+                );
+            }
+        }
+        for action in actions {
+            assert_eq!(decide_anonymous(action), Deny, "{action:?}");
+        }
+    }
+
+    #[test]
+    fn write_scope_cannot_publish() {
+        use Action::*;
+        let roles = builtin_roles();
+        let admin = roles
+            .iter()
+            .find(|(s, _, _)| *s == "admin")
+            .unwrap()
+            .2
+            .clone();
+        let scopes = |v: &[&str]| parse_scopes(&owned(v)).unwrap();
+        assert_eq!(
+            scopes(&["posts:publish", "*:publish"]),
+            vec![Scope::Publish("posts".into()), Scope::Publish("*".into())]
+        );
+        assert!(parse_scopes(&owned(&["admin:publish"])).is_err());
+        let write = scopes(&["posts:write"]);
+        assert_eq!(
+            decide(&admin, Some(&write), Publish, "posts"),
+            Decision::Deny
+        );
+        for action in [ReadDrafts, ReadVersions, Update] {
+            assert_eq!(
+                decide(&admin, Some(&write), action, "posts"),
+                Decision::Allow,
+                "{action:?}"
+            );
+        }
+        let publish = scopes(&["posts:publish"]);
+        assert_eq!(
+            decide(&admin, Some(&publish), Publish, "posts"),
+            Decision::Allow
+        );
+        assert_eq!(
+            decide(&admin, Some(&publish), Publish, "pages"),
+            Decision::Deny
+        );
+        for action in [Update, Read, ReadDrafts] {
+            assert_eq!(
+                decide(&admin, Some(&publish), action, "posts"),
+                Decision::Deny,
+                "{action:?}"
+            );
+        }
+        let read = scopes(&["posts:read"]);
+        for action in [ReadDrafts, ReadVersions, Publish] {
+            assert_eq!(
+                decide(&admin, Some(&read), action, "posts"),
+                Decision::Deny,
+                "{action:?}"
+            );
+        }
+        let all = scopes(&["admin"]);
+        for action in [Publish, Update] {
+            assert_eq!(decide(&admin, Some(&all), action, "posts"), Decision::Allow);
+        }
     }
 }

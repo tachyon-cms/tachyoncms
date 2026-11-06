@@ -53,9 +53,9 @@ impl From<Rule> for Value {
     }
 }
 
-/// `access` on a collection. A global takes only `read` and `update`.
+/// `access` on a collection. A global takes no `create` or `delete`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, rename_all = "camelCase")]
 pub struct CollectionAccess {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub read: Option<Rule>,
@@ -65,6 +65,15 @@ pub struct CollectionAccess {
     pub update: Option<Rule>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub delete: Option<Rule>,
+    /// Read drafts. Needs `versions.drafts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_drafts: Option<Rule>,
+    /// Read past versions. Needs `versions`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub read_versions: Option<Rule>,
+    /// Publish and unpublish. Needs `versions.drafts`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub publish: Option<Rule>,
 }
 
 /// `access` on a field.
@@ -353,11 +362,20 @@ pub fn check_rules(
             ("create", &a.create),
             ("update", &a.update),
             ("delete", &a.delete),
+            ("readDrafts", &a.read_drafts),
+            ("readVersions", &a.read_versions),
+            ("publish", &a.publish),
         ] {
             let Some(rule) = rule else { continue };
             let fail = |m: String| SchemaError::InvalidOption(format!("access.{action}: {m}"));
             if schema.kind == CollectionKind::Global && matches!(action, "create" | "delete") {
-                return Err(fail("globals have only read and update rules".into()));
+                return Err(fail("a global is one document that always exists, so it takes no create or delete rule".into()));
+            }
+            if matches!(action, "readDrafts" | "publish") && !schema.drafts() {
+                return Err(fail("needs drafts on, in versions.drafts".into()));
+            }
+            if action == "readVersions" && !schema.versioned() {
+                return Err(fail("needs versions on".into()));
             }
             let fixed = (action == "create").then_some(
                 "can use only roles, signedIn, true and false, since there's no document to compare yet",
@@ -393,10 +411,18 @@ pub fn named_roles(schema: &CollectionSchema) -> BTreeSet<String> {
     }
     let mut out = BTreeSet::new();
     if let Some(a) = &schema.access {
-        [&a.read, &a.create, &a.update, &a.delete]
-            .into_iter()
-            .flatten()
-            .for_each(|r| from_rule(r, &mut out));
+        [
+            &a.read,
+            &a.create,
+            &a.update,
+            &a.delete,
+            &a.read_drafts,
+            &a.read_versions,
+            &a.publish,
+        ]
+        .into_iter()
+        .flatten()
+        .for_each(|r| from_rule(r, &mut out));
     }
     from_fields(&data_fields(&schema.fields), &mut out);
     out
@@ -597,10 +623,11 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
         return true;
     };
     let rule = match action {
-        Action::Read => &a.read,
+        // A field hidden from readers stays hidden in drafts and past versions.
+        Action::Read | Action::ReadDrafts | Action::ReadVersions => &a.read,
         Action::Create => &a.create,
         Action::Update | Action::UpdateGlobal => &a.update,
-        Action::Delete | Action::Schemas | Action::Users => return true,
+        Action::Delete | Action::Schemas | Action::Users | Action::Publish => return true,
     };
     rule.as_ref()
         .is_none_or(|r| compile(r, caller, &[], &|_| None) == Compiled::Allow)
@@ -2502,7 +2529,7 @@ mod tests {
             Err("field `byline`: access.update: virtual and join fields are never written, so they take only a read rule".into())
         );
 
-        // Globals have only read and update rules.
+        // Globals take no create or delete rules.
         let global = |access: Value| {
             schema(json!({"slug": "site", "kind": "global", "access": access,
                           "fields": [{"name": "title", "type": "text"}]}))
@@ -2517,7 +2544,7 @@ mod tests {
             assert_eq!(
                 check(&global(json!({action: {"role": "editor"}}))),
                 Err(format!(
-                    "access.{action}: globals have only read and update rules"
+                    "access.{action}: a global is one document that always exists, so it takes no create or delete rule"
                 ))
             );
         }
@@ -2632,5 +2659,88 @@ mod tests {
                 path: "summary".into()
             }]
         );
+    }
+
+    #[test]
+    fn versions_refused_where_meaningless() {
+        let block = schema(
+            json!({"slug": "cta", "kind": "block", "versions": {"drafts": true},
+                                  "fields": [{"name": "title", "type": "text"}]}),
+        );
+        assert_eq!(
+            block.check().unwrap_err().to_string(),
+            "versions: a shared block has no documents, so it has no versions"
+        );
+        let posts = |versions: Value, access: Value| {
+            let mut v = serde_json::to_value(posts()).unwrap();
+            v["versions"] = versions;
+            v["access"] = access;
+            schema(v)
+        };
+        let own = json!({"author": {"equals": "$user.id"}});
+        for right in ["readDrafts", "publish"] {
+            assert_eq!(
+                check(&posts(json!({"drafts": false}), json!({right: true}))),
+                Err(format!(
+                    "access.{right}: needs drafts on, in versions.drafts"
+                ))
+            );
+            assert_eq!(
+                check(&posts(json!(null), json!({right: true}))),
+                Err(format!(
+                    "access.{right}: needs drafts on, in versions.drafts"
+                ))
+            );
+            // A filter, like read: a right on some documents only.
+            assert_eq!(
+                check(&posts(json!({"drafts": true}), json!({right: own}))),
+                Ok(())
+            );
+        }
+        assert_eq!(
+            check(&posts(json!(null), json!({"readVersions": true}))),
+            Err("access.readVersions: needs versions on".into())
+        );
+        assert_eq!(
+            check(&posts(json!({}), json!({"readVersions": own}))),
+            Ok(())
+        );
+        assert_eq!(
+            check(&posts(
+                json!({"drafts": true}),
+                json!({"readDrafts": {"nope": {"equals": 1}}})
+            ))
+            .unwrap_err()
+            .split(": ")
+            .next(),
+            Some("access.readDrafts"),
+            "filters are checked against the fields"
+        );
+        let global = schema(
+            json!({"slug": "site", "kind": "global", "versions": {"drafts": true},
+            "access": {"read": true, "update": true, "readDrafts": true, "readVersions": true, "publish": {"role": "editor"}},
+            "fields": [{"name": "title", "type": "text"}]}),
+        );
+        assert_eq!(global.check(), Ok(()));
+        assert_eq!(check(&global), Ok(()));
+        let input =
+            json!({"readDrafts": true, "readVersions": false, "publish": {"role": "editor"}});
+        let a: CollectionAccess = serde_json::from_value(input.clone()).unwrap();
+        assert_eq!(a.publish, Some(Rule::Role(vec!["editor".into()])));
+        assert_eq!(serde_json::to_value(&a).unwrap(), input);
+    }
+
+    #[test]
+    fn field_read_rules_cover_drafts_and_versions() {
+        let f: Field = serde_json::from_value(
+            json!({"name": "secret", "type": "text", "access": {"read": {"role": "editor"}}}),
+        )
+        .unwrap();
+        let author = signed_in("author");
+        for action in [Action::Read, Action::ReadDrafts, Action::ReadVersions] {
+            assert!(!field_allows(&f, action, &author), "{action:?}");
+            assert!(field_allows(&f, action, &signed_in("editor")), "{action:?}");
+        }
+        assert!(field_allows(&f, Action::Publish, &author));
     }
 }

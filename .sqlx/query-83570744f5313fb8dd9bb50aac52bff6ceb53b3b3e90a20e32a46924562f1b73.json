@@ -1,0 +1,14 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)\n                 SELECT tenant_id, from_doc, 'published', field_path, to_doc FROM relations\n                 WHERE from_doc = $1 AND copy = 'draft'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "83570744f5313fb8dd9bb50aac52bff6ceb53b3b3e90a20e32a46924562f1b73"
+}
