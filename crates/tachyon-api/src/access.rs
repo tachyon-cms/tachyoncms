@@ -1020,7 +1020,12 @@ impl Access {
         let limited = versions.filter.is_some();
         let one = HashMap::from([(c.id, versions)]);
         if get_many_readable(pool, &[id], &one).await?.is_empty() {
-            let known = global && (limited || documents::get(pool, c.id, id, copy).await.is_ok());
+            // Saved in any copy counts: a global never published, or taken down, is still known.
+            let saved = async |copy| documents::get(pool, c.id, id, copy).await.is_ok();
+            let known = global
+                && (limited
+                    || (c.schema.drafts() && saved(DocCopy::Draft).await)
+                    || saved(DocCopy::Published).await);
             return Err(if known {
                 self.refuse()
             } else {

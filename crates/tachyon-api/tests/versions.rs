@@ -942,3 +942,35 @@ async fn a_global_refuses_history_with_a_403(pool: PgPool) {
     .await;
     ok(&editor, "GET", uri, None).await;
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_global_nothing_published_still_refuses_its_history(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(
+            json!({"slug": "site", "kind": "global", "versions": {"drafts": true},
+                    "access": {"readVersions": true, "readDrafts": false},
+                    "fields": [{"name": "name", "type": "text"}]}),
+        ),
+    )
+    .await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let versions = "/api/globals/site/versions";
+    // Saved but never published, then published and taken down: either way a global's
+    // existence isn't secret, so its history is refused, not missing (Ruling T5-5).
+    ok(
+        &admin,
+        "PATCH",
+        "/api/globals/site",
+        Some(json!({"name": "One"})),
+    )
+    .await;
+    assert_problem(&call(&viewer, "GET", versions, None).await, 403);
+    ok(&admin, "POST", "/api/globals/site/publish", None).await;
+    ok(&viewer, "GET", versions, None).await;
+    ok(&admin, "POST", "/api/globals/site/unpublish", None).await;
+    assert_problem(&call(&viewer, "GET", versions, None).await, 403);
+}
