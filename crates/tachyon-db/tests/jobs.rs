@@ -488,3 +488,39 @@ async fn finished_at_is_when_the_run_ended(pool: PgPool) {
         "{started} {finished}"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn finished_jobs_are_swept_after_30_days(pool: PgPool) {
+    let later = now() + time::Duration::days(1);
+    let mut ids = Vec::new();
+    for (state, days) in [
+        ("done", 31),
+        ("cancelled", 31),
+        ("failed", 31),
+        ("done", 29),
+        ("queued", 31),
+    ] {
+        let id = add(&pool, &job(later, None)).await;
+        sqlx::query(
+            "UPDATE jobs SET state = $2,
+                 finished_at = CASE WHEN $2 = 'queued' THEN NULL
+                                    ELSE now() - make_interval(days => $3) END,
+                 created_at = now() - make_interval(days => $3)
+             WHERE id = $1",
+        )
+        .bind(id)
+        .bind(state)
+        .bind(days)
+        .execute(&pool)
+        .await
+        .unwrap();
+        ids.push(id);
+    }
+    assert!(jobs::claim(&pool, LEASE).await.unwrap().is_none());
+    let left: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM jobs ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    // Only what finished over 30 days ago goes; a recent one and a queued one stay.
+    assert_eq!(left, ids[3..]);
+}

@@ -59,6 +59,10 @@ CREATE UNIQUE INDEX jobs_one_pending ON jobs (tenant_id, dedupe_key)
     WHERE state IN ('queued', 'running');
 CREATE INDEX jobs_due ON jobs (run_at) WHERE state = 'queued';
 CREATE INDEX jobs_leased ON jobs (locked_until) WHERE state = 'running';
+-- A document's jobs, for its schedule and for the cascade when it's deleted.
+CREATE INDEX jobs_document ON jobs (document_id);
+-- Finished jobs are swept once they're old.
+CREATE INDEX jobs_finished ON jobs (finished_at) WHERE state IN ('done', 'cancelled', 'failed');
 -- Pruning keeps any version a pending job holds.
 CREATE INDEX jobs_held_version ON jobs ((payload->>'version')) WHERE state IN ('queued', 'running');
 

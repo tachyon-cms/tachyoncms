@@ -425,6 +425,7 @@ pub async fn publish_in(
             .await?;
         }
     }
+    // Drafts imply versions, so a collection that publishes always keeps a history to add to.
     crate::versions::record_version(tx, id, c, DocCopy::Published, &published.data.0, by).await?;
     Ok(published)
 }

@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, data AS \"data: Json<Map<String, Value>>\" FROM versions\n               WHERE tenant_id = $1 AND collection_id = $2 AND ($3::uuid IS NULL OR id > $3)\n               ORDER BY id\n               LIMIT $4",
+  "query": "SELECT id, kind, data AS \"data: Json<Map<String, Value>>\" FROM versions\n               WHERE tenant_id = $1 AND collection_id = $2 AND ($3::uuid IS NULL OR id > $3)\n               ORDER BY id\n               LIMIT $4",
   "describe": {
     "columns": [
       {
@@ -16,6 +16,17 @@
       },
       {
         "ordinal": 1,
+        "name": "kind",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "kind"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
         "name": "data: Json<Map<String, Value>>",
         "type_info": "Jsonb",
         "origin": {
@@ -36,8 +47,9 @@
     },
     "nullable": [
       false,
+      false,
       false
     ]
   },
-  "hash": "19a5ff0e580a49b70f0bc6e42c1dc76109867eb32bd1848078d47720967430e5"
+  "hash": "bd6ef5e568c91838302c0338baf7fefd55ddaf4067a18d73d278eb1109914655"
 }

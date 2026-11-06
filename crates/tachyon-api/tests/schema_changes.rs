@@ -357,3 +357,57 @@ async fn pruning_versions_needs_confirmation(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(count().await, 0);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_change_normalises_drafts_as_drafts(pool: PgPool) {
+    let app = common::admin_app(pool.clone()).await;
+    let schema = |when: &str| {
+        json!({"slug": "pages", "versions": {"drafts": true}, "fields": [
+            {"name": "title", "type": "text", "required": true},
+            {"name": "when", "type": when}
+        ]})
+    };
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema("text").to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    // A draft without its required title saves, and records a version of itself.
+    let when = "2026-10-12T09:30:00+02:00";
+    let res = send(
+        &app,
+        "POST",
+        "/api/pages",
+        Some(&json!({"when": when}).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let body = json!({"schema": schema("date"), "confirm": true});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/pages",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // Both are stored as a draft save would store them: the text is now a date, in UTC.
+    let utc = json!("2026-10-12T07:30:00.000Z");
+    let draft: Option<Value> = sqlx::query_scalar(
+        "SELECT d.draft->'when' FROM documents d JOIN collections c ON c.id = d.collection_id
+         WHERE c.slug = 'pages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(draft, Some(utc.clone()));
+    let version: Vec<Option<Value>> =
+        sqlx::query_scalar("SELECT data->'when' FROM versions WHERE kind = 'draft'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, [Some(utc)]);
+}

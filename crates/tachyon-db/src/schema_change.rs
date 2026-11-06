@@ -18,8 +18,10 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, LinkChange, Renames, SchemaDiff, diff, migrate_document, relink};
+use tachyon_core::validate::Mode;
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
+    validate_document_in,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
@@ -805,16 +807,24 @@ async fn check_no_pending_drafts(
 }
 
 /// One copy of a document, or a version, as `part.new` stores it: valid ones normalized,
-/// invalid ones as migrated, to fix on next edit.
-fn rewritten(part: &Part, links: &[LinkChange], data: &Map<String, Value>) -> Map<String, Value> {
+/// invalid ones as migrated, to fix on next edit. A draft (`Mode::Draft`) is judged as a
+/// draft save would judge it, so a missing required field doesn't keep it unnormalized.
+fn rewritten(
+    part: &Part,
+    links: &[LinkChange],
+    data: &Map<String, Value>,
+    mode: Mode,
+) -> Map<String, Value> {
     let fields = part.new.data();
     let mut migrated = migrate_document(fields, &part.renames, data);
     relink(fields, &mut migrated, links);
-    validate_document(fields, &Value::Object(Map::new()), Some(&migrated)).unwrap_or(migrated)
+    validate_document_in(mode, fields, &Value::Object(Map::new()), Some(&migrated))
+        .unwrap_or(migrated)
 }
 
-/// Drafts turned off: every draft goes, with its links. Nothing is lost, since
-/// `check_no_pending_drafts` found each one the same as what's published.
+/// Drafts turned off: every draft goes, with its links, and every scheduled publish or
+/// unpublish is cancelled. Nothing is lost, since `check_no_pending_drafts` found each draft
+/// the same as what's published.
 async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
         "DELETE FROM relations r USING documents d
@@ -826,6 +836,17 @@ async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<()
     .await?;
     sqlx::query!(
         "UPDATE documents SET draft = NULL WHERE tenant_id = $1 AND collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Publishing needs drafts, so what's scheduled could only fail; documents first, then
+    // their jobs, the order every write locks them in.
+    sqlx::query!(
+        "UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+         WHERE tenant_id = $1 AND collection_id = $2 AND kind IN ('publish', 'unpublish')
+           AND state IN ('queued', 'running')",
         DEFAULT_TENANT,
         collection_id,
     )
@@ -882,8 +903,14 @@ async fn rewrite(
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows {
-            let published = row.data.as_ref().map(|d| rewritten(part, links, d));
-            let draft = row.draft.as_ref().map(|d| rewritten(part, links, d));
+            let published = row
+                .data
+                .as_ref()
+                .map(|d| rewritten(part, links, d, Mode::Full));
+            let draft = row
+                .draft
+                .as_ref()
+                .map(|d| rewritten(part, links, d, Mode::Draft));
             if published != row.data || draft != row.draft {
                 sqlx::query!(
                     "UPDATE documents SET published = $2, draft = $3 WHERE id = $1",
@@ -921,7 +948,7 @@ async fn rewrite(
     let mut after: Option<Uuid> = None;
     loop {
         let rows = sqlx::query!(
-            r#"SELECT id, data AS "data: Json<Map<String, Value>>" FROM versions
+            r#"SELECT id, kind, data AS "data: Json<Map<String, Value>>" FROM versions
                WHERE tenant_id = $1 AND collection_id = $2 AND ($3::uuid IS NULL OR id > $3)
                ORDER BY id
                LIMIT $4"#,
@@ -935,7 +962,11 @@ async fn rewrite(
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for v in rows {
-            let data = rewritten(part, links, &v.data.0);
+            let mode = match v.kind == DocCopy::Draft.as_str() {
+                true => Mode::Draft,
+                false => Mode::Full,
+            };
+            let data = rewritten(part, links, &v.data.0, mode);
             if data != v.data.0 {
                 sqlx::query!(
                     "UPDATE versions SET data = $2 WHERE id = $1",

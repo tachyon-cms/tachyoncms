@@ -471,6 +471,38 @@ async fn trashing_cancels_schedule(pool: PgPool) {
     );
 }
 
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn turning_drafts_off_cancels_schedule(pool: PgPool) {
+    let admin = blog(&pool).await;
+    let id = post(&admin, "Live").await;
+    let one = format!("/api/posts/{id}");
+    ok(&admin, "POST", &format!("{one}/publish"), None).await;
+    ok(
+        &admin,
+        "PUT",
+        &format!("{one}/schedule"),
+        Some(json!({"publishAt": at(1), "unpublishAt": at(2)})),
+    )
+    .await;
+    // Nothing pending in the draft, so drafts may go, and with them what's scheduled.
+    let schema = json!({"slug": "posts", "versions": {"maxVersions": 2}, "fields": [
+        {"name": "title", "type": "text", "required": true},
+        {"name": "slug", "type": "slug"},
+        {"name": "author", "type": "relationship", "relationTo": "authors"}
+    ]});
+    ok(
+        &admin,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(json!({"schema": schema})),
+    )
+    .await;
+    assert_eq!(
+        jobs(&pool, &id).await,
+        [job("publish", "cancelled"), job("unpublish", "cancelled")]
+    );
+}
+
 /// `id`'s one job failed, with a reason containing `why`.
 async fn failed_with(pool: &PgPool, id: &str, why: &str) {
     let ran = jobs(pool, id).await;

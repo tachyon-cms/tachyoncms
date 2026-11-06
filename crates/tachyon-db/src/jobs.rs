@@ -27,6 +27,10 @@ use uuid::Uuid;
 
 use crate::{DEFAULT_TENANT, DbError, map_unique};
 
+/// How long a finished job (done, cancelled or failed) is kept, so its outcome can be looked
+/// into, before `claim` sweeps it away (Ruling F-3). A finished job holds no version.
+pub const KEEP_FINISHED_DAYS: i32 = 30;
+
 /// A job to add. `dedupe_key` names what it's for, such as `publish:<document id>`; a new
 /// one replaces the pending job of the same key.
 pub struct NewJob<'a> {
@@ -125,6 +129,7 @@ pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, D
 /// out. Rows another worker holds are skipped, not waited for. A job that lost its lease
 /// on its last attempt fails here instead, so one that kills its worker every time stops
 /// being retried; one whose run still holds its row is left to that run.
+/// Finished jobs older than `KEEP_FINISHED_DAYS` are deleted here too, a batch at a time.
 pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
     sqlx::query!(
         r#"UPDATE jobs SET state = 'failed', locked_until = NULL, finished_at = clock_timestamp(),
@@ -135,6 +140,19 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
                  AND attempts >= max_attempts
                FOR UPDATE SKIP LOCKED)"#,
         DEFAULT_TENANT,
+    )
+    .execute(pool)
+    .await?;
+    sqlx::query!(
+        r#"DELETE FROM jobs
+           WHERE id IN (
+               SELECT id FROM jobs
+               WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')
+                 AND finished_at < now() - make_interval(days => $2)
+               LIMIT 100
+               FOR UPDATE SKIP LOCKED)"#,
+        DEFAULT_TENANT,
+        KEEP_FINISHED_DAYS,
     )
     .execute(pool)
     .await?;
