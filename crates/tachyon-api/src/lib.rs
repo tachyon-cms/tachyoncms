@@ -39,6 +39,8 @@ pub(crate) struct AppState {
     pub pool: PgPool,
     pub schemas: Arc<Schemas>,
     pub auth: Arc<auth::AuthState>,
+    /// See `Options::schema_inline_rows`.
+    pub inline_rows: i64,
 }
 
 /// How the router is set up. `Default` suits development and tests.
@@ -46,6 +48,9 @@ pub(crate) struct AppState {
 pub struct Options {
     pub auth: auth::AuthConfig,
     pub jobs: JobsConfig,
+    /// The most rows a schema change or preview may scan inside its request; a bigger one
+    /// runs on a job worker. `None` is 2,000; tests lower it.
+    pub schema_inline_rows: Option<i64>,
 }
 
 /// Why the API couldn't start.
@@ -99,6 +104,7 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/admin/collections/{slug}/preview",
             post(collections::preview),
         )
+        .route("/api/admin/jobs/{id}", get(collections::job))
         .route("/api/access", get(access::report))
         .route(
             "/api/globals/{slug}",
@@ -172,6 +178,9 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         pool,
         schemas,
         auth,
+        inline_rows: options
+            .schema_inline_rows
+            .unwrap_or(collections::INLINE_ROWS),
     };
     let routes = routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),

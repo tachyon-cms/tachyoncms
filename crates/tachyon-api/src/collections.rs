@@ -1,10 +1,15 @@
 //! `/api/admin/collections`. Unauthenticated until M3, which is why the server binds to localhost by default.
+//!
+//! A change or preview too big to finish inside its request (over `INLINE_ROWS`) runs on a
+//! job worker instead: the route answers 202 with the job, which `GET /api/admin/jobs/{id}`
+//! reports on until it holds what the route would have answered.
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
-use serde::Deserialize;
+use axum::http::{StatusCode, header};
+use axum::response::{IntoResponse, Response};
+use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tachyon_core::access;
 use tachyon_core::auth::Action;
@@ -12,14 +17,29 @@ use tachyon_core::diff::Renames;
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
 };
+use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::indexes::reconcile_indexes;
+use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_db::schema_change::{self, ChangeError};
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
+use uuid::Uuid;
 
 use crate::auth::authorize;
 use crate::auth::principal::Principal;
 use crate::documents::json_body;
+use crate::jobs::{JobError, LEASE, keep_leased};
 use crate::{ApiError, AppState};
+
+/// The most rows (documents, trashed ones included, and their versions) a schema change or
+/// preview scans inside its request; a bigger one runs on a job worker.
+// shortcut: a constant, not a setting; make it one under `[jobs]` if anyone asks.
+pub(crate) const INLINE_ROWS: i64 = 2_000;
+
+/// The jobs a change and a preview too big for their request become.
+pub(crate) const SCHEMA_CHANGE: &str = "schema_change";
+pub(crate) const SCHEMA_PREVIEW: &str = "schema_preview";
 
 fn to_json(c: &Collection) -> Value {
     json!({ "id": c.id, "schemaVersion": c.schema_version, "schema": c.schema.to_compact_json() })
@@ -138,7 +158,7 @@ pub async fn delete(
     Ok(StatusCode::NO_CONTENT)
 }
 
-#[derive(Deserialize)]
+#[derive(Deserialize, Serialize)]
 #[serde(deny_unknown_fields)]
 struct ChangeRequest {
     schema: Value,
@@ -242,17 +262,20 @@ pub async fn preview(
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
+    if let Some(queued) = queue(&state, &principal, SCHEMA_PREVIEW, &slug, &req).await? {
+        return Ok(queued);
+    }
     let p = schema_change::preview(&state.pool, &slug, &schema, &req.renames)
         .await
         .map_err(change_error)?;
-    Ok(Json(json!(p)))
+    Ok(Json(json!(p)).into_response())
 }
 
 pub async fn update(
@@ -260,13 +283,16 @@ pub async fn update(
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<Json<Value>, ApiError> {
+) -> Result<Response, ApiError> {
     authorize(&principal, Action::Schemas, "")?;
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
+    if let Some(queued) = queue(&state, &principal, SCHEMA_CHANGE, &slug, &req).await? {
+        return Ok(queued);
+    }
     let (c, p) = schema_change::apply(&state.pool, &slug, &schema, &req.renames, req.confirm)
         .await
         .map_err(change_error)?;
@@ -274,5 +300,283 @@ pub async fn update(
     log_index_failure(&indexed, &slug);
     state.schemas.reload(&state.pool).await?;
     indexed?;
-    Ok(Json(json!({ "collection": to_json(&c), "preview": p })))
+    Ok(Json(json!({ "collection": to_json(&c), "preview": p })).into_response())
+}
+
+/// Queues a change or preview too big to run inside its request (over
+/// `AppState::inline_rows`) as a `kind` job, and answers 202 with it; `None` when it's small
+/// enough to run here. A schema has one such job at a time. A second is a 409, never a
+/// replacement: dropping an admin's change unseen is worse than asking them to wait.
+async fn queue(
+    state: &AppState,
+    principal: &Principal,
+    kind: &str,
+    slug: &str,
+    req: &ChangeRequest,
+) -> Result<Option<Response>, ApiError> {
+    if schema_change::rows(&state.pool, slug).await? <= state.inline_rows {
+        return Ok(None);
+    }
+    let key = format!("schema:{slug}");
+    let job = NewJob {
+        kind,
+        document_id: None,
+        collection_id: None,
+        payload: json!({ "slug": slug, "request": req }),
+        run_at: OffsetDateTime::now_utc(),
+        dedupe_key: Some(key.clone()),
+        created_by: principal.identity().map(|i| i.user_id),
+        key_id: match principal {
+            Principal::Key { key, .. } => Some(*key),
+            _ => None,
+        },
+    };
+    let mut conn = state.pool.acquire().await.map_err(DbError::from)?;
+    let id = match jobs::add(&mut conn, &job).await {
+        Ok(id) => id,
+        Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
+            return Err(ApiError::Conflict(
+                match jobs::pending_key(&state.pool, &key).await? {
+                    Some(id) => {
+                        format!("a change to `{slug}` is already queued; wait for job {id}")
+                    }
+                    None => format!("a change to `{slug}` just finished; try again"),
+                },
+            ));
+        }
+        Err(e) => return Err(e.into()),
+    };
+    let status = jobs::status(&state.pool, id)
+        .await?
+        .ok_or_else(|| ApiError::Internal(format!("job {id} went missing")))?;
+    let location = format!("/api/admin/jobs/{id}");
+    let body = json!({ "job": job_json(&status)? });
+    Ok(Some(
+        (
+            StatusCode::ACCEPTED,
+            [(header::LOCATION, location)],
+            Json(body),
+        )
+            .into_response(),
+    ))
+}
+
+fn job_json(s: &jobs::Status) -> Result<Value, ApiError> {
+    let at = |t: OffsetDateTime| {
+        t.format(&Rfc3339)
+            .map_err(|e| ApiError::Internal(e.to_string()))
+    };
+    Ok(json!({
+        "id": s.id,
+        "kind": s.kind,
+        "state": s.state,
+        "attempts": s.attempts,
+        "runAt": at(s.run_at)?,
+        "finishedAt": s.finished_at.map(at).transpose()?,
+        "result": s.result,
+    }))
+}
+
+/// `GET /api/admin/jobs/{id}`: a schema change or preview a request queued, for whoever may
+/// change schemas, as they're the ones who queue them. Any other job is missing. Its
+/// `last_error` is never shown; `result` says what went wrong.
+pub async fn job(
+    State(state): State<AppState>,
+    principal: Principal,
+    path: Result<Path<String>, PathRejection>,
+) -> Result<Json<Value>, ApiError> {
+    authorize(&principal, Action::Schemas, "")?;
+    let Path(id) = path.map_err(|_| ApiError::NotFound)?;
+    let id: Uuid = id.parse().map_err(|_| ApiError::NotFound)?;
+    match jobs::status(&state.pool, id).await? {
+        Some(s) if s.kind == SCHEMA_CHANGE || s.kind == SCHEMA_PREVIEW => Ok(Json(job_json(&s)?)),
+        _ => Err(ApiError::NotFound),
+    }
+}
+
+/// Why a run failed. A database fault (`retry`) runs again while attempts last; anything
+/// else ends the job with what the route would have answered: its status and problem,
+/// without a request ID, there being no request.
+fn failed(job: &Job, e: ApiError, retry: bool) -> JobError {
+    let error = format!("{e:?}");
+    if retry && job.attempts < job.max_attempts {
+        return JobError::Retry(error);
+    }
+    let (status, mut problem) = e.problem();
+    if let Some(p) = problem.as_object_mut() {
+        p.remove("requestId");
+    }
+    JobError::Failed {
+        error,
+        result: json!({ "status": status.as_u16(), "problem": problem }),
+    }
+}
+
+/// Runs a queued schema change or preview as whoever queued it is now, making every check
+/// the route made again, against the schemas as they are now. A long handler (see
+/// `crate::jobs`): it keeps its lease while it works and marks itself done in the change's
+/// own transaction, so a run that lost the job can't commit it. Its result is the route's
+/// 200 body.
+pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError> {
+    let (Some(slug), Ok(req)) = (
+        job.payload["slug"].as_str(),
+        ChangeRequest::deserialize(&job.payload["request"]),
+    ) else {
+        return Err(JobError::Permanent(
+            "the job's payload isn't a schema change".into(),
+        ));
+    };
+    let leased = keep_leased(state, job, LEASE);
+    let api = |e: ApiError| {
+        let retry = matches!(e, ApiError::Internal(_));
+        failed(job, e, retry)
+    };
+    let change = |e: ChangeError| {
+        let retry = matches!(e, ChangeError::Db(_));
+        failed(job, change_error(e), retry)
+    };
+    let db = |e: DbError| failed(job, e.into(), true);
+    let user = job
+        .created_by
+        .ok_or_else(|| JobError::Permanent("nobody queued it".into()))?;
+    let principal = Principal::for_job(state, user, job.key_id)
+        .await
+        .map_err(api)?
+        .ok_or_else(|| {
+            let why = "whoever queued this change was removed, or the API key they used was revoked or has expired";
+            failed(job, ApiError::Forbidden(why.into()), false)
+        })?;
+    authorize(&principal, Action::Schemas, "").map_err(api)?;
+    let schema = parse_schema(&req.schema).map_err(api)?;
+    let world = saved(state, &schema).map_err(api)?;
+    check_virtuals(&world).map_err(api)?;
+    check_dependents(&world).map_err(api)?;
+    check_rules(state, &world).await.map_err(api)?;
+
+    let (mut tx, result, changed) = if job.kind == SCHEMA_PREVIEW {
+        let p = schema_change::preview(&state.pool, slug, &schema, &req.renames)
+            .await
+            .map_err(change)?;
+        let tx = state.pool.begin().await.map_err(|e| db(e.into()))?;
+        (tx, json!(p), None)
+    } else {
+        let mut tx = state.pool.begin().await.map_err(|e| db(e.into()))?;
+        let (c, p) = schema_change::apply_in(&mut tx, slug, &schema, &req.renames, req.confirm)
+            .await
+            .map_err(change)?;
+        let result = json!({ "collection": to_json(&c), "preview": p });
+        (tx, result, Some(c.id))
+    };
+    drop(leased);
+    if !jobs::complete_with(&mut tx, job, Some(&result))
+        .await
+        .map_err(db)?
+    {
+        // Another worker took the job over, and its run is the one that counts.
+        return Ok(());
+    }
+    tx.commit().await.map_err(|e| db(e.into()))?;
+    if let Some(id) = changed {
+        // As the route does, though the change is saved and its result kept already.
+        let indexed = reconcile_indexes(&state.pool, id).await;
+        log_index_failure(&indexed, slug);
+        if let Err(error) = state.schemas.reload(&state.pool).await {
+            tracing::warn!(
+                ?error,
+                collection = slug,
+                "couldn't reload schemas after a change"
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use axum::body::Body;
+    use axum::http::Request;
+    use sqlx::PgPool;
+    use tower::ServiceExt;
+
+    use super::*;
+    use crate::schemas::Schemas;
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_run_that_lost_its_job_cant_commit_the_change(pool: PgPool) {
+        let app = crate::router(pool.clone()).await.unwrap();
+        let setup =
+            json!({"email": "a@example.com", "name": "A", "password": "a long enough passphrase"});
+        let res = app
+            .oneshot(
+                Request::post("/api/setup")
+                    .header("content-type", "application/json")
+                    .body(Body::from(setup.to_string()))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(res.status(), StatusCode::CREATED);
+        let user: Uuid = sqlx::query_scalar("SELECT user_id FROM accounts")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+        let posts: CollectionSchema = serde_json::from_value(
+            json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}),
+        )
+        .unwrap();
+        schema_change::create(&pool, &posts).await.unwrap();
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: INLINE_ROWS,
+        };
+        let request = json!({
+            "schema": {"slug": "posts", "fields": [{"name": "headline", "type": "text"}]},
+            "renames": {"title": "headline"},
+        });
+        let new = NewJob {
+            kind: SCHEMA_CHANGE,
+            document_id: None,
+            collection_id: None,
+            payload: json!({"slug": "posts", "request": request}),
+            run_at: OffsetDateTime::now_utc(),
+            dedupe_key: Some("schema:posts".into()),
+            created_by: Some(user),
+            key_id: None,
+        };
+        let id = jobs::add(&mut pool.acquire().await.unwrap(), &new)
+            .await
+            .unwrap();
+        let version = || async {
+            sqlx::query_scalar::<_, i32>(
+                "SELECT schema_version FROM collections WHERE schema->>'slug' = 'posts'",
+            )
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        };
+
+        // Worker A claims, then stalls past its lease; worker B takes the job over.
+        let a = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        sqlx::query("UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let b = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        assert_eq!((b.id, a.attempts, b.attempts), (id, 1, 2));
+
+        // A gets to the end first, and can't commit.
+        assert!(run_job(&state, &a).await.is_ok());
+        assert_eq!(version().await, 1, "A's change rolled back");
+        assert!(run_job(&state, &b).await.is_ok());
+        assert_eq!(version().await, 2, "B's change went in");
+        let done = jobs::status(&pool, id).await.unwrap().unwrap();
+        assert_eq!((done.state.as_str(), done.attempts), ("done", 2));
+        assert_eq!(done.result.unwrap()["collection"]["schemaVersion"], 2);
+        // Run again, A changes nothing more.
+        let _ = run_job(&state, &a).await;
+        assert_eq!(version().await, 2, "the change went in once");
+    }
 }

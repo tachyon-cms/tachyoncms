@@ -454,6 +454,8 @@ curl -X PUT localhost:3000/api/admin/collections/posts \
 
 Renamed fields keep their data. Anything that would delete or retype data comes back first as a preview (what changes, how many documents it touches, which ones won't validate) and only goes through when you send it again with `"confirm": true`. `POST .../posts/preview` shows the same report without changing anything.
 
+A request gets 30 seconds, and carrying tens of thousands of documents across can take longer. So when a change or a preview would scan more than 2,000 rows (documents, trashed ones too, and their versions), the server hands it to a job worker and answers `202 Accepted` straight away, with the job in the body and a `Location` header pointing at `GET /api/admin/jobs/{id}`. Poll that until `state` reads `done` or `failed`. Either way, `result` holds what the request would have said: the same body as the 200, or the `status` and `problem` it would have sent back. Everything is checked again when the job runs, against the data as it is by then. What the request would have refused, the job refuses: a change that loses data without `"confirm": true` fails with the 409 and a fresh preview, so you can look before you send it again. Each schema takes one queued change at a time; a second gets a 409 naming the job to wait for. And somebody has to run the job, so at least one server needs `workers` above 0 under `[jobs]`. Without one, use `schema apply` from the command line, which has no time limit.
+
 Prefer files under version control? Export every content type, edit the JSON, and apply it:
 
 ```bash

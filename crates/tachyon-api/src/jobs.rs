@@ -7,12 +7,14 @@
 //! the document can't deadlock with the job's row. It must never call
 //! `jobs::heartbeat`, which would wait forever on the row `complete_in` locked.
 //! A long handler calls `jobs::heartbeat` at least every third of `LEASE`, stops when that
-//! returns false, and calls `jobs::complete_in` only at the end.
+//! returns false, and calls `jobs::complete_in` only at the end. `keep_leased` does the
+//! heartbeats; drop what it returns before `complete_in`.
 
 use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use serde_json::Value;
 use tachyon_db::jobs::{self, Job};
 use uuid::Uuid;
 
@@ -69,6 +71,36 @@ impl RunningJobs {
 pub(crate) enum JobError {
     Retry(String),
     Permanent(String),
+    /// Permanent, with the answer to keep for whoever waits on the job.
+    Failed {
+        error: String,
+        result: Value,
+    },
+}
+
+/// Keeps `job`'s lease, for a long handler, until the returned guard drops: a heartbeat
+/// every third of `lease`, on a connection of its own, ending once the lease is lost.
+pub(crate) fn keep_leased(state: &AppState, job: &Job, lease: Duration) -> impl Drop + Send {
+    struct Beating(tokio::task::JoinHandle<()>);
+    impl Drop for Beating {
+        fn drop(&mut self) {
+            self.0.abort();
+        }
+    }
+    let (pool, job) = (state.pool.clone(), job.clone());
+    Beating(tokio::spawn(async move {
+        loop {
+            tokio::time::sleep(lease / 3).await;
+            match jobs::heartbeat(&pool, &job, lease).await {
+                Ok(true) => {}
+                Ok(false) => break,
+                // The next one may get through before the lease runs out.
+                Err(error) => {
+                    tracing::warn!(job = %job.id, %error, "couldn't extend a job's lease")
+                }
+            }
+        }
+    }))
 }
 
 /// Starts `config.workers` workers, each its own task, until the pool closes.
@@ -115,14 +147,15 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
         })
         .await
     };
-    let (error, retry) = match outcome {
+    let (error, retry, result) = match outcome {
         Ok(Ok(())) => return,
-        Ok(Err(JobError::Retry(e))) => (e, true),
-        Ok(Err(JobError::Permanent(e))) => (e, false),
-        Err(_) => ("the job's handler panicked".to_owned(), true),
+        Ok(Err(JobError::Retry(e))) => (e, true, None),
+        Ok(Err(JobError::Permanent(e))) => (e, false, None),
+        Ok(Err(JobError::Failed { error, result })) => (error, false, Some(result)),
+        Err(_) => ("the job's handler panicked".to_owned(), true, None),
     };
     tracing::warn!(job = %job.id, kind = %job.kind, attempt = job.attempts, %error, retry, "job failed");
-    if let Err(e) = jobs::fail(&state.pool, &job, &error, retry).await {
+    if let Err(e) = jobs::fail_with(&state.pool, &job, &error, retry, result.as_ref()).await {
         // Its lease runs out, and the job is claimed again.
         tracing::warn!(job = %job.id, error = %e, "couldn't record a job's failure");
     }
@@ -131,6 +164,9 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
 async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
     match job.kind.as_str() {
         "publish" | "unpublish" => crate::schedule::run(state, job).await,
+        crate::collections::SCHEMA_CHANGE | crate::collections::SCHEMA_PREVIEW => {
+            crate::collections::run_job(state, job).await
+        }
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]
@@ -236,12 +272,40 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_long_run_keeps_its_lease_until_it_lets_go(pool: PgPool) {
+        let lease = Duration::from_millis(600);
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let held = keep_leased(&state, &job, lease);
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&pool, lease).await.unwrap().is_none(),
+            "still leased three leases on"
+        );
+        drop(held);
+        tokio::time::sleep(lease * 2).await;
+        let taken = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        assert_eq!(
+            (taken.id, taken.attempts),
+            (job.id, 2),
+            "taken over once let go"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn a_dropped_run_leaves_its_handler_listed(pool: PgPool) {
         let id = add(&pool, "test-hang", OffsetDateTime::now_utc()).await;
         let state = AppState {
             pool: pool.clone(),
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let job = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
         let running = RunningJobs::default();

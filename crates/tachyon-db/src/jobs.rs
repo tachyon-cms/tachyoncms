@@ -90,6 +90,12 @@ async fn enqueue_once(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid,
     if let Some(key) = &job.dedupe_key {
         cancel(conn, key).await?;
     }
+    add(conn, job).await
+}
+
+/// Adds `job`, leaving any pending job with its `dedupe_key` in place: then it's
+/// `DbError::UniqueViolation("jobs_one_pending")`, and `pending_key` names the one there.
+pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbError> {
     let id = Uuid::now_v7();
     sqlx::query!(
         r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
@@ -203,11 +209,22 @@ pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool
 /// first keeps it from deadlocking with a write that locks a document, then its jobs. Such
 /// a run must never `heartbeat`. A long run calls it at the end instead.
 pub async fn complete_in(tx: &mut PgConnection, job: &Job) -> Result<bool, DbError> {
+    complete_with(tx, job, None).await
+}
+
+/// `complete_in`, keeping `result` for whoever waits on the job.
+pub async fn complete_with(
+    tx: &mut PgConnection,
+    job: &Job,
+    result: Option<&Value>,
+) -> Result<bool, DbError> {
     let done = sqlx::query!(
-        r#"UPDATE jobs SET state = 'done', locked_until = NULL, finished_at = clock_timestamp()
+        r#"UPDATE jobs SET state = 'done', locked_until = NULL, finished_at = clock_timestamp(),
+               result = $3
            WHERE id = $1 AND attempts = $2 AND state = 'running'"#,
         job.id,
         job.attempts,
+        result.map(Json) as _,
     )
     .execute(&mut *tx)
     .await?;
@@ -218,6 +235,17 @@ pub async fn complete_in(tx: &mut PgConnection, job: &Job) -> Result<bool, DbErr
 /// queued again after 10 s × attempts²; otherwise it fails for good. Does nothing when this
 /// run no longer holds the job.
 pub async fn fail(pool: &PgPool, job: &Job, error: &str, retry: bool) -> Result<(), DbError> {
+    fail_with(pool, job, error, retry, None).await
+}
+
+/// `fail`, keeping `result` for whoever waits on the job once it fails for good.
+pub async fn fail_with(
+    pool: &PgPool,
+    job: &Job,
+    error: &str,
+    retry: bool,
+    result: Option<&Value>,
+) -> Result<(), DbError> {
     sqlx::query!(
         r#"UPDATE jobs SET
                state = CASE WHEN $4 AND attempts < max_attempts THEN 'queued' ELSE 'failed' END,
@@ -226,12 +254,14 @@ pub async fn fail(pool: &PgPool, job: &Job, error: &str, retry: bool) -> Result<
                              ELSE run_at END,
                finished_at = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE clock_timestamp() END,
                locked_until = NULL,
-               last_error = $3
+               last_error = $3,
+               result = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE $5::jsonb END
            WHERE id = $1 AND attempts = $2 AND state = 'running'"#,
         job.id,
         job.attempts,
         error,
         retry,
+        result.map(Json) as _,
     )
     .execute(pool)
     .await?;
@@ -253,4 +283,43 @@ pub async fn pending(pool: &PgPool, document_id: Uuid) -> Result<Vec<Job>, DbErr
     .fetch_all(pool)
     .await?;
     Ok(jobs)
+}
+
+/// How a job stands, for whoever queued it. `result` is null until it finishes.
+#[derive(Debug, Clone)]
+pub struct Status {
+    pub id: Uuid,
+    pub kind: String,
+    pub state: String,
+    pub attempts: i32,
+    pub run_at: OffsetDateTime,
+    pub finished_at: Option<OffsetDateTime>,
+    pub result: Option<Value>,
+}
+
+/// Job `id`, whatever its state. `None` when there's no such job.
+pub async fn status(pool: &PgPool, id: Uuid) -> Result<Option<Status>, DbError> {
+    let status = sqlx::query_as!(
+        Status,
+        r#"SELECT id, kind, state, attempts, run_at, finished_at, result
+           FROM jobs WHERE tenant_id = $1 AND id = $2"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(status)
+}
+
+/// The pending (queued or running) job with `dedupe_key`, if any.
+pub async fn pending_key(pool: &PgPool, dedupe_key: &str) -> Result<Option<Uuid>, DbError> {
+    let id = sqlx::query_scalar!(
+        r#"SELECT id FROM jobs
+           WHERE tenant_id = $1 AND dedupe_key = $2 AND state IN ('queued', 'running')"#,
+        DEFAULT_TENANT,
+        dedupe_key,
+    )
+    .fetch_optional(pool)
+    .await?;
+    Ok(id)
 }
