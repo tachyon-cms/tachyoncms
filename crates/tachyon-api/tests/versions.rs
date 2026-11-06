@@ -748,6 +748,88 @@ async fn draft_versions_need_read_drafts(pool: PgPool) {
             assert!(!res.json.to_string().contains("Next"), "{}", res.json);
         }
     }
+    // A page never published is one the viewer can't read, so its history isn't there
+    // either: no empty list to say it exists.
+    let unseen = id_of(
+        &ok(
+            &admin,
+            "POST",
+            "/api/pages",
+            Some(json!({"title": "Draft"})),
+        )
+        .await,
+    );
+    let unseen = format!("/api/pages/{unseen}");
+    ok(&admin, "PATCH", &unseen, Some(json!({"title": "Again"}))).await;
+    assert_problem(&call(&viewer, "GET", &unseen, None).await, 404);
+    assert_problem(
+        &call(&viewer, "GET", &format!("{unseen}/versions"), None).await,
+        404,
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn history_follows_the_copy_the_caller_reads(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    ok(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "posts", "versions": {"drafts": true},
+        "access": {"read": {"visibility": "public"}, "readVersions": true,
+                   "readDrafts": {"role": "editor"}},
+        "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "visibility", "type": "select", "options": ["public", "private"]}
+        ]})),
+    )
+    .await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    // Published as `from`, then a draft that turns it to `to`.
+    let post = async |from: &str, to: &str| {
+        let id = id_of(
+            &ok(
+                &admin,
+                "POST",
+                "/api/posts",
+                Some(json!({"title": "T", "visibility": from})),
+            )
+            .await,
+        );
+        let one = format!("/api/posts/{id}");
+        ok(&admin, "POST", &format!("{one}/publish"), None).await;
+        ok(&admin, "PATCH", &one, Some(json!({"visibility": to}))).await;
+        let all = ok(&admin, "GET", &format!("{one}/versions"), None).await;
+        let published = all["docs"][1]["id"].as_str().unwrap().to_owned();
+        (one, published)
+    };
+    // What's live is private and the draft public: the viewer can't read the post, nor its
+    // history.
+    let (hidden, vid) = post("private", "public").await;
+    assert_problem(&call(&viewer, "GET", &hidden, None).await, 404);
+    for uri in [
+        format!("{hidden}/versions"),
+        format!("{hidden}/versions/{vid}"),
+        format!("{hidden}/diff?from={vid}&to={vid}"),
+    ] {
+        assert_problem(&call(&viewer, "GET", &uri, None).await, 404);
+    }
+    // The other way about: the post reads, and so does what was published of it.
+    let (shown, vid) = post("public", "private").await;
+    ok(&viewer, "GET", &shown, None).await;
+    let list = ok(&viewer, "GET", &format!("{shown}/versions"), None).await;
+    assert_eq!(list["docs"].as_array().unwrap().len(), 1, "{list}");
+    assert_eq!(list["docs"][0]["id"], vid);
+    let v = ok(&viewer, "GET", &format!("{shown}/versions/{vid}"), None).await;
+    assert_eq!(v["data"]["visibility"], "public");
+    let diff = ok(
+        &viewer,
+        "GET",
+        &format!("{shown}/diff?from={vid}&to={vid}"),
+        None,
+    )
+    .await;
+    assert_eq!(diff["changes"], json!([]), "{diff}");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

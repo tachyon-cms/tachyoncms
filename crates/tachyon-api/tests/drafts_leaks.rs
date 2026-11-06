@@ -174,30 +174,32 @@ async fn site(pool: &PgPool) -> Site {
 }
 
 /// `where` probes on posts that could only match through a draft: each must answer
-/// exactly as the same probe for a value nothing has.
-fn probes(ghost: &str) -> Vec<(String, String)> {
+/// exactly as the same probe for a value nothing has. The third of each is the one post
+/// an Admin's draft read of the hit finds.
+fn probes(s: &Site) -> Vec<(String, String, String)> {
     let nothing = "Nobody";
     let missing = Uuid::now_v7().to_string();
+    let (ghost, post, mine) = (s.ghost.as_str(), s.post.as_str(), s.mine.as_str());
     [
-        ("author.name", "Ghost", nothing),
-        ("author.id", ghost, missing.as_str()),
-        ("author", ghost, missing.as_str()),
-        ("authorName", "Ghost", nothing),
+        ("author.name", "Ghost", nothing, post),
+        ("author.id", ghost, missing.as_str(), post),
+        ("author", ghost, missing.as_str(), post),
+        ("authorName", "Ghost", nothing, post),
         // `mine`, the other Author's own draft, links Ann as `author`: only her draft
         // matches these, and they may read only what's published of her.
-        ("author.name", "SECRET%20name", nothing),
-        ("author.slug", "secret-slug", nothing),
-        ("authorName", "SECRET%20name", nothing),
-        ("coauthor.name", "SECRET%20name", nothing),
-        ("coauthor.slug", "secret-slug", nothing),
-        ("coauthorName", "SECRET%20name", nothing),
-        ("title", "SECRET%20title", nothing),
+        ("author.name", "SECRET%20name", nothing, mine),
+        ("author.slug", "secret-slug", nothing, mine),
+        ("authorName", "SECRET%20name", nothing, mine),
+        ("coauthor.name", "SECRET%20name", nothing, post),
+        ("coauthor.slug", "secret-slug", nothing, post),
+        ("coauthorName", "SECRET%20name", nothing, post),
+        ("title", "SECRET%20title", nothing, post),
     ]
     .into_iter()
-    .flat_map(|(path, hit, miss)| {
+    .flat_map(|(path, hit, miss, via)| {
         ["", "&draft=true"].map(|draft| {
             let probe = |v: &str| format!("/api/posts?where[{path}][equals]={v}{draft}");
-            (probe(hit), probe(miss))
+            (probe(hit), probe(miss), via.to_owned())
         })
     })
     .collect()
@@ -381,14 +383,17 @@ async fn drafts_never_leak(pool: PgPool) {
         }
         assert_eq!(joined.json["name"], "Ann", "{who}");
         // A schedule is for those who may read the draft: refused outright without the
-        // right, and as missing for a document that isn't theirs.
+        // right (signed out, a 401), and as missing for a document that isn't theirs.
         let schedule = call(app, "GET", &format!("/api/posts/{post}/schedule"), None).await;
         let status = match *who {
             "other author" => 404,
+            "anonymous" => 401,
             _ => 403,
         };
         assert_problem(&schedule, status);
-        for (hit, miss) in probes(ghost) {
+        let body = schedule.json.to_string();
+        assert_eq!(leaks(&body), None, "{who}: schedule: {body}");
+        for (hit, miss, _) in probes(&s) {
             let (a, b) = (
                 call(app, "GET", &hit, None).await,
                 call(app, "GET", &miss, None).await,
@@ -396,8 +401,9 @@ async fn drafts_never_leak(pool: PgPool) {
             assert_eq!(outcome(&a), outcome(&b), "{who}: {hit}: {}", a.json);
         }
     }
-    // The Admin's probes do hit, so equal answers above mean something.
-    for (hit, miss) in probes(ghost) {
+    // The Admin's probes do hit, and each through the one post it's about (`mine`'s
+    // through `mine` alone, not `pub`), so equal answers above mean something.
+    for (hit, miss, via) in probes(&s) {
         if !hit.contains("draft=true") {
             continue;
         }
@@ -406,6 +412,13 @@ async fn drafts_never_leak(pool: PgPool) {
             call(&s.admin, "GET", &miss, None).await,
         );
         assert_ne!(outcome(&a), outcome(&b), "{hit}");
+        let found: Vec<&str> = a.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap())
+            .collect();
+        assert_eq!(found, [via.as_str()], "{hit}: {}", a.json);
     }
 
     // The other Author reads their own draft, and its link to Ann as what's published.

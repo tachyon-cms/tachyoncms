@@ -128,14 +128,16 @@ async fn drafts_are_private_until_published(pool: PgPool) {
     let edited = ok(&author, "PATCH", &one, Some(json!({"title": "Edited"}))).await;
     assert_eq!(edited["title"], "Edited");
 
-    // No right to drafts is a 403 naming `draft`, whoever asks.
+    // No right to drafts is a 403 naming `draft`, and signed out it's a 401 (Ruling F-6).
     for res in [
         call(&viewer, "GET", "/api/posts?draft=true", None).await,
         call(&viewer, "GET", &draft_one, None).await,
-        call(&anon, "GET", "/api/posts?draft=true", None).await,
     ] {
         assert_problem(&res, 403);
         names_draft(&res);
+    }
+    for uri in ["/api/posts?draft=true", draft_one.as_str()] {
+        assert_problem(&call(&anon, "GET", uri, None).await, 401);
     }
     let key = ok(
         &admin,

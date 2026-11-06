@@ -664,8 +664,8 @@ impl Access {
     }
 
     /// The copy of `c` a read asking for its draft (`draft`) gets: a 400 when `c` has no
-    /// drafts, and a 403 when the caller may not read them. Asking for it makes the request
-    /// one that works on drafts.
+    /// drafts, and a 403 when the caller may not read them (a 401 when signed out). Asking
+    /// for it makes the request one that works on drafts.
     pub(crate) fn copy_for(&self, c: &Collection, draft: bool) -> Result<DocCopy, ApiError> {
         if !draft {
             return Ok(DocCopy::Published);
@@ -680,6 +680,10 @@ impl Access {
             .readable_in(c, true)
             .is_none_or(|r| r.copy != DocCopy::Draft)
         {
+            // Signed out is a 401, as every other refusal gives it (Ruling F-6).
+            if matches!(self.principal, Principal::Anonymous) {
+                return Err(self.refuse());
+            }
             return Err(ApiError::Forbidden(format!(
                 "`draft`: you don't have permission to read the drafts of `{slug}`"
             )));
@@ -995,12 +999,13 @@ impl Access {
     }
 
     /// Refuses unless the caller may read the past versions of document `id` of `c`: its
-    /// `readVersions` and read rules, judged on its current copy (the draft, with drafts),
-    /// and the creator for an own-only right, which reaches no global. Refused and missing
-    /// are both a 404 (W1-R14), as is a document in the trash; a global, whose existence
-    /// isn't secret, is refused with a 403 (Ruling T5-5), even before it's saved when a rule
-    /// limits the caller. Answers whether they may also read the versions
-    /// that were drafts, which takes `readDrafts` on the document too (Ruling T5-3).
+    /// `readVersions` and read rules, judged on the copy they may read (the draft where they
+    /// may read drafts, else what's published), and the creator for an own-only right, which
+    /// reaches no global. Refused and missing are both a 404 (W1-R14), as is a document in
+    /// the trash; a global, whose existence isn't secret, is refused with a 403 (Ruling
+    /// T5-5), even before it's saved when a rule limits the caller. Answers whether they may
+    /// also read the versions that were drafts, which takes `readDrafts` on the document too
+    /// (Ruling T5-3).
     pub(crate) async fn versions_of(
         &self,
         pool: &PgPool,
@@ -1022,9 +1027,13 @@ impl Access {
                 ApiError::NotFound
             });
         }
-        // Without drafts, every version is of what was published.
-        let Some(drafts) = self.draft_readable(c, read) else {
+        // Without drafts, every version is of what was published; judged on the published
+        // copy, the caller may not read drafts.
+        if copy == DocCopy::Published {
             return Ok(!c.schema.drafts());
+        }
+        let Some(drafts) = self.draft_readable(c, read) else {
+            return Ok(false);
         };
         // The draft was just found, so only a filter or an owner can still hide it. Not
         // folded into the query above: each takes one readable per collection, and these
@@ -1037,9 +1046,9 @@ impl Access {
     }
 
     /// What reading the past versions of a document of `c` runs under, before any document
-    /// is looked at (see `versions_of`, which also judges the document): its current copy
-    /// under the read and `readVersions` rules, and the creator for an own-only right. Also
-    /// the read filter alone. Refusals are as `versions_of` gives them.
+    /// is looked at (see `versions_of`, which also judges the document): the copy they may
+    /// read under the read and `readVersions` rules, and the creator for an own-only right.
+    /// Also the read filter alone. Refusals are as `versions_of` gives them.
     fn versions_rules(&self, c: &Collection) -> Result<(Readable, Option<Filter>), ApiError> {
         let slug = &c.schema.slug;
         self.scope(Action::ReadVersions, slug)?;
@@ -1063,9 +1072,11 @@ impl Access {
             true if global => return Err(refused()),
             true => Some(self.principal.identity().ok_or_else(refused)?.user_id),
         };
-        let copy = match c.schema.drafts() {
-            true => DocCopy::Draft,
-            false => DocCopy::Published,
+        // Judged on the copy the caller may read: the draft only where they may read drafts
+        // at all, else what's published, so a never-published document stays hidden.
+        let copy = match self.draft_readable(c, read.clone()) {
+            Some(_) => DocCopy::Draft,
+            None => DocCopy::Published,
         };
         let versions = Readable {
             filter,
