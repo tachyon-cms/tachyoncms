@@ -314,10 +314,14 @@ async fn queue(
     slug: &str,
     req: &ChangeRequest,
 ) -> Result<Option<Response>, ApiError> {
-    if schema_change::rows(&state.pool, slug).await? <= state.inline_rows {
-        return Ok(None);
-    }
     let key = format!("schema:{slug}");
+    if schema_change::rows(&state.pool, slug).await? <= state.inline_rows {
+        // Small enough to run here, but not ahead of a change already waiting (Ruling P1-3).
+        return match jobs::pending_key(&state.pool, &key).await? {
+            Some(id) => Err(already_queued(slug, id)),
+            None => Ok(None),
+        };
+    }
     let job = NewJob {
         kind,
         document_id: None,
@@ -335,14 +339,12 @@ async fn queue(
     let id = match jobs::add(&mut conn, &job).await {
         Ok(id) => id,
         Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
-            return Err(ApiError::Conflict(
-                match jobs::pending_key(&state.pool, &key).await? {
-                    Some(id) => {
-                        format!("a change to `{slug}` is already queued; wait for job {id}")
-                    }
-                    None => format!("a change to `{slug}` just finished; try again"),
-                },
-            ));
+            return Err(match jobs::pending_key(&state.pool, &key).await? {
+                Some(id) => already_queued(slug, id),
+                None => {
+                    ApiError::Conflict(format!("a change to `{slug}` just finished; try again"))
+                }
+            });
         }
         Err(e) => return Err(e.into()),
     };
@@ -361,6 +363,15 @@ async fn queue(
     ))
 }
 
+fn already_queued(slug: &str, job: Uuid) -> ApiError {
+    ApiError::Conflict(format!(
+        "a change to `{slug}` is already queued; wait for job {job}"
+    ))
+}
+
+/// A job as its route shows it. One that failed with no answer kept, such as one whose
+/// lease ran out on its last attempt, still gets one, so a client never sees a failure it
+/// can't read.
 fn job_json(s: &jobs::Status) -> Result<Value, ApiError> {
     let at = |t: OffsetDateTime| {
         t.format(&Rfc3339)
@@ -373,7 +384,21 @@ fn job_json(s: &jobs::Status) -> Result<Value, ApiError> {
         "attempts": s.attempts,
         "runAt": at(s.run_at)?,
         "finishedAt": s.finished_at.map(at).transpose()?,
-        "result": s.result,
+        "result": match (&s.result, s.state.as_str()) {
+            (None, "failed") => {
+                let detail = match s.attempts >= s.max_attempts {
+                    true => "the job ran out of attempts; queue the change again",
+                    false => "the job couldn't run; queue the change again",
+                };
+                json!({ "status": 500, "problem": {
+                    "type": "about:blank",
+                    "title": "Internal server error",
+                    "status": 500,
+                    "detail": detail,
+                }})
+            }
+            (result, _) => json!(result),
+        },
     }))
 }
 
@@ -391,6 +416,16 @@ pub async fn job(
     match jobs::status(&state.pool, id).await? {
         Some(s) if s.kind == SCHEMA_CHANGE || s.kind == SCHEMA_PREVIEW => Ok(Json(job_json(&s)?)),
         _ => Err(ApiError::NotFound),
+    }
+}
+
+/// A fault worth running again: ours, or the database's, a deadlock or serialization
+/// failure included, which `ApiError` reports as a 409 asking to try again.
+fn fault(e: &ApiError) -> bool {
+    match e {
+        ApiError::Internal(_) => true,
+        ApiError::Conflict(d) => d == crate::error::TRY_AGAIN,
+        _ => false,
     }
 }
 
@@ -426,9 +461,9 @@ pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError>
             "the job's payload isn't a schema change".into(),
         ));
     };
-    let leased = keep_leased(state, job, LEASE);
+    let leased = keep_leased(state, job, LEASE).await?;
     let api = |e: ApiError| {
-        let retry = matches!(e, ApiError::Internal(_));
+        let retry = fault(&e);
         failed(job, e, retry)
     };
     let change = |e: ChangeError| {
@@ -453,10 +488,18 @@ pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError>
     check_dependents(&world).map_err(api)?;
     check_rules(state, &world).await.map_err(api)?;
 
+    // A run that lost the job stops (see `crate::jobs`): the run that took it is the one
+    // that counts, and this one couldn't complete anyway.
+    if leased.lost() {
+        return Ok(());
+    }
     let (mut tx, result, changed) = if job.kind == SCHEMA_PREVIEW {
         let p = schema_change::preview(&state.pool, slug, &schema, &req.renames)
             .await
             .map_err(change)?;
+        if leased.lost() {
+            return Ok(());
+        }
         let tx = state.pool.begin().await.map_err(|e| db(e.into()))?;
         (tx, json!(p), None)
     } else {
@@ -472,7 +515,10 @@ pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError>
         .await
         .map_err(db)?
     {
-        // Another worker took the job over, and its run is the one that counts.
+        // Another worker took the job over, and its run is the one that counts. Rolled
+        // back now, not when the connection is next used, so the takeover's wait on these
+        // locks ends here.
+        tx.rollback().await.map_err(|e| db(e.into()))?;
         return Ok(());
     }
     tx.commit().await.map_err(|e| db(e.into()))?;
@@ -493,16 +539,19 @@ pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError>
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use axum::body::Body;
     use axum::http::Request;
     use sqlx::PgPool;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tower::ServiceExt;
 
     use super::*;
     use crate::schemas::Schemas;
 
-    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-    async fn a_run_that_lost_its_job_cant_commit_the_change(pool: PgPool) {
+    /// An Admin, `posts` with a title, and a queued rename of it to `headline`.
+    async fn queued(pool: &PgPool) -> (AppState, Uuid) {
         let app = crate::router(pool.clone()).await.unwrap();
         let setup =
             json!({"email": "a@example.com", "name": "A", "password": "a long enough passphrase"});
@@ -517,17 +566,17 @@ mod tests {
             .unwrap();
         assert_eq!(res.status(), StatusCode::CREATED);
         let user: Uuid = sqlx::query_scalar("SELECT user_id FROM accounts")
-            .fetch_one(&pool)
+            .fetch_one(pool)
             .await
             .unwrap();
         let posts: CollectionSchema = serde_json::from_value(
             json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}),
         )
         .unwrap();
-        schema_change::create(&pool, &posts).await.unwrap();
+        schema_change::create(pool, &posts).await.unwrap();
         let state = AppState {
             pool: pool.clone(),
-            schemas: std::sync::Arc::new(Schemas::load(&pool).await.unwrap()),
+            schemas: std::sync::Arc::new(Schemas::load(pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: INLINE_ROWS,
         };
@@ -548,35 +597,146 @@ mod tests {
         let id = jobs::add(&mut pool.acquire().await.unwrap(), &new)
             .await
             .unwrap();
-        let version = || async {
-            sqlx::query_scalar::<_, i32>(
-                "SELECT schema_version FROM collections WHERE schema->>'slug' = 'posts'",
-            )
-            .fetch_one(&pool)
+        (state, id)
+    }
+
+    async fn version(pool: &PgPool) -> i32 {
+        sqlx::query_scalar("SELECT schema_version FROM collections WHERE schema->>'slug' = 'posts'")
+            .fetch_one(pool)
             .await
             .unwrap()
-        };
+    }
 
-        // Worker A claims, then stalls past its lease; worker B takes the job over.
-        let a = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+    /// Ends job `id`'s lease now, as if its worker had stalled past it.
+    async fn expire(pool: &PgPool, id: Uuid) {
         sqlx::query("UPDATE jobs SET locked_until = now() - interval '1 second' WHERE id = $1")
             .bind(id)
-            .execute(&pool)
+            .execute(pool)
             .await
             .unwrap();
+    }
+
+    /// Waits until `n` of this database's sessions are waiting on a lock.
+    async fn waiting(pool: &PgPool, n: i64) {
+        for _ in 0..200 {
+            let waiting: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM pg_stat_activity
+                 WHERE datname = current_database() AND wait_event_type = 'Lock'",
+            )
+            .fetch_one(pool)
+            .await
+            .unwrap();
+            if waiting >= n {
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        panic!("{n} sessions never waited on a lock");
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_run_that_lost_its_job_cant_commit_the_change(pool: PgPool) {
+        let (state, id) = queued(&pool).await;
+        // Worker A claims, then stalls past its lease; worker B takes the job over.
+        let a = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        expire(&pool, id).await;
         let b = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
         assert_eq!((b.id, a.attempts, b.attempts), (id, 1, 2));
 
-        // A gets to the end first, and can't commit.
+        // A runs first, and changes nothing.
         assert!(run_job(&state, &a).await.is_ok());
-        assert_eq!(version().await, 1, "A's change rolled back");
+        assert_eq!(version(&pool).await, 1, "A's change rolled back");
         assert!(run_job(&state, &b).await.is_ok());
-        assert_eq!(version().await, 2, "B's change went in");
+        assert_eq!(version(&pool).await, 2, "B's change went in");
         let done = jobs::status(&pool, id).await.unwrap().unwrap();
         assert_eq!((done.state.as_str(), done.attempts), ("done", 2));
         assert_eq!(done.result.unwrap()["collection"]["schemaVersion"], 2);
         // Run again, A changes nothing more.
         let _ = run_job(&state, &a).await;
-        assert_eq!(version().await, 2, "the change went in once");
+        assert_eq!(version(&pool).await, 2, "the change went in once");
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_deadlock_while_checking_runs_again(pool: PgPool) {
+        sqlx::raw_sql("CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let lock = |id: i32| sqlx::query("SELECT id FROM t WHERE id = $1 FOR UPDATE").bind(id);
+        let (mut a, mut b) = (pool.begin().await.unwrap(), pool.begin().await.unwrap());
+        lock(1).execute(&mut *a).await.unwrap();
+        lock(2).execute(&mut *b).await.unwrap();
+        let (x, y) = tokio::join!(lock(2).execute(&mut *a), lock(1).execute(&mut *b));
+        let deadlock = ApiError::from(DbError::from(x.err().or(y.err()).unwrap()));
+        assert!(fault(&deadlock), "{deadlock:?}");
+        assert!(fault(&ApiError::Internal("down".into())));
+        assert!(!fault(&ApiError::Conflict("`posts` already exists".into())));
+        assert!(!fault(&ApiError::Forbidden("no".into())));
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_run_that_lost_its_lease_stops_before_the_work(pool: PgPool) {
+        let (state, id) = queued(&pool).await;
+        let a = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        expire(&pool, id).await;
+        let b = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        // Every schema save waits on this lock, so a run that starts the change hangs here.
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("SELECT pg_advisory_xact_lock(7311002)")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let stale = tokio::time::timeout(Duration::from_secs(5), run_job(&state, &a)).await;
+        assert!(
+            matches!(stale, Ok(Ok(()))),
+            "A stopped without waiting: {stale:?}"
+        );
+        held.rollback().await.unwrap();
+        assert_eq!(version(&pool).await, 1);
+        assert!(run_job(&state, &b).await.is_ok());
+        assert_eq!(version(&pool).await, 2);
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_takeover_waits_for_the_stale_run_and_commits_once(
+        opts: PgPoolOptions,
+        connect: PgConnectOptions,
+    ) {
+        // Each run holds a connection for its heartbeats and one for its change.
+        let pool = opts
+            .max_connections(10)
+            .connect_with(connect)
+            .await
+            .unwrap();
+        let (state, id) = queued(&pool).await;
+        let a = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        // Hold the collection's row, so A stops midway with its transaction open.
+        let mut held = pool.begin().await.unwrap();
+        sqlx::query("SELECT id FROM collections WHERE schema->>'slug' = 'posts' FOR UPDATE")
+            .execute(&mut *held)
+            .await
+            .unwrap();
+        let run_a = {
+            let (state, a) = (state.clone(), a.clone());
+            tokio::spawn(async move { run_job(&state, &a).await })
+        };
+        waiting(&pool, 1).await;
+
+        // A's lease runs out mid-run; B takes the job over and waits on A's locks.
+        expire(&pool, id).await;
+        let b = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        assert_eq!((a.attempts, b.attempts), (1, 2));
+        let run_b = {
+            let state = state.clone();
+            tokio::spawn(async move { run_job(&state, &b).await })
+        };
+        waiting(&pool, 2).await;
+
+        held.rollback().await.unwrap();
+        assert!(run_a.await.unwrap().is_ok(), "A loses at the fence");
+        assert!(run_b.await.unwrap().is_ok());
+        assert_eq!(version(&pool).await, 2, "the change went in once");
+        let done = jobs::status(&pool, id).await.unwrap().unwrap();
+        assert_eq!((done.state.as_str(), done.attempts), ("done", 2));
     }
 }

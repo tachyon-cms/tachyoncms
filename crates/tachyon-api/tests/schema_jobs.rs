@@ -425,3 +425,82 @@ async fn a_shared_block_counts_the_documents_it_reaches(pool: PgPool) {
         assert_eq!(res.status, 201, "{}", res.json);
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_inline_change_waits_for_a_queued_one(pool: PgPool) {
+    let app = admin(&pool).await;
+    collection(&app, "posts", 3).await;
+    let res = call(&app, "PUT", "/api/admin/collections/posts", rename("posts")).await;
+    let (_, job) = queued(&res);
+    // Small enough to run inline here, yet it still waits its turn.
+    let inline = tachyon_api::router_with(pool.clone(), options(None, 0))
+        .await
+        .unwrap();
+    let inline = signed_in(inline, ADMIN).await;
+    for (method, uri) in [
+        ("PUT", "/api/admin/collections/posts"),
+        ("POST", "/api/admin/collections/posts/preview"),
+    ] {
+        let res = call(&inline, method, uri, rename("posts")).await;
+        assert_problem(&res, 409);
+        assert_eq!(
+            res.json["detail"],
+            format!(
+                "a change to `posts` is already queued; wait for job {}",
+                job["id"].as_str().unwrap()
+            )
+        );
+    }
+    assert_eq!(schema_version(&app, "posts").await, 1);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_job_that_failed_without_an_answer_still_has_one(pool: PgPool) {
+    let app = admin(&pool).await;
+    collection(&app, "posts", 1).await;
+    let add = |payload: Value| NewJob {
+        kind: "schema_change",
+        document_id: None,
+        collection_id: None,
+        payload,
+        run_at: OffsetDateTime::now_utc(),
+        dedupe_key: None,
+        created_by: None,
+        key_id: None,
+    };
+    let mut conn = pool.acquire().await.unwrap();
+    // Nobody queued it, so it fails on its first run.
+    let orphan = jobs::enqueue(
+        &mut conn,
+        &add(json!({"slug": "posts", "request": rename("posts")})),
+    )
+    .await
+    .unwrap();
+    // Its lease ran out on its last attempt.
+    let lost = jobs::enqueue(&mut conn, &add(json!({}))).await.unwrap();
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', attempts = max_attempts,
+             locked_until = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(lost)
+    .execute(&pool)
+    .await
+    .unwrap();
+    drop(conn);
+
+    let _worker = worker(&pool).await;
+    for (id, detail) in [
+        (orphan, "the job couldn't run; queue the change again"),
+        (lost, "the job ran out of attempts; queue the change again"),
+    ] {
+        let done = finished(&app, &format!("/api/admin/jobs/{id}")).await;
+        assert_eq!(done["state"], "failed", "{done}");
+        assert_eq!(
+            done["result"],
+            json!({"status": 500, "problem": {
+                "type": "about:blank", "title": "Internal server error", "status": 500,
+                "detail": detail,
+            }})
+        );
+    }
+}

@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use sqlx::types::Json;
-use sqlx::{PgConnection, PgPool};
+use sqlx::{PgConnection, PgExecutor, PgPool};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -185,10 +185,15 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
     Ok(job)
 }
 
-/// Extends `job`'s lease to `lease` from now. False when the lease was lost: another worker
+/// Extends `job`'s lease to `lease` from now, on `conn`: a pool, or a connection a long run
+/// holds for it so a busy pool can't starve it. False when the lease was lost: another worker
 /// took the job over, or it was cancelled. The caller should stop. Only for long runs: a
 /// run that called `complete_in` holds the row, and this would wait on it forever.
-pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool, DbError> {
+pub async fn heartbeat<'e>(
+    conn: impl PgExecutor<'e>,
+    job: &Job,
+    lease: Duration,
+) -> Result<bool, DbError> {
     let done = sqlx::query!(
         r#"UPDATE jobs SET locked_until = now() + make_interval(secs => $3)
            WHERE id = $1 AND attempts = $2 AND state = 'running'"#,
@@ -196,7 +201,7 @@ pub async fn heartbeat(pool: &PgPool, job: &Job, lease: Duration) -> Result<bool
         job.attempts,
         lease.as_secs_f64(),
     )
-    .execute(pool)
+    .execute(conn)
     .await?;
     Ok(done.rows_affected() == 1)
 }
@@ -292,6 +297,7 @@ pub struct Status {
     pub kind: String,
     pub state: String,
     pub attempts: i32,
+    pub max_attempts: i32,
     pub run_at: OffsetDateTime,
     pub finished_at: Option<OffsetDateTime>,
     pub result: Option<Value>,
@@ -301,7 +307,7 @@ pub struct Status {
 pub async fn status(pool: &PgPool, id: Uuid) -> Result<Option<Status>, DbError> {
     let status = sqlx::query_as!(
         Status,
-        r#"SELECT id, kind, state, attempts, run_at, finished_at, result
+        r#"SELECT id, kind, state, attempts, max_attempts, run_at, finished_at, result
            FROM jobs WHERE tenant_id = $1 AND id = $2"#,
         DEFAULT_TENANT,
         id,
