@@ -106,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
             let options = tachyon_api::Options {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
                 jobs,
+                schema_inline_rows: None,
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;

@@ -64,8 +64,9 @@ impl From<DbError> for ApiError {
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+impl ApiError {
+    /// The status and problem+json body this error answers with.
+    pub(crate) fn problem(self) -> (StatusCode, serde_json::Value) {
         let mut extra = None;
         let (status, title, detail, errors) = match self {
             Self::NeedsConfirmation(preview) => {
@@ -137,6 +138,13 @@ impl IntoResponse for ApiError {
         if let Some((key, value)) = extra {
             body[key] = value;
         }
+        (status, body)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, body) = self.problem();
         (
             status,
             [(header::CONTENT_TYPE, "application/problem+json")],
