@@ -8,9 +8,10 @@
 //! `jobs::heartbeat`, which would wait forever on the row `complete_in` locked.
 //! A long handler calls `jobs::heartbeat` at least every third of `LEASE`, stops when that
 //! returns false, and calls `jobs::complete_in` only at the end. `keep_leased` does the
-//! heartbeats; drop what it returns before `complete_in`.
+//! heartbeats, on a connection of its own; drop what it returns before `complete_in`.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
@@ -78,29 +79,62 @@ pub(crate) enum JobError {
     },
 }
 
-/// Keeps `job`'s lease, for a long handler, until the returned guard drops: a heartbeat
-/// every third of `lease`, on a connection of its own, ending once the lease is lost.
-pub(crate) fn keep_leased(state: &AppState, job: &Job, lease: Duration) -> impl Drop + Send {
-    struct Beating(tokio::task::JoinHandle<()>);
-    impl Drop for Beating {
-        fn drop(&mut self) {
-            self.0.abort();
-        }
+/// A long handler's lease, kept until this drops (see `keep_leased`).
+pub(crate) struct Leased {
+    beating: tokio::task::JoinHandle<()>,
+    lost: Arc<AtomicBool>,
+}
+
+impl Leased {
+    /// A heartbeat found the lease gone: another worker took the job over, or it was
+    /// cancelled. The handler should stop, as its run can no longer complete.
+    pub(crate) fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
     }
-    let (pool, job) = (state.pool.clone(), job.clone());
-    Beating(tokio::spawn(async move {
-        loop {
-            tokio::time::sleep(lease / 3).await;
-            match jobs::heartbeat(&pool, &job, lease).await {
-                Ok(true) => {}
-                Ok(false) => break,
+}
+
+impl Drop for Leased {
+    fn drop(&mut self) {
+        self.beating.abort();
+    }
+}
+
+/// Keeps `job`'s lease for a long handler: a heartbeat now, then every third of `lease`
+/// until the returned guard drops or one finds the lease gone. All of them run on one
+/// connection taken first, so a busy pool can't starve them past the lease. Without a
+/// connection to spare it's a `Retry`, before any work.
+pub(crate) async fn keep_leased(
+    state: &AppState,
+    job: &Job,
+    lease: Duration,
+) -> Result<Leased, JobError> {
+    let mut conn =
+        state.pool.acquire().await.map_err(|e| {
+            JobError::Retry(format!("no connection to keep the job's lease on: {e}"))
+        })?;
+    let lost = Arc::new(AtomicBool::new(false));
+    // The first one here, so a run that already lost the job stops before its work.
+    match jobs::heartbeat(&mut *conn, job, lease).await {
+        Ok(held) => lost.store(!held, Ordering::Relaxed),
+        Err(e) => return Err(JobError::Retry(e.to_string())),
+    }
+    let (flag, job) = (lost.clone(), job.clone());
+    let beating = tokio::spawn(async move {
+        let every = lease / 3;
+        let mut beats = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while !flag.load(Ordering::Relaxed) {
+            beats.tick().await;
+            match jobs::heartbeat(&mut *conn, &job, lease).await {
+                Ok(held) => flag.store(!held, Ordering::Relaxed),
                 // The next one may get through before the lease runs out.
                 Err(error) => {
                     tracing::warn!(job = %job.id, %error, "couldn't extend a job's lease")
                 }
             }
         }
-    }))
+    });
+    Ok(Leased { beating, lost })
 }
 
 /// Starts `config.workers` workers, each its own task, until the pool closes.
@@ -179,6 +213,7 @@ async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
 mod tests {
     use serde_json::json;
     use sqlx::PgPool;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tachyon_db::jobs::NewJob;
     use time::OffsetDateTime;
 
@@ -282,7 +317,7 @@ mod tests {
             inline_rows: crate::collections::INLINE_ROWS,
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
-        let held = keep_leased(&state, &job, lease);
+        let held = keep_leased(&state, &job, lease).await.unwrap();
         tokio::time::sleep(lease * 3).await;
         assert!(
             jobs::claim(&pool, lease).await.unwrap().is_none(),
@@ -295,6 +330,43 @@ mod tests {
             (taken.id, taken.attempts),
             (job.id, 2),
             "taken over once let go"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_lease_is_kept_while_the_pool_is_full(
+        opts: PgPoolOptions,
+        connect: PgConnectOptions,
+    ) {
+        let lease = Duration::from_millis(600);
+        let pool = opts
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(connect.clone())
+            .await
+            .unwrap();
+        // Another server's workers, which the full pool doesn't hold up.
+        let other = PgPool::connect_with(connect).await.unwrap();
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let _held = keep_leased(&state, &job, lease).await.unwrap();
+        let mut busy = Vec::new();
+        while let Ok(Ok(conn)) =
+            tokio::time::timeout(Duration::from_millis(200), pool.acquire()).await
+        {
+            busy.push(conn);
+        }
+        assert_eq!(busy.len(), 1, "the heartbeats hold the other connection");
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&other, lease).await.unwrap().is_none(),
+            "still leased with the pool full"
         );
     }
 

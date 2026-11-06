@@ -4,6 +4,10 @@ use serde_json::json;
 use tachyon_core::FieldError;
 use tachyon_db::DbError;
 
+/// A write that met another's locks and was undone, which may safely run again.
+pub(crate) const TRY_AGAIN: &str =
+    "Another change to the same documents got in the way; try again.";
+
 /// Every API error, rendered as RFC 9457 `application/problem+json`.
 #[derive(Debug)]
 pub enum ApiError {
@@ -55,9 +59,7 @@ impl From<DbError> for ApiError {
             DbError::Sqlx(sqlx::Error::Database(e))
                 if matches!(e.code().as_deref(), Some("40P01" | "40001")) =>
             {
-                Self::Conflict(
-                    "Another change to the same documents got in the way; try again.".into(),
-                )
+                Self::Conflict(TRY_AGAIN.into())
             }
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
