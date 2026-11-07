@@ -323,10 +323,33 @@ impl<'s, 'k> Reader<'s, 'k> {
             self.event(event, line)?;
         }
         if let Some(&line) = self.directives.keys().min() {
-            return Err((
-                line,
-                "a directive must start its own line, indented less than four spaces".into(),
-            ));
+            // The line begins with a list or task marker, so the directive sits inside a
+            // checklist or ordered item and never reaches the parser as a block (#49):
+            // the author sees it at the start of the line, so the generic message reads
+            // as wrong. Name the list instead; the four-space indent keeps the old message.
+            // A directive left unparsed whose line starts with a list or task marker sits
+            // inside a list item, so it never reaches the parser as a block: the author
+            // sees it at the start of the line, and the generic message reads as wrong (#49).
+            // Name the list; every other case (the four-space indent included) keeps the old message.
+            let src_line = self.src.lines().nth(line - 1).unwrap_or("");
+            let trimmed = src_line.trim_start();
+            let marker = trimmed.split_whitespace().next().unwrap_or("");
+            let after_marker = &trimmed[marker.len()..];
+            let in_list = (matches!(marker, "-" | "*" | "+") && after_marker.starts_with(' '))
+                || trimmed.starts_with("[ ] ")
+                || trimmed.starts_with("[x] ")
+                || trimmed.starts_with("[X] ")
+                || (!marker.is_empty()
+                    && marker.len() <= 9
+                    && marker.chars().all(|c| c.is_ascii_digit())
+                    && after_marker.starts_with(". "));
+            let msg = if in_list {
+                "a directive can't sit inside a list item; put it on its own line, outside the list"
+                    .to_string()
+            } else {
+                "a directive must start its own line, indented less than four spaces".to_string()
+            };
+            return Err((line, msg));
         }
         if let Some(Frame {
             line,
@@ -1345,6 +1368,21 @@ mod tests {
                 "",
                 "line 2: a directive must start its own line, indented less than four spaces"
                     .into(),
+            ),
+            // #49: the directive sits inside a task item, so it never reaches the parser
+            // as a block; the message names the list rather than claiming the line isn't
+            // the directive's own.
+            (
+                &b,
+                "- [ ] ::video{url=\"x\"}",
+                "",
+                "line 1: a directive can't sit inside a list item; put it on its own line, outside the list".into(),
+            ),
+            (
+                &b,
+                "* [x] ::video{url=\"x\"}",
+                "",
+                "line 1: a directive can't sit inside a list item; put it on its own line, outside the list".into(),
             ),
             (
                 &b,
