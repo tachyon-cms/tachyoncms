@@ -4,7 +4,7 @@ use axum::Json;
 use axum::Router;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
-use axum::http::header::{SET_COOKIE, USER_AGENT};
+use axum::http::header::{CACHE_CONTROL, SET_COOKIE, USER_AGENT};
 use axum::http::{HeaderMap, HeaderValue, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post};
@@ -249,6 +249,9 @@ async fn login(
         SET_COOKIE,
         session_cookie(&token, limits.absolute.as_secs()),
     );
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
     Ok(response)
 }
 

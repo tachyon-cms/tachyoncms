@@ -38,6 +38,7 @@ async fn keys_are_shown_once_and_stored_hashed(pool: PgPool) {
     let admin = site(&pool).await;
     let res = make_key(&admin, json!({"name": "website", "scopes": ["posts:read"]})).await;
     assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.headers["cache-control"], "no-store");
     let key = res.json["key"].as_str().unwrap().to_owned();
     assert!(key.starts_with(&format!("tcy_{}_", res.json["prefix"].as_str().unwrap())));
     let list = send(&admin, "GET", "/api/auth/keys", None).await;
@@ -200,6 +201,7 @@ async fn rotation_replaces_the_secret(pool: PgPool) {
     );
     let rotated = send(&admin, "POST", &format!("/api/auth/keys/{id}/rotate"), None).await;
     assert_eq!(rotated.status, 201, "{}", rotated.json);
+    assert_eq!(rotated.headers["cache-control"], "no-store");
     let new = rotated.json["key"].as_str().unwrap();
     assert_ne!(new, old);
     assert_eq!(rotated.json["name"], "k");
