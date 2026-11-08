@@ -23,6 +23,7 @@ use std::any::Any;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -197,6 +198,19 @@ fn layers<S: Clone + Send + Sync + 'static>(routes: Router<S>, limit: Duration) 
         }))
         .layer(axum::middleware::from_fn_with_state(limit, time_limit))
         .layer(axum::middleware::from_fn(request_id::middleware))
+        // Outermost: also decorate responses created by panic/timeout guards.
+        .layer(axum::middleware::map_response(add_security_headers))
+}
+
+async fn add_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn time_limit(State(limit): State<Duration>, req: Request, next: Next) -> Response {
@@ -236,6 +250,7 @@ mod tests {
 
     fn app() -> Router {
         let routes = Router::new()
+            .route("/ok", get(|| async { "ok" }))
             .route(
                 "/slow",
                 get(|| async {
@@ -269,5 +284,23 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(kind, "application/problem+json");
         assert!(!body["requestId"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_headers_cover_success_not_found_and_panics() {
+        for (uri, expected_status) in [
+            ("/ok", StatusCode::OK),
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/panic", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let res = app()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected_status, "{uri}");
+            assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{uri}");
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
+            assert_eq!(res.headers()["referrer-policy"], "no-referrer", "{uri}");
+        }
     }
 }

@@ -10,6 +10,32 @@ use common::{
 use serde_json::{Value, json};
 use sqlx::PgPool;
 
+fn assert_security_headers(res: &Res) {
+    for (name, expected) in [
+        ("x-content-type-options", "nosniff"),
+        ("x-frame-options", "DENY"),
+        ("referrer-policy", "no-referrer"),
+    ] {
+        assert_eq!(
+            res.headers[name], expected,
+            "missing {name} on {}",
+            res.status
+        );
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hardening_headers_cover_success_and_not_found(pool: PgPool) {
+    let app = admin_app(pool).await;
+    let ok = send(&app, "GET", "/api/auth/me", None).await;
+    assert_eq!(ok.status, 200);
+    assert_security_headers(&ok);
+
+    let missing = send(&app, "GET", "/not-a-route", None).await;
+    assert_problem(&missing, 404);
+    assert_security_headers(&missing);
+}
+
 async fn with_key(app: &Router, key: &str, method: &str, uri: &str, body: Option<Value>) -> Res {
     let req = Request::builder()
         .method(method)
