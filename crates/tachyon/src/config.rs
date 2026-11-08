@@ -256,8 +256,9 @@ impl Config {
         })
     }
 
-    /// The job workers the API runs with, given the database pool's size. Each worker can
-    /// hold a connection, so they must leave at least one for requests.
+    /// The job workers the API runs with, given the database pool's size. A worker running a
+    /// schema change holds two connections (its heartbeat and the change), so the workers must
+    /// leave at least one for requests.
     pub fn jobs_config(&self, pool_connections: u32) -> Result<JobsConfig, String> {
         let workers = self.jobs.workers;
         if workers > MAX_WORKERS {
@@ -265,9 +266,10 @@ impl Config {
                 "jobs.workers is {workers}; it can be at most {MAX_WORKERS}"
             ));
         }
-        if workers >= pool_connections as usize {
+        if workers > 0 && 2 * workers + 1 > pool_connections as usize {
+            let most = (pool_connections as usize).saturating_sub(1) / 2;
             return Err(format!(
-                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; use fewer than {pool_connections} so requests still get one"
+                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; each worker can hold two and requests need one, so use at most {most}"
             ));
         }
         Ok(JobsConfig {
@@ -571,15 +573,19 @@ mod tests {
     #[test]
     fn jobs_workers_fit_the_pool_and_the_cap() {
         let at = |n: usize, pool: u32| load(&format!("[jobs]\nworkers = {n}")).jobs_config(pool);
-        assert_eq!(at(16, 40).unwrap().workers, 16);
+        assert_eq!(at(16, 33).unwrap().workers, 16);
         assert_eq!(
             at(17, 40).unwrap_err(),
             "jobs.workers is 17; it can be at most 16"
         );
-        assert_eq!(at(9, 10).unwrap().workers, 9);
+        assert_eq!(at(4, 10).unwrap().workers, 4);
         assert_eq!(
-            at(10, 10).unwrap_err(),
-            "jobs.workers is 10, but the database pool has 10 connections; use fewer than 10 so requests still get one"
+            at(5, 10).unwrap_err(),
+            "jobs.workers is 5, but the database pool has 10 connections; each worker can hold two and requests need one, so use at most 4"
+        );
+        assert_eq!(
+            at(1, 2).unwrap_err(),
+            "jobs.workers is 1, but the database pool has 2 connections; each worker can hold two and requests need one, so use at most 0"
         );
         assert!(at(0, 1).is_ok(), "no workers fit any pool");
     }

@@ -462,6 +462,10 @@ pub(crate) async fn run_job(state: &AppState, job: &Job) -> Result<(), JobError>
         ));
     };
     let leased = keep_leased(state, job, LEASE).await?;
+    // Already taken over: the checks below could only fail into a fenced `fail`.
+    if leased.lost() {
+        return Ok(());
+    }
     let api = |e: ApiError| {
         let retry = fault(&e);
         failed(job, e, retry)

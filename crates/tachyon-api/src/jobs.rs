@@ -118,7 +118,7 @@ pub(crate) async fn keep_leased(
         Ok(held) => lost.store(!held, Ordering::Relaxed),
         Err(e) => return Err(JobError::Retry(e.to_string())),
     }
-    let (flag, job) = (lost.clone(), job.clone());
+    let (flag, job, state) = (lost.clone(), job.clone(), state.clone());
     let beating = tokio::spawn(async move {
         let every = lease / 3;
         let mut beats = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
@@ -127,9 +127,14 @@ pub(crate) async fn keep_leased(
             beats.tick().await;
             match jobs::heartbeat(&mut *conn, &job, lease).await {
                 Ok(held) => flag.store(!held, Ordering::Relaxed),
-                // The next one may get through before the lease runs out.
+                // The next one may get through before the lease runs out, on a fresh
+                // connection if this one has died.
                 Err(error) => {
-                    tracing::warn!(job = %job.id, %error, "couldn't extend a job's lease")
+                    tracing::warn!(job = %job.id, %error, "couldn't extend a job's lease");
+                    if let Ok(fresh) = state.pool.acquire().await {
+                        conn.close_on_drop();
+                        conn = fresh;
+                    }
                 }
             }
         }
@@ -367,6 +372,44 @@ mod tests {
         assert!(
             jobs::claim(&other, lease).await.unwrap().is_none(),
             "still leased with the pool full"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_lease_is_kept_when_its_connection_dies(
+        opts: PgPoolOptions,
+        connect: PgConnectOptions,
+    ) {
+        let lease = Duration::from_millis(600);
+        let pool = opts
+            .max_connections(2)
+            .connect_with(connect.clone())
+            .await
+            .unwrap();
+        let other = PgPool::connect_with(connect).await.unwrap();
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let _held = keep_leased(&state, &job, lease).await.unwrap();
+        // Ends every connection but this one, the heartbeats' included.
+        let mut killer = other.acquire().await.unwrap();
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .execute(&mut *killer)
+        .await
+        .unwrap();
+        drop(killer);
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&other, lease).await.unwrap().is_none(),
+            "still leased after the heartbeats' connection died"
         );
     }
 
