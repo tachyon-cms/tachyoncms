@@ -4299,7 +4299,57 @@ mod tests {
             ),
             (
                 json!({"imageSizes": [{"name": "t", "fit": "squash"}]}),
-                "upload: unknown variant `squash`",
+                "upload.imageSizes.0.fit: unknown value `squash`",
+            ),
+            (
+                json!({"imageSizes": [{"width": 1}]}),
+                "upload.imageSizes.0.name: is required",
+            ),
+            (
+                json!({"formatOptions": {"format": "bmp"}}),
+                "upload.formatOptions.format: unknown value `bmp`",
+            ),
+            (
+                json!({"formatOptions": {"format": "png", "options": {"quality": 300}}}),
+                "upload.formatOptions.options.quality: ",
+            ),
+            (json!({"filesizeLimit": -1}), "upload.filesizeLimit: "),
+            (json!({"crop": "yes"}), "upload.crop: "),
+            (
+                json!({"constructorOptions": {"failOn": "never"}}),
+                "upload.constructorOptions.failOn: unknown value `never`",
+            ),
+            (
+                json!({"constructorOptions": {"limitInputPixels": 0}}),
+                "upload.constructorOptions.limitInputPixels: 0 ",
+            ),
+            (
+                json!({"constructorOptions": {"limitInputPixels": true}}),
+                "upload.constructorOptions.limitInputPixels: `true`",
+            ),
+            (
+                json!({"pasteURL": "yes"}),
+                "upload.pasteURL: must be true, false or",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"port": "1"}]}}),
+                "upload.pasteURL.allowList.0.hostname: is required",
+            ),
+            (
+                json!({"pasteURL": {"allowList": "a.com"}}),
+                "upload.pasteURL.allowList: ",
+            ),
+            (
+                json!({"skipSafeFetch": "x"}),
+                "upload.skipSafeFetch: must be true, false or a list",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": 1}]}),
+                "upload.skipSafeFetch.0.hostname: ",
+            ),
+            (
+                json!({"modifyResponseHeaders": {"X-A": 1}}),
+                "upload.modifyResponseHeaders.X-A: ",
             ),
             (json!("yes"), "upload: must be true, false or an object"),
         ] {
@@ -4308,6 +4358,9 @@ mod tests {
                 .unwrap_err()
                 .to_string();
             assert!(err.starts_with(want), "{err}");
+            for internal in ["Shape", "untagged", "variant", "u32", "u64", "u8"] {
+                assert!(!err.contains(internal), "{err}");
+            }
         }
 
         // Rules `check` applies.
@@ -4466,6 +4519,27 @@ mod tests {
             );
             assert!(crate::query::parse_sort(s.data(), path).is_err(), "{path}");
         }
+        // A PATCH never stores them either: not in a whole `sizes` group the document
+        // didn't have, nor merged into one it did.
+        let existing = crate::validate_document(s.data(), &json!({"alt": "A cat"}), None).unwrap();
+        let patch = json!({"url": "/x", "thumbnailURL": "/y", "sizes": {"thumbnail": {
+            "url": "/z", "width": 400, "formats": {"avif": {"url": "/a", "width": 400}}}}});
+        let want = json!({"alt": "A cat", "focalX": 50, "focalY": 50, "sizes": {"thumbnail": {
+            "width": 400, "formats": {"avif": {"width": 400}}}}});
+        let patched = crate::validate_document(s.data(), &patch, Some(&existing)).unwrap();
+        assert_eq!(Value::Object(patched.clone()), want);
+        assert_eq!(
+            Value::Object(crate::merged(s.data(), &patch, Some(&existing))),
+            want
+        );
+        let again = crate::validate_document(s.data(), &patch, Some(&patched)).unwrap();
+        assert_eq!(Value::Object(again), want);
+        // A read's own values sent back unchanged still save.
+        let mut round_trip = want.clone();
+        round_trip["url"] = json!("/media/file/cat.png");
+        round_trip["sizes"]["thumbnail"]["url"] = json!("/media/file/cat-400x300.png");
+        let saved = crate::validate_document(s.data(), &round_trip, Some(&patched)).unwrap();
+        assert_eq!(Value::Object(saved), want);
         // A `url` placed first still isn't the title: it isn't stored.
         let url_first = schema(json!({"slug": "media", "upload": true, "fields": [
             {"name": "url", "type": "text", "label": "Link"}]}));

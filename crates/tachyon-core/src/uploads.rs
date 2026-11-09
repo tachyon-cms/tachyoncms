@@ -523,15 +523,28 @@ fn cut(s: &str, max: usize) -> &str {
     &s[..end]
 }
 
-/// `stem` + `suffix` + `.ext`, the stem cut so the whole fits `MAX_FILENAME` bytes.
+/// The longest extension kept whole; a longer one is cut so the stem survives.
+const MAX_EXTENSION: usize = 32;
+
+/// `stem` + `suffix` + `.ext`, the stem cut so the whole fits `MAX_FILENAME` bytes. Never
+/// empty, and never starts with a dot or ends with a dot or space, however it's cut.
 fn compose(stem: &str, suffix: &str, ext: &str) -> String {
+    let ext = cut(ext, MAX_EXTENSION);
     let tail = if ext.is_empty() {
         suffix.to_owned()
     } else {
         format!("{suffix}.{ext}")
     };
     let stem = cut(stem, MAX_FILENAME.saturating_sub(tail.len()));
-    cut(&format!("{stem}{tail}"), MAX_FILENAME).to_owned()
+    let name = format!("{stem}{tail}");
+    let name = cut(&name, MAX_FILENAME)
+        .trim_start_matches('.')
+        .trim_end_matches(['.', ' ']);
+    if name.is_empty() {
+        "file".into()
+    } else {
+        name.to_owned()
+    }
 }
 
 /// Characters that reorder or hide text: they make `a\u{202E}gnp.exe` show as `aexe.png`.
@@ -542,8 +555,38 @@ fn invisible(c: char) -> bool {
 }
 
 const WINDOWS_RESERVED: &[&str] = &[
-    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6", "COM7", "COM8",
-    "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6", "LPT7", "LPT8", "LPT9",
+    "CON",
+    "PRN",
+    "AUX",
+    "NUL",
+    "CONIN$",
+    "CONOUT$",
+    "COM0",
+    "COM1",
+    "COM2",
+    "COM3",
+    "COM4",
+    "COM5",
+    "COM6",
+    "COM7",
+    "COM8",
+    "COM9",
+    "COM\u{b9}",
+    "COM\u{b2}",
+    "COM\u{b3}",
+    "LPT0",
+    "LPT1",
+    "LPT2",
+    "LPT3",
+    "LPT4",
+    "LPT5",
+    "LPT6",
+    "LPT7",
+    "LPT8",
+    "LPT9",
+    "LPT\u{b9}",
+    "LPT\u{b2}",
+    "LPT\u{b3}",
 ];
 
 /// An uploaded name made safe to show and to put in a URL or storage key: its last path
@@ -689,38 +732,265 @@ pub(crate) fn check(u: &Upload, fields: &[Field]) -> Result<(), String> {
     Ok(())
 }
 
-/// Sharp-only values, which parse would refuse with a bare message: named by path instead.
-/// `upload` is the raw option.
-pub(crate) fn check_raw(upload: &Value) -> Result<(), String> {
-    let Value::Object(_) = upload else {
-        return match upload {
-            Value::Null | Value::Bool(_) => Ok(()),
-            _ => Err("upload: must be true, false or an object of upload options".into()),
-        };
+/// Checks one raw option value, named by its path, such as `upload.imageSizes.0.fit`.
+type Check = fn(&Value, &str) -> Result<(), String>;
+
+/// `v` parses as `T`, or an error at `path` in words rather than serde's type names.
+fn leaf<T: serde::de::DeserializeOwned>(v: &Value, path: &str) -> Result<(), String> {
+    T::deserialize(v).map(|_| ()).map_err(|e| {
+        let mut m = e.to_string();
+        for (from, to) in [
+            ("unknown variant", "unknown value"),
+            ("expected u8", "expected a whole number from 0 to 255"),
+            ("expected u32", "expected a whole number"),
+            ("expected u64", "expected a whole number"),
+            ("a sequence", "a list"),
+            ("a map", "an object"),
+        ] {
+            m = m.replace(from, to);
+        }
+        format!("{path}: {m}")
+    })
+}
+
+/// `v` is an object (or `null`, when `nullable`) whose `required` keys are present and whose
+/// known keys pass their checks. Unknown keys are `reject_unknown_options`'s.
+fn object(
+    v: &Value,
+    path: &str,
+    nullable: bool,
+    required: &[&str],
+    keys: &[(&str, Check)],
+) -> Result<(), String> {
+    let o = match v {
+        Value::Null if nullable => return Ok(()),
+        Value::Object(o) => o,
+        _ => return Err(format!("{path}: expected an object")),
     };
-    if upload.pointer("/constructorOptions/limitInputPixels") == Some(&Value::Bool(false)) {
-        return Err("upload.constructorOptions.limitInputPixels: the pixel cap can't be turned off; give a number of pixels".into());
+    if let Some(r) = required.iter().find(|r| !o.contains_key(**r)) {
+        return Err(format!("{path}.{r}: is required"));
     }
-    let mut positions = vec![(
-        "upload.resizeOptions.position".to_owned(),
-        upload.pointer("/resizeOptions/position"),
-    )];
-    if let Some(Value::Array(sizes)) = upload.get("imageSizes") {
-        for (i, s) in sizes.iter().enumerate() {
-            for key in ["position", "crop"] {
-                positions.push((format!("upload.imageSizes.{i}.{key}"), s.get(key)));
-            }
+    for (k, v) in o {
+        if let Some((_, check)) = keys.iter().find(|(name, _)| name == k) {
+            check(v, &format!("{path}.{k}"))?;
         }
     }
-    for (at, v) in positions {
-        if let Some(Value::String(p)) = v
-            && matches!(p.as_str(), "attention" | "entropy")
-        {
-            return Err(format!(
-                "{at}: `{p}` is a strategy only sharp has; name a position such as centre or top"
-            ));
-        }
+    Ok(())
+}
+
+/// `v` is a list, each item passing `item`.
+fn list(v: &Value, path: &str, item: Check) -> Result<(), String> {
+    let Value::Array(items) = v else {
+        return leaf::<Vec<Value>>(v, path);
+    };
+    for (i, v) in items.iter().enumerate() {
+        item(v, &format!("{path}.{i}"))?;
     }
+    Ok(())
+}
+
+fn position(v: &Value, path: &str) -> Result<(), String> {
+    if let Value::String(p) = v
+        && matches!(p.as_str(), "attention" | "entropy")
+    {
+        return Err(format!(
+            "{path}: `{p}` is a strategy only sharp has; name a position such as centre or top"
+        ));
+    }
+    leaf::<Option<Position>>(v, path)
+}
+
+fn url_pattern(v: &Value, path: &str) -> Result<(), String> {
+    let text: Check = leaf::<Option<String>>;
+    object(
+        v,
+        path,
+        false,
+        &["hostname"],
+        &[
+            ("protocol", text),
+            ("hostname", leaf::<String>),
+            ("port", text),
+            ("pathname", text),
+            ("search", text),
+        ],
+    )
+}
+
+fn format_options(v: &Value, path: &str) -> Result<(), String> {
+    fn encode(v: &Value, path: &str) -> Result<(), String> {
+        object(
+            v,
+            path,
+            true,
+            &[],
+            &[
+                ("quality", leaf::<Option<u8>>),
+                ("lossless", leaf::<bool>),
+                ("effort", leaf::<Option<u8>>),
+                ("progressive", leaf::<bool>),
+            ],
+        )
+    }
+    object(
+        v,
+        path,
+        true,
+        &["format"],
+        &[("format", leaf::<ImageFormat>), ("options", encode)],
+    )
+}
+
+fn image_size(v: &Value, path: &str) -> Result<(), String> {
+    object(
+        v,
+        path,
+        false,
+        &["name"],
+        &[
+            ("name", leaf::<String>),
+            ("width", leaf::<Option<u32>>),
+            ("height", leaf::<Option<u32>>),
+            ("fit", leaf::<Fit>),
+            ("position", position),
+            ("withoutEnlargement", leaf::<Option<bool>>),
+            ("formatOptions", format_options),
+            ("crop", position),
+        ],
+    )
+}
+
+fn limit_input_pixels(v: &Value, path: &str) -> Result<(), String> {
+    match v {
+        Value::Bool(false) => Err(format!(
+            "{path}: the pixel cap can't be turned off; give a number of pixels"
+        )),
+        Value::Bool(true) => Err(format!(
+            "{path}: `true` isn't needed; leave it out for the instance's cap, or give a number of pixels"
+        )),
+        // In sharp, 0 means no limit, the same as `false`.
+        v if v.as_u64() == Some(0) => Err(format!(
+            "{path}: 0 would turn the pixel cap off, which can't be done; give a number of pixels"
+        )),
+        v => leaf::<Option<u64>>(v, path),
+    }
+}
+
+fn paste_url(v: &Value, path: &str) -> Result<(), String> {
+    match v {
+        Value::Bool(_) => Ok(()),
+        Value::Object(_) => object(
+            v,
+            path,
+            false,
+            &["allowList"],
+            &[("allowList", |v, p| list(v, p, url_pattern))],
+        ),
+        _ => Err(format!(
+            "{path}: must be true, false or {{\"allowList\": [{{\"hostname\": \"example.com\"}}]}}"
+        )),
+    }
+}
+
+fn skip_safe_fetch(v: &Value, path: &str) -> Result<(), String> {
+    match v {
+        Value::Bool(_) => Ok(()),
+        Value::Array(_) => list(v, path, url_pattern),
+        _ => Err(format!(
+            "{path}: must be true, false or a list like [{{\"hostname\": \"example.com\"}}]"
+        )),
+    }
+}
+
+/// Values parse would refuse with a bare serde message, and sharp-only values, named by
+/// path instead. `upload` is the raw option.
+pub(crate) fn check_raw(upload: &Value) -> Result<(), String> {
+    match upload {
+        Value::Null | Value::Bool(_) => return Ok(()),
+        Value::Object(_) => {}
+        _ => return Err("upload: must be true, false or an object of upload options".into()),
+    }
+    let flag: Check = leaf::<bool>;
+    let text: Check = leaf::<Option<String>>;
+    let texts: Check = leaf::<Option<Vec<String>>>;
+    object(
+        upload,
+        "upload",
+        false,
+        &[],
+        &[
+            ("storage", leaf::<String>),
+            ("mimeTypes", leaf::<Vec<String>>),
+            ("filesizeLimit", leaf::<Option<u64>>),
+            ("imageSizes", |v, p| list(v, p, image_size)),
+            ("adminThumbnail", text),
+            ("crop", flag),
+            ("focalPoint", flag),
+            ("formatOptions", format_options),
+            ("resizeOptions", |v, p| {
+                object(
+                    v,
+                    p,
+                    true,
+                    &[],
+                    &[
+                        ("width", leaf::<Option<u32>>),
+                        ("height", leaf::<Option<u32>>),
+                        ("fit", leaf::<Fit>),
+                        ("position", position),
+                        ("withoutEnlargement", leaf::<Option<bool>>),
+                    ],
+                )
+            }),
+            ("trimOptions", |v, p| {
+                object(
+                    v,
+                    p,
+                    true,
+                    &[],
+                    &[
+                        ("background", leaf::<Option<String>>),
+                        ("threshold", leaf::<Option<u8>>),
+                    ],
+                )
+            }),
+            ("withMetadata", flag),
+            ("constructorOptions", |v, p| {
+                object(
+                    v,
+                    p,
+                    true,
+                    &[],
+                    &[
+                        ("limitInputPixels", limit_input_pixels),
+                        ("failOn", leaf::<FailOn>),
+                    ],
+                )
+            }),
+            ("staticDir", text),
+            ("disableLocalStorage", flag),
+            ("filesRequiredOnCreate", flag),
+            ("filenameCompoundIndex", texts),
+            ("pasteURL", paste_url),
+            ("skipSafeFetch", skip_safe_fetch),
+            ("allowRestrictedFileTypes", flag),
+            ("bulkUpload", flag),
+            ("displayPreview", flag),
+            ("hideFileInputOnCreate", flag),
+            ("hideRemoveFile", flag),
+            ("cacheTags", flag),
+            ("modifyResponseHeaders", |v, p| {
+                let Value::Object(o) = v else {
+                    return leaf::<BTreeMap<String, String>>(v, p);
+                };
+                for (name, value) in o {
+                    leaf::<String>(value, &format!("{p}.{name}"))?;
+                }
+                Ok(())
+            }),
+        ],
+    )?;
+    // Anything the checks above missed still gets a path.
     Upload::deserialize(upload)
         .map(|_| ())
         .map_err(|e| format!("upload: {e}"))
@@ -746,6 +1016,12 @@ mod tests {
             ("", "file"),
             ("..", "file"),
             ("photo.jpg", "photo.jpg"),
+            ("COM0.txt", "COM0-file.txt"),
+            ("lpt0", "lpt0-file"),
+            ("COM\u{b9}.txt", "COM\u{b9}-file.txt"),
+            ("lpt\u{b3}", "lpt\u{b3}-file"),
+            ("CONIN$", "CONIN$-file"),
+            ("conout$.log", "conout$-file.log"),
         ] {
             assert_eq!(sanitize_filename(raw), want, "{raw:?}");
         }
@@ -757,6 +1033,28 @@ mod tests {
         assert!(numbered(&safe, 12).len() <= 255);
         assert!(numbered(&safe, 12).ends_with("-12.png"));
         assert_eq!(size_filename("a.png", 640, 400, "webp"), "a-640x400.webp");
+        // Never a leading dot, a trailing dot or space, or empty, whatever is cut.
+        let ext = "x".repeat(300);
+        let long_ext = format!("a.{ext}");
+        assert_eq!(sanitize_filename(&long_ext), format!("a.{}", &ext[..32]));
+        let spaced = format!("{} b", "a".repeat(254));
+        assert_eq!(sanitize_filename(&spaced), "a".repeat(254));
+        for made in [
+            numbered(&long_ext, 2),
+            size_filename(&long_ext, 1, 1, &ext),
+            size_filename(".png", 1, 1, "webp"),
+            numbered("...", 3),
+            numbered(&spaced, 7),
+        ] {
+            assert!(
+                !made.is_empty()
+                    && made.len() <= 255
+                    && !made.starts_with('.')
+                    && !made.ends_with(['.', ' ']),
+                "{made:?}"
+            );
+        }
+        assert_eq!(size_filename(".png", 1, 1, "webp"), "png-1x1.webp");
     }
 
     #[test]
