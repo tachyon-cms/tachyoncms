@@ -545,3 +545,39 @@ async fn the_default_attempts_match_the_column(pool: PgPool) {
         .unwrap();
     assert_eq!(max, jobs::DEFAULT_ATTEMPTS);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn backoff_stops_growing_at_an_hour(pool: PgPool) {
+    let id = add(
+        &pool,
+        &NewJob {
+            max_attempts: Some(i32::MAX),
+            ..job(now(), None)
+        },
+    )
+    .await;
+    let mut delays = Vec::new();
+    // 18 is the last attempt under an hour (3,240 s), 19 the first over (3,610 s); 50,000
+    // would overflow a 32-bit square.
+    for attempts in [18, 19, 100, 50_000] {
+        sqlx::query("UPDATE jobs SET attempts = $2 - 1, run_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(attempts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let j = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        assert_eq!(j.attempts, attempts);
+        jobs::fail(&pool, &j, "down", true).await.unwrap();
+        let (state, delay): (String, f64) = sqlx::query_as(
+            "SELECT state, extract(epoch FROM run_at - now())::float8 FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "queued");
+        delays.push(delay.round());
+    }
+    assert_eq!(delays, [3240.0, 3600.0, 3600.0, 3600.0]);
+}

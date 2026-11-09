@@ -510,7 +510,8 @@ pub async fn forget_in(tx: &mut PgConnection, id: Uuid) -> Result<bool, DbError>
 
 /// Queues again, with fresh attempts, each failed cleanup still worth trying on one of
 /// `storages` (the configured ones): a file's whose file is still gone or pending past its
-/// grace, and every `{"keys"}` one. Storage that was down for longer than the retries is
+/// grace, and a `{"keys"}` one that ran out of attempts (one refused outright, for a bad
+/// payload, would only be refused again). Storage that was down for longer than the retries is
 /// tried again. The newest failed job per dedupe key, and none whose key already has a
 /// pending one. Returns how many.
 pub async fn requeue_cleanups_in(
@@ -522,14 +523,16 @@ pub async fn requeue_cleanups_in(
                finished_at = NULL, result = NULL
            WHERE id IN (
                SELECT DISTINCT ON (coalesce(j.dedupe_key, j.id::text)) j.id FROM jobs j
-               LEFT JOIN files f ON f.tenant_id = j.tenant_id AND f.id::text = j.payload->>'file'
+               LEFT JOIN files f ON f.tenant_id = j.tenant_id
+                   AND f.id = CASE WHEN j.payload->>'file' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                                   THEN (j.payload->>'file')::uuid END
                WHERE j.tenant_id = $1 AND j.kind = $2 AND j.state = 'failed'
                  AND CASE WHEN j.payload ? 'file' THEN
                           f.storage = ANY($4)
                           AND (f.state = 'gone'
                                OR (f.state = 'pending'
                                    AND f.created_at + make_interval(secs => $3) <= now()))
-                     ELSE j.payload->>'storage' = ANY($4) END
+                     ELSE j.payload->>'storage' = ANY($4) AND j.attempts >= j.max_attempts END
                  AND NOT EXISTS (SELECT 1 FROM jobs o
                                  WHERE o.tenant_id = $1 AND o.dedupe_key = j.dedupe_key
                                    AND o.state IN ('queued', 'running'))

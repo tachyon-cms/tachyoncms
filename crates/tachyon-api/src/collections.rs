@@ -30,7 +30,7 @@ use crate::auth::authorize;
 use crate::auth::principal::Principal;
 use crate::documents::json_body;
 use crate::jobs::{JobError, LEASE, keep_leased};
-use crate::{ApiError, AppState, UploadsConfig};
+use crate::{ApiError, AppState, UploadLimits};
 use tachyon_media::storage::check_prefix;
 
 /// The most rows (documents, trashed ones included, and their versions) a schema change or
@@ -73,14 +73,14 @@ fn saved(state: &AppState, schema: &CollectionSchema) -> Result<Vec<CollectionSc
     }
     let world = state.schemas.with_saved(schema).map_err(schema_error)?;
     world[0].check().map_err(schema_error)?;
-    check_upload(&state.media, schema).map_err(|e| ApiError::Validation(vec![e]))?;
+    check_upload(&state.media.limits(), schema).map_err(|e| ApiError::Validation(vec![e]))?;
     Ok(world)
 }
 
 /// The parts of `upload` that depend on this server: the storage it names, `staticDir` and
 /// the pixel cap. The error is at its path, such as `upload.storage`. The schema routes and
 /// `tachyon schema apply` both run it.
-pub fn check_upload(media: &UploadsConfig, schema: &CollectionSchema) -> Result<(), FieldError> {
+pub fn check_upload(limits: &UploadLimits, schema: &CollectionSchema) -> Result<(), FieldError> {
     let Some(u) = &schema.upload else {
         return Ok(());
     };
@@ -90,10 +90,9 @@ pub fn check_upload(media: &UploadsConfig, schema: &CollectionSchema) -> Result<
             message,
         })
     };
-    match media.storages.get(&u.storage) {
+    match limits.storages.get(&u.storage) {
         None => {
-            let mut names: Vec<&str> = media.storages.0.keys().map(String::as_str).collect();
-            names.sort_unstable();
+            let names: Vec<&str> = limits.storages.keys().map(String::as_str).collect();
             return refuse(
                 "upload.storage",
                 format!(
@@ -103,7 +102,7 @@ pub fn check_upload(media: &UploadsConfig, schema: &CollectionSchema) -> Result<
                 ),
             );
         }
-        Some(s) if u.disable_local_storage && s.is_local() => {
+        Some(&local) if u.disable_local_storage && local => {
             return refuse(
                 "upload.storage",
                 format!(
@@ -124,12 +123,12 @@ pub fn check_upload(media: &UploadsConfig, schema: &CollectionSchema) -> Result<
         .constructor_options
         .as_ref()
         .and_then(|c| c.limit_input_pixels);
-    if let Some(limit) = limit.filter(|&l| l > media.max_pixels) {
+    if let Some(limit) = limit.filter(|&l| l > limits.max_pixels) {
         return refuse(
             "upload.constructorOptions.limitInputPixels",
             format!(
                 "{limit} is above this server's limit of {} (`[uploads] max_pixels`)",
-                media.max_pixels
+                limits.max_pixels
             ),
         );
     }

@@ -6,7 +6,7 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
-use tachyon_api::{UploadsConfig, check_upload};
+use tachyon_api::{UploadLimits, check_upload};
 use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
@@ -150,7 +150,7 @@ fn describe(slug: &str, p: &Preview) -> String {
 /// refusing destructive changes unless `yes`. Collections missing from the file are left alone.
 pub async fn run(
     pool: &PgPool,
-    uploads: &UploadsConfig,
+    uploads: &UploadLimits,
     text: &str,
     renames: &BTreeMap<String, Renames>,
     apply: Option<bool>,
@@ -316,6 +316,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// What a server with only `default` local storage checks uploads against.
+    fn limits() -> UploadLimits {
+        UploadLimits {
+            storages: BTreeMap::from([("default".to_owned(), true)]),
+            max_pixels: 50_000_000,
+        }
+    }
+
     fn posts(fields: Value) -> CollectionSchema {
         serde_json::from_value(json!({"slug": "posts", "fields": fields})).unwrap()
     }
@@ -340,15 +348,9 @@ mod tests {
             .unwrap();
         let file = export(&pool).await.unwrap();
         assert!(!file.contains("false") && !file.contains("null"), "{file}");
-        let out = run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap();
+        let out = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
         assert!(out.contains("= posts unchanged"), "{out}");
     }
 
@@ -367,9 +369,7 @@ mod tests {
         .to_string();
         let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
 
-        let plan = run(&pool, &UploadsConfig::default(), &file, &renames, None)
-            .await
-            .unwrap();
+        let plan = run(&pool, &limits(), &file, &renames, None).await.unwrap();
         assert!(
             plan.contains("~ change posts: rename title to headline; add author (relationship)"),
             "{plan}"
@@ -381,15 +381,9 @@ mod tests {
             "diff changes nothing"
         );
 
-        run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &renames,
-            Some(false),
-        )
-        .await
-        .unwrap();
+        run(&pool, &limits(), &file, &renames, Some(false))
+            .await
+            .unwrap();
         let slugs: Vec<String> = collections::list(&pool)
             .await
             .unwrap()
@@ -413,16 +407,10 @@ mod tests {
         .unwrap();
         let file = json!({"collections": [{"slug": "posts", "fields": [{"name": "title", "type": "text"}]}]}).to_string();
 
-        let err = run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap_err()
+            .to_string();
         assert!(
             err.contains("remove summary") && err.contains("--yes"),
             "{err}"
@@ -438,15 +426,9 @@ mod tests {
             2
         );
 
-        run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &BTreeMap::new(),
-            Some(true),
-        )
-        .await
-        .unwrap();
+        run(&pool, &limits(), &file, &BTreeMap::new(), Some(true))
+            .await
+            .unwrap();
         assert_eq!(
             collections::get_by_slug(&pool, "posts")
                 .await
@@ -468,15 +450,9 @@ mod tests {
             {"name": "title", "type": "text", "unique": true}
         ]}]})
         .to_string();
-        let plan = run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &BTreeMap::new(),
-            None,
-        )
-        .await
-        .unwrap();
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), None)
+            .await
+            .unwrap();
         assert!(
             plan.contains("\n  indexes: create title (unique)"),
             "{plan}"
@@ -501,16 +477,10 @@ mod tests {
             {"slug": "posts", "fields": []}, {"slug": "posts", "fields": []}
         ]})
         .to_string();
-        let err = run(
-            &pool,
-            &UploadsConfig::default(),
-            &twice,
-            &BTreeMap::new(),
-            None,
-        )
-        .await
-        .unwrap_err()
-        .to_string();
+        let err = run(&pool, &limits(), &twice, &BTreeMap::new(), None)
+            .await
+            .unwrap_err()
+            .to_string();
         assert_eq!(err, "`posts` appears more than once in the file");
 
         let new = json!({"collections": [{"slug": "posts", "fields": [
@@ -518,7 +488,7 @@ mod tests {
         ]}]})
         .to_string();
         let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
-        let err = run(&pool, &UploadsConfig::default(), &new, &renames, None)
+        let err = run(&pool, &limits(), &new, &renames, None)
             .await
             .unwrap_err()
             .to_string();
@@ -542,7 +512,7 @@ mod tests {
         };
         let err = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &file("author.nope"),
             &BTreeMap::new(),
             None,
@@ -555,7 +525,7 @@ mod tests {
         );
         run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &file("author.name"),
             &BTreeMap::new(),
             Some(false),
@@ -578,22 +548,16 @@ mod tests {
             ]})
             .to_string()
         };
-        let err = run(
-            &pool,
-            &UploadsConfig::default(),
-            &file("title"),
-            &BTreeMap::new(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = run(&pool, &limits(), &file("title"), &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "categories: field `posts`: posts.title isn't a relationship field"
         );
         run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &file("category"),
             &BTreeMap::new(),
             Some(false),
@@ -613,35 +577,23 @@ mod tests {
             ]}
         ]})
         .to_string();
-        run(
-            &pool,
-            &UploadsConfig::default(),
-            &both,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap();
+        run(&pool, &limits(), &both, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
         let only_posts = json!({"collections": [{"slug": "posts", "fields": [
             {"name": "title", "type": "text"}
         ]}]})
         .to_string();
-        let err = run(
-            &pool,
-            &UploadsConfig::default(),
-            &only_posts,
-            &BTreeMap::new(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = run(&pool, &limits(), &only_posts, &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "categories (not in the file) would break: field `posts`: posts has no field `category`"
         );
         let plan = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &json!({"collections": [{"slug": "categories", "fields": []}]}).to_string(),
             &BTreeMap::new(),
             None,
@@ -678,7 +630,7 @@ mod tests {
         let file = json!({"collections": [users, posts(read)]});
         run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &file.to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -704,7 +656,7 @@ mod tests {
         );
         let out = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &exported.to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -728,15 +680,9 @@ mod tests {
             ),
         ] {
             let file = json!({"collections": [posts(read)]}).to_string();
-            let err = run(
-                &pool,
-                &UploadsConfig::default(),
-                &file,
-                &BTreeMap::new(),
-                Some(false),
-            )
-            .await
-            .unwrap_err();
+            let err = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+                .await
+                .unwrap_err();
             assert_eq!(format!("{err:#}"), message);
         }
 
@@ -746,7 +692,7 @@ mod tests {
         ]}]});
         let err = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &no_team.to_string(),
             &BTreeMap::new(),
             Some(true),
@@ -763,7 +709,7 @@ mod tests {
         ruled["access"] = json!({"read": true});
         let err = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &json!({"collections": [ruled]}).to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -785,15 +731,9 @@ mod tests {
         let label = json!([{"name": "label", "type": "text"}]);
         // The block comes after the collection in the file, and is still applied first.
         let file = json!({"collections": [pages, cta(label.clone())]}).to_string();
-        let plan = run(
-            &pool,
-            &UploadsConfig::default(),
-            &file,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap();
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
         assert!(
             plan.contains("+ create cta") && plan.contains("+ create pages"),
             "{plan}"
@@ -816,7 +756,7 @@ mod tests {
         );
         let out = run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &exported.to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -833,15 +773,9 @@ mod tests {
             {"name": "label", "type": "text"}, {"name": "url", "type": "text"}
         ]))]})
         .to_string();
-        let plan = run(
-            &pool,
-            &UploadsConfig::default(),
-            &changed,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap();
+        let plan = run(&pool, &limits(), &changed, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
         assert!(plan.contains("~ change cta: add url (text)"), "{plan}");
         assert!(
             plan.contains("in pages: add layout.cta.url (text)"),
@@ -854,9 +788,7 @@ mod tests {
         ]))]})
         .to_string();
         let r = parse_renames(&["cta:label=text".into()]).unwrap();
-        let plan = run(&pool, &UploadsConfig::default(), &renamed, &r, None)
-            .await
-            .unwrap();
+        let plan = run(&pool, &limits(), &renamed, &r, None).await.unwrap();
         assert!(
             plan.contains("in pages: rename layout.cta.label to layout.cta.text"),
             "{plan}"
@@ -867,15 +799,9 @@ mod tests {
             {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "nope"}]}
         ]}]})
         .to_string();
-        let err = run(
-            &pool,
-            &UploadsConfig::default(),
-            &missing,
-            &BTreeMap::new(),
-            None,
-        )
-        .await
-        .unwrap_err();
+        let err = run(&pool, &limits(), &missing, &BTreeMap::new(), None)
+            .await
+            .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "posts: field `layout`: blockRef `nope` doesn't match a shared block"
@@ -891,7 +817,7 @@ mod tests {
         ]}]});
         run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &first.to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -908,15 +834,9 @@ mod tests {
             ]}]}
         ]})
         .to_string();
-        let out = run(
-            &pool,
-            &UploadsConfig::default(),
-            &second,
-            &BTreeMap::new(),
-            Some(false),
-        )
-        .await
-        .unwrap();
+        let out = run(&pool, &limits(), &second, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
         assert!(out.contains("~ change cta: remove note"), "{out}");
         let pages = collections::get_by_slug(&pool, "pages").await.unwrap();
         assert_eq!(
@@ -933,15 +853,9 @@ mod tests {
         ]})
         .to_string();
         assert!(
-            run(
-                &pool,
-                &UploadsConfig::default(),
-                &broken,
-                &BTreeMap::new(),
-                Some(true)
-            )
-            .await
-            .is_err()
+            run(&pool, &limits(), &broken, &BTreeMap::new(), Some(true))
+                .await
+                .is_err()
         );
         let cta_now = collections::get_by_slug(&pool, "cta").await.unwrap();
         assert_eq!(cta_now.schema.fields.len(), 1);
@@ -967,7 +881,7 @@ mod tests {
             let file = json!({"collections": [{"slug": "images", "upload": upload, "fields": []}]});
             let err = run(
                 &pool,
-                &UploadsConfig::default(),
+                &limits(),
                 &file.to_string(),
                 &BTreeMap::new(),
                 Some(true),
@@ -986,7 +900,7 @@ mod tests {
         let ok = json!({"collections": [{"slug": "images", "upload": {"staticDir": "media"}, "fields": []}]});
         run(
             &pool,
-            &UploadsConfig::default(),
+            &limits(),
             &ok.to_string(),
             &BTreeMap::new(),
             Some(true),

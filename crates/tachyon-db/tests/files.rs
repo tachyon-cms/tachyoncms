@@ -841,7 +841,7 @@ async fn failed_cleanups_outlive_the_job_purge(pool: PgPool) {
         .await
         .unwrap();
     let mut conn = pool.acquire().await.unwrap();
-    let mut add = async |kind: &str, payload: Value| {
+    let mut add = async |kind: &str, payload: Value, ran_out: bool| {
         let id = tachyon_db::jobs::add(
             &mut conn,
             &tachyon_db::jobs::NewJob {
@@ -860,22 +860,32 @@ async fn failed_cleanups_outlive_the_job_purge(pool: PgPool) {
         .unwrap();
         // Failed for good, longer ago than jobs are kept.
         sqlx::query(
-            "UPDATE jobs SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = $1",
+            "UPDATE jobs SET state = 'failed', finished_at = now() - interval '31 days',
+                    attempts = CASE WHEN $2 THEN max_attempts ELSE 1 END WHERE id = $1",
         )
         .bind(id)
+        .bind(ran_out)
         .execute(&pool)
         .await
         .unwrap();
         id
     };
-    let for_gone = add(CLEANUP, json!({ "file": gone.id })).await;
+    let for_gone = add(CLEANUP, json!({ "file": gone.id }), false).await;
     let for_keys = add(
         CLEANUP,
         json!({"keys": ["a/b/c.png"], "storage": "default"}),
+        true,
     )
     .await;
-    let for_live = add(CLEANUP, json!({ "file": live.id })).await;
-    let other = add("publish", json!({})).await;
+    // Refused for its payload, on its first run: it would never be done.
+    let refused = add(
+        CLEANUP,
+        json!({"keys": "a/b/c.png", "storage": "default"}),
+        false,
+    )
+    .await;
+    let for_live = add(CLEANUP, json!({ "file": live.id }), true).await;
+    let other = add("publish", json!({}), true).await;
     drop(conn);
     tachyon_db::jobs::claim(&pool, std::time::Duration::from_secs(60))
         .await
@@ -890,5 +900,5 @@ async fn failed_cleanups_outlive_the_job_purge(pool: PgPool) {
         [for_gone, for_keys],
         "kept while their objects may be in storage"
     );
-    assert!(!left.contains(&for_live) && !left.contains(&other));
+    assert!(!left.contains(&for_live) && !left.contains(&other) && !left.contains(&refused));
 }

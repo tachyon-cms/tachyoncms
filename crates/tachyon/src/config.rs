@@ -8,7 +8,7 @@ use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
 use tachyon_api::auth::AuthConfig;
-use tachyon_api::{JobsConfig, UploadsConfig};
+use tachyon_api::{JobsConfig, UploadLimits, UploadsConfig};
 use tachyon_db::files::PENDING_GRACE;
 use tachyon_media::storage::{Adapter, SignedDownloads, StorageConfig, Storages, credential_var};
 
@@ -469,6 +469,40 @@ impl Config {
         })
     }
 
+    /// Each `[storage.<name>]` as the storage reads it, checked but not opened.
+    fn storage_configs(&self) -> Result<BTreeMap<String, StorageConfig>, String> {
+        let mut configs = BTreeMap::new();
+        for (name, s) in &self.storage {
+            // Environment variables are named from it, upper-cased and split on `__`.
+            let plain = name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !plain || name.contains("__") || name.starts_with('_') || name.ends_with('_') {
+                return Err(format!(
+                    "storage.{name}: a storage name is lowercase letters and digits, with single _ between them"
+                ));
+            }
+            configs.insert(name.clone(), s.to_config(name)?);
+        }
+        Ok(configs)
+    }
+
+    /// What a schema's `upload` is checked against, for `tachyon schema`: the storages'
+    /// names and kinds and the pixel cap. Nothing is created or written, and no credential
+    /// is needed, so it works on a machine that only reaches the database.
+    pub fn upload_limits(&self) -> Result<UploadLimits, String> {
+        let mut storages: BTreeMap<String, bool> = self
+            .storage_configs()?
+            .into_iter()
+            .map(|(name, c)| (name, matches!(c.adapter, Adapter::Local { .. })))
+            .collect();
+        storages.entry("default".into()).or_insert(true);
+        Ok(UploadLimits {
+            storages,
+            max_pixels: self.uploads.max_pixels,
+        })
+    }
+
     /// Upload limits and the storages they go to, each storage opened (a local root is
     /// created). Refuses, naming the key, a size or duration it can't read, `max_pixels`
     /// of 0, a `temp_dir` it can't write to and a credential in the file.
@@ -484,19 +518,7 @@ impl Config {
             return Err("uploads.max_pixels is 0; it has to be at least 1".into());
         }
         check_writable(&u.temp_dir)?;
-        let mut configs = BTreeMap::new();
-        for (name, s) in &self.storage {
-            // Environment variables are named from it, upper-cased and split on `__`.
-            let plain = name
-                .bytes()
-                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
-            if !plain || name.contains("__") || name.starts_with('_') || name.ends_with('_') {
-                return Err(format!(
-                    "storage.{name}: a storage name is lowercase letters and digits, with single _ between them"
-                ));
-            }
-            configs.insert(name.clone(), s.to_config(name)?);
-        }
+        let configs = self.storage_configs()?;
         let timeout = duration("uploads.timeout", &u.timeout)?;
         // A reserved upload not taken within the grace is cleaned up, so a request still
         // streaming by then would lose its file and leave the object behind.
@@ -1030,6 +1052,44 @@ mod tests {
                     .any(|c| format!("{config:?}").contains(c)),
                 "credentials aren't settings"
             );
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn schema_checks_need_only_the_settings() {
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            // An unwritable spool, a local root that doesn't exist and an R2 bucket with no
+            // keys in the environment: serving would refuse all three.
+            jail.create_file(
+                "tachyon.toml",
+                "[uploads]\ntemp_dir = \"/dev/null/tachyon\"\nmax_pixels = 1000\n[storage.disk]\nadapter = \"local\"\nroot = \"never-made\"\n[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\nendpoint = \"https://acct.r2.cloudflarestorage.com\"\n",
+            )?;
+            let config = Config::load(None)?;
+            let limits = config.upload_limits().unwrap();
+            assert_eq!(
+                limits.storages,
+                std::collections::BTreeMap::from([
+                    ("default".to_owned(), true),
+                    ("disk".to_owned(), true),
+                    ("r2".to_owned(), false),
+                ])
+            );
+            assert_eq!(limits.max_pixels, 1000);
+            for made in ["never-made", "uploads"] {
+                assert!(
+                    !jail.directory().join(made).exists(),
+                    "{made} isn't created"
+                );
+            }
+            assert!(config.uploads_config().is_err(), "serving would refuse it");
+            // A setting that's wrong whatever runs is still refused.
+            jail.create_file(
+                "tachyon.toml",
+                "[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\naccess_key_id = \"x\"\n",
+            )?;
+            assert!(Config::load(None)?.upload_limits().is_err());
             Ok(())
         });
     }

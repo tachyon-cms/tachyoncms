@@ -756,6 +756,13 @@ async fn the_sweep_requeues_only_what_still_waits(pool: PgPool) {
     )
     .await;
     fail_for_good(&pool, keys).await;
+    // Refused for its payload: reviving it would only see it refused again.
+    let refused = queue_cleanup(
+        &pool,
+        json!({"keys": "images/x/s.png", "storage": "default"}),
+        None,
+    )
+    .await;
     let keys_old = queue_cleanup(
         &pool,
         json!({"keys": ["images/x/s.png"], "storage": "old"}),
@@ -765,6 +772,18 @@ async fn the_sweep_requeues_only_what_still_waits(pool: PgPool) {
     fail_for_good(&pool, keys_old).await;
 
     let _app = serve(&pool, storage).await;
+    until("the refused cleanup failed", async || {
+        job_state(&pool, refused).await == ("failed".into(), 1)
+    })
+    .await;
+    let finished = async || -> Option<OffsetDateTime> {
+        sqlx::query_scalar("SELECT finished_at FROM jobs WHERE id = $1")
+            .bind(refused)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let refused_at = finished().await;
     sweep_now(&pool).await;
     for (what, job) in [
         ("the expired reservation's", p_job),
@@ -789,6 +808,12 @@ async fn the_sweep_requeues_only_what_still_waits(pool: PgPool) {
             "{what} stays failed, never run again"
         );
     }
+    assert_eq!(
+        job_state(&pool, refused).await,
+        ("failed".into(), 1),
+        "a refused payload isn't revived"
+    );
+    assert_eq!(finished().await, refused_at, "nor run again");
     assert_ne!(job_state(&pool, c_queued).await.0, "failed");
     assert_eq!(files::get(&pool, d.id).await.unwrap().state, "gone");
 }

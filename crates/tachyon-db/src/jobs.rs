@@ -165,12 +165,16 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
                WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')
                  AND finished_at < now() - make_interval(days => $2)
                  -- A failed cleanup is the only record of objects left in storage, so it's
-                 -- kept until the sweep gets it done, unless its file is live again.
+                 -- kept until the sweep gets it done: a file's while the file isn't live
+                 -- again, stale sizes' while it ran out of attempts (a refused payload never
+                 -- will be done).
                  AND NOT (kind = 'file_cleanup' AND state = 'failed'
-                          AND (NOT payload ? 'file'
-                               OR EXISTS (SELECT 1 FROM files f
-                                          WHERE f.id::text = jobs.payload->>'file'
-                                            AND f.state <> 'live')))
+                          AND CASE WHEN payload ? 'file' THEN EXISTS (
+                                       SELECT 1 FROM files f
+                                       WHERE f.id = CASE WHEN payload->>'file' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                                                         THEN (payload->>'file')::uuid END
+                                         AND f.state <> 'live')
+                                   ELSE attempts >= max_attempts END)
                LIMIT 100
                FOR UPDATE SKIP LOCKED)"#,
         DEFAULT_TENANT,
@@ -253,7 +257,8 @@ pub async fn complete_with(
 }
 
 /// Records that `job`'s run failed with `error`. With `retry`, and attempts left, it's
-/// queued again after 10 s × attempts²; otherwise it fails for good. Does nothing when this
+/// queued again after 10 s × attempts², an hour at most, so a job that never runs out of
+/// attempts still tries hourly after a long outage; otherwise it fails for good. Does nothing when this
 /// run no longer holds the job.
 pub async fn fail(pool: &PgPool, job: &Job, error: &str, retry: bool) -> Result<(), DbError> {
     fail_with(pool, job, error, retry, None).await
@@ -271,7 +276,7 @@ pub async fn fail_with(
         r#"UPDATE jobs SET
                state = CASE WHEN $4 AND attempts < max_attempts THEN 'queued' ELSE 'failed' END,
                run_at = CASE WHEN $4 AND attempts < max_attempts
-                             THEN now() + make_interval(secs => 10 * attempts * attempts)
+                             THEN now() + make_interval(secs => least(10 * attempts::bigint * attempts, 3600))
                              ELSE run_at END,
                finished_at = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE clock_timestamp() END,
                locked_until = NULL,

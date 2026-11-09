@@ -61,7 +61,8 @@ fn storage<'a>(state: &'a AppState, name: &str) -> Result<&'a Arc<Storage>, JobE
         .media
         .storages
         .get(name)
-        .ok_or_else(|| JobError::Permanent(format!("no storage named `{name}` is configured")))
+        // A retry: the storage may be configured again, and the sweep revives it then.
+        .ok_or_else(|| JobError::Retry(format!("no storage named `{name}` is configured")))
 }
 
 /// Deletes a file's objects, then its row (`{"file": id}`), or only the objects named
@@ -159,11 +160,21 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
         .map_err(retry)?;
     tx.commit().await.map_err(retry)?;
     let names: Vec<String> = state.media.storages.0.keys().cloned().collect();
-    let mut tx = state.pool.begin().await.map_err(retry)?;
-    let n = files::requeue_cleanups_in(&mut tx, &names)
-        .await
-        .map_err(retry)?;
-    tx.commit().await.map_err(retry)?;
+    // This run is done whatever happens now, and the next one is queued: a failure is only
+    // logged, and the next run tries again.
+    let requeued = async {
+        let mut tx = state.pool.begin().await?;
+        let n = files::requeue_cleanups_in(&mut tx, &names).await?;
+        tx.commit().await?;
+        Ok::<_, DbError>(n)
+    };
+    let n = match requeued.await {
+        Ok(n) => n,
+        Err(error) => {
+            tracing::error!(%error, "couldn't queue failed file cleanups again; the next sweep tries in an hour");
+            return Ok(());
+        }
+    };
     if n > 0 {
         tracing::info!(cleanups = n, "queued failed file cleanups again");
     }

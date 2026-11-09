@@ -17,6 +17,7 @@ mod schemas;
 mod trash;
 mod versions;
 
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -61,6 +62,28 @@ pub struct UploadsConfig {
     /// How long an upload request may take.
     pub timeout: Duration,
     pub storages: Arc<Storages>,
+}
+
+/// What `check_upload` reads from the server's config: each storage by name, with whether
+/// it's local, and the pixel cap. Built without opening anything, for `tachyon schema`.
+#[derive(Debug, Clone)]
+pub struct UploadLimits {
+    pub storages: BTreeMap<String, bool>,
+    pub max_pixels: u64,
+}
+
+impl UploadsConfig {
+    pub fn limits(&self) -> UploadLimits {
+        UploadLimits {
+            storages: self
+                .storages
+                .0
+                .iter()
+                .map(|(name, s)| (name.clone(), s.is_local()))
+                .collect(),
+            max_pixels: self.max_pixels,
+        }
+    }
 }
 
 impl Default for UploadsConfig {
