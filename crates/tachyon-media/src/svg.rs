@@ -78,11 +78,17 @@ pub fn sanitize(input: &[u8]) -> Result<Sanitised, SvgError> {
                 if open.is_empty() {
                     out.push_str(&format!(" xmlns=\"{SVG_NS}\" xmlns:xlink=\"{XLINK_NS}\""));
                 }
+                // Two prefixes bound to one namespace write the same name: the first stays.
+                let mut written: Vec<&'static str> = Vec::new();
                 for a in e.attributes() {
                     let a = a.map_err(|e| SvgError::Malformed(e.to_string()))?;
                     let Some((key, value)) = kept(&reader, &a) else {
                         continue;
                     };
+                    if written.contains(&key) {
+                        continue;
+                    }
+                    written.push(key);
                     if open.is_empty() {
                         match key {
                             "width" => width = plain_number(&value),
@@ -90,7 +96,13 @@ pub fn sanitize(input: &[u8]) -> Result<Sanitised, SvgError> {
                             _ => {}
                         }
                     }
-                    out.push_str(&format!(" {key}=\"{}\"", escape(&value)));
+                    // Written as references, these come back as themselves rather than as
+                    // the spaces a parser makes of them.
+                    let value = escape(&value)
+                        .replace('\n', "&#10;")
+                        .replace('\t', "&#9;")
+                        .replace('\r', "&#13;");
+                    out.push_str(&format!(" {key}=\"{value}\""));
                 }
                 if empty {
                     out.push_str("/>");
@@ -407,9 +419,13 @@ fn stays_local(v: &str) -> bool {
     }
     lower.match_indices('(').all(|(i, _)| {
         let before = lower[..i].trim_end();
+        // Just past the last character that can't be in a name, which may be wider than
+        // one byte.
         let start = before
-            .rfind(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .map_or(0, |s| s + 1);
+            .char_indices()
+            .rev()
+            .find(|&(_, c)| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+            .map_or(0, |(s, c)| s + c.len_utf8());
         let name = &before[start..];
         if name == "url" {
             let inner = lower[i + 1..]
@@ -523,6 +539,39 @@ mod tests {
         );
         assert!(out.contains("style="), "{out}");
         assert!(out.contains("transform="), "{out}");
+    }
+
+    #[test]
+    fn non_ascii_before_a_bracket_doesnt_panic() {
+        for value in [
+            "éurl(//x)",
+            "font-family:é(x)",
+            "ＵＲＬ(//x)",
+            "a\u{301}url(//x)",
+        ] {
+            let out = clean(&format!(
+                r#"<svg xmlns="http://www.w3.org/2000/svg"><rect fill="{value}"/></svg>"#
+            ));
+            assert!(out.contains("<rect/>"), "{value}: {out}");
+        }
+    }
+
+    #[test]
+    fn aliased_prefixes_dont_repeat_an_attribute() {
+        let out = clean(
+            r##"<svg xmlns="http://www.w3.org/2000/svg" xmlns:a="http://www.w3.org/1999/xlink" xmlns:b="http://www.w3.org/1999/xlink"><use a:href="#x" b:href="#y"/></svg>"##,
+        );
+        assert!(out.contains(r##"<use xlink:href="#x"/>"##), "{out}");
+        assert_eq!(clean(&out), out);
+    }
+
+    #[test]
+    fn whitespace_references_survive_a_second_pass() {
+        let out = clean(
+            r#"<svg xmlns="http://www.w3.org/2000/svg"><rect id="a&#10;b&#9;c&#13;d"/></svg>"#,
+        );
+        assert!(out.contains(r#"id="a&#10;b&#9;c&#13;d""#), "{out}");
+        assert_eq!(clean(&out), out);
     }
 
     #[test]

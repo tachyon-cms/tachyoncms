@@ -83,6 +83,7 @@ const ATTRIBUTES: &[&str] = &[
     "xmlns:x",
     "xmlns:XLINK",
     "xml:space",
+    "l:href",
     "attributeName",
     "to",
     "begin",
@@ -131,6 +132,14 @@ const VALUES: &[&str] = &[
     "onload",
     "",
     "\"",
+    "é(x)",
+    "éurl(//x)",
+    "font-family:é(x)",
+    "ＵＲＬ(//x)",
+    "a\u{301}url(//x)",
+    "a&#10;b",
+    "a&#9;b",
+    "a&#13;b",
 ];
 
 const TEXTS: &[&str] = &[
@@ -206,7 +215,7 @@ fn document(rng: &mut Rng) -> String {
         0 => {}
         1 => out.push_str(" xmlns=\"http://www.w3.org/2000/svg\""),
         _ => out.push_str(
-            " xmlns=\"http://www.w3.org/2000/svg\" xmlns:svg=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xmlns:x=\"http://www.w3.org/1999/xhtml\"",
+            " xmlns=\"http://www.w3.org/2000/svg\" xmlns:svg=\"http://www.w3.org/2000/svg\" xmlns:xlink=\"http://www.w3.org/1999/xlink\" xmlns:l=\"http://www.w3.org/1999/xlink\" xmlns:x=\"http://www.w3.org/1999/xhtml\"",
         ),
     }
     attrs(rng, &mut out);
@@ -237,9 +246,20 @@ fn fetches(v: &str) -> bool {
     squashed.match_indices("url(").any(|(i, _)| {
         let rest = squashed[i + 4..].trim_start_matches(['"', '\'']);
         !rest.starts_with('#')
-    }) || ["image-set(", "src(", "expression(", "image("]
-        .iter()
-        .any(|f| squashed.contains(f))
+    }) || [
+        "image-set(",
+        "src(",
+        "expression(",
+        "image(",
+        "var(",
+        "attr(",
+        "element(",
+        "cross-fade(",
+        "paint(",
+        "@import",
+    ]
+    .iter()
+    .any(|f| squashed.contains(f))
 }
 
 /// Parses `out` on its own and fails on anything that could run or fetch.

@@ -1023,9 +1023,10 @@ async fn decompression_bomb_is_refused_before_decoding(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(res.json["errors"][0]["path"], "file");
     let message = res.json["errors"][0]["message"].as_str().unwrap();
-    assert!(
-        message.contains("10000000000") && message.contains("50000000"),
-        "{message}"
+    // The headers' refusal, not a decoder's: only the probe words it this way.
+    assert_eq!(
+        message,
+        "this image is 10000000000 pixels, all its frames counted; the limit is 50000000"
     );
     assert_eq!(file_rows(&pool).await, 0);
     assert!(files_in(&d.temp).is_empty());
@@ -1264,4 +1265,66 @@ async fn decodes_queue_for_a_permit(pool: PgPool) {
     assert_eq!(tachyon_api::decodes_peak(), 2);
     assert!(most <= 8 + 2, "{most} files in the spool directory at once");
     assert!(files_in(&d.temp).is_empty());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_cancelled_upload_keeps_its_permit_until_the_work_ends(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"upload": {"resizeOptions": {"width": 100}, "formatOptions": {"format": "jpeg"}}}),
+    )
+    .await;
+    let big = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+        8000,
+        6000,
+        image::Luma([90]),
+    ));
+    let png = Arc::new(fixtures::encoded(&big, image::ImageFormat::Png));
+    drop(big);
+    let tasks: Vec<_> = (0..6)
+        .map(|i| {
+            let (app, png) = (app.clone(), png.clone());
+            tokio::spawn(async move {
+                upload(
+                    &app,
+                    "POST",
+                    "/api/images",
+                    Some(&png),
+                    &format!("{i}.png"),
+                    None,
+                )
+                .await
+            })
+        })
+        .collect();
+    // Every request is spooled and the first decodes are under way: then the clients go.
+    until("all six are spooled", async || files_in(&d.temp).len() >= 6).await;
+    tokio::time::sleep(Duration::from_millis(100)).await;
+    for t in &tasks {
+        t.abort();
+    }
+    for i in 0..2 {
+        let res = upload(
+            &app,
+            "POST",
+            "/api/images",
+            Some(&png),
+            &format!("late{i}.png"),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    until("the abandoned work has cleaned up", async || {
+        files_in(&d.temp).is_empty()
+    })
+    .await;
+    assert!(
+        tachyon_api::decodes_peak() <= 2,
+        "{}",
+        tachyon_api::decodes_peak()
+    );
 }

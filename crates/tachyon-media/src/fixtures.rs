@@ -157,3 +157,274 @@ pub fn cmyk_jpeg(w: u16, h: u16) -> Vec<u8> {
     out.extend_from_slice(&[0xFF, 0xD9]);
     out
 }
+
+/// A raw deflate stream of `n` zero bytes, written as fixed-Huffman copies of 258.
+fn deflate_zeros(n: usize) -> Vec<u8> {
+    struct Bits {
+        out: Vec<u8>,
+        acc: u64,
+        len: u32,
+    }
+    impl Bits {
+        fn put(&mut self, value: u32, bits: u32) {
+            self.acc |= u64::from(value) << self.len;
+            self.len += bits;
+            while self.len >= 8 {
+                self.out.push(self.acc as u8);
+                self.acc >>= 8;
+                self.len -= 8;
+            }
+        }
+        /// A Huffman code, which deflate stores most significant bit first.
+        fn code(&mut self, code: u32, bits: u32) {
+            let reversed = code.reverse_bits() >> (32 - bits);
+            self.put(reversed, bits);
+        }
+    }
+    let mut b = Bits {
+        out: Vec::new(),
+        acc: 0,
+        len: 0,
+    };
+    b.put(1, 1); // the last block
+    b.put(1, 2); // fixed Huffman codes
+    b.code(0x30, 8); // a literal 0
+    let mut left = n.saturating_sub(1);
+    while left >= 258 {
+        b.code(0b1100_0101, 8); // length 258
+        b.code(0, 5); // distance 1
+        left -= 258;
+    }
+    for _ in 0..left {
+        b.code(0x30, 8);
+    }
+    b.code(0, 7); // end of block
+    b.put(0, 7);
+    b.out
+}
+
+/// `data` as a zlib stream.
+fn zlib(n_zeros: usize) -> Vec<u8> {
+    let mut out = vec![0x78, 0x01];
+    out.extend_from_slice(&deflate_zeros(n_zeros));
+    let b = (n_zeros % 65521) as u32;
+    out.extend_from_slice(&((b << 16) | 1).to_be_bytes());
+    out
+}
+
+/// A 1×1 PNG whose ICC profile inflates to `inflated` zero bytes.
+pub fn iccp_bomb_png(inflated: usize) -> Vec<u8> {
+    let full = encoded(&rgba(1, 1), Codec::Png);
+    let mut png = img_parts::png::Png::from_bytes(full.into()).unwrap();
+    let mut body = b"bomb\0\0".to_vec();
+    body.extend_from_slice(&zlib(inflated));
+    png.chunks_mut()
+        .insert(1, img_parts::png::PngChunk::new(*b"iCCP", body.into()));
+    png.encoder().bytes().to_vec()
+}
+
+/// A `w`×`h` opaque RGBA image, the kind an icon holds.
+pub fn rgba(w: u32, h: u32) -> DynamicImage {
+    DynamicImage::ImageRgba8(RgbaImage::from_pixel(w, h, Rgba([1, 2, 3, 255])))
+}
+
+/// An ICO holding `png` as its one entry.
+pub fn ico_around(png: &[u8]) -> Vec<u8> {
+    let side = |at: usize| png[at + 3]; // IHDR's width and height, under 256 here
+    let mut out = vec![0, 0, 1, 0, 1, 0];
+    out.extend_from_slice(&[side(16), side(20), 0, 0, 1, 0, 32, 0]);
+    out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+    out.extend_from_slice(&22u32.to_le_bytes());
+    out.extend_from_slice(png);
+    out
+}
+
+/// The boxes directly inside `data`: (type, start of the box, start of its body, end).
+fn boxes(data: &[u8], from: usize, to: usize) -> Vec<([u8; 4], usize, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = from;
+    while i + 8 <= to {
+        let size = u32::from_be_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+        let kind: [u8; 4] = data[i + 4..i + 8].try_into().unwrap();
+        let end = if size == 0 { to } else { i + size };
+        out.push((kind, i, i + 8, end));
+        i = end;
+    }
+    out
+}
+
+/// Where the iloc of AVIF `data` puts its one item's single extent: the offset of the
+/// extent's (offset, length) fields, which are 4 bytes each, and the values.
+fn first_extent(data: &[u8]) -> (usize, usize, usize) {
+    let meta = boxes(data, 0, data.len())
+        .into_iter()
+        .find(|b| &b.0 == b"meta")
+        .unwrap();
+    let iloc = boxes(data, meta.2 + 4, meta.3)
+        .into_iter()
+        .find(|b| &b.0 == b"iloc")
+        .unwrap();
+    let body = iloc.2;
+    let version = data[body];
+    let sizes = data[body + 4];
+    let more = data[body + 5];
+    assert_eq!(
+        (sizes, more >> 4),
+        (0x44, 0),
+        "4-byte offsets and lengths, no base"
+    );
+    let mut i = body + 6;
+    i += if version < 2 { 2 } else { 4 }; // item count
+    i += if version < 2 { 2 } else { 4 }; // item ID
+    if version >= 1 {
+        i += 2;
+    }
+    i += 2; // data reference index
+    i += 2; // extent count
+    let at = |j: usize| u32::from_be_bytes(data[j..j + 4].try_into().unwrap()) as usize;
+    (i, at(i), at(i + 4))
+}
+
+/// The sequence header OBU at the front of an AV1 item.
+fn sequence_header(item: &[u8]) -> Vec<u8> {
+    let mut i = 0;
+    loop {
+        let header = item[i];
+        let mut j = i + 1 + usize::from(header & 4 != 0);
+        let (mut size, mut shift) = (0usize, 0);
+        loop {
+            let b = item[j];
+            j += 1;
+            size |= usize::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        if (header >> 3) & 0xF == 1 {
+            return item[i..j + size].to_vec();
+        }
+        i = j + size;
+    }
+}
+
+/// A `w`×`h` AVIF with the sequence header of a 1×1 one put in front of its own, so its
+/// first header claims far fewer pixels than it decodes to.
+pub fn avif_two_headers(w: u32, h: u32) -> Vec<u8> {
+    let small = encoded(&gradient(1, 1), Codec::Avif);
+    let (_, off, len) = first_extent(&small);
+    let lie = sequence_header(&small[off..off + len]);
+    let mut big = encoded(&gradient(w, h), Codec::Avif);
+    let (field, off, len) = first_extent(&big);
+    big[field + 4..field + 8].copy_from_slice(&((len + lie.len()) as u32).to_be_bytes());
+    let mdat = boxes(&big, 0, big.len())
+        .into_iter()
+        .find(|b| &b.0 == b"mdat")
+        .unwrap();
+    let size = (mdat.3 - mdat.1 + lie.len()) as u32;
+    big[mdat.1..mdat.1 + 4].copy_from_slice(&size.to_be_bytes());
+    big.splice(off..off, lie);
+    big
+}
+
+/// Grows the size field of the box starting at `at` by `by`.
+fn grow(data: &mut [u8], at: usize, by: usize) {
+    let size = u32::from_be_bytes(data[at..at + 4].try_into().unwrap()) as usize;
+    data[at..at + 4].copy_from_slice(&((size + by) as u32).to_be_bytes());
+}
+
+/// A `w`×`h` AVIF whose primary item carries an `irot` of `quarter_turns` anticlockwise.
+pub fn avif_rotated(w: u32, h: u32, quarter_turns: u8) -> Vec<u8> {
+    let mut data = encoded(&gradient(w, h), Codec::Avif);
+    let meta = boxes(&data, 0, data.len())
+        .into_iter()
+        .find(|b| &b.0 == b"meta")
+        .unwrap();
+    let inner = boxes(&data, meta.2 + 4, meta.3);
+    let iprp = inner.iter().find(|b| &b.0 == b"iprp").unwrap();
+    let props = boxes(&data, iprp.2, iprp.3);
+    let ipco = props.iter().find(|b| &b.0 == b"ipco").unwrap();
+    let ipma = props.iter().find(|b| &b.0 == b"ipma").unwrap();
+    let count = boxes(&data, ipco.2, ipco.3).len();
+    assert_eq!(data[ipma.2 + 3] & 1, 0, "one-byte property indices");
+    assert!(data[ipma.2] == 0, "two-byte item IDs");
+    // The first entry is the primary item: its association count, then its indices.
+    let entries = u32::from_be_bytes(data[ipma.2 + 4..ipma.2 + 8].try_into().unwrap());
+    assert!(entries >= 1);
+    let n_at = ipma.2 + 8 + 2;
+    let n = usize::from(data[n_at]);
+    let (ipco_end, ipma_insert) = (ipco.3, n_at + 1 + n);
+    let (meta_at, iprp_at, ipco_at, ipma_at) = (meta.1, iprp.1, ipco.1, ipma.1);
+    // irot after the existing properties, and its index after the item's others.
+    let irot = [0, 0, 0, 9, b'i', b'r', b'o', b't', quarter_turns & 3];
+    data.insert(ipma_insert, 0x80 | (count as u8 + 1));
+    data[n_at] += 1;
+    grow(&mut data, ipma_at, 1);
+    data.splice(ipco_end..ipco_end, irot);
+    grow(&mut data, ipco_at, 9);
+    grow(&mut data, iprp_at, 10);
+    grow(&mut data, meta_at, 10);
+    // The picture moved 10 bytes on: so do its extents.
+    let (field, off, _) = first_extent(&data);
+    data[field..field + 4].copy_from_slice(&((off + 10) as u32).to_be_bytes());
+    data
+}
+
+/// A `w`×`h` AVIF carrying `exif` as an EXIF item.
+pub fn avif_with_exif(w: u32, h: u32, exif: Vec<u8>) -> Vec<u8> {
+    use ::image::ImageEncoder;
+    let mut out = Vec::new();
+    let mut e = ::image::codecs::avif::AvifEncoder::new(&mut out);
+    e.set_exif_metadata(exif).unwrap();
+    gradient(w, h).write_with_encoder(e).unwrap();
+    out
+}
+
+/// An uncompressed 2×2 grey TIFF with an ImageDescription of `description`.
+pub fn tiff_with_description(description: &str) -> Vec<u8> {
+    let mut text = description.as_bytes().to_vec();
+    text.push(0);
+    let entries: [(u16, u16, u32, u32); 9] = [
+        (256, 3, 1, 2),                 // width
+        (257, 3, 1, 2),                 // height
+        (258, 3, 1, 8),                 // bits a sample
+        (259, 3, 1, 1),                 // no compression
+        (262, 3, 1, 1),                 // black is zero
+        (270, 2, text.len() as u32, 0), // the description, placed below
+        (273, 4, 1, 0),                 // strip offset, placed below
+        (278, 3, 1, 2),                 // rows a strip
+        (279, 4, 1, 4),                 // strip bytes
+    ];
+    let ifd_len = 2 + 12 * entries.len() + 4;
+    let text_at = 8 + ifd_len;
+    let pixels_at = text_at + text.len();
+    let mut out = b"II*\0\x08\0\0\0".to_vec();
+    out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+    for (tag, kind, count, value) in entries {
+        let value = match tag {
+            270 => text_at as u32,
+            273 => pixels_at as u32,
+            _ => value,
+        };
+        out.extend_from_slice(&tag.to_le_bytes());
+        out.extend_from_slice(&kind.to_le_bytes());
+        out.extend_from_slice(&count.to_le_bytes());
+        out.extend_from_slice(&value.to_le_bytes());
+    }
+    out.extend_from_slice(&[0; 4]);
+    out.extend_from_slice(&text);
+    out.extend_from_slice(&[10, 80, 160, 240]);
+    out
+}
+
+/// A `w`×`h` PNG with an ICC profile of `icc_len` zero bytes and EXIF orientation 6.
+pub fn png_icc_turned(w: u32, h: u32, icc_len: usize) -> Vec<u8> {
+    let full = encoded(&gradient(w, h), Codec::Png);
+    let mut png = img_parts::png::Png::from_bytes(full.into()).unwrap();
+    let mut body = b"Display P3\0\0".to_vec();
+    body.extend_from_slice(&zlib(icc_len));
+    png.chunks_mut()
+        .insert(1, img_parts::png::PngChunk::new(*b"iCCP", body.into()));
+    png.set_exif(Some(exif(Some(6), false).into()));
+    png.encoder().bytes().to_vec()
+}

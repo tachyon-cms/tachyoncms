@@ -332,7 +332,7 @@ pub(crate) fn file_limit(state: &AppState, c: &Collection) -> Option<u64> {
 /// Images decoding at once, each holding up to `[uploads] max_pixels` in memory.
 /// shortcut: fixed count; make it an [uploads] key when a big server needs more
 pub(crate) static DECODES: Semaphore = Semaphore::const_new(2);
-/// Decodes holding a permit now, and the most there have been.
+/// Decodes running now, and the most there have been.
 static BUSY: AtomicUsize = AtomicUsize::new(0);
 static PEAK: AtomicUsize = AtomicUsize::new(0);
 
@@ -342,12 +342,17 @@ pub fn decodes_peak() -> usize {
     PEAK.load(Ordering::Relaxed)
 }
 
-/// A `DECODES` permit, counted while it's held.
+/// A `DECODES` permit, counted while the blocking work holding it runs. It's moved into
+/// that work, so a request dropped meanwhile can't give it back early.
 struct Decoding(#[allow(dead_code)] SemaphorePermit<'static>);
 
 impl Decoding {
-    async fn start() -> Self {
-        let permit = DECODES.acquire().await.expect("DECODES is never closed");
+    async fn permit() -> SemaphorePermit<'static> {
+        DECODES.acquire().await.expect("DECODES is never closed")
+    }
+
+    /// Called first thing in the blocking work.
+    fn running(permit: SemaphorePermit<'static>) -> Self {
         let now = BUSY.fetch_add(1, Ordering::Relaxed) + 1;
         PEAK.fetch_max(now, Ordering::Relaxed);
         Self(permit)
@@ -409,20 +414,28 @@ pub(crate) async fn check_and_process(
     }
     let path = spool.file.path().to_path_buf();
     let (mut mime, mut width, mut height, mut blurhash) = (mime, None, None, None);
+    // The spool moves into the blocking work and comes back with its result: should the
+    // request be dropped meanwhile, the work still owns it and deletes it when done, so
+    // nothing it writes outlives it.
     if mime == "image/svg+xml" {
-        let at = path.clone();
-        let clean = blocking(move || -> Result<svg::Sanitised, ApiError> {
-            let bytes = std::fs::read(&at)
-                .map_err(|e| ApiError::Internal(format!("can't read a spooled upload: {e}")))?;
-            let clean = svg::sanitize(&bytes).map_err(|e| match e {
-                SvgError::NotSvg => ApiError::UnsupportedMediaType(e.to_string()),
-                SvgError::Malformed(_) => at_file(e.to_string()),
-            })?;
-            std::fs::write(&at, &clean.bytes)
-                .map_err(|e| ApiError::Internal(format!("can't write a spooled upload: {e}")))?;
-            Ok(clean)
+        let (back, clean) = blocking(move || {
+            let clean = (|| {
+                let bytes = std::fs::read(&path)
+                    .map_err(|e| ApiError::Internal(format!("can't read a spooled upload: {e}")))?;
+                let clean = svg::sanitize(&bytes).map_err(|e| match e {
+                    SvgError::NotSvg => ApiError::UnsupportedMediaType(e.to_string()),
+                    SvgError::Malformed(_) => at_file(e.to_string()),
+                })?;
+                std::fs::write(&path, &clean.bytes).map_err(|e| {
+                    ApiError::Internal(format!("can't write a spooled upload: {e}"))
+                })?;
+                Ok::<_, ApiError>(clean)
+            })();
+            (spool, clean)
         })
-        .await??;
+        .await?;
+        spool = back;
+        let clean = clean?;
         spool.len = clean.bytes.len() as u64;
         (width, height) = (clean.width, clean.height);
     } else if picture::decodes(mime) {
@@ -432,23 +445,28 @@ pub(crate) async fn check_and_process(
             .map_err(image_refused)?;
         let max_pixels = state.media.max_pixels;
         picture::check_cap(&probe, picture::cap(u, max_pixels)).map_err(image_refused)?;
-        let decoding = Decoding::start().await;
+        let permit = Decoding::permit().await;
         let (u, out_dir) = (u.clone(), state.media.temp_dir.clone());
-        let done = blocking(move || -> Result<picture::Processed, ImageError> {
-            let done = picture::process_original(&path, &probe, &u, max_pixels, &out_dir)?;
-            // Over the spool, so a request never holds more than its spool once the permit
-            // is given back.
-            if done.path != path {
-                std::fs::rename(&done.path, &path).map_err(|e| {
-                    let _ = std::fs::remove_file(&done.path);
-                    ImageError::Internal(format!("can't replace a spooled upload: {e}"))
-                })?;
-            }
-            Ok(done)
+        let (back, done) = blocking(move || {
+            let _decoding = Decoding::running(permit);
+            let done = picture::process_original(&path, &probe, &u, max_pixels, &out_dir).and_then(
+                |done| {
+                    // Over the spool, so a request never holds more than its spool once
+                    // the permit is given back.
+                    if done.path != path {
+                        std::fs::rename(&done.path, &path).map_err(|e| {
+                            let _ = std::fs::remove_file(&done.path);
+                            ImageError::Internal(format!("can't replace a spooled upload: {e}"))
+                        })?;
+                    }
+                    Ok(done)
+                },
+            );
+            (spool, done)
         })
-        .await?
-        .map_err(image_refused)?;
-        drop(decoding);
+        .await?;
+        spool = back;
+        let done = done.map_err(image_refused)?;
         if done.mime != mime {
             spool.name = with_extension(&spool.name, done.mime);
         }
