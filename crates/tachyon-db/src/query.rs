@@ -125,6 +125,15 @@ fn push_distance(qb: &mut QueryBuilder<Postgres>, base: &str, path: &[String], l
 /// draft never NULL), so a collection without drafts may have a field of that name.
 const PUBLISHED_AT: &str = "CASE WHEN draft IS NOT NULL THEN published_at END AS published_at";
 
+/// `updated_at` as `copy` shows it: a published read gets when the published copy last
+/// changed, so a draft-only save doesn't show through.
+fn updated_at(copy: DocCopy) -> &'static str {
+    match copy {
+        DocCopy::Published => "published_updated_at AS updated_at",
+        DocCopy::Draft => "updated_at",
+    }
+}
+
 /// What a condition reads from: the document's own JSON (the copy read) and columns at the
 /// top, a linked document's (`t1.published`, `t1.id`) or a list row's (`r1.v`) further in.
 /// `depth` keeps each nested alias distinct.
@@ -203,6 +212,10 @@ fn expr_in(target: &Target, base: &Base) -> String {
     match target {
         Target::Id => format!("{columns}id"),
         Target::CreatedAt => format!("{columns}created_at"),
+        // A published copy's own time (see `updated_at`); a source row has it already.
+        Target::UpdatedAt if base.json.ends_with(DocCopy::Published.as_str()) => {
+            format!("{columns}published_updated_at")
+        }
         Target::UpdatedAt => format!("{columns}updated_at"),
         Target::Field { path, kind } => field_expr_on(&base.json, path, *kind),
         Target::Via { .. } | Target::Row { .. } => {
@@ -694,8 +707,9 @@ async fn list_from(
         trashed,
     };
     let mut qb = QueryBuilder::<Postgres>::new(format!(
-        "SELECT id, status, created_at, updated_at, {PUBLISHED_AT}, deleted_at, {} AS data \
+        "SELECT id, status, created_at, {}, {PUBLISHED_AT}, deleted_at, {} AS data \
          FROM documents",
+        updated_at(q.copy),
         q.copy.as_str()
     ));
     push_where(&mut qb, &scope);
@@ -796,9 +810,9 @@ fn push_source(qb: &mut QueryBuilder<Postgres>, collection_id: Uuid, read: &Read
         if i > 0 {
             qb.push(" UNION ALL ");
         }
-        let copy = way.copy.as_str();
+        let (copy, updated) = (way.copy.as_str(), updated_at(way.copy));
         qb.push(format!(
-            "SELECT id, status, created_at, updated_at, published_at, draft, \
+            "SELECT id, status, created_at, {updated}, published_at, draft, \
              {copy} AS data, '{copy}'::text AS copy FROM documents WHERE tenant_id = "
         ))
         .push_bind(DEFAULT_TENANT)
@@ -930,8 +944,9 @@ pub async fn get_many_readable(
             qb.push(" UNION ALL ");
         }
         qb.push(format!(
-            "SELECT id, collection_id, status, created_at, updated_at, {PUBLISHED_AT}, \
+            "SELECT id, collection_id, status, created_at, {}, {PUBLISHED_AT}, \
              {} AS data FROM documents WHERE tenant_id = ",
+            updated_at(copy),
             copy.as_str()
         ))
         .push_bind(DEFAULT_TENANT)

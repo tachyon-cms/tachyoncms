@@ -835,3 +835,73 @@ async fn refusals_come_before_bad_parameters(pool: PgPool) {
         assert_problem(&send_with(&anon, req, body.as_deref()).await, 403);
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_draft_save_never_moves_the_published_updated_at(pool: PgPool) {
+    let admin = blog(&pool).await;
+    collection(
+        &admin,
+        json!({"slug": "pages", "fields": [
+            {"name": "post", "type": "relationship", "relationTo": "posts"}]}),
+    )
+    .await;
+    let viewer = app_as(&pool, "viewer@example.com", "viewer").await;
+    let post = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "One"}))).await);
+    ok(&admin, "POST", &format!("/api/posts/{post}/publish"), None).await;
+    let page = id_of(&ok(&admin, "POST", "/api/pages", Some(json!({"post": post}))).await);
+    let at = ok(&viewer, "GET", &format!("/api/posts/{post}"), None).await["updatedAt"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ok(
+        &admin,
+        "PATCH",
+        &format!("/api/posts/{post}"),
+        Some(json!({"title": "Two"})),
+    )
+    .await;
+    let shown = |v: &Value| v["updatedAt"].as_str().unwrap().to_owned();
+    let read = ok(&viewer, "GET", &format!("/api/posts/{post}"), None).await;
+    assert_eq!(shown(&read), at, "a published read: {read}");
+    let listed = ok(&viewer, "GET", "/api/posts", None).await;
+    assert_eq!(shown(&listed["docs"][0]), at, "a list: {listed}");
+    let linked = ok(&viewer, "GET", &format!("/api/pages/{page}?depth=1"), None).await;
+    assert_eq!(shown(&linked["post"]), at, "a populated link: {linked}");
+    let draft = ok(
+        &admin,
+        "GET",
+        &format!("/api/posts/{post}?draft=true"),
+        None,
+    )
+    .await;
+    assert!(shown(&draft) > at, "the draft shows its own save: {draft}");
+    let saved = shown(&draft);
+    let since = ok(
+        &viewer,
+        "GET",
+        &format!("/api/posts?where[updatedAt][gte]={saved}&sort=-updatedAt"),
+        None,
+    )
+    .await;
+    assert_eq!(since["docs"], json!([]), "a filter on it: {since}");
+
+    ok(&admin, "POST", &format!("/api/posts/{post}/publish"), None).await;
+    let read = ok(&viewer, "GET", &format!("/api/posts/{post}"), None).await;
+    assert!(shown(&read) > at, "publishing moves it: {read}");
+
+    // Without drafts, every save is a published one.
+    let note = id_of(&ok(&admin, "POST", "/api/notes", Some(json!({"title": "A"}))).await);
+    let before = shown(&ok(&viewer, "GET", &format!("/api/notes/{note}"), None).await);
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    ok(
+        &admin,
+        "PATCH",
+        &format!("/api/notes/{note}"),
+        Some(json!({"title": "B"})),
+    )
+    .await;
+    let after = shown(&ok(&viewer, "GET", &format!("/api/notes/{note}"), None).await);
+    assert!(after > before, "{before} then {after}");
+}

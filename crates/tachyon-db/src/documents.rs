@@ -22,6 +22,7 @@ pub struct Document {
     pub status: String,
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
+    /// When the copy read last changed: a published read never shows a draft-only save.
     #[serde(with = "time::serde::rfc3339")]
     pub updated_at: OffsetDateTime,
     /// When the published copy was last published, on collections with drafts; `None`
@@ -186,7 +187,8 @@ pub async fn get(
 ) -> Result<Document, DbError> {
     sqlx::query_as!(
         Document,
-        r#"SELECT id, status, created_at, updated_at,
+        r#"SELECT id, status, created_at,
+                  CASE WHEN $4 THEN updated_at ELSE published_updated_at END AS "updated_at!",
                   CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
                   CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
            FROM documents
@@ -206,7 +208,7 @@ pub async fn get(
 /// collection ID.
 pub async fn get_many(pool: &PgPool, ids: &[Uuid]) -> Result<Vec<(Uuid, Document)>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT id, collection_id, status, created_at, updated_at,
+        r#"SELECT id, collection_id, status, created_at, published_updated_at AS updated_at,
                   CASE WHEN draft IS NOT NULL THEN published_at END AS published_at,
                   published AS "data!: Json<Map<String, Value>>"
            FROM documents
@@ -318,6 +320,7 @@ pub async fn update_in<E: From<DbError>>(
         r#"UPDATE documents
            SET published = CASE WHEN $6 THEN published ELSE $4::jsonb END,
                draft = CASE WHEN $6 THEN $4::jsonb ELSE draft END,
+               published_updated_at = CASE WHEN $6 THEN published_updated_at ELSE now() END,
                updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
            RETURNING id, status, created_at, updated_at,
@@ -391,7 +394,8 @@ pub async fn publish_in(
         Document,
         r#"UPDATE documents
            SET published = COALESCE($4::jsonb, draft), status = 'published',
-               published_at = now(), updated_at = now(), updated_by = COALESCE($5, updated_by)
+               published_at = now(), published_updated_at = now(), updated_at = now(),
+               updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND draft IS NOT NULL
            RETURNING id, status, created_at, updated_at, published_at, deleted_at,
@@ -629,6 +633,7 @@ pub async fn restore_in(
         Document,
         r#"UPDATE documents
            SET published = COALESCE($4::jsonb, published), draft = COALESCE($5::jsonb, draft),
+               published_updated_at = CASE WHEN $4::jsonb IS NULL THEN published_updated_at ELSE now() END,
                deleted_at = NULL, updated_at = now(), updated_by = COALESCE($6, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NOT NULL
            RETURNING id, status, created_at, updated_at,
