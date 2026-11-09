@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM relations r USING documents d\n         WHERE r.from_doc = d.id AND r.copy = 'draft' AND d.tenant_id = $1 AND d.collection_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "ff11bd2d70d3b9c618146fc86368b3bbb1e0d7ded50f931653316e5738b8480b"
+}

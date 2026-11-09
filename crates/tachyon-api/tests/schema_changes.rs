@@ -262,3 +262,156 @@ async fn startup_doesnt_wait_for_another_servers_index_build(pool: PgPool) {
         .await
         .unwrap();
 }
+
+fn versioned(versions: Value, extra: Value) -> String {
+    let fields =
+        json!([{"name": "title", "type": "text"}, {"name": "summary", "type": "textarea"}]);
+    let mut body = json!({"schema": {"slug": "posts", "versions": versions, "fields": fields}});
+    body.as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    body.to_string()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn drafts_off_is_refused_while_drafts_are_pending(pool: PgPool) {
+    let (app, url) = app(pool.clone()).await;
+    let put = |body: String| {
+        let app = app.clone();
+        async move { send(&app, "PUT", "/api/admin/collections/posts", Some(&body)).await }
+    };
+    let res = put(versioned(json!({"drafts": true}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let id = url.rsplit('/').next().unwrap().to_owned();
+    sqlx::query("UPDATE documents SET draft = '{\"title\": \"Edited\"}' WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // `confirm` can't override it.
+    let res = put(versioned(
+        json!({"drafts": false}),
+        json!({"confirm": true}),
+    ))
+    .await;
+    assert_problem(&res, 409);
+    assert_eq!(
+        res.json["detail"],
+        "1 document has an unpublished draft; publish or delete it first"
+    );
+    sqlx::query("UPDATE documents SET draft = published WHERE id = $1::uuid")
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let res = put(versioned(json!({"drafts": false}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn pruning_versions_needs_confirmation(pool: PgPool) {
+    let (app, url) = app(pool.clone()).await;
+    let put = |body: String| {
+        let app = app.clone();
+        async move { send(&app, "PUT", "/api/admin/collections/posts", Some(&body)).await }
+    };
+    let res = put(versioned(json!({"maxVersions": 3}), json!({}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let id = url.rsplit('/').next().unwrap().to_owned();
+    for _ in 0..3 {
+        sqlx::query(
+            "INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data)
+             SELECT gen_random_uuid(), tenant_id, collection_id, id, 'published', published
+             FROM documents WHERE id = $1::uuid",
+        )
+        .bind(&id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    }
+    let count = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM versions")
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+
+    let res = put(versioned(json!({"maxVersions": 1}), json!({}))).await;
+    assert_problem(&res, 409);
+    assert_eq!(res.json["preview"]["pruned"], 2);
+    assert_eq!(res.json["preview"]["needsConfirmation"], true);
+    assert_eq!(
+        res.json["detail"],
+        "This change deletes 2 old versions. Send it again with \"confirm\": true to go ahead."
+    );
+    assert_eq!(count().await, 3);
+    let res = put(versioned(
+        json!({"maxVersions": 1}),
+        json!({"confirm": true}),
+    ))
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(count().await, 1);
+
+    let res = put(versioned(json!(false), json!({}))).await;
+    assert_problem(&res, 409);
+    assert_eq!(res.json["preview"]["pruned"], 1);
+    let res = put(versioned(json!(false), json!({"confirm": true}))).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(count().await, 0);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_change_normalises_drafts_as_drafts(pool: PgPool) {
+    let app = common::admin_app(pool.clone()).await;
+    let schema = |when: &str| {
+        json!({"slug": "pages", "versions": {"drafts": true}, "fields": [
+            {"name": "title", "type": "text", "required": true},
+            {"name": "when", "type": when}
+        ]})
+    };
+    let res = send(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(&schema("text").to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    // A draft without its required title saves, and records a version of itself.
+    let when = "2026-10-12T09:30:00+02:00";
+    let res = send(
+        &app,
+        "POST",
+        "/api/pages",
+        Some(&json!({"when": when}).to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let body = json!({"schema": schema("date"), "confirm": true});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/pages",
+        Some(&body.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // Both are stored as a draft save would store them: the text is now a date, in UTC.
+    let utc = json!("2026-10-12T07:30:00.000Z");
+    let draft: Option<Value> = sqlx::query_scalar(
+        "SELECT d.draft->'when' FROM documents d JOIN collections c ON c.id = d.collection_id
+         WHERE c.slug = 'pages'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(draft, Some(utc.clone()));
+    let version: Vec<Option<Value>> =
+        sqlx::query_scalar("SELECT data->'when' FROM versions WHERE kind = 'draft'")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(version, [Some(utc)]);
+}

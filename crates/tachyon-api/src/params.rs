@@ -33,6 +33,8 @@ pub(crate) struct ListParams {
     pub populate: Shapes,
     pub joins: Joins,
     pub format: Format,
+    /// The trash only: least recently deleted first (`sort=deletedAt`).
+    pub oldest_first: bool,
 }
 
 /// How a single read is shaped.
@@ -131,6 +133,75 @@ fn single<'a>(params: &'a Map<String, Value>, name: &str) -> Result<Option<&'a s
     }
 }
 
+/// A `true`/`false` parameter, false when absent.
+fn flag(params: &Map<String, Value>, name: &str) -> Result<bool, ApiError> {
+    match single(params, name)? {
+        None | Some("false") => Ok(false),
+        Some("true") => Ok(true),
+        Some(_) => Err(bad(format!("{name} must be true or false"))),
+    }
+}
+
+/// `draft=true`: read `c`'s drafts. Worked out before anything that reaches through links,
+/// since it decides which copy of each linked collection they read.
+fn draft(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result<(), ApiError> {
+    let draft = flag(params, "draft").map_err(|_| bad("`draft` must be true or false"))?;
+    access.copy_for(c, draft).map(|_| ())
+}
+
+/// Refuses any query parameter, for a write that takes none.
+pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
+    params(raw, &[]).map(|_| ())
+}
+
+/// `?limit&page` for a list without filters, such as a document's versions.
+pub(crate) fn page_params(raw: Option<&str>) -> Result<(i64, i64), ApiError> {
+    let params = params(raw, &["limit", "page"])?;
+    let limit = number(&params, "limit")?.unwrap_or(DEFAULT_LIMIT);
+    if limit < 1 {
+        return Err(bad("limit must be at least 1"));
+    }
+    let page = number(&params, "page")?.unwrap_or(1);
+    if page < 1 {
+        return Err(bad("page must be at least 1"));
+    }
+    Ok((limit.min(MAX_LIMIT), page))
+}
+
+/// `?from&to` for a diff, both required.
+pub(crate) fn diff_params(raw: Option<&str>) -> Result<(String, String), ApiError> {
+    let params = params(raw, &["from", "to"])?;
+    let side = |name: &str| {
+        single(&params, name)?.map(str::to_owned).ok_or_else(|| {
+            bad(format!(
+                "`{name}` is required: a version ID, `draft` or `published`"
+            ))
+        })
+    };
+    Ok((side("from")?, side("to")?))
+}
+
+/// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
+/// that turns autosave on.
+pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {
+    let params = params(raw, &["autosave"])?;
+    let autosave =
+        flag(&params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
+    let on = c
+        .schema
+        .versions
+        .as_ref()
+        .and_then(|v| v.drafts.as_ref())
+        .is_some_and(|d| d.autosave.is_some());
+    if autosave && !on {
+        return Err(bad(format!(
+            "`autosave`: `{}` doesn't autosave",
+            c.schema.slug
+        )));
+    }
+    Ok(autosave)
+}
+
 fn number(params: &Map<String, Value>, name: &str) -> Result<Option<i64>, ApiError> {
     single(params, name)?
         .map(|s| {
@@ -140,10 +211,14 @@ fn number(params: &Map<String, Value>, name: &str) -> Result<Option<i64>, ApiErr
         .transpose()
 }
 
-fn select(params: &Map<String, Value>, fields: &[Field]) -> Result<Option<Select>, ApiError> {
+fn select(
+    params: &Map<String, Value>,
+    fields: &[Field],
+    drafts: bool,
+) -> Result<Option<Select>, ApiError> {
     params
         .get("select")
-        .map(|s| parse_select(fields, s, "select"))
+        .map(|s| parse_select(fields, drafts, s, "select"))
         .transpose()
         .map_err(|e| bad(e.to_string()))
 }
@@ -168,8 +243,13 @@ fn populate(params: &Map<String, Value>, schemas: &Schemas) -> Result<Shapes, Ap
                 "populate[{slug}]: expected populate[{slug}][field]=true"
             )));
         }
-        let select = parse_select(c.schema.data(), tree, &format!("populate[{slug}]"))
-            .map_err(|e| bad(e.to_string()))?;
+        let select = parse_select(
+            c.schema.data(),
+            c.schema.drafts(),
+            tree,
+            &format!("populate[{slug}]"),
+        )
+        .map_err(|e| bad(e.to_string()))?;
         out.insert(slug.clone(), select);
     }
     Ok(out)
@@ -346,14 +426,46 @@ pub(crate) fn list_params(
     c: &Collection,
     access: &Access,
 ) -> Result<ListParams, ApiError> {
-    let schemas = access.schemas();
-    let params = params(
+    list_params_of(
         raw,
+        c,
+        access,
         &[
             "limit", "page", "after", "count", "depth", "where", "sort", "select", "populate",
-            "joins", "format",
+            "joins", "format", "draft",
         ],
-    )?;
+        false,
+    )
+}
+
+/// `list_params` for the trash, which reads at depth 0 and pages by number:
+/// `limit`, `page`, `count`, `where`, `sort` (by `deletedAt` too) and `select` only.
+pub(crate) fn trash_params(
+    raw: Option<&str>,
+    c: &Collection,
+    access: &Access,
+) -> Result<ListParams, ApiError> {
+    list_params_of(
+        raw,
+        c,
+        access,
+        &["limit", "page", "count", "where", "sort", "select"],
+        true,
+    )
+}
+
+/// `list_params`, taking only the parameters in `allowed`, and with `trash` sorting by
+/// `deletedAt` too.
+fn list_params_of(
+    raw: Option<&str>,
+    c: &Collection,
+    access: &Access,
+    allowed: &[&str],
+    trash: bool,
+) -> Result<ListParams, ApiError> {
+    let schemas = access.schemas();
+    let params = params(raw, allowed)?;
+    draft(&params, c, access)?;
     let fields = c.schema.data();
 
     let limit = number(&params, "limit")?.unwrap_or(DEFAULT_LIMIT);
@@ -364,11 +476,7 @@ pub(crate) fn list_params(
     if page.is_some_and(|p| p < 1) {
         return Err(bad("page must be at least 1"));
     }
-    let count = match single(&params, "count")? {
-        None | Some("false") => false,
-        Some("true") => true,
-        Some(_) => return Err(bad("count must be true or false")),
-    };
+    let count = flag(&params, "count")?;
     let visible = access.readable_fields(c);
     let filter = params
         .get("where")
@@ -380,9 +488,15 @@ pub(crate) fn list_params(
         })
         .transpose()?
         .map(|f| access.guard(f));
-    let sort = single(&params, "sort")?
-        .map(|s| readable(|v| parse_sort(if v { &visible } else { fields }, s)))
-        .transpose()?;
+    let (sort, oldest_first) = match single(&params, "sort")? {
+        Some("deletedAt") if trash => (None, true),
+        Some("-deletedAt") if trash => (None, false),
+        sort => (
+            sort.map(|s| readable(|v| parse_sort(if v { &visible } else { fields }, s)))
+                .transpose()?,
+            false,
+        ),
+    };
     let after = single(&params, "after")?
         .map(|s| Cursor::decode(s).ok_or_else(|| bad("after isn't a valid cursor")))
         .transpose()?;
@@ -404,12 +518,13 @@ pub(crate) fn list_params(
         after,
         count,
         depth: depth(&params)?,
-        select: select(&params, fields)?,
+        select: select(&params, fields, c.schema.drafts())?,
         populate: populate(&params, schemas)?,
         joins: joins(&params, c, access)?,
         format: format(&params)?,
         filter,
         sort,
+        oldest_first,
     })
 }
 
@@ -418,10 +533,14 @@ pub(crate) fn read_params(
     c: &Collection,
     access: &Access,
 ) -> Result<ReadParams, ApiError> {
-    let params = params(raw, &["depth", "select", "populate", "joins", "format"])?;
+    let params = params(
+        raw,
+        &["depth", "select", "populate", "joins", "format", "draft"],
+    )?;
+    draft(&params, c, access)?;
     Ok(ReadParams {
         depth: depth(&params)?,
-        select: select(&params, c.schema.data())?,
+        select: select(&params, c.schema.data(), c.schema.drafts())?,
         populate: populate(&params, access.schemas())?,
         joins: joins(&params, c, access)?,
         format: format(&params)?,

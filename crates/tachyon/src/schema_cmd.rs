@@ -10,7 +10,7 @@ use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
-use tachyon_db::schema_change::{self, ChangeError, Preview, Save};
+use tachyon_db::schema_change::{self, ChangeError, ConfirmationScope, Preview, Save};
 use tachyon_db::{collections, indexes};
 
 /// Every collection's schema as a pretty JSON bundle.
@@ -56,6 +56,7 @@ fn parse_bundle(text: &str) -> anyhow::Result<Vec<CollectionSchema>> {
         .iter()
         .map(|item| {
             let slug = item.get("slug").and_then(Value::as_str).unwrap_or("?");
+            CollectionSchema::check_option_types(item).with_context(|| slug.to_owned())?;
             let schema = CollectionSchema::deserialize(item)
                 .map_err(|e| anyhow!("{slug}: {}", explain_parse_error(item, &e)))?;
             schema
@@ -84,6 +85,7 @@ fn changes(p: &Preview) -> String {
             Change::OptionsChanged { path } => format!("update options on {path}"),
             Change::LayoutChanged => "rearrange fields in the admin".to_owned(),
             Change::CollectionOptionsChanged => "update collection options".to_owned(),
+            Change::VersionsChanged { .. } => "update versions and drafts".to_owned(),
             Change::VirtualRemoved { path } => format!("remove {path} (it stored nothing)"),
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")
@@ -267,8 +269,13 @@ pub async fn run(
         bail!("{report}\n\nSome unique fields have duplicate values. Fix those documents first.");
     }
     if !yes && outcomes.iter().any(|o| o.preview.needs_confirmation) {
+        let scope = outcomes
+            .iter()
+            .map(|o| o.preview.confirmation_scope())
+            .fold(ConfirmationScope::default(), ConfirmationScope::combine);
         bail!(
-            "{report}\n\nThese changes remove or retype fields, or leave documents that won't validate. Re-run with --yes to apply them."
+            "{report}\n\n{} Re-run with --yes to apply them.",
+            scope.what()
         );
     }
     // One transaction: if anything fails, nothing went in. `yes` again here: the check

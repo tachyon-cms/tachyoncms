@@ -4,9 +4,12 @@ pub mod auth;
 pub mod collections;
 pub mod documents;
 pub mod indexes;
+pub mod jobs;
 pub mod query;
 pub mod schema_change;
+pub mod versions;
 
+pub use documents::DocCopy;
 pub use sqlx::PgPool;
 use uuid::Uuid;
 

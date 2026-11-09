@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"n!\" FROM (\n                   SELECT id, row_number() OVER (\n                       PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n\n                   FROM versions WHERE tenant_id = $1 AND collection_id = $2\n               ) ranked\n               WHERE n > $3 AND NOT EXISTS (\n                   SELECT 1 FROM jobs j\n                   WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')\n                     AND j.payload->>'version' = ranked.id::text)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "9632bd57163191be60ec15c84d8249e3937809efe8b41904a9fdb2a30d615949"
+}

@@ -98,6 +98,63 @@ impl Filter {
     }
 }
 
+/// One of a document's two copies: what's live, or the working draft beside it (drafts on).
+/// Each keeps its own links.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, Debug, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DocCopy {
+    Published,
+    Draft,
+}
+
+impl DocCopy {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Published => "published",
+            Self::Draft => "draft",
+        }
+    }
+
+    /// The copy `as_str` names, or `None` for anything else.
+    pub fn parse(s: &str) -> Option<Self> {
+        [Self::Published, Self::Draft]
+            .into_iter()
+            .find(|c| c.as_str() == s)
+    }
+}
+
+/// How a caller may read one collection: which copy, narrowed by a read filter (`None`:
+/// all of it) and, for own-only rights, to the documents `owner` created. With `otherwise`,
+/// a document that can't be read this way is read that way instead: a draft where the
+/// caller may read it, else what's published where they may read that.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Readable {
+    pub filter: Option<Filter>,
+    pub copy: DocCopy,
+    pub owner: Option<Uuid>,
+    pub otherwise: Option<Box<Readable>>,
+}
+
+impl Readable {
+    /// The published copy, under `filter`.
+    pub fn published(filter: Option<Filter>) -> Self {
+        Self {
+            filter,
+            copy: DocCopy::Published,
+            owner: None,
+            otherwise: None,
+        }
+    }
+
+    /// This, with nothing to fall back to.
+    pub fn alone(&self) -> Self {
+        Self {
+            otherwise: None,
+            ..self.clone()
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub struct Cond {
     pub target: Target,
@@ -123,10 +180,11 @@ pub enum Target {
         polymorphic: bool,
         collections: Vec<String>,
         inner: Box<Target>,
-        /// The read filter of each linked collection the caller may read (`None`: all of
-        /// it), so hidden documents never match. Empty means unguarded. Otherwise a
-        /// collection missing from the list is unreadable, and nothing in it matches.
-        guards: Vec<(String, Option<Box<Filter>>)>,
+        /// How the caller may read each linked collection, so hidden documents never match
+        /// and each is read in its own copy. Empty means unguarded, reading published
+        /// copies. Otherwise a collection missing from the list is unreadable, and nothing
+        /// in it matches.
+        guards: Vec<(String, Readable)>,
     },
     /// Some row of the list at `list` matches `inner`, whose path is relative to the row.
     Row {
@@ -1139,6 +1197,15 @@ mod tests {
     use super::*;
     use crate::Field;
     use serde_json::json;
+
+    #[test]
+    fn doc_copies_parse_only_their_own_names() {
+        for copy in [DocCopy::Published, DocCopy::Draft] {
+            assert_eq!(DocCopy::parse(copy.as_str()), Some(copy));
+        }
+        assert_eq!(DocCopy::parse("Draft"), None);
+        assert_eq!(DocCopy::parse(""), None);
+    }
 
     fn fields() -> Vec<Field> {
         serde_json::from_value(json!([

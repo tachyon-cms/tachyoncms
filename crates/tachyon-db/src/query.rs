@@ -8,7 +8,10 @@ use std::collections::HashMap;
 use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{PgPool, Postgres, QueryBuilder};
-use tachyon_core::query::{Cond, Cursor, Filter, Op, Operand, Scalar, Sort, Target, ValueKind};
+pub use tachyon_core::query::Readable;
+use tachyon_core::query::{
+    Cond, Cursor, DocCopy, Filter, Op, Operand, Scalar, Sort, Target, ValueKind,
+};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
 use uuid::Uuid;
@@ -23,6 +26,10 @@ pub struct ListQuery<'a> {
     pub offset: i64,
     pub after: Option<&'a Cursor>,
     pub count: bool,
+    /// The copy read, filtered and returned.
+    pub copy: DocCopy,
+    /// Only documents this user created (own-only rights).
+    pub owner: Option<Uuid>,
 }
 
 #[derive(Debug)]
@@ -48,7 +55,12 @@ fn assert_identifier(segment: &str) {
 
 /// The SQL expression for a field. Index DDL uses this too, so indexes always match queries.
 pub fn field_expr(path: &[String], kind: ValueKind) -> String {
-    field_expr_on("published", path, kind)
+    field_expr_for(DocCopy::Published, path, kind)
+}
+
+/// `field_expr`, read from `copy`.
+pub fn field_expr_for(copy: DocCopy, path: &[String], kind: ValueKind) -> String {
+    field_expr_on(copy.as_str(), path, kind)
 }
 
 /// `field_expr` read from another JSON expression: a linked document's `t1.published`, or a
@@ -75,16 +87,16 @@ fn field_expr_on(base: &str, path: &[String], kind: ValueKind) -> String {
 /// Only a two-number array whose numbers are in range counts. The CASEs are nested
 /// because Postgres doesn't promise to evaluate AND left to right, and
 /// `jsonb_array_length` fails on anything that isn't an array.
-fn coordinate(path: &[String], index: usize) -> String {
+fn coordinate(base: &str, path: &[String], index: usize) -> String {
     path.iter().for_each(|s| assert_identifier(s));
     let path = path.join(",");
     let limit = if index == 0 { 180 } else { 90 };
     format!(
-        "(CASE WHEN jsonb_typeof(published #> '{{{path}}}') = 'array' THEN \
-           CASE WHEN jsonb_array_length(published #> '{{{path}}}') = 2 \
-                 AND jsonb_typeof(published #> '{{{path},{index}}}') = 'number' THEN \
-             CASE WHEN (published #>> '{{{path},{index}}}')::numeric BETWEEN -{limit} AND {limit} \
-               THEN (published #>> '{{{path},{index}}}')::float8 END \
+        "(CASE WHEN jsonb_typeof({base} #> '{{{path}}}') = 'array' THEN \
+           CASE WHEN jsonb_array_length({base} #> '{{{path}}}') = 2 \
+                 AND jsonb_typeof({base} #> '{{{path},{index}}}') = 'number' THEN \
+             CASE WHEN ({base} #>> '{{{path},{index}}}')::numeric BETWEEN -{limit} AND {limit} \
+               THEN ({base} #>> '{{{path},{index}}}')::float8 END \
            END \
          END)"
     )
@@ -92,8 +104,8 @@ fn coordinate(path: &[String], index: usize) -> String {
 
 /// Metres from a stored point to (`lng`, `lat`): haversine on a sphere of the mean earth
 /// radius, accurate to well under 1% for finding nearby places.
-fn push_distance(qb: &mut QueryBuilder<Postgres>, path: &[String], lng: f64, lat: f64) {
-    let (x, y) = (coordinate(path, 0), coordinate(path, 1));
+fn push_distance(qb: &mut QueryBuilder<Postgres>, base: &str, path: &[String], lng: f64, lat: f64) {
+    let (x, y) = (coordinate(base, path, 0), coordinate(base, path, 1));
     qb.push("(6371008.8 * 2 * asin(least(1, sqrt(power(sin(radians((")
         .push(&y)
         .push(" - ");
@@ -109,9 +121,22 @@ fn push_distance(qb: &mut QueryBuilder<Postgres>, path: &[String], lng: f64, lat
     qb.push(") / 2)), 2)))))");
 }
 
-/// What a condition reads from: the document's own JSON and columns at the top, a linked
-/// document's (`t1.published`, `t1.id`) or a list row's (`r1.v`) further in. `depth` keeps
-/// each nested alias distinct.
+/// When the document was published, reported only where drafts are on (only there is the
+/// draft never NULL), so a collection without drafts may have a field of that name.
+const PUBLISHED_AT: &str = "CASE WHEN draft IS NOT NULL THEN published_at END AS published_at";
+
+/// `updated_at` as `copy` shows it: a published read gets when the published copy last
+/// changed, so a draft-only save doesn't show through.
+fn updated_at(copy: DocCopy) -> &'static str {
+    match copy {
+        DocCopy::Published => "published_updated_at AS updated_at",
+        DocCopy::Draft => "updated_at",
+    }
+}
+
+/// What a condition reads from: the document's own JSON (the copy read) and columns at the
+/// top, a linked document's (`t1.published`, `t1.id`) or a list row's (`r1.v`) further in.
+/// `depth` keeps each nested alias distinct.
 struct Base {
     json: String,
     columns: String,
@@ -119,17 +144,67 @@ struct Base {
 }
 
 impl Base {
-    fn top() -> Self {
+    fn top(copy: DocCopy) -> Self {
         Self {
-            json: "published".into(),
+            json: copy.as_str().into(),
             columns: String::new(),
             depth: 0,
         }
     }
 }
 
-fn expr(target: &Target) -> String {
-    expr_in(target, &Base::top())
+fn expr(copy: DocCopy, target: &Target) -> String {
+    expr_in(target, &Base::top(copy))
+}
+
+/// ` AND` the row (columns prefixed with `columns`) has `copy` to read and, with an
+/// `owner`, was created by them.
+fn push_copy(qb: &mut QueryBuilder<Postgres>, columns: &str, copy: DocCopy, owner: Option<Uuid>) {
+    // A guard as well as a filter: a row without the copy must never reach decoding.
+    qb.push(format!(" AND {columns}{} IS NOT NULL", copy.as_str()));
+    if let Some(owner) = owner {
+        qb.push(format!(" AND {columns}created_by = "))
+            .push_bind(owner);
+    }
+}
+
+/// Where a row's `copy` is read: its JSON and columns, `columns` naming the row.
+fn copy_base(columns: &str, depth: u8, copy: DocCopy) -> Base {
+    Base {
+        json: format!("{columns}{}", copy.as_str()),
+        columns: columns.into(),
+        depth,
+    }
+}
+
+/// ` AND` the row (columns prefixed with `columns`) can be read as `read` says: its copy,
+/// owner and filter. Not `read.otherwise`, which callers add.
+fn push_readable(qb: &mut QueryBuilder<Postgres>, columns: &str, depth: u8, read: &Readable) {
+    push_copy(qb, columns, read.copy, read.owner);
+    if let Some(f) = &read.filter {
+        qb.push(" AND ");
+        push_filter_in(qb, f, &copy_base(columns, depth, read.copy));
+    }
+}
+
+/// ` AND` the row can't be read as `read` says. A filter that comes to NULL (a missing
+/// value) means it can't, so the row falls through to what it's read as otherwise.
+fn push_unreadable(qb: &mut QueryBuilder<Postgres>, columns: &str, depth: u8, read: &Readable) {
+    qb.push(" AND NOT COALESCE((TRUE");
+    push_readable(qb, columns, depth, read);
+    qb.push("), FALSE)");
+}
+
+/// Each way a row of a collection read as `read` may be read: `read` itself, then its
+/// `otherwise` for rows `read` can't reach. One level: a fallback has no fallback.
+fn ways(read: &Readable) -> impl Iterator<Item = (&Readable, Option<&Readable>)> {
+    debug_assert!(
+        read.otherwise
+            .as_ref()
+            .is_none_or(|o| o.otherwise.is_none()),
+        "a fallback has no fallback"
+    );
+    std::iter::once((read, None)).chain(read.otherwise.as_deref().map(|o| (o, Some(read))))
 }
 
 fn expr_in(target: &Target, base: &Base) -> String {
@@ -137,6 +212,10 @@ fn expr_in(target: &Target, base: &Base) -> String {
     match target {
         Target::Id => format!("{columns}id"),
         Target::CreatedAt => format!("{columns}created_at"),
+        // A published copy's own time (see `updated_at`); a source row has it already.
+        Target::UpdatedAt if base.json.ends_with(DocCopy::Published.as_str()) => {
+            format!("{columns}published_updated_at")
+        }
         Target::UpdatedAt => format!("{columns}updated_at"),
         Target::Field { path, kind } => field_expr_on(&base.json, path, *kind),
         Target::Via { .. } | Target::Row { .. } => {
@@ -215,8 +294,8 @@ fn escape_like(s: &str) -> String {
         .replace('_', "\\_")
 }
 
-fn push_filter(qb: &mut QueryBuilder<Postgres>, f: &Filter) {
-    push_filter_in(qb, f, &Base::top());
+fn push_filter(qb: &mut QueryBuilder<Postgres>, copy: DocCopy, f: &Filter) {
+    push_filter_in(qb, f, &Base::top(copy));
 }
 
 fn push_filter_in(qb: &mut QueryBuilder<Postgres>, f: &Filter, base: &Base) {
@@ -288,11 +367,11 @@ fn push_exists(
     // Inside the subquery a bare `published` would mean the linked document's, so the
     // outer document's JSON is named by its table.
     let outer = if base.depth == 0 {
-        "documents.published".to_owned()
+        format!("documents.{}", base.json)
     } else {
         base.json.clone()
     };
-    let inner = match target {
+    match target {
         Target::Row {
             list,
             inner,
@@ -316,7 +395,7 @@ fn push_exists(
                 columns: String::new(),
                 depth,
             };
-            (inner, row)
+            push_inner(qb, inner, op, value, &row);
         }
         Target::Via {
             link,
@@ -360,45 +439,87 @@ fn push_exists(
             .push_bind(DEFAULT_TENANT)
             .push(" AND slug = ANY(")
             .push_bind(collections.clone())
-            .push(")) AND ");
-            let linked = Base {
-                json: format!("{alias}.published"),
-                columns: format!("{alias}."),
-                depth,
-            };
-            if !guards.is_empty() {
-                push_guards(qb, &alias, collections, guards, &linked);
+            .push("))");
+            if guards.is_empty() {
+                qb.push(" AND ");
+                push_linked_copy(
+                    qb,
+                    &alias,
+                    depth,
+                    inner,
+                    op,
+                    value,
+                    &Readable::published(None),
+                );
+            } else {
+                push_guards(qb, &alias, depth, collections, guards, (inner, op, value));
             }
-            (inner, linked)
         }
         _ => unreachable!("push_exists is only called on nested targets"),
-    };
-    let (inner, next) = inner;
-    if inner.is_nested() {
-        push_exists(qb, inner, op, value, &next);
-    } else {
-        let leaf = Cond {
-            target: (**inner).clone(),
-            op,
-            value: value.clone(),
-        };
-        push_cond(qb, &leaf, &next);
     }
     qb.push(")");
 }
 
-/// `(…) AND `: a linked document must be in a collection the caller may read, and match
-/// that collection's read filter. A collection with no guard entry reads nothing.
+/// `inner` matched in `base`, through further links or rows when it's nested.
+fn push_inner(
+    qb: &mut QueryBuilder<Postgres>,
+    inner: &Target,
+    op: Op,
+    value: &Operand,
+    base: &Base,
+) {
+    if inner.is_nested() {
+        push_exists(qb, inner, op, value, base);
+    } else {
+        let leaf = Cond {
+            target: inner.clone(),
+            op,
+            value: value.clone(),
+        };
+        push_cond(qb, &leaf, base);
+    }
+}
+
+/// `(…)`: linked document `alias` can be read as `read` says (or else as its
+/// `otherwise`), and matches `inner` in the copy it's read in.
+fn push_linked_copy(
+    qb: &mut QueryBuilder<Postgres>,
+    alias: &str,
+    depth: u8,
+    inner: &Target,
+    op: Op,
+    value: &Operand,
+    read: &Readable,
+) {
+    let columns = format!("{alias}.");
+    qb.push("(FALSE");
+    for (way, unless) in ways(read) {
+        qb.push(" OR (TRUE");
+        if let Some(first) = unless {
+            push_unreadable(qb, &columns, depth, first);
+        }
+        push_readable(qb, &columns, depth, way);
+        qb.push(" AND ");
+        push_inner(qb, inner, op, value, &copy_base(&columns, depth, way.copy));
+        qb.push(")");
+    }
+    qb.push(")");
+}
+
+/// ` AND (…)`: a linked document must be in a collection the caller may read, and match
+/// `inner` in the copy they read there. A collection with no guard entry reads nothing.
+/// Each collection gets its own branch, since each may be read in a different copy.
 fn push_guards(
     qb: &mut QueryBuilder<Postgres>,
     alias: &str,
+    depth: u8,
     collections: &[String],
-    guards: &[(String, Option<Box<Filter>>)],
-    linked: &Base,
+    guards: &[(String, Readable)],
+    (inner, op, value): (&Target, Op, &Operand),
 ) {
-    qb.push("(FALSE");
+    qb.push(" AND (FALSE");
     for slug in collections {
-        let Some((_, guard)) = guards.iter().find(|(s, _)| s == slug) else {
+        let Some((_, read)) = guards.iter().find(|(s, _)| s == slug) else {
             continue;
         };
         qb.push(format!(
@@ -407,14 +528,11 @@ fn push_guards(
         .push_bind(DEFAULT_TENANT)
         .push(" AND slug = ")
         .push_bind(slug.clone())
-        .push(")");
-        if let Some(f) = guard {
-            qb.push(" AND ");
-            push_filter_in(qb, f, linked);
-        }
+        .push(") AND ");
+        push_linked_copy(qb, alias, depth, inner, op, value, read);
         qb.push(")");
     }
-    qb.push(") AND ");
+    qb.push(")");
 }
 
 fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
@@ -473,18 +591,18 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
             // Both coordinates must be real numbers: `least()` ignores NULLs, so a broken
             // value would otherwise come out as a distance.
             qb.push("(")
-                .push(coordinate(path, 0))
+                .push(coordinate(&base.json, path, 0))
                 .push(" IS NOT NULL AND ")
-                .push(coordinate(path, 1))
+                .push(coordinate(&base.json, path, 1))
                 .push(" IS NOT NULL");
             if let Some(max) = max {
                 qb.push(" AND ");
-                push_distance(qb, path, *lng, *lat);
+                push_distance(qb, &base.json, path, *lng, *lat);
                 qb.push(" <= ").push_bind(*max);
             }
             if let Some(min) = min {
                 qb.push(" AND ");
-                push_distance(qb, path, *lng, *lat);
+                push_distance(qb, &base.json, path, *lng, *lat);
                 qb.push(" >= ").push_bind(*min);
             }
             qb.push(")");
@@ -494,33 +612,77 @@ fn push_cond(qb: &mut QueryBuilder<Postgres>, c: &Cond, base: &Base) {
 }
 
 /// Built-in columns are NOT NULL, so they skip NULLS LAST and can use the plain indexes.
-fn order_by(sort: Option<&Sort>) -> String {
+fn order_by(copy: DocCopy, sort: Option<&Sort>) -> String {
+    order_by_in(&Base::top(copy), sort)
+}
+
+/// `order_by`, of the JSON `base` names.
+fn order_by_in(base: &Base, sort: Option<&Sort>) -> String {
     let Some(s) = sort else {
         return "id DESC".into();
     };
     let direction = if s.descending { "DESC" } else { "ASC" };
+    let e = expr_in(&s.target, base);
     match &s.target {
         Target::Id => format!("id {direction}"),
-        Target::Field { .. } => format!("{} {direction} NULLS LAST, id DESC", expr(&s.target)),
-        _ => format!("{} {direction}, id DESC", expr(&s.target)),
+        Target::Field { .. } => format!("{e} {direction} NULLS LAST, id DESC"),
+        _ => format!("{e} {direction}, id DESC"),
     }
 }
 
-fn push_where(qb: &mut QueryBuilder<Postgres>, collection_id: Uuid, filter: Option<&Filter>) {
+/// Where one collection's live documents (its trashed ones, with `trashed`) are read in
+/// `copy`, by `owner` when given, and matching `filter`.
+struct Scope<'a> {
+    collection_id: Uuid,
+    copy: DocCopy,
+    owner: Option<Uuid>,
+    filter: Option<&'a Filter>,
+    trashed: bool,
+}
+
+fn push_where(qb: &mut QueryBuilder<Postgres>, s: &Scope<'_>) {
     qb.push(" WHERE tenant_id = ").push_bind(DEFAULT_TENANT);
     // A literal (not a bind) so the planner can match per-collection partial indexes.
     qb.push(format!(
-        " AND collection_id = '{collection_id}' AND deleted_at IS NULL"
+        " AND collection_id = '{}' AND deleted_at IS {}NULL",
+        s.collection_id,
+        if s.trashed { "NOT " } else { "" }
     ));
-    if let Some(f) = filter {
+    push_copy(qb, "", s.copy, s.owner);
+    if let Some(f) = s.filter {
         qb.push(" AND ");
-        push_filter(qb, f);
+        push_filter(qb, s.copy, f);
     }
 }
 
 pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Result<Page, DbError> {
+    list_from(pool, collection_id, q, None).await
+}
+
+/// `list`, of the collection's trash, each with its `deleted_at`: unless `q` sorts, most
+/// recently deleted first, or least recently with `oldest_first`. It pages by number only.
+pub async fn list_trash(
+    pool: &PgPool,
+    collection_id: Uuid,
+    q: &ListQuery<'_>,
+    oldest_first: bool,
+) -> Result<Page, DbError> {
+    if q.after.is_some() {
+        return Err(DbError::InvalidQuery("the trash pages by number only"));
+    }
+    list_from(pool, collection_id, q, Some(oldest_first)).await
+}
+
+/// `list`, or with `trash` (`Some(oldest_first)`) `list_trash`.
+async fn list_from(
+    pool: &PgPool,
+    collection_id: Uuid,
+    q: &ListQuery<'_>,
+    trash: Option<bool>,
+) -> Result<Page, DbError> {
+    let trashed = trash.is_some();
     let (sort_expr, descending) = match q.sort {
-        Some(s) => (expr(&s.target), s.descending),
+        Some(s) => (expr(q.copy, &s.target), s.descending),
         None => ("id".to_owned(), true),
     };
 
@@ -537,10 +699,20 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
         ));
     }
 
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT id, status, created_at, updated_at, published AS data FROM documents",
-    );
-    push_where(&mut qb, collection_id, q.filter);
+    let scope = Scope {
+        collection_id,
+        copy: q.copy,
+        owner: q.owner,
+        filter: q.filter,
+        trashed,
+    };
+    let mut qb = QueryBuilder::<Postgres>::new(format!(
+        "SELECT id, status, created_at, {}, {PUBLISHED_AT}, deleted_at, {} AS data \
+         FROM documents",
+        updated_at(q.copy),
+        q.copy.as_str()
+    ));
+    push_where(&mut qb, &scope);
     if let Some(cursor) = q.after {
         qb.push(" AND ");
         push_after(&mut qb, q.sort, &sort_expr, descending, cursor);
@@ -548,11 +720,17 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
     match near {
         Some((path, lng, lat)) => {
             qb.push(" ORDER BY ");
-            push_distance(&mut qb, path, lng, lat);
+            push_distance(&mut qb, q.copy.as_str(), path, lng, lat);
             qb.push(" ASC NULLS LAST, id DESC LIMIT ");
         }
+        None if trashed && q.sort.is_none() => {
+            let direction = if trash == Some(true) { "ASC" } else { "DESC" };
+            qb.push(format!(
+                " ORDER BY deleted_at {direction}, id {direction} LIMIT "
+            ));
+        }
         None => {
-            qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.sort)));
+            qb.push(format!(" ORDER BY {} LIMIT ", order_by(q.copy, q.sort)));
         }
     }
     // One extra row says whether another page follows, without a separate count.
@@ -567,7 +745,7 @@ pub async fn list(pool: &PgPool, collection_id: Uuid, q: &ListQuery<'_>) -> Resu
 
     let total = if q.count {
         let mut qb = QueryBuilder::<Postgres>::new("SELECT count(*) FROM documents");
-        push_where(&mut qb, collection_id, q.filter);
+        push_where(&mut qb, &scope);
         Some(qb.build_query_scalar::<i64>().fetch_one(pool).await?)
     } else {
         None
@@ -599,6 +777,9 @@ pub struct JoinQuery<'a> {
     pub limit: i64,
     pub offset: i64,
     pub count: bool,
+    /// How the linking documents are read: the copy (each one's own, with a fallback),
+    /// whose links are followed and `filter` judges, and who must have created them.
+    pub read: &'a Readable,
 }
 
 #[derive(sqlx::FromRow)]
@@ -608,17 +789,54 @@ struct JoinedRow {
     doc: Document,
 }
 
-/// ` AND` the document links to `p.parent` through a path `pattern` matches. `EXISTS`, so a
-/// document linking twice still counts once.
+/// ` AND` the copy each document is read in links to `p.parent` through a path `pattern`
+/// matches. `EXISTS`, so a document linking twice still counts once.
 fn push_linked(qb: &mut QueryBuilder<Postgres>, pattern: &str) {
     qb.push(
         " AND EXISTS (SELECT 1 FROM relations r WHERE r.from_doc = documents.id \
-         AND r.to_doc = p.parent AND r.tenant_id = ",
+         AND r.to_doc = p.parent AND r.copy = documents.copy AND r.tenant_id = ",
     )
     .push_bind(DEFAULT_TENANT)
     .push(" AND r.field_path ~ ")
     .push_bind(pattern.to_owned())
     .push(")");
+}
+
+/// `(…) AS documents`: the live documents of `collection_id` as `read` reads them, each
+/// with its `data` (the copy read) and `copy` (which one, whose links count).
+fn push_source(qb: &mut QueryBuilder<Postgres>, collection_id: Uuid, read: &Readable) {
+    qb.push("(");
+    for (i, (way, unless)) in ways(read).enumerate() {
+        if i > 0 {
+            qb.push(" UNION ALL ");
+        }
+        let (copy, updated) = (way.copy.as_str(), updated_at(way.copy));
+        qb.push(format!(
+            "SELECT id, status, created_at, {updated}, published_at, draft, \
+             {copy} AS data, '{copy}'::text AS copy FROM documents WHERE tenant_id = "
+        ))
+        .push_bind(DEFAULT_TENANT)
+        // A literal (not a bind) so the planner can match per-collection partial indexes.
+        .push(format!(
+            " AND collection_id = '{collection_id}' AND deleted_at IS NULL"
+        ));
+        if let Some(first) = unless {
+            push_unreadable(qb, "", 0, first);
+        }
+        push_readable(qb, "", 0, way);
+    }
+    qb.push(") AS documents");
+}
+
+/// ` WHERE` a joined document matches the join's filter, in the copy it's read in, and
+/// links to the parent.
+fn push_join_where(qb: &mut QueryBuilder<Postgres>, q: &JoinQuery<'_>, data: &Base) {
+    qb.push(" WHERE TRUE");
+    if let Some(f) = q.filter {
+        qb.push(" AND ");
+        push_filter_in(qb, f, data);
+    }
+    push_linked(qb, q.pattern);
 }
 
 /// One page of linking documents for every parent, in one query: a `LATERAL` subquery
@@ -648,15 +866,24 @@ pub async fn joined(
     if parents.is_empty() {
         return Ok(out);
     }
-    let order = order_by(q.sort);
+    let data = Base {
+        json: "data".into(),
+        columns: String::new(),
+        depth: 0,
+    };
+    let order = order_by_in(&data, q.sort);
     let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT p.parent, d.id, d.status, d.created_at, d.updated_at, d.data FROM unnest(",
+        "SELECT p.parent, d.id, d.status, d.created_at, d.updated_at, d.published_at, d.data \
+         FROM unnest(",
     );
     qb.push_bind(parents.to_vec())
-        .push("::uuid[]) AS p(parent) CROSS JOIN LATERAL (SELECT id, status, created_at, updated_at, published AS data, ")
-        .push(format!("row_number() OVER (ORDER BY {order}) AS n FROM documents"));
-    push_where(&mut qb, q.collection_id, q.filter);
-    push_linked(&mut qb, q.pattern);
+        .push(format!(
+            "::uuid[]) AS p(parent) CROSS JOIN LATERAL (SELECT id, status, created_at, \
+             updated_at, {PUBLISHED_AT}, data, "
+        ))
+        .push(format!("row_number() OVER (ORDER BY {order}) AS n FROM "));
+    push_source(&mut qb, q.collection_id, q.read);
+    push_join_where(&mut qb, q, &data);
     qb.push(format!(" ORDER BY {order} LIMIT "))
         .push_bind(q.limit.saturating_add(1))
         .push(" OFFSET ")
@@ -675,10 +902,9 @@ pub async fn joined(
     }
 
     if q.count {
-        let mut qb =
-            QueryBuilder::<Postgres>::new("SELECT p.parent, (SELECT count(*) FROM documents");
-        push_where(&mut qb, q.collection_id, q.filter);
-        push_linked(&mut qb, q.pattern);
+        let mut qb = QueryBuilder::<Postgres>::new("SELECT p.parent, (SELECT count(*) FROM ");
+        push_source(&mut qb, q.collection_id, q.read);
+        push_join_where(&mut qb, q, &data);
         qb.push(") FROM unnest(")
             .push_bind(parents.to_vec())
             .push("::uuid[]) AS p(parent)");
@@ -699,54 +925,162 @@ struct ReadableRow {
     doc: Document,
 }
 
-/// `documents::get_many`, keeping only what the caller may read. `read` maps each readable
-/// collection's ID to its read filter (`None`: all of it); documents in any other
-/// collection don't come back.
+/// Live documents with these IDs, keeping only what the caller may read. `read` maps each
+/// readable collection's ID to how they read it, which also picks the copy returned;
+/// documents in any other collection don't come back.
 pub async fn get_many_readable(
     pool: &PgPool,
     ids: &[Uuid],
-    read: &HashMap<Uuid, Option<Filter>>,
+    read: &HashMap<Uuid, Readable>,
 ) -> Result<Vec<(Uuid, Document)>, DbError> {
-    let mut qb = QueryBuilder::<Postgres>::new(
-        "SELECT id, collection_id, status, created_at, updated_at, published AS data \
-         FROM documents WHERE tenant_id = ",
-    );
-    qb.push_bind(DEFAULT_TENANT)
-        .push(" AND id = ANY(")
-        .push_bind(ids.to_vec())
-        .push(") AND deleted_at IS NULL AND (FALSE");
     // Sorted, so the same map always builds the same SQL text (and reuses its statement).
     let mut read: Vec<_> = read.iter().collect();
     read.sort_unstable_by_key(|(id, _)| **id);
-    for (collection_id, filter) in read {
-        qb.push(" OR (collection_id = ").push_bind(*collection_id);
-        if let Some(f) = filter {
-            qb.push(" AND ");
-            push_filter(&mut qb, f);
+    // One half per copy, each row in exactly one: a fallback only takes rows the way
+    // before it can't read.
+    let mut qb = QueryBuilder::<Postgres>::new("");
+    for (i, copy) in [DocCopy::Published, DocCopy::Draft].into_iter().enumerate() {
+        if i > 0 {
+            qb.push(" UNION ALL ");
+        }
+        qb.push(format!(
+            "SELECT id, collection_id, status, created_at, {}, {PUBLISHED_AT}, \
+             {} AS data FROM documents WHERE tenant_id = ",
+            updated_at(copy),
+            copy.as_str()
+        ))
+        .push_bind(DEFAULT_TENANT)
+        .push(" AND id = ANY(")
+        .push_bind(ids.to_vec())
+        .push(") AND deleted_at IS NULL AND (FALSE");
+        for (collection_id, r) in &read {
+            for (way, unless) in ways(r).filter(|(way, _)| way.copy == copy) {
+                qb.push(" OR (collection_id = ").push_bind(**collection_id);
+                if let Some(first) = unless {
+                    push_unreadable(&mut qb, "", 0, first);
+                }
+                push_readable(&mut qb, "", 0, way);
+                qb.push(")");
+            }
         }
         qb.push(")");
     }
-    qb.push(")");
     let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(pool).await?;
     Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
 }
 
-/// Whether live document `id` matches `filter`. Run after locking the row, this judges the
-/// version the rest of the transaction writes over.
+/// The IDs of up to two live documents of `collection_id` readable as `read` (its
+/// fallback too) whose top-level text field `field`, in the copy each is read in, is one of
+/// `slugs`, by slug. Two settles that a slug is ambiguous, so no more are looked for, and
+/// only IDs come back.
+pub async fn by_slug(
+    pool: &PgPool,
+    collection_id: Uuid,
+    field: &str,
+    slugs: &[String],
+    read: &Readable,
+) -> Result<HashMap<String, std::collections::HashSet<Uuid>>, DbError> {
+    let path = [field.to_owned()];
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT s.want, m.id FROM unnest(");
+    qb.push_bind(slugs.to_vec())
+        .push(
+            "::text[]) AS s(want) CROSS JOIN LATERAL (SELECT id FROM documents WHERE tenant_id = ",
+        )
+        .push_bind(DEFAULT_TENANT)
+        .push(" AND collection_id = ")
+        .push_bind(collection_id)
+        .push(" AND deleted_at IS NULL AND (FALSE");
+    for (way, unless) in ways(read) {
+        qb.push(" OR (");
+        qb.push(field_expr_for(way.copy, &path, ValueKind::Text))
+            .push(" = s.want");
+        if let Some(first) = unless {
+            push_unreadable(&mut qb, "", 0, first);
+        }
+        push_readable(&mut qb, "", 0, way);
+        qb.push(")");
+    }
+    qb.push(") LIMIT 2) m");
+    let rows: Vec<(String, Uuid)> = qb.build_query_as().fetch_all(pool).await?;
+    let mut out: HashMap<String, std::collections::HashSet<Uuid>> = HashMap::new();
+    for (slug, id) in rows {
+        out.entry(slug).or_default().insert(id);
+    }
+    Ok(out)
+}
+
+/// Whether live document `id`'s `copy` matches `filter`. Run after locking the row, this
+/// judges the version the rest of the transaction writes over.
 pub(crate) async fn matches(
     conn: &mut sqlx::PgConnection,
     id: Uuid,
+    copy: DocCopy,
     filter: &Filter,
 ) -> Result<bool, DbError> {
     let mut qb =
         QueryBuilder::<Postgres>::new("SELECT EXISTS (SELECT 1 FROM documents WHERE tenant_id = ");
     qb.push_bind(DEFAULT_TENANT)
         .push(" AND deleted_at IS NULL AND id = ")
-        .push_bind(id)
-        .push(" AND ");
-    push_filter(&mut qb, filter);
+        .push_bind(id);
+    push_copy(&mut qb, "", copy, None);
+    qb.push(" AND ");
+    push_filter(&mut qb, copy, filter);
     qb.push(")");
     Ok(qb.build_query_scalar().fetch_one(conn).await?)
+}
+
+/// Locks the trashed documents of `collection_id` that `read` reaches (its copy, owner and
+/// filter; no fallback), or only `id` among them, for a restore or a purge inside `conn`'s
+/// transaction, and returns their IDs. The collection is locked first, as every write
+/// locks it, and must still be at `schema_version`.
+pub async fn lock_trash_in(
+    conn: &mut sqlx::PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+    read: &Readable,
+    id: Option<Uuid>,
+) -> Result<Vec<Uuid>, DbError> {
+    crate::documents::check_schema(&mut *conn, collection_id, schema_version).await?;
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT id FROM documents");
+    push_trash_where(&mut qb, collection_id, read, id);
+    qb.push(" ORDER BY id FOR UPDATE");
+    Ok(qb.build_query_scalar().fetch_all(conn).await?)
+}
+
+/// `lock_trash_in`, as a plain read that locks nothing: whether `read` reaches trashed
+/// document `id` of `collection_id`.
+pub async fn in_trash(
+    conn: &mut sqlx::PgConnection,
+    collection_id: Uuid,
+    read: &Readable,
+    id: Uuid,
+) -> Result<bool, DbError> {
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT EXISTS (");
+    qb.push("SELECT id FROM documents");
+    push_trash_where(&mut qb, collection_id, read, Some(id));
+    qb.push(")");
+    Ok(qb.build_query_scalar().fetch_one(conn).await?)
+}
+
+fn push_trash_where(
+    qb: &mut QueryBuilder<Postgres>,
+    collection_id: Uuid,
+    read: &Readable,
+    id: Option<Uuid>,
+) {
+    push_where(
+        qb,
+        &Scope {
+            collection_id,
+            copy: read.copy,
+            owner: read.owner,
+            filter: read.filter.as_ref(),
+            trashed: true,
+        },
+    );
+    if let Some(id) = id {
+        qb.push(" AND id = ").push_bind(id);
+    }
 }
 
 /// Rows after `cursor` in `ORDER BY sort_expr <dir> NULLS LAST, id DESC` order.
@@ -807,15 +1141,66 @@ fn sort_value(sort: Option<&Sort>, doc: &Document) -> Option<Scalar> {
 mod tests {
     use super::*;
 
+    #[sqlx::test(migrator = "crate::MIGRATOR")]
+    async fn matches_judges_the_copy_named(pool: PgPool) {
+        let schema: tachyon_core::CollectionSchema = serde_json::from_value(json!({
+            "slug": "posts", "versions": {"drafts": true},
+            "fields": [{"name": "title", "type": "text"}]
+        }))
+        .unwrap();
+        let c = crate::collections::create(&pool, &schema).await.unwrap().id;
+        let data = json!({"title": "Live"}).as_object().unwrap().clone();
+        let id =
+            crate::documents::insert(&pool, c, 1, None, &crate::documents::Prepared::plain(data))
+                .await
+                .unwrap()
+                .id;
+        sqlx::query("UPDATE documents SET draft = '{\"title\": \"Edited\"}' WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let title = |t: &str| {
+            let raw =
+                tachyon_core::query::parse_query(&format!("where[title][equals]={t}")).unwrap();
+            tachyon_core::query::parse_filter(&schema.fields, &raw["where"]).unwrap()
+        };
+        let mut conn = pool.acquire().await.unwrap();
+        for (copy, yes, no) in [
+            (DocCopy::Draft, "Edited", "Live"),
+            (DocCopy::Published, "Live", "Edited"),
+        ] {
+            assert!(
+                matches(&mut conn, id, copy, &title(yes)).await.unwrap(),
+                "{copy:?}"
+            );
+            assert!(
+                !matches(&mut conn, id, copy, &title(no)).await.unwrap(),
+                "{copy:?}"
+            );
+        }
+        // A copy that isn't there matches nothing.
+        sqlx::query("UPDATE documents SET draft = NULL WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let any = Filter::All(Vec::new());
+        assert!(!matches(&mut conn, id, DocCopy::Draft, &any).await.unwrap());
+    }
+
     #[test]
     fn built_in_sorts_match_their_indexes() {
         // NOT NULL columns get no NULLS LAST, so Postgres can walk the (…, id DESC) index.
-        assert_eq!(order_by(None), "id DESC");
+        assert_eq!(order_by(DocCopy::Published, None), "id DESC");
         let created = Sort {
             target: Target::CreatedAt,
             descending: false,
         };
-        assert_eq!(order_by(Some(&created)), "created_at ASC, id DESC");
+        assert_eq!(
+            order_by(DocCopy::Published, Some(&created)),
+            "created_at ASC, id DESC"
+        );
         let price = Sort {
             target: Target::Field {
                 path: vec!["price".into()],
@@ -824,7 +1209,7 @@ mod tests {
             descending: true,
         };
         assert_eq!(
-            order_by(Some(&price)),
+            order_by(DocCopy::Published, Some(&price)),
             "(CASE WHEN jsonb_typeof(published #> '{price}') = 'number' THEN (published #>> '{price}')::numeric END) DESC NULLS LAST, id DESC"
         );
     }

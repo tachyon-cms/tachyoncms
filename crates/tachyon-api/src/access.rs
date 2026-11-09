@@ -18,7 +18,7 @@ use tachyon_core::access::{
     readable_rows, strip_to, unwritable, visible_errors,
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
-use tachyon_core::query::{Filter, Target};
+use tachyon_core::query::{DocCopy, Filter, Readable, Target};
 use tachyon_core::{CollectionKind, CollectionSchema, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
@@ -39,8 +39,13 @@ pub(crate) struct Access {
     /// fields. `None` when signed out.
     user: Option<Map<String, Value>>,
     schemas: Arc<Schemas>,
-    /// `readable()`, worked out once per request.
-    readable: OnceLock<HashMap<Uuid, Option<Filter>>>,
+    /// Whether the request works on drafts: asked for with `?draft=true`, or a write to a
+    /// collection with drafts. Each linked document is then read as its draft where the
+    /// caller may read that draft, else as what's published. Set once, before anything is
+    /// read: the first read fixes it.
+    drafts: OnceLock<bool>,
+    /// `linked()`, worked out once per request.
+    linked: OnceLock<HashMap<Uuid, Readable>>,
     /// Each collection (by ID and schema version) as the caller can read it, worked out
     /// once per request.
     visible: Mutex<HashMap<(Uuid, i32), Shape>>,
@@ -228,19 +233,29 @@ fn uses_profile(rule: &Rule) -> bool {
 /// request's collections never compile for it, and a rule missing a profile value it needed
 /// fails closed anyway, so this only decides whether the lookup is worth making.
 fn needs_profile(schemas: &Schemas, reach: &Reach) -> bool {
+    // A read is of either copy, so `readDrafts` counts as reading.
     let read = |c: &Collection| {
-        c.schema
-            .access
-            .as_ref()
-            .and_then(|a| a.read.as_ref())
-            .is_some_and(uses_profile)
-    };
-    let any_action = |c: &Collection| {
         c.schema.access.as_ref().is_some_and(|a| {
-            [&a.read, &a.create, &a.update, &a.delete]
+            [&a.read, &a.read_drafts]
                 .into_iter()
                 .flatten()
                 .any(uses_profile)
+        })
+    };
+    let any_action = |c: &Collection| {
+        c.schema.access.as_ref().is_some_and(|a| {
+            [
+                &a.read,
+                &a.create,
+                &a.update,
+                &a.delete,
+                &a.read_drafts,
+                &a.read_versions,
+                &a.publish,
+            ]
+            .into_iter()
+            .flatten()
+            .any(uses_profile)
         })
     };
     let start = match reach {
@@ -296,7 +311,14 @@ impl Access {
                     && needs_profile(&state.schemas, &reach)
                     && let Some(users) = state.schemas.get(USERS)
                 {
-                    match documents::get(&state.pool, users.id, identity.user_id).await {
+                    match documents::get(
+                        &state.pool,
+                        users.id,
+                        identity.user_id,
+                        DocCopy::Published,
+                    )
+                    .await
+                    {
                         Ok(doc) => user = doc.data.0,
                         Err(DbError::NotFound) => {}
                         Err(e) => return Err(e.into()),
@@ -311,7 +333,8 @@ impl Access {
             principal,
             user,
             schemas: state.schemas.clone(),
-            readable: OnceLock::new(),
+            drafts: OnceLock::new(),
+            linked: OnceLock::new(),
             visible: Mutex::new(HashMap::new()),
         })
     }
@@ -416,14 +439,15 @@ impl Access {
         refuse_fields(c, input, action, &self.caller(), existing)
     }
 
-    /// The role default, narrowed by a key's scopes.
-    fn by_role(&self, action: Action, slug: &str) -> Decision {
+    /// The role default, narrowed by a key's scopes when `scoped`; otherwise what a key's
+    /// owner may do, whatever its scopes.
+    fn by_role_in(&self, action: Action, slug: &str, scoped: bool) -> Decision {
         match &self.principal {
             Principal::Anonymous => decide_anonymous(action),
             Principal::User { identity, .. } => decide(&identity.abilities, None, action, slug),
-            Principal::Key { identity, scopes } => {
-                decide(&identity.abilities, Some(scopes), action, slug)
-            }
+            Principal::Key {
+                identity, scopes, ..
+            } => decide(&identity.abilities, scoped.then_some(scopes), action, slug),
         }
     }
 
@@ -434,6 +458,9 @@ impl Access {
             Action::Create => a.create.as_ref(),
             Action::Update | Action::UpdateGlobal => a.update.as_ref(),
             Action::Delete => a.delete.as_ref(),
+            Action::ReadDrafts => a.read_drafts.as_ref(),
+            Action::ReadVersions => a.read_versions.as_ref(),
+            Action::Publish => a.publish.as_ref(),
             Action::Schemas | Action::Users => None,
         }
     }
@@ -451,8 +478,14 @@ impl Access {
     /// What `action` on `c` comes to for this caller: its rule, compiled, or the role default
     /// where there's none. An Author's own-only default is `Allow` here; `actor` carries it.
     pub(crate) fn allows(&self, action: Action, c: &Collection) -> Compiled {
+        self.allows_in(action, c, true)
+    }
+
+    /// `allows`, or with `scoped` false what a key's owner may do, whatever its scopes:
+    /// only for what publishing reads on a `:publish` key's behalf (Ruling T1-2).
+    fn allows_in(&self, action: Action, c: &Collection, scoped: bool) -> Compiled {
         let slug = c.schema.slug.as_str();
-        if self.scope(action, slug).is_err() {
+        if scoped && self.scope(action, slug).is_err() {
             return Compiled::Deny;
         }
         // A profile reads like content wherever a document links to it (populate, filters,
@@ -460,7 +493,9 @@ impl Access {
         // listed and changed only through their own routes, which check self-or-admin.
         if slug == USERS {
             return match action {
-                Action::Read if self.by_role(action, USERS) != Decision::Deny => Compiled::Allow,
+                Action::Read if self.by_role_in(action, USERS, scoped) != Decision::Deny => {
+                    Compiled::Allow
+                }
                 _ => Compiled::Deny,
             };
         }
@@ -469,7 +504,7 @@ impl Access {
                 let lookup = |s: &str| self.schemas.lookup(s);
                 compile(rule, &self.caller(), c.schema.data(), &lookup)
             }
-            None if self.by_role(action, slug) == Decision::Deny => Compiled::Deny,
+            None if self.by_role_in(action, slug, scoped) == Decision::Deny => Compiled::Deny,
             None => Compiled::Allow,
         }
     }
@@ -497,15 +532,164 @@ impl Access {
         }
     }
 
+    /// Whether the role default limits `action` on `c` to documents the caller created
+    /// (only when `c` has no rule for it). `allows` reads that as `Allow`.
+    fn own_only(&self, action: Action, c: &Collection) -> bool {
+        self.own_only_in(action, c, true)
+    }
+
+    /// `own_only`, scoped as `allows_in` is.
+    fn own_only_in(&self, action: Action, c: &Collection, scoped: bool) -> bool {
+        self.rule(action, c).is_none()
+            && self.by_role_in(action, &c.schema.slug, scoped) == Decision::OwnOnly
+    }
+
     /// Who the database records as writing, and whether the role default limits them to
-    /// documents they created (only when `c` has no rule for `action`).
+    /// documents they created.
     pub(crate) fn actor(&self, action: Action, c: &Collection) -> Option<Actor> {
-        let own_only = self.rule(action, c).is_none()
-            && self.by_role(action, &c.schema.slug) == Decision::OwnOnly;
+        let own_only = self.own_only(action, c);
         self.principal.identity().map(|i| Actor {
             id: i.user_id,
             own_only,
         })
+    }
+
+    /// Whether the request works on drafts (see `drafts`). Asking fixes the answer.
+    pub(crate) fn drafts(&self) -> bool {
+        *self.drafts.get_or_init(|| false)
+    }
+
+    /// Makes the request one that works on drafts. Refused once anything has been read
+    /// without them, since what was read then would no longer match.
+    fn use_drafts(&self) -> Result<(), ApiError> {
+        match self.drafts.set(true) {
+            Ok(()) => Ok(()),
+            Err(_) if self.drafts() => Ok(()),
+            Err(_) => {
+                debug_assert!(false, "drafts turned on after a published read");
+                Err(ApiError::Internal(
+                    "drafts were asked for after reading began".into(),
+                ))
+            }
+        }
+    }
+
+    /// The copy a write to `c` changes: its draft when it has drafts, which makes the
+    /// request one that works on drafts.
+    pub(crate) fn write_copy(&self, c: &Collection) -> Result<DocCopy, ApiError> {
+        if c.schema.drafts() {
+            self.use_drafts()?;
+            Ok(DocCopy::Draft)
+        } else {
+            Ok(DocCopy::Published)
+        }
+    }
+
+    /// How the caller reads `c`'s drafts, given its `read` filter: the read rule and the
+    /// `readDrafts` rule both judge the draft, and an own-only right narrows it to what they
+    /// created. `None` when `c` has no drafts or they may not read them. Nobody created a
+    /// global, so an own-only right reaches no global's draft.
+    fn draft_readable(&self, c: &Collection, read: Option<Filter>) -> Option<Readable> {
+        self.draft_readable_in(c, read, true)
+    }
+
+    /// `draft_readable`, scoped as `allows_in` is.
+    fn draft_readable_in(
+        &self,
+        c: &Collection,
+        read: Option<Filter>,
+        scoped: bool,
+    ) -> Option<Readable> {
+        if !c.schema.drafts() {
+            return None;
+        }
+        let drafts = match self.allows_in(Action::ReadDrafts, c, scoped) {
+            Compiled::Deny => return None,
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        let owner = match self.own_only_in(Action::ReadDrafts, c, scoped) {
+            false => None,
+            true if c.schema.kind == CollectionKind::Global => return None,
+            true => Some(self.principal.identity()?.user_id),
+        };
+        Some(Readable {
+            filter: both(read, drafts),
+            copy: DocCopy::Draft,
+            owner,
+            otherwise: None,
+        })
+    }
+
+    /// How the caller reads a document of `c` that something links to: with `drafts`, as
+    /// its draft where they may read that draft, else as what's published where they may
+    /// read that. Filters through links, joins, populate, virtuals, rendering, link checks
+    /// and slug lookups all read linked documents this way.
+    fn linked_in(&self, c: &Collection, drafts: bool) -> Option<Readable> {
+        let read = self.readable_in(c, false)?;
+        match self.readable_in(c, drafts) {
+            Some(draft) if draft.copy == DocCopy::Draft => Some(Readable {
+                otherwise: Some(Box::new(read)),
+                ..draft
+            }),
+            _ => Some(read),
+        }
+    }
+
+    /// How the caller reads documents of `c` that this request links to (see `linked_in`).
+    pub(crate) fn linked_of(&self, c: &Collection) -> Option<Readable> {
+        self.linked_in(c, self.drafts())
+    }
+
+    /// How the caller reads `c`, its draft when `drafts` and they may read it there, else
+    /// its published copy; `None` when they can't read `c`. Never both: a document asked
+    /// for itself is read in one copy.
+    fn readable_in(&self, c: &Collection, drafts: bool) -> Option<Readable> {
+        let read = match self.allows(Action::Read, c) {
+            Compiled::Deny => return None,
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        match drafts {
+            true => self.draft_readable(c, read.clone()),
+            false => None,
+        }
+        .or(Some(Readable::published(read)))
+    }
+
+    /// How the caller reads `c` in this request (see `drafts`), for documents asked for
+    /// themselves (a list, a get): one copy, no fallback. Links use `linked_of`.
+    pub(crate) fn readable_of(&self, c: &Collection) -> Option<Readable> {
+        self.readable_in(c, self.drafts())
+    }
+
+    /// The copy of `c` a read asking for its draft (`draft`) gets: a 400 when `c` has no
+    /// drafts, and a 403 when the caller may not read them (a 401 when signed out). Asking
+    /// for it makes the request one that works on drafts.
+    pub(crate) fn copy_for(&self, c: &Collection, draft: bool) -> Result<DocCopy, ApiError> {
+        if !draft {
+            return Ok(DocCopy::Published);
+        }
+        let slug = &c.schema.slug;
+        if !c.schema.drafts() {
+            return Err(ApiError::BadRequest(format!(
+                "`draft`: `{slug}` has no drafts"
+            )));
+        }
+        if self
+            .readable_in(c, true)
+            .is_none_or(|r| r.copy != DocCopy::Draft)
+        {
+            // Signed out is a 401, as every other refusal gives it (Ruling F-6).
+            if matches!(self.principal, Principal::Anonymous) {
+                return Err(self.refuse());
+            }
+            return Err(ApiError::Forbidden(format!(
+                "`draft`: you don't have permission to read the drafts of `{slug}`"
+            )));
+        }
+        self.use_drafts()?;
+        Ok(DocCopy::Draft)
     }
 
     /// The rules an update or delete (`action`) on `c` runs under, before any document is
@@ -542,29 +726,28 @@ impl Access {
         }
     }
 
-    /// Each collection the caller may read, with its read filter (`None`: all of it).
-    /// Globals are left out: nothing links to them.
-    pub(crate) fn readable(&self) -> &HashMap<Uuid, Option<Filter>> {
-        self.readable
-            .get_or_init(|| self.read_filters(|c| c.schema.kind == CollectionKind::Collection))
+    /// How the caller reads each collection's documents that this request links to (see
+    /// `linked_in`). Globals are left out: nothing links to them.
+    pub(crate) fn linked(&self) -> &HashMap<Uuid, Readable> {
+        let drafts = self.drafts();
+        self.linked.get_or_init(|| {
+            self.schemas
+                .all()
+                .iter()
+                .filter(|c| c.schema.kind == CollectionKind::Collection)
+                .filter_map(|c| Some((c.id, self.linked_in(c, drafts)?)))
+                .collect()
+        })
     }
 
-    /// `readable`, with globals too: a global can link to a document, so it can be one of
-    /// that document's references.
-    pub(crate) fn readable_with_globals(&self) -> HashMap<Uuid, Option<Filter>> {
-        self.read_filters(|_| true)
-    }
-
-    fn read_filters(&self, which: impl Fn(&Collection) -> bool) -> HashMap<Uuid, Option<Filter>> {
+    /// Each collection, globals too, as the caller reads it in one copy: drafts where they
+    /// may read them there (`drafts`), else published. A global can link to a document, so
+    /// it can be one of that document's references.
+    pub(crate) fn readable_with_globals(&self, drafts: bool) -> HashMap<Uuid, Readable> {
         self.schemas
             .all()
             .iter()
-            .filter(|c| which(c))
-            .filter_map(|c| match self.allows(Action::Read, c) {
-                Compiled::Allow => Some((c.id, None)),
-                Compiled::Filter(f) => Some((c.id, Some(f))),
-                Compiled::Deny => None,
-            })
+            .filter_map(|c| Some((c.id, self.readable_in(c, drafts)?)))
             .collect()
     }
 
@@ -579,24 +762,43 @@ impl Access {
             }
     }
 
-    /// Whether the caller may read `doc` of `c`, which they just wrote.
+    /// Whether the caller may read `copy` of document `doc` of `c`, which they just wrote.
     pub(crate) async fn can_read(
         &self,
         pool: &PgPool,
         c: &Collection,
         doc: Uuid,
+        copy: DocCopy,
     ) -> Result<bool, ApiError> {
-        Ok(match self.allows(Action::Read, c) {
-            Compiled::Allow => true,
-            Compiled::Deny => false,
-            Compiled::Filter(f) => {
-                let one = HashMap::from([(c.id, Some(f))]);
-                !get_many_readable(pool, &[doc], &one).await?.is_empty()
+        Ok(self.read_copy(pool, c, doc, copy).await?.is_some())
+    }
+
+    /// `copy` of document `doc` of `c`, when the caller may read that copy of it.
+    pub(crate) async fn read_copy(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        doc: Uuid,
+        copy: DocCopy,
+    ) -> Result<Option<Document>, ApiError> {
+        let read = self
+            .readable_in(c, copy == DocCopy::Draft)
+            .filter(|r| r.copy == copy);
+        Ok(match read {
+            None => None,
+            Some(r) => {
+                let one = HashMap::from([(c.id, r)]);
+                get_many_readable(pool, &[doc], &one)
+                    .await?
+                    .pop()
+                    .map(|(_, d)| d)
             }
         })
     }
 
-    /// Document `id` of `c`, when the caller may read it; a 404 when they may not.
+    /// Document `id` of `c` as this request reads it, when the caller may; a 404 when they
+    /// may not. Always through the read filter, copy and owner together: an own-only draft
+    /// read must never fall back to a plain get.
     pub(crate) async fn read_one(
         &self,
         pool: &PgPool,
@@ -604,12 +806,8 @@ impl Access {
         id: Uuid,
     ) -> Result<Document, ApiError> {
         self.scope(Action::Read, &c.schema.slug)?;
-        let filter = match self.allows(Action::Read, c) {
-            Compiled::Deny => return Err(ApiError::NotFound),
-            Compiled::Allow => return Ok(documents::get(pool, c.id, id).await?),
-            Compiled::Filter(f) => f,
-        };
-        let read = HashMap::from([(c.id, Some(filter))]);
+        let read = self.readable_of(c).ok_or(ApiError::NotFound)?;
+        let read = HashMap::from([(c.id, read)]);
         get_many_readable(pool, &[id], &read)
             .await?
             .pop()
@@ -617,9 +815,46 @@ impl Access {
             .ok_or(ApiError::NotFound)
     }
 
+    /// Whether the caller may read the published copy of document `id` of `c`.
+    async fn sees_published(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let Some(read) = self.readable_in(c, false) else {
+            return Ok(false);
+        };
+        let one = HashMap::from([(c.id, read)]);
+        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
+    }
+
+    /// Whether the caller may read either copy of document `id` of `c`.
+    pub(crate) async fn sees(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        id: Uuid,
+    ) -> Result<bool, ApiError> {
+        for drafts in [false, true] {
+            if let Some(r) = self.readable_in(c, drafts)
+                && (r.copy == DocCopy::Draft) == drafts
+            {
+                let one = HashMap::from([(c.id, r)]);
+                if !get_many_readable(pool, &[id], &one).await?.is_empty() {
+                    return Ok(true);
+                }
+            }
+        }
+        Ok(false)
+    }
+
     /// The guard an update or delete of document `id` runs under: the read filter and the
     /// action's filter, both checked on the locked row. A document the caller can't read is
     /// a 404; one they can read but not change is a 403 (from the write, when it's a filter).
+    /// With drafts, a write changes the draft, so it's the draft they must be able to read
+    /// (`readDrafts` too, and their own for an own-only right), and the draft the guard
+    /// judges.
     pub(crate) async fn write_guard(
         &self,
         pool: &PgPool,
@@ -627,7 +862,7 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<Option<Filter>, ApiError> {
-        self.scope(action, &c.schema.slug)?;
+        self.may_write(action, c)?;
         let (read, write) = match self.write_rules(action, c) {
             Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
             // Refused for the whole collection, so a 403 before the readability check is
@@ -635,14 +870,300 @@ impl Access {
             Err(WriteRefusal::Refused) => return Err(self.refuse()),
             Ok(filters) => filters,
         };
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            // Refused for the whole collection, as above.
+            None if c.schema.drafts() => return Err(self.refuse()),
+            None => Readable::published(read),
+        };
         // Checked first so a hidden document is a 404; the guard checks it again under the
-        // lock, so a change in between can only turn this into a 403.
-        if let Some(f) = &read {
-            let one = HashMap::from([(c.id, Some(f.clone()))]);
+        // lock, so a change in between can only turn this into a 403. The owner never
+        // changes, so it needn't be. A draft the caller can't read, of a document whose
+        // published copy they can, is theirs to know about: a 403.
+        if read.filter.is_some() || read.owner.is_some() {
+            let one = HashMap::from([(c.id, read.clone())]);
             if get_many_readable(pool, &[id], &one).await?.is_empty() {
-                return Err(ApiError::NotFound);
+                return Err(match read.copy {
+                    DocCopy::Draft if self.sees_published(pool, c, id).await? => self.refuse(),
+                    _ => ApiError::NotFound,
+                });
             }
         }
+        Ok(both(read.filter, write))
+    }
+
+    /// The refusals an update or delete (`action`) of `c` meets before any document is
+    /// looked at, as `write_guard` gives them: so a refused caller hears that first, before
+    /// anything about the request's parameters.
+    pub(crate) fn may_write(&self, action: Action, c: &Collection) -> Result<(), ApiError> {
+        self.scope(action, &c.schema.slug)?;
+        match self.write_rules(action, c) {
+            Err(WriteRefusal::Hidden) => Err(ApiError::NotFound),
+            Err(WriteRefusal::Refused) => Err(self.refuse()),
+            Ok((read, _))
+                if c.schema.drafts() && self.draft_readable(c, read.clone()).is_none() =>
+            {
+                Err(self.refuse())
+            }
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// How the caller reaches `c`'s trash, where everything takes `delete` (plan call 9):
+    /// the copy a delete judges (the draft, with drafts, which makes the request one that
+    /// works on drafts), the read filter (and `readDrafts`) with the delete filter, and
+    /// only what they created when either right is own-only. The trash shows a document
+    /// only this way, so one it doesn't reach is a 404.
+    pub(crate) fn trash_readable(&self, c: &Collection) -> Result<Readable, ApiError> {
+        self.may_write(Action::Delete, c)?;
+        let (read, delete) = self
+            .write_rules(Action::Delete, c)
+            .map_err(|_| self.refuse())?;
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            // `may_write` refused a drafts collection whose drafts they can't read.
+            None => Readable::published(read),
+        };
+        self.write_copy(c)?;
+        let owner = match self.own_only(Action::Delete, c) {
+            true => Some(self.user_id().ok_or_else(|| self.refuse())?),
+            false => read.owner,
+        };
+        Ok(Readable {
+            filter: both(read.filter, delete),
+            owner,
+            ..read
+        })
+    }
+
+    /// What publishing or unpublishing document `id` of `c` runs under, judged on its draft
+    /// once locked: the read, `readDrafts` and `publish` rules, and the creator for an
+    /// own-only `readDrafts`. A key needs only the `:publish` scope (Ruling T1-2): its
+    /// owner's rights decide what it may read to publish, and it reads nothing back. A
+    /// document whose draft the caller can't read is a 404, or a 403 when they can read
+    /// what's published; a global, whose existence isn't secret, is a 403.
+    pub(crate) async fn publish_guard(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        id: Uuid,
+    ) -> Result<Readable, ApiError> {
+        let global = c.schema.kind == CollectionKind::Global;
+        let draft = self.publish_rules(c)?;
+        // Checked first so a hidden document is a 404; the lock checks it again.
+        let one = HashMap::from([(c.id, draft.clone())]);
+        if get_many_readable(pool, &[id], &one).await?.is_empty() {
+            let known = match global {
+                true => documents::get(pool, c.id, id, DocCopy::Draft).await.is_ok(),
+                false => self.sees_published(pool, c, id).await?,
+            };
+            return Err(if known {
+                self.refuse()
+            } else {
+                ApiError::NotFound
+            });
+        }
+        Ok(draft)
+    }
+
+    /// What publishing a document of `c` runs under, before any document is looked at (see
+    /// `publish_guard`, which also judges the document): the draft under the read,
+    /// `readDrafts` and `publish` rules. A 400 when `c` has no drafts; a 404 when the
+    /// caller can't read the collection, or a 403 for a global; a 403 when they may not
+    /// publish or read its drafts.
+    fn publish_rules(&self, c: &Collection) -> Result<Readable, ApiError> {
+        let slug = &c.schema.slug;
+        // Callers check the `:publish` scope first, before anything about the request.
+        if !c.schema.drafts() {
+            return Err(ApiError::BadRequest(format!("`{slug}` has no drafts")));
+        }
+        let global = c.schema.kind == CollectionKind::Global;
+        let read = match self.allows_in(Action::Read, c, false) {
+            Compiled::Deny if !global => return Err(ApiError::NotFound),
+            Compiled::Deny => return Err(self.refuse()),
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        let publish = match self.allows(Action::Publish, c) {
+            Compiled::Deny => return Err(self.refuse()),
+            Compiled::Allow => None,
+            Compiled::Filter(f) => Some(f),
+        };
+        let draft = self
+            .draft_readable_in(c, read, false)
+            .ok_or_else(|| self.refuse())?;
+        Ok(Readable {
+            filter: both(draft.filter, publish),
+            ..draft
+        })
+    }
+
+    /// Refuses unless the caller may read the past versions of document `id` of `c`: its
+    /// `readVersions` and read rules, judged on the copy they may read (the draft where they
+    /// may read drafts, else what's published), and the creator for an own-only right, which
+    /// reaches no global. Refused and missing are both a 404 (W1-R14), as is a document in
+    /// the trash; a global, whose existence isn't secret, is refused with a 403 (Ruling
+    /// T5-5), even before it's saved when a rule limits the caller. Answers whether they may
+    /// also read the versions that were drafts, which takes `readDrafts` on the document too
+    /// (Ruling T5-3).
+    pub(crate) async fn versions_of(
+        &self,
+        pool: &PgPool,
+        c: &Collection,
+        id: Uuid,
+    ) -> Result<bool, ApiError> {
+        let global = c.schema.kind == CollectionKind::Global;
+        let (versions, read) = self.versions_rules(c)?;
+        let copy = versions.copy;
+        // A rule could refuse even what isn't saved yet, so a global it limits is refused,
+        // saved or not; only a global nothing limits can be missing, a 404.
+        let limited = versions.filter.is_some();
+        let one = HashMap::from([(c.id, versions)]);
+        if get_many_readable(pool, &[id], &one).await?.is_empty() {
+            // Saved in any copy counts: a global never published, or taken down, is still known.
+            let saved = async |copy| documents::get(pool, c.id, id, copy).await.is_ok();
+            let known = global
+                && (limited
+                    || (c.schema.drafts() && saved(DocCopy::Draft).await)
+                    || saved(DocCopy::Published).await);
+            return Err(if known {
+                self.refuse()
+            } else {
+                ApiError::NotFound
+            });
+        }
+        // Without drafts, every version is of what was published; judged on the published
+        // copy, the caller may not read drafts.
+        if copy == DocCopy::Published {
+            return Ok(!c.schema.drafts());
+        }
+        let Some(drafts) = self.draft_readable(c, read) else {
+            return Ok(false);
+        };
+        // The draft was just found, so only a filter or an owner can still hide it. Not
+        // folded into the query above: each takes one readable per collection, and these
+        // two judge the same copy by different rules.
+        if drafts.filter.is_none() && drafts.owner.is_none() {
+            return Ok(true);
+        }
+        let one = HashMap::from([(c.id, drafts)]);
+        Ok(!get_many_readable(pool, &[id], &one).await?.is_empty())
+    }
+
+    /// What reading the past versions of a document of `c` runs under, before any document
+    /// is looked at (see `versions_of`, which also judges the document): the copy they may
+    /// read under the read and `readVersions` rules, and the creator for an own-only right.
+    /// Also the read filter alone. Refusals are as `versions_of` gives them.
+    fn versions_rules(&self, c: &Collection) -> Result<(Readable, Option<Filter>), ApiError> {
+        let slug = &c.schema.slug;
+        self.scope(Action::ReadVersions, slug)?;
+        if !c.schema.versioned() {
+            return Err(ApiError::BadRequest(format!("`{slug}` keeps no versions")));
+        }
+        let global = c.schema.kind == CollectionKind::Global;
+        let refused = || match global {
+            true => self.refuse(),
+            false => ApiError::NotFound,
+        };
+        let rule = |action| match self.allows(action, c) {
+            Compiled::Deny => Err(refused()),
+            Compiled::Allow => Ok(None),
+            Compiled::Filter(f) => Ok(Some(f)),
+        };
+        let read = rule(Action::Read)?;
+        let filter = both(read.clone(), rule(Action::ReadVersions)?);
+        let owner = match self.own_only(Action::ReadVersions, c) {
+            false => None,
+            true if global => return Err(refused()),
+            true => Some(self.principal.identity().ok_or_else(refused)?.user_id),
+        };
+        // Judged on the copy the caller may read: the draft only where they may read drafts
+        // at all, else what's published, so a never-published document stays hidden.
+        let copy = match self.draft_readable(c, read.clone()) {
+            Some(_) => DocCopy::Draft,
+            None => DocCopy::Published,
+        };
+        let versions = Readable {
+            filter,
+            copy,
+            owner,
+            otherwise: None,
+        };
+        Ok((versions, read))
+    }
+
+    /// `/api/access`'s answers for drafts and history on `c`, added to `a`: `readDrafts`
+    /// and `publish` when it has drafts, `readVersions` when it keeps versions. Each is
+    /// judged as its routes judge it before looking at a document, and is conditional when
+    /// a rule is a filter or the right is own-only, as `write_answer` is.
+    fn history_answers(&self, c: &Collection, a: &mut Value) {
+        let answer = |r: Option<Readable>| -> Value {
+            match r {
+                None => false.into(),
+                Some(r) if r.filter.is_none() && r.owner.is_none() => true.into(),
+                Some(_) => "conditional".into(),
+            }
+        };
+        if c.schema.drafts() {
+            // What `?draft=true` reads, which every draft route goes by.
+            let drafts = self
+                .readable_in(c, true)
+                .filter(|r| r.copy == DocCopy::Draft);
+            a["readDrafts"] = answer(drafts);
+            let publish = match self.scope(Action::Publish, &c.schema.slug) {
+                Ok(()) => self.publish_rules(c).ok(),
+                Err(_) => None,
+            };
+            a["publish"] = answer(publish);
+        }
+        if c.schema.versioned() {
+            a["readVersions"] = answer(self.versions_rules(c).ok().map(|(r, _)| r));
+        }
+    }
+
+    /// What a published copy may link to: each collection's published documents the caller
+    /// may read, as their key's owner would (see `publish_guard`). Globals are left out:
+    /// nothing links to them.
+    pub(crate) fn publishable(&self) -> HashMap<Uuid, Readable> {
+        self.schemas
+            .all()
+            .iter()
+            .filter(|c| c.schema.kind == CollectionKind::Collection)
+            .filter_map(|c| {
+                let read = match self.allows_in(Action::Read, c, false) {
+                    Compiled::Deny => return None,
+                    Compiled::Allow => None,
+                    Compiled::Filter(f) => Some(f),
+                };
+                Some((c.id, Readable::published(read)))
+            })
+            .collect()
+    }
+
+    /// Who the caller acts for, as versions and publishing record them.
+    pub(crate) fn user_id(&self) -> Option<Uuid> {
+        self.principal.identity().map(|i| i.user_id)
+    }
+
+    /// The API key the caller came with, if any, which a job they schedule acts as.
+    pub(crate) fn key_id(&self) -> Option<Uuid> {
+        match &self.principal {
+            Principal::Key { key, .. } => Some(*key),
+            _ => None,
+        }
+    }
+
+    /// The guard a global's update runs under (see `write_guard`); a global's existence
+    /// isn't secret, so one the caller can't read or change is refused, not hidden.
+    pub(crate) fn global_guard(&self, c: &Collection) -> Result<Option<Filter>, ApiError> {
+        let (read, write) = self
+            .write_rules(Action::UpdateGlobal, c)
+            .map_err(|_| self.refuse())?;
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r.filter,
+            None if c.schema.drafts() => return Err(self.refuse()),
+            None => read,
+        };
         Ok(both(read, write))
     }
 
@@ -669,25 +1190,21 @@ impl Access {
                 inner,
                 ..
             } => {
-                let mut guards: Vec<(String, Option<Box<Filter>>)> = collections
+                let mut guards: Vec<(String, Readable)> = collections
                     .iter()
                     .map(|slug| {
                         let read = self
                             .schemas
                             .get(slug)
                             .filter(|c| c.schema.kind == CollectionKind::Collection)
-                            .map_or(Compiled::Deny, |c| self.allows(Action::Read, &c));
-                        let guard = match read {
-                            Compiled::Allow => None,
-                            Compiled::Filter(f) => Some(Box::new(f)),
-                            Compiled::Deny => Some(Box::new(nothing())),
-                        };
+                            .and_then(|c| self.linked_of(&c));
+                        let guard = read.unwrap_or_else(|| Readable::published(Some(nothing())));
                         (slug.clone(), guard)
                     })
                     .collect();
                 // No guards would mean unguarded; with no collections nothing should match.
                 if guards.is_empty() {
-                    guards.push((String::new(), Some(Box::new(nothing()))));
+                    guards.push((String::new(), Readable::published(Some(nothing()))));
                 }
                 Target::Via {
                     link,
@@ -755,6 +1272,9 @@ fn field_map(c: &Collection, caller: &Caller, gate: [bool; 3]) -> Value {
 ///   fields have no create.
 /// - For `users`, `read` is about profiles as links show them, like content; create,
 ///   update and delete are about the account routes, which keep to self-or-admin.
+/// - A collection or global with drafts also answers `readDrafts` and `publish`, and one
+///   that keeps versions `readVersions`; a `:publish` key's `publish` goes by its owner's
+///   read rights, as publishing does.
 pub(crate) async fn report(
     State(state): State<AppState>,
     principal: Principal,
@@ -783,6 +1303,9 @@ pub(crate) async fn report(
                 "delete": access.write_answer(Action::Delete, c),
             })
         };
+        if c.schema.slug != USERS {
+            access.history_answers(c, &mut a);
+        }
         if a.as_object()
             .is_some_and(|m| m.values().all(|v| v == false))
         {
@@ -838,6 +1361,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let viewer = builtin_roles()[3].2.clone();
         let principal = Principal::User {
@@ -898,6 +1422,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let principal = Principal::User {
             identity: Identity {

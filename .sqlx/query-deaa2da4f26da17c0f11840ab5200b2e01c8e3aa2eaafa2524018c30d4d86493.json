@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM jobs\n           WHERE id IN (\n               SELECT id FROM jobs\n               WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')\n                 AND finished_at < now() - make_interval(days => $2)\n               LIMIT 100\n               FOR UPDATE SKIP LOCKED)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "deaa2da4f26da17c0f11840ab5200b2e01c8e3aa2eaafa2524018c30d4d86493"
+}

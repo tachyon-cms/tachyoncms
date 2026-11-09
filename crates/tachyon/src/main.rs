@@ -3,7 +3,10 @@
 mod config;
 mod schema_cmd;
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use std::time::Duration;
+
+use anyhow::Context;
 
 use clap::{Parser, Subcommand};
 use sqlx::PgPool;
@@ -74,14 +77,36 @@ async fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
     let config = Config::load(cli.config.as_deref())?;
-    let pool = PgPool::connect(&config.database_url).await?;
+    // A missing schema file or a bad --rename should say so at once, not after the database
+    // answers.
+    let schema_input = match &cli.command {
+        Command::Schema {
+            command:
+                SchemaCommand::Diff { file, renames } | SchemaCommand::Apply { file, renames, .. },
+        } => Some((read_schema(file)?, schema_cmd::parse_renames(renames)?)),
+        _ => None,
+    };
+    let pool = PgPool::connect(&config.database_url)
+        .await
+        .with_context(|| {
+            format!(
+                "couldn't connect to Postgres at {}; for local development, start it with `docker compose up -d`",
+                database_location(&config.database_url)
+            )
+        })?;
     tachyon_db::MIGRATOR.run(&pool).await?;
 
     match cli.command {
         Command::Serve => {
             config.check_serve().map_err(anyhow::Error::msg)?;
+            let jobs = config
+                .jobs_config(pool.options().get_max_connections())
+                .map_err(anyhow::Error::msg)?;
+            let running = jobs.running.clone();
             let options = tachyon_api::Options {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
+                jobs,
+                schema_inline_rows: None,
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -94,24 +119,35 @@ async fn main() -> anyhow::Result<()> {
             axum::serve(listener, app)
                 .with_graceful_shutdown(shutdown())
                 .await?;
+            // Gives the job workers a while to finish what they're running; they stop with the
+            // pool. Cutting one off is safe: its transaction rolls back, its lease runs out,
+            // and the run that takes it over is the only one that can complete it.
+            if tokio::time::timeout(Duration::from_secs(30), pool.close())
+                .await
+                .is_err()
+            {
+                tracing::warn!(
+                    jobs = ?running.ids(),
+                    "stopped with jobs still running; they run again once their lease runs out"
+                );
+            }
         }
         Command::Migrate => {}
         Command::Schema { command } => match command {
             SchemaCommand::Export { out } => {
                 let json = schema_cmd::export(&pool).await?;
                 match out {
-                    Some(path) => std::fs::write(path, json)?,
+                    Some(path) => std::fs::write(&path, json)
+                        .with_context(|| format!("writing {}", path.display()))?,
                     None => print!("{json}"),
                 }
             }
-            SchemaCommand::Diff { file, renames } => {
-                let text = std::fs::read_to_string(file)?;
-                let renames = schema_cmd::parse_renames(&renames)?;
+            SchemaCommand::Diff { .. } => {
+                let (text, renames) = schema_input.expect("read before connecting");
                 println!("{}", schema_cmd::run(&pool, &text, &renames, None).await?);
             }
-            SchemaCommand::Apply { file, renames, yes } => {
-                let text = std::fs::read_to_string(file)?;
-                let renames = schema_cmd::parse_renames(&renames)?;
+            SchemaCommand::Apply { yes, .. } => {
+                let (text, renames) = schema_input.expect("read before connecting");
                 println!(
                     "{}",
                     schema_cmd::run(&pool, &text, &renames, Some(yes)).await?
@@ -120,6 +156,29 @@ async fn main() -> anyhow::Result<()> {
         },
     }
     Ok(())
+}
+
+fn read_schema(path: &Path) -> anyhow::Result<String> {
+    std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))
+}
+
+/// Where `database_url` points, without the user or password: `postgres://u:secret@h:5432/db`
+/// is `h:5432/db`. It goes into error messages, so it must never carry the password.
+fn database_location(database_url: &str) -> String {
+    // Anything else, such as `u:secret@h/db`, may parse as some other kind of URL with the
+    // password in it, so it's described rather than shown.
+    let Some(url) = url::Url::parse(database_url)
+        .ok()
+        .filter(|u| matches!(u.scheme(), "postgres" | "postgresql"))
+    else {
+        return "database_url, which isn't a postgres:// URL".into();
+    };
+    let host = url
+        .host_str()
+        .filter(|h| !h.is_empty())
+        .unwrap_or("localhost");
+    let port = url.port().map(|p| format!(":{p}")).unwrap_or_default();
+    format!("{host}{port}{}", url.path().trim_end_matches('/'))
 }
 
 async fn shutdown() {
@@ -140,5 +199,49 @@ async fn shutdown() {
     tokio::select! {
         () = ctrl_c => {}
         () = terminate => {}
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{database_location, read_schema};
+
+    #[test]
+    fn database_location_leaves_out_the_user_and_password() {
+        for (url, location) in [
+            ("postgres://u:secret@h:5432/db", "h:5432/db"),
+            (
+                "postgres://tachyon:tachyon@127.0.0.1:54329/tachyon",
+                "127.0.0.1:54329/tachyon",
+            ),
+            ("postgres://u:secret@h/db", "h/db"),
+            ("postgres://u:secret@h:5432", "h:5432"),
+            (
+                "postgresql://u@[::1]:5432/db?sslmode=require",
+                "[::1]:5432/db",
+            ),
+            ("postgres:///db", "localhost/db"),
+            (
+                "u:secret@h/db",
+                "database_url, which isn't a postgres:// URL",
+            ),
+            (
+                "not a url secret",
+                "database_url, which isn't a postgres:// URL",
+            ),
+        ] {
+            let got = database_location(url);
+            assert_eq!(got, location, "{url}");
+            assert!(!got.contains("secret"), "{url}");
+        }
+    }
+
+    #[test]
+    fn a_missing_schema_file_is_named() {
+        let err = read_schema("nope.json".as_ref()).unwrap_err();
+        assert!(
+            format!("{err:#}").starts_with("reading nope.json: "),
+            "{err:#}"
+        );
     }
 }

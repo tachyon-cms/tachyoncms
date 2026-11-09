@@ -4,7 +4,9 @@
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
 use axum::extract::{Path, State};
-use axum::http::StatusCode;
+use axum::http::header::CACHE_CONTROL;
+use axum::http::{HeaderValue, StatusCode};
+use axum::response::{IntoResponse, Response};
 use base64::Engine;
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -63,17 +65,21 @@ fn new_secret() -> (String, String) {
 }
 
 /// The key's details plus, this once, the key itself.
-fn shown(info: &ApiKeyInfo, secret: &str) -> Json<Value> {
+fn shown(info: &ApiKeyInfo, secret: &str) -> Response {
     let mut v = json!(info);
     v["key"] = format!("tcy_{}_{secret}", info.prefix).into();
-    Json(v)
+    let mut response = (StatusCode::CREATED, Json(v)).into_response();
+    response
+        .headers_mut()
+        .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+    response
 }
 
 pub(crate) async fn create(
     State(state): State<AppState>,
     principal: Principal,
     body: Result<Json<Value>, JsonRejection>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<Response, ApiError> {
     let me = session_user(&principal)?;
     let req: NewKey = serde_json::from_value(json_body(body)?)
         .map_err(|e| ApiError::BadRequest(e.to_string()))?;
@@ -106,7 +112,7 @@ pub(crate) async fn create(
         )
         .await
         {
-            Ok(info) => return Ok((StatusCode::CREATED, shown(&info, &secret))),
+            Ok(info) => return Ok(shown(&info, &secret)),
             Err(tachyon_db::DbError::UniqueViolation(_)) => continue,
             Err(e) => return Err(e.into()),
         }
@@ -148,14 +154,14 @@ pub(crate) async fn rotate(
     State(state): State<AppState>,
     principal: Principal,
     path: Result<Path<String>, PathRejection>,
-) -> Result<(StatusCode, Json<Value>), ApiError> {
+) -> Result<Response, ApiError> {
     let me = session_user(&principal)?;
     let id = key_id(path)?;
     for _ in 0..3 {
         let (prefix, secret) = new_secret();
         match auth::rotate_api_key(&state.pool, me.user_id, id, &prefix, &token_hash(&secret)).await
         {
-            Ok(Some(info)) => return Ok((StatusCode::CREATED, shown(&info, &secret))),
+            Ok(Some(info)) => return Ok(shown(&info, &secret)),
             Ok(None) => return Err(ApiError::NotFound),
             Err(tachyon_db::DbError::UniqueViolation(_)) => continue,
             Err(e) => return Err(e.into()),

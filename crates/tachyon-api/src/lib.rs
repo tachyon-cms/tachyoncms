@@ -6,11 +6,15 @@ mod collections;
 mod documents;
 mod error;
 mod globals;
+mod jobs;
 mod joins;
 mod params;
 mod populate;
 mod request_id;
+mod schedule;
 mod schemas;
+mod trash;
+mod versions;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -19,14 +23,16 @@ use std::any::Any;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::http::HeaderValue;
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post};
+use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 use tachyon_db::DbError;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
+pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;
 
 #[derive(Clone)]
@@ -34,12 +40,18 @@ pub(crate) struct AppState {
     pub pool: PgPool,
     pub schemas: Arc<Schemas>,
     pub auth: Arc<auth::AuthState>,
+    /// See `Options::schema_inline_rows`.
+    pub inline_rows: i64,
 }
 
 /// How the router is set up. `Default` suits development and tests.
 #[derive(Debug, Clone, Default)]
 pub struct Options {
     pub auth: auth::AuthConfig,
+    pub jobs: JobsConfig,
+    /// The most rows a schema change or preview may scan inside its request; a bigger one
+    /// runs on a job worker. `None` is 2,000; tests lower it.
+    pub schema_inline_rows: Option<i64>,
 }
 
 /// Why the API couldn't start.
@@ -58,6 +70,9 @@ pub async fn router(pool: PgPool) -> Result<Router, StartError> {
     router_with(pool, Options::default()).await
 }
 
+/// The API with `options`. It also starts `options.jobs.workers` job workers, which run until
+/// `pool` closes: dropping the router doesn't stop them, and a second router on the same pool
+/// starts as many again.
 pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
@@ -90,15 +105,46 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/admin/collections/{slug}/preview",
             post(collections::preview),
         )
+        .route("/api/admin/jobs/{id}", get(collections::job))
         .route("/api/access", get(access::report))
         .route(
             "/api/globals/{slug}",
             get(globals::get).patch(globals::update),
         )
         .route(
+            "/api/globals/{slug}/publish",
+            post(versions::publish_global),
+        )
+        .route(
+            "/api/globals/{slug}/unpublish",
+            post(versions::unpublish_global),
+        )
+        .route("/api/globals/{slug}/versions", get(versions::list_global))
+        .route(
+            "/api/globals/{slug}/versions/{vid}",
+            get(versions::get_global),
+        )
+        .route(
+            "/api/globals/{slug}/versions/{vid}/restore",
+            post(versions::restore_global),
+        )
+        .route("/api/globals/{slug}/diff", get(versions::diff_global))
+        .route(
+            "/api/globals/{slug}/schedule",
+            put(schedule::put_global)
+                .get(schedule::get_global)
+                .delete(schedule::delete_global),
+        )
+        .route(
             "/api/{collection}",
             get(documents::list).post(documents::create),
         )
+        .route(
+            "/api/{collection}/trash",
+            get(trash::list).delete(trash::empty),
+        )
+        .route("/api/{collection}/trash/{id}", delete(trash::purge))
+        .route("/api/{collection}/trash/{id}/restore", post(trash::restore))
         .route(
             "/api/{collection}/{id}",
             get(documents::get)
@@ -109,17 +155,39 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             "/api/{collection}/{id}/references",
             get(documents::references),
         )
+        .route("/api/{collection}/{id}/publish", post(versions::publish))
+        .route(
+            "/api/{collection}/{id}/unpublish",
+            post(versions::unpublish),
+        )
+        .route("/api/{collection}/{id}/versions", get(versions::list))
+        .route("/api/{collection}/{id}/versions/{vid}", get(versions::get))
+        .route(
+            "/api/{collection}/{id}/versions/{vid}/restore",
+            post(versions::restore),
+        )
+        .route("/api/{collection}/{id}/diff", get(versions::diff))
+        .route(
+            "/api/{collection}/{id}/schedule",
+            put(schedule::put)
+                .get(schedule::get)
+                .delete(schedule::delete),
+        )
         .merge(auth::routes())
         .method_not_allowed_fallback(|| async { ApiError::MethodNotAllowed });
     let state = AppState {
         pool,
         schemas,
         auth,
+        inline_rows: options
+            .schema_inline_rows
+            .unwrap_or(collections::INLINE_ROWS),
     };
     let routes = routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::principal::resolve,
     ));
+    jobs::spawn_workers(state.clone(), &options.jobs);
     Ok(layers(routes, Duration::from_secs(30)).with_state(state))
 }
 
@@ -139,6 +207,19 @@ fn layers<S: Clone + Send + Sync + 'static>(routes: Router<S>, limit: Duration) 
         }))
         .layer(axum::middleware::from_fn_with_state(limit, time_limit))
         .layer(axum::middleware::from_fn(request_id::middleware))
+        // Outermost: also decorate responses created by panic/timeout guards.
+        .layer(axum::middleware::map_response(add_security_headers))
+}
+
+async fn add_security_headers(mut response: Response) -> Response {
+    let headers = response.headers_mut();
+    headers.insert(
+        "x-content-type-options",
+        HeaderValue::from_static("nosniff"),
+    );
+    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
+    response
 }
 
 async fn time_limit(State(limit): State<Duration>, req: Request, next: Next) -> Response {
@@ -178,6 +259,7 @@ mod tests {
 
     fn app() -> Router {
         let routes = Router::new()
+            .route("/ok", get(|| async { "ok" }))
             .route(
                 "/slow",
                 get(|| async {
@@ -211,5 +293,23 @@ mod tests {
         assert_eq!(status, StatusCode::INTERNAL_SERVER_ERROR);
         assert_eq!(kind, "application/problem+json");
         assert!(!body["requestId"].as_str().unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn security_headers_cover_success_not_found_and_panics() {
+        for (uri, expected_status) in [
+            ("/ok", StatusCode::OK),
+            ("/missing", StatusCode::NOT_FOUND),
+            ("/panic", StatusCode::INTERNAL_SERVER_ERROR),
+        ] {
+            let res = app()
+                .oneshot(Request::get(uri).body(Body::empty()).unwrap())
+                .await
+                .unwrap();
+            assert_eq!(res.status(), expected_status, "{uri}");
+            assert_eq!(res.headers()["x-content-type-options"], "nosniff", "{uri}");
+            assert_eq!(res.headers()["x-frame-options"], "DENY", "{uri}");
+            assert_eq!(res.headers()["referrer-policy"], "no-referrer", "{uri}");
+        }
     }
 }

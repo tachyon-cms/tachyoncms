@@ -82,6 +82,7 @@ async fn login_sets_a_secure_host_cookie_and_can_return_a_bearer_token(pool: PgP
     setup(&app).await;
     let res = login(&app, "admin@EXAMPLE.com", PASSWORD, false).await;
     assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.headers["cache-control"], "no-store");
     let set = res.headers["set-cookie"].to_str().unwrap();
     for part in [
         "__Host-tachyon_session=tcs_",
@@ -99,6 +100,7 @@ async fn login_sets_a_secure_host_cookie_and_can_return_a_bearer_token(pool: PgP
     assert_eq!(me.json["role"], "admin");
 
     let res = login(&app, "admin@example.com", PASSWORD, true).await;
+    assert_eq!(res.headers["cache-control"], "no-store");
     let token = res.json["token"].as_str().unwrap().to_owned();
     assert!(token.starts_with("tcs_"));
     let req = Request::builder()
@@ -306,6 +308,7 @@ async fn breached_passwords_are_refused_at_setup_and_change(pool: PgPool) {
             breach_check_url: url,
             ..Default::default()
         },
+        ..Default::default()
     };
     let app = tachyon_api::router_with(pool, options).await.unwrap();
     let body = json!({"email": "a@b.co", "name": "A", "password": "password1234567"});
@@ -405,6 +408,7 @@ async fn public_urls_with_a_path_and_extra_origins_match(pool: PgPool) {
             allowed_origins: vec!["https://www.example.com".into()],
             ..Default::default()
         },
+        ..Default::default()
     };
     let app = tachyon_api::router_with(pool, options).await.unwrap();
     setup(&app).await;

@@ -5,10 +5,7 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 
-use serde_json::{Map, Value, json};
-use tachyon_core::access::Compiled;
-use tachyon_core::auth::Action;
-use tachyon_core::query::parse_filter;
+use serde_json::{Map, Value};
 use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::validate::markdown_inputs;
@@ -19,10 +16,10 @@ use tachyon_core::{
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
 use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
-use tachyon_db::query::{self, ListQuery, get_many_readable};
+use tachyon_db::query::{self, Readable, get_many_readable};
 use uuid::Uuid;
 
-use crate::access::{Access, both};
+use crate::access::Access;
 use crate::params::Format;
 use crate::{ApiError, AppState};
 
@@ -94,6 +91,16 @@ pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
         .collect()
 }
 
+/// Documents with these IDs, from any collection, as this request reads what it links to
+/// (see `Access::linked`).
+pub(crate) async fn readable_docs(
+    state: &AppState,
+    access: &Access,
+    ids: &[Uuid],
+) -> Result<Vec<(Uuid, Document)>, ApiError> {
+    Ok(get_many_readable(&state.pool, ids, access.linked()).await?)
+}
+
 /// The most documents one write may name by slug.
 const MAX_SLUGS: usize = 1000;
 
@@ -122,7 +129,7 @@ pub(crate) async fn from_markdown(
             .unwrap_or_default()
             .to_owned()
     };
-    // Each lookup is a query per 100 slugs, so a write may name only so many.
+    // Each slug is a lookup of its own, so a write may name only so many.
     let mut named: HashMap<String, HashSet<String>> = HashMap::new();
     let mut count = 0;
     for (path, kind) in &paths {
@@ -143,10 +150,10 @@ pub(crate) async fn from_markdown(
             ));
         }
     }
-    let mut found: HashMap<(String, String), Uuid> = HashMap::new();
+    let mut found: HashMap<(String, String), HashSet<Uuid>> = HashMap::new();
     for (to, slugs) in named {
-        for (slug, id) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
-            found.insert((to.clone(), slug), id);
+        for (slug, ids) in by_slug(state, access, &to, slugs.into_iter().collect()).await? {
+            found.insert((to.clone(), slug), ids);
         }
     }
     let mut errors = Vec::new();
@@ -155,13 +162,24 @@ pub(crate) async fn from_markdown(
             richtext::slug_refs_mut(text, kind, &mut |at, link| {
                 let (to, slug) = (get(link, "relationTo"), get(link, "slug"));
                 let line = link.get("line").and_then(Value::as_u64).unwrap_or(1);
-                match found.get(&(to.clone(), slug.clone())) {
-                    Some(id) => {
+                match found
+                    .get(&(to.clone(), slug.clone()))
+                    .map(|ids| (ids.len(), ids.iter().next()))
+                {
+                    // Drafts may share a slug: which one is meant is the writer's to say.
+                    Some((2.., _)) => errors.push(FieldError {
+                        path: format!("{path}.{at}"),
+                        message: format!(
+                            "line {line}: `{}` matches more than one document; link it by id",
+                            clipped(&slug)
+                        ),
+                    }),
+                    Some((_, Some(id))) => {
                         link.remove("slug");
                         link.remove("line");
                         link.insert("value".into(), id.to_string().into());
                     }
-                    None => errors.push(FieldError {
+                    _ => errors.push(FieldError {
                         path: format!("{path}.{at}"),
                         message: format!(
                             "line {line}: no `{to}` document you can read has the slug `{}`",
@@ -187,14 +205,15 @@ fn clipped(s: &str) -> String {
 }
 
 /// The IDs of the documents of collection `to` the caller may read whose slug is one of
-/// `slugs`, by slug. None when they can't read the collection or its slug field.
+/// `slugs`, by slug: two where drafts share it, since no more are looked for. None when
+/// they can't read the collection or its slug field.
 async fn by_slug(
     state: &AppState,
     access: &Access,
     to: &str,
     slugs: Vec<String>,
-) -> Result<HashMap<String, Uuid>, ApiError> {
-    let mut out = HashMap::new();
+) -> Result<HashMap<String, HashSet<Uuid>>, ApiError> {
+    let out = HashMap::new();
     let Some(c) = state
         .schemas
         .get(to)
@@ -205,31 +224,12 @@ async fn by_slug(
     let Some(field) = c.schema.slug_field().filter(|f| access.reads(&c, &f.name)) else {
         return Ok(out);
     };
-    let read = match access.allows(Action::Read, &c) {
-        Compiled::Deny => return Ok(out),
-        Compiled::Allow => None,
-        Compiled::Filter(f) => Some(f),
+    // As links are read: a draft the caller may read, else what's published.
+    let Some(read) = access.linked_of(&c) else {
+        return Ok(out);
     };
-    // A filter's `in` takes 100 values at most.
-    for chunk in slugs.chunks(100) {
-        let named = parse_filter(c.schema.data(), &json!({ &field.name: { "in": chunk } }))
-            .map_err(|e| ApiError::Internal(e.to_string()))?;
-        let filter = both(Some(named), read.clone());
-        let q = ListQuery {
-            filter: filter.as_ref(),
-            sort: None,
-            limit: chunk.len() as i64,
-            offset: 0,
-            after: None,
-            count: false,
-        };
-        for doc in query::list(&state.pool, c.id, &q).await?.docs {
-            if let Some(slug) = c.schema.slug_of(&doc.data) {
-                out.insert(slug, doc.id);
-            }
-        }
-    }
-    Ok(out)
+    // Two per slug at most: a second match already makes the link ambiguous.
+    Ok(query::by_slug(&state.pool, c.id, &field.name, &slugs, &read).await?)
 }
 
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
@@ -237,7 +237,9 @@ pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
 
 /// Refuses the links in `next` that `before` didn't hold and that the caller can't read,
 /// exactly as a link to no document is refused, so a write can't tell a hidden document
-/// from a missing one. Links already on the document stay as they are.
+/// from a missing one. Links already on the document stay as they are. A draft (a request
+/// working on drafts) may link to a draft the caller may read as well as to what's
+/// published; anything else links only to what's published.
 pub(crate) async fn check_links(
     state: &AppState,
     access: &Access,
@@ -260,17 +262,51 @@ pub(crate) async fn check_links(
     // read like content, so `readable()` already holds users for most callers; this keeps
     // it true for an API key whose scopes don't cover reading users, which may still link
     // any existing user it holds the ID of.
-    let mut linkable = access.readable().clone();
+    let mut linkable = access.linked().clone();
     if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
-        linkable.insert(users.id, None);
+        linkable.insert(users.id, Readable::published(None));
+    }
+    let found = get_many_readable(&state.pool, &ids, &linkable).await?;
+    let vouched = found
+        .into_iter()
+        .map(|(collection_id, doc)| (doc.id, collection_id))
+        .collect();
+    vouched_links(next, before, &vouched)?;
+    Ok(vouched)
+}
+
+/// Refuses every link in `next`, about to be published, to a document with no published
+/// copy the caller may read: a draft may link to drafts, what's published may not. A
+/// hidden target and a missing one get the same error.
+///
+/// Read outside the publish's row locks on purpose. A target trashed meanwhile can't slip
+/// through: `sync_relations` re-checks every target under `FOR KEY SHARE`, which blocks a
+/// delete. A target unpublished, or hidden by a rule change, meanwhile leaves what
+/// unpublishing it a moment later would anyway, which is allowed: published copies keep
+/// their links to it, shown as bare IDs. Locking targets `FOR SHARE` would only add
+/// deadlocks between documents that link each other.
+pub(crate) async fn published_links(
+    state: &AppState,
+    access: &Access,
+    next: &Prepared,
+) -> Result<(), ApiError> {
+    let mut ids: Vec<Uuid> = next.relations.iter().map(|r| r.id).collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if ids.is_empty() {
+        return Ok(());
+    }
+    // Any existing user may be linked, as `check_links` explains.
+    let mut linkable = access.publishable();
+    if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
+        linkable.insert(users.id, Readable::published(None));
     }
     let vouched = get_many_readable(&state.pool, &ids, &linkable)
         .await?
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))
         .collect();
-    vouched_links(next, before, &vouched)?;
-    Ok(vouched)
+    vouched_links(next, &[], &vouched)
 }
 
 /// `check_links`' answer applied to the document as locked for the write: a link added
@@ -342,7 +378,7 @@ pub(crate) async fn fill_virtuals_each(
         return Ok(());
     }
     // Each linked document as the caller may read it, so a hidden field gives no value.
-    let linked: HashMap<Uuid, Value> = get_many_readable(&state.pool, &ids, access.readable())
+    let linked: HashMap<Uuid, Value> = readable_docs(state, access, &ids)
         .await?
         .into_iter()
         .filter_map(|(collection_id, doc)| {
@@ -376,6 +412,7 @@ pub(crate) fn child_shape(c: &Collection, shapes: &Shapes) -> Option<Select> {
     // Checked when the schema was saved, so this only fails on a hand-edited row.
     parse_select(
         c.schema.data(),
+        c.schema.drafts(),
         &Value::Object(dp.clone()),
         "defaultPopulate",
     )
@@ -435,7 +472,7 @@ async fn render(
     ids.dedup();
     let mut targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = HashMap::new();
     if !ids.is_empty() {
-        for (collection_id, doc) in get_many_readable(&state.pool, &ids, access.readable()).await? {
+        for (collection_id, doc) in readable_docs(state, access, &ids).await? {
             let Some(c) = state.schemas.get_by_id(collection_id) else {
                 continue;
             };
@@ -507,12 +544,11 @@ fn populate_each<'a>(
             return Ok(items.into_iter().map(|(v, _, _)| v).collect());
         }
 
-        let found: HashMap<Uuid, (Uuid, Document)> =
-            get_many_readable(&state.pool, &ids, access.readable())
-                .await?
-                .into_iter()
-                .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
-                .collect();
+        let found: HashMap<Uuid, (Uuid, Document)> = readable_docs(state, access, &ids)
+            .await?
+            .into_iter()
+            .map(|(collection_id, doc)| (doc.id, (collection_id, doc)))
+            .collect();
         // The same document wanted at two depths is populated once for each.
         let mut keys: Vec<(Uuid, u8)> = wanted.iter().flat_map(|w| w.values().copied()).collect();
         keys.sort_unstable();
@@ -593,6 +629,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let b = collections::create(&pool, &schema(json!({"slug": "b", "fields": []})))
             .await

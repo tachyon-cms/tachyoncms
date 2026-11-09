@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"n!\", count(*) FILTER (WHERE deleted_at IS NOT NULL) AS \"trashed!\"\n           FROM documents\n           WHERE tenant_id = $1 AND collection_id = $2\n             AND (draft IS DISTINCT FROM published OR published IS NULL)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "trashed!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "6f557e346e6bb80ebba78563702287842402f883e9a8df7ef58dc1af8f5e4429"
+}

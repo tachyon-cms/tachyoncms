@@ -4,6 +4,7 @@ use std::time::Duration;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
+use tachyon_api::JobsConfig;
 use tachyon_api::auth::AuthConfig;
 
 #[derive(Debug, Deserialize)]
@@ -15,6 +16,8 @@ pub struct Config {
     pub public_url: Option<String>,
     #[serde(default)]
     pub auth: AuthSettings,
+    #[serde(default)]
+    pub jobs: JobsSettings,
 }
 
 /// `[auth]` in the config file (or `TACHYON_AUTH__*` in the environment).
@@ -47,6 +50,23 @@ impl Default for AuthSettings {
         }
     }
 }
+
+/// `[jobs]` in the config file (or `TACHYON_JOBS__*` in the environment).
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct JobsSettings {
+    /// Workers running scheduled work on this server; 0 leaves it to other servers.
+    pub workers: usize,
+}
+
+impl Default for JobsSettings {
+    fn default() -> Self {
+        Self { workers: 2 }
+    }
+}
+
+/// More workers than this would mostly wait on each other's database connections.
+const MAX_WORKERS: usize = 16;
 
 /// `15m`, `12h`, `7d`: a whole number and a unit.
 fn duration(name: &str, text: &str) -> Result<Duration, String> {
@@ -233,6 +253,28 @@ impl Config {
             argon2_memory_kib: a.argon2_memory_kib,
             breach_check: a.breach_check,
             breach_check_url: a.breach_check_url.clone(),
+        })
+    }
+
+    /// The job workers the API runs with, given the database pool's size. A worker running a
+    /// schema change holds two connections (its heartbeat and the change), so the workers must
+    /// leave at least one for requests.
+    pub fn jobs_config(&self, pool_connections: u32) -> Result<JobsConfig, String> {
+        let workers = self.jobs.workers;
+        if workers > MAX_WORKERS {
+            return Err(format!(
+                "jobs.workers is {workers}; it can be at most {MAX_WORKERS}"
+            ));
+        }
+        if workers > 0 && 2 * workers + 1 > pool_connections as usize {
+            let most = (pool_connections as usize).saturating_sub(1) / 2;
+            return Err(format!(
+                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; each worker can hold two and requests need one, so use at most {most}"
+            ));
+        }
+        Ok(JobsConfig {
+            workers,
+            ..JobsConfig::default()
         })
     }
 
@@ -494,7 +536,7 @@ mod tests {
             let err = Config::load(None).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth"
+                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth, jobs"
             );
             // A variable that isn't a setting, such as one for another tool, is left alone.
             jail.create_file(
@@ -505,6 +547,47 @@ mod tests {
             assert!(Config::load(None)?.public_url.is_some());
             Ok(())
         });
+    }
+
+    #[test]
+    fn jobs_run_two_workers_unless_told_otherwise() {
+        assert_eq!(load("").jobs_config(10).unwrap().workers, 2);
+        assert_eq!(
+            load("[jobs]\nworkers = 0").jobs_config(10).unwrap().workers,
+            0
+        );
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.create_file("tachyon.toml", "[jobs]\nwokers = 4\n")?;
+            let err = Config::load(None).unwrap_err().to_string();
+            assert!(err.contains("unknown field: found `wokers`"), "{err}");
+            jail.create_file("tachyon.toml", "[jobs]\nworkers = -1\n")?;
+            assert!(Config::load(None).is_err(), "a negative count");
+            jail.create_file("tachyon.toml", "[jobs]\nworkers = 4\n")?;
+            jail.set_env("TACHYON_JOBS__WORKERS", "1");
+            assert_eq!(Config::load(None)?.jobs_config(10).unwrap().workers, 1);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn jobs_workers_fit_the_pool_and_the_cap() {
+        let at = |n: usize, pool: u32| load(&format!("[jobs]\nworkers = {n}")).jobs_config(pool);
+        assert_eq!(at(16, 33).unwrap().workers, 16);
+        assert_eq!(
+            at(17, 40).unwrap_err(),
+            "jobs.workers is 17; it can be at most 16"
+        );
+        assert_eq!(at(4, 10).unwrap().workers, 4);
+        assert_eq!(
+            at(5, 10).unwrap_err(),
+            "jobs.workers is 5, but the database pool has 10 connections; each worker can hold two and requests need one, so use at most 4"
+        );
+        assert_eq!(
+            at(1, 2).unwrap_err(),
+            "jobs.workers is 1, but the database pool has 2 connections; each worker can hold two and requests need one, so use at most 0"
+        );
+        assert!(at(0, 1).is_ok(), "no workers fit any pool");
     }
 
     #[test]

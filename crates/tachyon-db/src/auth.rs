@@ -37,6 +37,11 @@ pub fn check_users_schema(schema: &CollectionSchema) -> Result<(), tachyon_core:
             "access: rules on users aren't enforced yet, so they can't be saved; rules on its fields are".into(),
         ));
     }
+    if schema.versions.is_some() {
+        return Err(SchemaError::InvalidOption(
+            "versions: accounts change through their own routes, so users can't have versions or drafts".into(),
+        ));
+    }
     if let Some(f) = schema
         .data()
         .iter()
@@ -246,7 +251,13 @@ pub async fn create_account_with(
     )
     .execute(&mut *tx)
     .await?;
-    crate::documents::sync_relations(&mut tx, id, &profile.relations).await?;
+    crate::documents::sync_relations(
+        &mut tx,
+        id,
+        crate::documents::DocCopy::Published,
+        &profile.relations,
+    )
+    .await?;
     sqlx::query!(
         "INSERT INTO accounts (user_id, tenant_id, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)",
         id,
@@ -789,6 +800,66 @@ pub async fn api_key_by_prefix(
     Ok(Some((key, identity)))
 }
 
+/// A live key by its ID, as `api_key_by_prefix` finds one, when it's `user_id`'s: for
+/// acting later on what the key asked for, such as a scheduled publish.
+pub async fn api_key_by_id(
+    pool: &PgPool,
+    id: Uuid,
+    user_id: Uuid,
+) -> Result<Option<(KeyRow, Identity)>, DbError> {
+    let Some(row) = sqlx::query!(
+        r#"SELECT k.id, k.secret_hash, k.scopes, k.user_id, a.role, r.abilities
+           FROM api_keys k
+           JOIN accounts a ON a.user_id = k.user_id
+           JOIN roles r ON r.tenant_id = a.tenant_id AND r.slug = a.role
+           JOIN documents d ON d.id = k.user_id AND d.deleted_at IS NULL
+           WHERE k.id = $1 AND k.user_id = $2 AND k.tenant_id = $3 AND k.revoked_at IS NULL
+             AND (k.expires_at IS NULL OR k.expires_at > now())"#,
+        id,
+        user_id,
+        DEFAULT_TENANT,
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    let key = KeyRow {
+        id: row.id,
+        secret_hash: row.secret_hash,
+        scopes: row.scopes,
+    };
+    let identity = Identity {
+        user_id: row.user_id,
+        role: row.role,
+        abilities: abilities(row.abilities)?,
+    };
+    Ok(Some((key, identity)))
+}
+
+/// A live user's identity: their role as it is now, and what it lets them do.
+pub async fn identity(pool: &PgPool, user_id: Uuid) -> Result<Option<Identity>, DbError> {
+    let Some(row) = sqlx::query!(
+        r#"SELECT a.role, r.abilities
+           FROM accounts a
+           JOIN roles r ON r.tenant_id = a.tenant_id AND r.slug = a.role
+           JOIN documents d ON d.id = a.user_id AND d.deleted_at IS NULL
+           WHERE a.user_id = $1 AND a.tenant_id = $2"#,
+        user_id,
+        DEFAULT_TENANT,
+    )
+    .fetch_optional(pool)
+    .await?
+    else {
+        return Ok(None);
+    };
+    Ok(Some(Identity {
+        user_id,
+        role: row.role,
+        abilities: abilities(row.abilities)?,
+    }))
+}
+
 /// Notes a key's use, at most once a minute.
 pub async fn touch_api_key(pool: &PgPool, id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
@@ -864,4 +935,25 @@ pub async fn rotate_api_key(
     .map_err(crate::map_unique)?;
     tx.commit().await?;
     Ok(Some(new))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn users_refuse_versions() {
+        let users = |versions: Value| -> CollectionSchema {
+            serde_json::from_value(json!({"slug": "users", "versions": versions,
+                "fields": [{"name": "name", "type": "text"}]}))
+            .unwrap()
+        };
+        assert_eq!(check_users_schema(&users(Value::Null)), Ok(()));
+        assert_eq!(
+            check_users_schema(&users(json!({"drafts": true})))
+                .unwrap_err()
+                .to_string(),
+            "versions: accounts change through their own routes, so users can't have versions or drafts"
+        );
+    }
 }

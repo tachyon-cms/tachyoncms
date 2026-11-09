@@ -5,13 +5,11 @@ use std::sync::Arc;
 
 use serde_json::{Map, Value, json};
 use tachyon_core::CollectionKind;
-use tachyon_core::access::Compiled;
-use tachyon_core::auth::Action;
 use tachyon_core::joins::{JoinField, on_pattern};
 use tachyon_core::query::{Filter, parse_filter_with, parse_sort};
 use tachyon_core::select::{Select, project};
 use tachyon_db::collections::Collection;
-use tachyon_db::query::{self, JoinQuery};
+use tachyon_db::query::{self, JoinQuery, Readable};
 use uuid::Uuid;
 
 use crate::access::{Access, both};
@@ -56,6 +54,8 @@ struct Plan {
     pattern: String,
     filter: Option<Filter>,
     sort: Option<tachyon_core::query::Sort>,
+    /// How the joined documents are read, the caller's read rules included.
+    read: Readable,
 }
 
 // ponytail: the schema's `where` and `defaultSort` are parsed on every read; cache them on
@@ -65,11 +65,7 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         .schemas
         .get(&j.collection)
         .filter(|t| t.schema.kind == CollectionKind::Collection)?;
-    let read = match access.allows(Action::Read, &target) {
-        Compiled::Deny => return None,
-        Compiled::Allow => None,
-        Compiled::Filter(f) => Some(f),
-    };
+    let read = access.linked_of(&target)?;
     // Which documents link here through a field the caller can't read is hidden too.
     if !access.reads(&target, &j.on) {
         return None;
@@ -82,9 +78,9 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         }
         None => None,
     };
-    // The schema's filter and the caller's read rule always apply; a request can only
-    // narrow them.
-    let filter = both(both(schema_filter, read), req.filter.take());
+    // The schema's filter and the caller's read rules (in `read`) always apply; a request
+    // can only narrow them.
+    let filter = both(schema_filter, req.filter.take());
     // A default sort on a field the caller can't read would rank what they can't see, so
     // they get the usual order instead.
     let sort = req.sort.take().or_else(|| {
@@ -97,6 +93,7 @@ fn plan(state: &AppState, access: &Access, j: &JoinField, req: &mut JoinRequest)
         pattern,
         filter,
         sort,
+        read,
     })
 }
 
@@ -158,6 +155,7 @@ pub(crate) async fn fill_joins(
                 limit,
                 offset,
                 count,
+                read: &plan.read,
             };
             #[cfg(test)]
             let _ = JOIN_QUERIES.try_with(|n| n.set(n.get() + 1));

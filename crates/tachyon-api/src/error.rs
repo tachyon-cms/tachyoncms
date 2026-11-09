@@ -4,6 +4,10 @@ use serde_json::json;
 use tachyon_core::FieldError;
 use tachyon_db::DbError;
 
+/// A write that met another's locks and was undone, which may safely run again.
+pub(crate) const TRY_AGAIN: &str =
+    "Another change to the same documents got in the way; try again.";
+
 /// Every API error, rendered as RFC 9457 `application/problem+json`.
 #[derive(Debug)]
 pub enum ApiError {
@@ -21,8 +25,11 @@ pub enum ApiError {
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
     Unique(String),
-    /// A schema change needs `"confirm": true`; carries the preview to show the user.
-    NeedsConfirmation(serde_json::Value),
+    /// A schema change needs `"confirm": true`; carries what it costs and the preview to show.
+    NeedsConfirmation {
+        detail: String,
+        preview: serde_json::Value,
+    },
     /// The cause is logged, never sent to the client.
     Internal(String),
 }
@@ -51,21 +58,30 @@ impl From<DbError> for ApiError {
             DbError::SchemaChanged => Self::Conflict(
                 "This collection's fields just changed. Reload and try again.".into(),
             ),
+            // Two writes that met each other's locks: Postgres undid one, which may run again.
+            DbError::Sqlx(sqlx::Error::Database(e))
+                if matches!(e.code().as_deref(), Some("40P01" | "40001")) =>
+            {
+                Self::Conflict(TRY_AGAIN.into())
+            }
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+impl ApiError {
+    /// The status and problem+json body this error answers with.
+    pub(crate) fn problem(self) -> (StatusCode, serde_json::Value) {
         let mut extra = None;
         let (status, title, detail, errors) = match self {
-            Self::NeedsConfirmation(preview) => {
+            Self::NeedsConfirmation { detail, preview } => {
                 extra = Some(("preview", preview));
                 (
                     StatusCode::CONFLICT,
                     "Confirmation required",
-                    Some("This change removes or retypes fields, or leaves documents that won't validate. Send it again with \"confirm\": true to go ahead.".to_owned()),
+                    Some(format!(
+                        "{detail} Send it again with \"confirm\": true to go ahead."
+                    )),
                     None,
                 )
             }
@@ -129,11 +145,43 @@ impl IntoResponse for ApiError {
         if let Some((key, value)) = extra {
             body[key] = value;
         }
+        (status, body)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, body) = self.problem();
         (
             status,
             [(header::CONTENT_TYPE, "application/problem+json")],
             body.to_string(),
         )
             .into_response()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use sqlx::PgPool;
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_deadlock_says_try_again(pool: PgPool) {
+        sqlx::raw_sql("CREATE TABLE t (id int PRIMARY KEY); INSERT INTO t VALUES (1), (2)")
+            .execute(&pool)
+            .await
+            .unwrap();
+        let lock = |id: i32| sqlx::query("SELECT id FROM t WHERE id = $1 FOR UPDATE").bind(id);
+        let (mut a, mut b) = (pool.begin().await.unwrap(), pool.begin().await.unwrap());
+        lock(1).execute(&mut *a).await.unwrap();
+        lock(2).execute(&mut *b).await.unwrap();
+        // Each now waits on the other's row; Postgres undoes one of them.
+        let (x, y) = tokio::join!(lock(2).execute(&mut *a), lock(1).execute(&mut *b));
+        let e = x.err().or(y.err()).expect("one of them deadlocked");
+        assert!(matches!(
+            ApiError::from(DbError::from(e)),
+            ApiError::Conflict(d) if d.contains("try again")
+        ));
     }
 }

@@ -18,14 +18,16 @@ use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, LinkChange, Renames, SchemaDiff, diff, migrate_document, relink};
+use tachyon_core::validate::Mode;
 use tachyon_core::{
     CollectionKind, CollectionSchema, FieldError, SchemaError, relations, validate_document,
+    validate_document_in,
 };
 use time::OffsetDateTime;
 use uuid::Uuid;
 
 use crate::collections::Collection;
-use crate::documents::{Relation, sync_relations};
+use crate::documents::{DocCopy, Relation, sync_relations};
 use crate::indexes::{Wanted, ddl, existing_indexes, wanted_indexes};
 use crate::{DEFAULT_TENANT, DbError};
 
@@ -47,9 +49,67 @@ pub struct Preview {
     /// Live documents that lose a link because its collection is no longer allowed.
     pub cleared: i64,
     pub indexes: IndexChanges,
+    /// Versions the change deletes: those past a lowered `maxVersions`, or every one when
+    /// `versions` goes. A version a pending job holds is kept.
+    pub pruned: i64,
     /// For a shared block: the change in each schema that names it, by slug.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub collections: BTreeMap<String, Preview>,
+}
+
+/// What a confirmation prompt is actually about: data the change costs, old versions it
+/// deletes, or both. A lowered `maxVersions` costs neither fields nor documents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfirmationScope {
+    /// Fields go or change type, or live documents stop validating.
+    pub fields: bool,
+    /// Old document versions the change deletes.
+    pub versions: i64,
+}
+
+impl ConfirmationScope {
+    /// Both scopes in one: either of them asking for data means asking.
+    pub fn combine(self, other: Self) -> Self {
+        Self {
+            fields: self.fields || other.fields,
+            versions: self.versions + other.versions,
+        }
+    }
+
+    /// The clause naming the cost, without the sentence that tells the caller how to go on.
+    pub fn what(&self) -> String {
+        const FIELDS: &str =
+            "This change removes or retypes fields, or leaves documents that won't validate";
+        match (self.fields, self.versions) {
+            (true, 0) => format!("{FIELDS}."),
+            (false, 0) => "This change needs confirmation.".to_owned(),
+            (true, n) => format!("{FIELDS}, and deletes {n} old {}.", versions(n)),
+            (false, n) => format!("This change deletes {n} old {}.", versions(n)),
+        }
+    }
+}
+
+fn versions(n: i64) -> &'static str {
+    if n == 1 { "version" } else { "versions" }
+}
+
+impl Preview {
+    /// What confirming this change would actually cost. A shared block reports its schemas
+    /// one level down, and their counts don't roll up into this preview's own.
+    pub fn confirmation_scope(&self) -> ConfirmationScope {
+        let mut scope = ConfirmationScope {
+            fields: self.diff.is_destructive() || self.invalid > 0,
+            versions: 0,
+        };
+        if self.collections.is_empty() {
+            scope.versions = self.pruned;
+        } else {
+            for part in self.collections.values() {
+                scope = scope.combine(part.confirmation_scope());
+            }
+        }
+        scope
+    }
 }
 
 /// Indexes the change builds and drops, labelled like `title (unique)`.
@@ -75,6 +135,9 @@ pub enum ChangeError {
     Duplicates(Box<Preview>),
     #[error("the change needs confirmation")]
     NeedsConfirmation(Box<Preview>),
+    /// Turning drafts off would lose work that isn't published; no `confirm` overrides it.
+    #[error("{0}")]
+    PendingDrafts(String),
     #[error(transparent)]
     Db(#[from] DbError),
 }
@@ -136,6 +199,63 @@ pub async fn apply(
     Ok((o.collection, o.preview))
 }
 
+/// `apply`, in the caller's transaction, which it leaves open: commit it to keep the
+/// change, or drop it to undo it, as after any error. A job uses this to mark itself done
+/// in the transaction that holds its change, so a run that lost its job can't commit.
+pub async fn apply_in(
+    conn: &mut PgConnection,
+    slug: &str,
+    new: &CollectionSchema,
+    renames: &Renames,
+    confirm: bool,
+) -> Result<(Collection, Preview), ChangeError> {
+    let save = Save {
+        slug,
+        schema: new,
+        renames,
+        new: false,
+    };
+    let o = run_in(conn, &[save], Some(confirm)).await?.remove(0);
+    Ok((o.collection, o.preview))
+}
+
+/// How many rows changing `slug` scans: documents, trashed ones included, and their
+/// versions, in it or, for a shared block, in every schema reaching it. 0 when there's no
+/// `slug`, which the change itself reports.
+pub async fn rows(pool: &PgPool, slug: &str) -> Result<i64, DbError> {
+    let stored = crate::collections::list(pool).await?;
+    let before = |s: &str| stored.iter().map(|c| &c.schema.0).find(|c| c.slug == s);
+    let Some(target) = stored.iter().find(|c| c.schema.slug == slug) else {
+        return Ok(0);
+    };
+    // Who reaches a shared block doesn't change with it, so the stored schemas say.
+    let ids: Vec<Uuid> = match target.schema.kind {
+        CollectionKind::Block => stored
+            .iter()
+            .filter(|c| c.schema.kind != CollectionKind::Block)
+            .filter(|c| {
+                c.schema
+                    .expand_placed(before)
+                    .is_ok_and(|(_, placed)| placed.iter().any(|(_, s)| s == slug))
+            })
+            .map(|c| c.id)
+            .collect(),
+        _ => vec![target.id],
+    };
+    let rows = sqlx::query_scalar!(
+        r#"SELECT (SELECT count(*) FROM documents WHERE tenant_id = $1 AND collection_id = ANY($2))
+                + (SELECT count(*) FROM versions
+                   WHERE document_id IN (SELECT id FROM documents
+                                         WHERE tenant_id = $1 AND collection_id = ANY($2)))
+                AS "rows!""#,
+        DEFAULT_TENANT,
+        &ids,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Several saves as one change, such as a schema file's: each sees the others' versions,
 /// so a shared block's cascade reaches a schema the file also changes as the file has it.
 pub async fn preview_all(pool: &PgPool, saves: &[Save<'_>]) -> Result<Vec<Outcome>, ChangeError> {
@@ -184,7 +304,9 @@ fn index_changes(id: Uuid, old: &CollectionSchema, new: &CollectionSchema) -> In
 struct Row {
     id: Uuid,
     live: bool,
-    data: Map<String, Value>,
+    /// The published copy, missing on a document never published.
+    data: Option<Map<String, Value>>,
+    draft: Option<Map<String, Value>>,
 }
 
 async fn batch(
@@ -193,7 +315,9 @@ async fn batch(
     after: Option<Uuid>,
 ) -> Result<Vec<Row>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT id, deleted_at IS NULL AS "live!", published AS "data!: Json<Map<String, Value>>"
+        r#"SELECT id, deleted_at IS NULL AS "live!",
+                  published AS "data: Json<Map<String, Value>>",
+                  draft AS "draft: Json<Map<String, Value>>"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND ($3::uuid IS NULL OR id > $3)
            ORDER BY id
@@ -210,7 +334,8 @@ async fn batch(
         .map(|r| Row {
             id: r.id,
             live: r.live,
-            data: r.data.0,
+            data: r.data.map(|d| d.0),
+            draft: r.draft.map(|d| d.0),
         })
         .collect())
 }
@@ -244,6 +369,7 @@ impl Preview {
             needs_confirmation: false,
             cleared: 0,
             indexes: IndexChanges::default(),
+            pruned: 0,
             collections: BTreeMap::new(),
         }
     }
@@ -262,6 +388,7 @@ fn summarize(own: &SchemaDiff, reached: Vec<(String, Preview)>) -> Preview {
         documents: reached.iter().map(|(_, p)| p.documents).sum(),
         invalid: reached.iter().map(|(_, p)| p.invalid).sum(),
         cleared: reached.iter().map(|(_, p)| p.cleared).sum(),
+        pruned: reached.iter().map(|(_, p)| p.pruned).sum(),
         needs_confirmation: reached.iter().any(|(_, p)| p.needs_confirmation),
         duplicates,
         collections: reached.into_iter().collect(),
@@ -269,10 +396,24 @@ fn summarize(own: &SchemaDiff, reached: Vec<(String, Preview)>) -> Preview {
     }
 }
 
-// NOTE: the whole change runs in one transaction; very large collections should move to a
-// background job once the M4 job queue exists.
+/// `run_in`, in a transaction of its own: a write commits, a preview rolls back.
 async fn run(
     pool: &PgPool,
+    saves: &[Save<'_>],
+    write: Option<bool>,
+) -> Result<Vec<Outcome>, ChangeError> {
+    let mut tx = pool.begin().await?;
+    let out = run_in(&mut tx, saves, write).await?;
+    if write.is_some() {
+        tx.commit().await?;
+    }
+    Ok(out)
+}
+
+/// The whole change, in `tx`, left open for the caller. The API runs one too big for a
+/// request on a job worker (`INLINE_ROWS` in `tachyon-api`).
+async fn run_in(
+    tx: &mut PgConnection,
     saves: &[Save<'_>],
     write: Option<bool>,
 ) -> Result<Vec<Outcome>, ChangeError> {
@@ -299,11 +440,10 @@ async fn run(
         }
         crate::auth::check_users_schema(s.schema).map_err(|e| own(s.slug, e))?;
     }
-    let mut tx = pool.begin().await?;
     if write.is_some() {
         // Every schema save holds R42's lock to its commit (W1-R16), so what's read below
         // stays true until then: no other schema, shared block or role changes meanwhile.
-        crate::auth::lock_rule_roles(&mut tx).await?;
+        crate::auth::lock_rule_roles(&mut *tx).await?;
     }
     let stored = sqlx::query_as!(
         Collection,
@@ -500,7 +640,7 @@ async fn run(
             true => own(&part.slug, e),
             false => breaks(&part.slug, e),
         })?;
-        previews.push(scan(&mut tx, part, changes).await?);
+        previews.push(scan(&mut *tx, part, changes).await?);
     }
     let stored_differs: Vec<bool> = current
         .iter()
@@ -560,15 +700,18 @@ async fn run(
     if let Some(p) = out.iter().find(|p| !p.duplicates.is_empty()) {
         return Err(ChangeError::Duplicates(Box::new(p.clone())));
     }
+    for part in parts.iter().filter(|p| p.old.drafts() && !p.new.drafts()) {
+        check_no_pending_drafts(&mut *tx, part.id).await?;
+    }
     if !confirm && let Some(p) = out.iter().find(|p| p.needs_confirmation) {
         return Err(ChangeError::NeedsConfirmation(Box::new(p.clone())));
     }
     for s in saves {
-        crate::auth::check_rule_roles(&mut tx, s.schema).await?;
+        crate::auth::check_rule_roles(&mut *tx, s.schema).await?;
     }
     // New ones first, so links into them are kept.
     for (i, s) in saves.iter().enumerate().filter(|(_, s)| s.new) {
-        current[i] = crate::collections::insert(&mut tx, current[i].id, s.schema).await?;
+        current[i] = crate::collections::insert(&mut *tx, current[i].id, s.schema).await?;
     }
 
     // Pass 2.
@@ -577,12 +720,22 @@ async fn run(
             continue;
         }
         let part = &parts[k];
-        if let Some(field) = rewrite(&mut tx, part, &targets, &previews[k].diff.links).await? {
+        let drafts = (part.old.drafts(), part.new.drafts());
+        if drafts == (true, false) {
+            clear_drafts(&mut *tx, part.id).await?;
+        }
+        if part.old.versions != part.new.versions {
+            prune(&mut *tx, part.id, kept(&part.new), true).await?;
+        }
+        if let Some(field) = rewrite(&mut *tx, part, &targets, &previews[k].diff.links).await? {
             previews[k].duplicates = vec![field];
             return Err(ChangeError::Duplicates(Box::new(entry(
                 part.owners[0],
                 &previews,
             ))));
+        }
+        if drafts == (false, true) {
+            seed_drafts(&mut *tx, part.id).await?;
         }
         if !part.saved {
             // Its fields changed with a shared block, so writes validated against the old
@@ -617,7 +770,6 @@ async fn run(
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
     Ok(outcomes(current, out))
 }
 
@@ -650,7 +802,11 @@ async fn scan(
         after = Some(last.id);
         for row in rows.iter().filter(|r| r.live) {
             p.documents += 1;
-            let mut migrated = migrate_document(data, &part.renames, &row.data);
+            // A draft is checked when it's published, and drafts needn't be unique.
+            let Some(published) = &row.data else {
+                continue;
+            };
+            let mut migrated = migrate_document(data, &part.renames, published);
             if relink(data, &mut migrated, links) {
                 p.cleared += 1;
             }
@@ -672,13 +828,192 @@ async fn scan(
         }
     }
     p.duplicates = duplicates.into_iter().collect();
-    p.needs_confirmation = p.diff.is_destructive() || p.invalid > 0;
+    if old.versions != new.versions {
+        p.pruned = prune(&mut *conn, part.id, kept(new), false).await?;
+    }
+    p.needs_confirmation = p.diff.is_destructive() || p.invalid > 0 || p.pruned > 0;
     Ok(p)
 }
 
-/// Pass 2 for one part: rewrites every document, deleted ones included so Trash restores
-/// cleanly, then builds its new unique indexes. Returns a unique field whose index found
-/// duplicate values.
+/// How many versions a document keeps under `schema`: `None` for every one.
+fn kept(schema: &CollectionSchema) -> Option<i64> {
+    match &schema.versions {
+        None => Some(0),
+        Some(v) if v.max_versions == 0 => None,
+        Some(v) => Some(v.max_versions.into()),
+    }
+}
+
+/// Counts, or with `delete` deletes, a collection's versions past the newest `keep` of
+/// each document. Never one a queued or running job holds, such as a scheduled publish's.
+async fn prune(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+    keep: Option<i64>,
+    delete: bool,
+) -> Result<i64, DbError> {
+    let Some(keep) = keep else {
+        return Ok(0);
+    };
+    // The same rows either way; counting stays a plain SELECT, so a preview runs on a
+    // read-only transaction or a replica.
+    let n = if delete {
+        sqlx::query!(
+            r#"DELETE FROM versions WHERE id IN (
+                   SELECT id FROM (
+                       SELECT id, row_number() OVER (
+                           PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n
+                       FROM versions WHERE tenant_id = $1 AND collection_id = $2
+                   ) ranked
+                   WHERE n > $3 AND NOT EXISTS (
+                       SELECT 1 FROM jobs j
+                       WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
+                         AND j.payload->>'version' = ranked.id::text))"#,
+            DEFAULT_TENANT,
+            collection_id,
+            keep,
+        )
+        .execute(&mut *conn)
+        .await?
+        .rows_affected()
+        .try_into()
+        .unwrap_or(i64::MAX)
+    } else {
+        sqlx::query_scalar!(
+            r#"SELECT count(*) AS "n!" FROM (
+                   SELECT id, row_number() OVER (
+                       PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n
+                   FROM versions WHERE tenant_id = $1 AND collection_id = $2
+               ) ranked
+               WHERE n > $3 AND NOT EXISTS (
+                   SELECT 1 FROM jobs j
+                   WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
+                     AND j.payload->>'version' = ranked.id::text)"#,
+            DEFAULT_TENANT,
+            collection_id,
+            keep,
+        )
+        .fetch_one(&mut *conn)
+        .await?
+    };
+    Ok(n)
+}
+
+/// Refuses turning drafts off while a document's draft isn't what's published, trashed
+/// documents included: there's no way to do it without publishing or losing that work.
+async fn check_no_pending_drafts(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+) -> Result<(), ChangeError> {
+    let row = sqlx::query!(
+        r#"SELECT count(*) AS "n!", count(*) FILTER (WHERE deleted_at IS NOT NULL) AS "trashed!"
+           FROM documents
+           WHERE tenant_id = $1 AND collection_id = $2
+             AND (draft IS DISTINCT FROM published OR published IS NULL)"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_one(&mut *conn)
+    .await?;
+    let trashed = match row.trashed {
+        0 => String::new(),
+        m => format!(" ({m} in trash)"),
+    };
+    match row.n {
+        0 => Ok(()),
+        1 => Err(ChangeError::PendingDrafts(format!(
+            "1 document has an unpublished draft{trashed}; publish or delete it first"
+        ))),
+        n => Err(ChangeError::PendingDrafts(format!(
+            "{n} documents have unpublished drafts{trashed}; publish or delete them first"
+        ))),
+    }
+}
+
+/// One copy of a document, or a version, as `part.new` stores it: valid ones normalized,
+/// invalid ones as migrated, to fix on next edit. A draft (`Mode::Draft`) is judged as a
+/// draft save would judge it, so a missing required field doesn't keep it unnormalized.
+fn rewritten(
+    part: &Part,
+    links: &[LinkChange],
+    data: &Map<String, Value>,
+    mode: Mode,
+) -> Map<String, Value> {
+    let fields = part.new.data();
+    let mut migrated = migrate_document(fields, &part.renames, data);
+    relink(fields, &mut migrated, links);
+    validate_document_in(mode, fields, &Value::Object(Map::new()), Some(&migrated))
+        .unwrap_or(migrated)
+}
+
+/// Drafts turned off: every draft goes, with its links, and every scheduled publish or
+/// unpublish is cancelled. Nothing is lost, since `check_no_pending_drafts` found each draft
+/// the same as what's published.
+async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
+    sqlx::query!(
+        "DELETE FROM relations r USING documents d
+         WHERE r.from_doc = d.id AND r.copy = 'draft' AND d.tenant_id = $1 AND d.collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query!(
+        "UPDATE documents SET draft = NULL WHERE tenant_id = $1 AND collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Publishing needs drafts, so what's scheduled could only fail; documents first, then
+    // their jobs, the order every write locks them in.
+    sqlx::query!(
+        "UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+         WHERE tenant_id = $1 AND collection_id = $2 AND kind IN ('publish', 'unpublish')
+           AND state IN ('queued', 'running')",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Drafts turned on: every document's draft starts as its published copy, links included,
+/// trashed documents too.
+async fn seed_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
+    sqlx::query!(
+        "UPDATE documents SET draft = published WHERE tenant_id = $1 AND collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    // The rewrite synced live drafts from nothing; a trashed one may hold stale rows.
+    sqlx::query!(
+        "DELETE FROM relations r USING documents d
+         WHERE r.from_doc = d.id AND r.copy = 'draft' AND d.tenant_id = $1 AND d.collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    sqlx::query!(
+        "INSERT INTO relations (tenant_id, from_doc, copy, field_path, to_doc)
+         SELECT r.tenant_id, r.from_doc, 'draft', r.field_path, r.to_doc
+         FROM relations r JOIN documents d ON d.id = r.from_doc
+         WHERE r.copy = 'published' AND d.tenant_id = $1 AND d.collection_id = $2",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *conn)
+    .await?;
+    Ok(())
+}
+
+/// Pass 2 for one part: rewrites both copies of every document, deleted ones included so
+/// a restore starts from the new fields, and every version, then builds its new unique
+/// indexes. Returns a unique field whose index found duplicate values.
 async fn rewrite(
     conn: &mut PgConnection,
     part: &Part,
@@ -692,34 +1027,78 @@ async fn rewrite(
         let Some(last) = rows.last() else { break };
         after = Some(last.id);
         for row in rows {
-            let mut migrated = migrate_document(new.data(), &part.renames, &row.data);
-            relink(new.data(), &mut migrated, links);
-            // Valid documents are stored normalized; invalid ones as migrated, to fix on next edit.
-            let stored = validate_document(new.data(), &Value::Object(Map::new()), Some(&migrated))
-                .unwrap_or(migrated);
-            if stored != row.data {
+            let published = row
+                .data
+                .as_ref()
+                .map(|d| rewritten(part, links, d, Mode::Full));
+            let draft = row
+                .draft
+                .as_ref()
+                .map(|d| rewritten(part, links, d, Mode::Draft));
+            if published != row.data || draft != row.draft {
                 sqlx::query!(
-                    "UPDATE documents SET published = $2 WHERE id = $1",
+                    "UPDATE documents SET published = $2, draft = $3 WHERE id = $1",
                     row.id,
-                    Json(&stored) as _
+                    published.as_ref().map(Json) as _,
+                    draft.as_ref().map(Json) as _,
                 )
                 .execute(&mut *conn)
                 .await?;
             }
-            // Deleted documents keep their old link rows; they re-sync when restored and saved (M4).
+            // Trashed documents keep their old link rows; a restore re-syncs both copies.
             if row.live {
-                let links: Vec<Relation> = relations(new.data(), &stored)
-                    .into_iter()
-                    .filter_map(|r| {
-                        Some(Relation {
-                            path: r.path,
-                            at: r.at,
-                            collection_id: *targets.get(&r.relation_to)?,
-                            id: r.id,
+                for (copy, data) in [(DocCopy::Published, &published), (DocCopy::Draft, &draft)] {
+                    // Without drafts there are no draft rows to clear: skip the DELETE.
+                    if copy == DocCopy::Draft && data.is_none() && !new.drafts() {
+                        continue;
+                    }
+                    let links: Vec<Relation> = data
+                        .iter()
+                        .flat_map(|d| relations(new.data(), d))
+                        .filter_map(|r| {
+                            Some(Relation {
+                                path: r.path,
+                                at: r.at,
+                                collection_id: *targets.get(&r.relation_to)?,
+                                id: r.id,
+                            })
                         })
-                    })
-                    .collect();
-                sync_relations(&mut *conn, row.id, &links).await?;
+                        .collect();
+                    sync_relations(&mut *conn, row.id, copy, &links).await?;
+                }
+            }
+        }
+    }
+    let mut after: Option<Uuid> = None;
+    loop {
+        let rows = sqlx::query!(
+            r#"SELECT id, kind, data AS "data: Json<Map<String, Value>>" FROM versions
+               WHERE tenant_id = $1 AND collection_id = $2 AND ($3::uuid IS NULL OR id > $3)
+               ORDER BY id
+               LIMIT $4"#,
+            DEFAULT_TENANT,
+            part.id,
+            after,
+            BATCH,
+        )
+        .fetch_all(&mut *conn)
+        .await?;
+        let Some(last) = rows.last() else { break };
+        after = Some(last.id);
+        for v in rows {
+            let mode = match v.kind == DocCopy::Draft.as_str() {
+                true => Mode::Draft,
+                false => Mode::Full,
+            };
+            let data = rewritten(part, links, &v.data.0, mode);
+            if data != v.data.0 {
+                sqlx::query!(
+                    "UPDATE versions SET data = $2 WHERE id = $1",
+                    v.id,
+                    Json(&data) as _
+                )
+                .execute(&mut *conn)
+                .await?;
             }
         }
     }
@@ -760,5 +1139,77 @@ fn unique_key(value: &Value) -> String {
     match value {
         Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), |f| f.to_string()),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_versions_only_scope_names_the_versions() {
+        let scope = ConfirmationScope {
+            fields: false,
+            versions: 340,
+        };
+        assert_eq!(scope.what(), "This change deletes 340 old versions.");
+        assert_eq!(
+            ConfirmationScope {
+                fields: false,
+                versions: 1,
+            }
+            .what(),
+            "This change deletes 1 old version."
+        );
+    }
+
+    #[test]
+    fn a_scope_with_fields_keeps_the_field_warning() {
+        assert_eq!(
+            ConfirmationScope {
+                fields: true,
+                versions: 0,
+            }
+            .what(),
+            "This change removes or retypes fields, or leaves documents that won't validate."
+        );
+    }
+
+    #[test]
+    fn a_scope_with_both_names_both() {
+        assert_eq!(
+            ConfirmationScope {
+                fields: true,
+                versions: 340,
+            }
+            .what(),
+            "This change removes or retypes fields, or leaves documents that won't validate, and deletes 340 old versions."
+        );
+    }
+
+    #[test]
+    fn combining_scopes_adds_versions_and_keeps_either_field_warning() {
+        let fields = ConfirmationScope {
+            fields: true,
+            versions: 0,
+        };
+        let versions = ConfirmationScope {
+            fields: false,
+            versions: 2,
+        };
+        assert_eq!(
+            fields.combine(versions),
+            ConfirmationScope {
+                fields: true,
+                versions: 2,
+            }
+        );
+        assert_eq!(
+            versions.combine(fields),
+            ConfirmationScope {
+                fields: true,
+                versions: 2,
+            }
+        );
     }
 }

@@ -125,7 +125,7 @@ async fn linked_documents_are_protected_and_listed(pool: PgPool) {
         .json;
     assert_eq!(
         refs["docs"],
-        json!([{"collection": "posts", "id": post["id"], "path": "author"}])
+        json!([{"collection": "posts", "id": post["id"], "path": "author", "copy": "published"}])
     );
 
     let post_url = format!("/api/posts/{}", post["id"].as_str().unwrap());

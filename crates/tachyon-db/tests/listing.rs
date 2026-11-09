@@ -2,8 +2,9 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
+use tachyon_db::DocCopy;
 use tachyon_db::documents::{self, Prepared};
-use tachyon_db::query::{self, ListQuery};
+use tachyon_db::query::{self, ListQuery, Readable};
 use tachyon_db::{DbError, collections};
 use uuid::Uuid;
 
@@ -61,6 +62,8 @@ fn q<'a>(filter: Option<&'a Filter>, sort: Option<&'a Sort>) -> ListQuery<'a> {
         offset: 0,
         after: None,
         count: false,
+        copy: DocCopy::Published,
+        owner: None,
     }
 }
 
@@ -145,6 +148,8 @@ async fn cursors_walk_every_document_once(pool: PgPool) {
                     offset: 0,
                     after: after.as_ref(),
                     count: false,
+                    copy: DocCopy::Published,
+                    owner: None,
                 },
             )
             .await
@@ -176,6 +181,8 @@ async fn counts_match_the_filter(pool: PgPool) {
             offset: 0,
             after: None,
             count: true,
+            copy: DocCopy::Published,
+            owner: None,
         },
     )
     .await
@@ -228,6 +235,8 @@ async fn numbers_compare_exactly(pool: PgPool) {
                 offset: 0,
                 after: after.as_ref(),
                 count: false,
+                copy: DocCopy::Published,
+                owner: None,
             },
         )
         .await
@@ -454,6 +463,8 @@ async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool)
         offset,
         after: None,
         count: false,
+        copy: DocCopy::Published,
+        owner: None,
     };
     let first = query::list(&pool, c, &page(0)).await.unwrap();
     assert!(first.has_more);
@@ -470,6 +481,8 @@ async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool)
             offset: 0,
             after: None,
             count: false,
+            copy: DocCopy::Published,
+            owner: None,
         },
     )
     .await
@@ -493,6 +506,8 @@ async fn pages_report_whether_more_follow_and_near_refuses_cursors(pool: PgPool)
             offset: 0,
             after: Some(&cursor),
             count: false,
+            copy: DocCopy::Published,
+            owner: None,
         },
     )
     .await;
@@ -554,6 +569,13 @@ mod joins {
     use tachyon_core::joins::on_pattern;
     use tachyon_db::documents::Relation;
     use tachyon_db::query::{JoinQuery, joined};
+
+    static PUBLISHED: Readable = Readable {
+        filter: None,
+        copy: DocCopy::Published,
+        owner: None,
+        otherwise: None,
+    };
 
     struct Fixture {
         posts: Uuid,
@@ -632,6 +654,7 @@ mod joins {
             limit: 10,
             offset: 0,
             count: false,
+            read: &PUBLISHED,
         }
     }
 
@@ -1000,7 +1023,7 @@ mod cross {
                     inner: Box::new(target(*inner, guards)),
                     guards: guards
                         .iter()
-                        .map(|(slug, f)| ((*slug).to_owned(), f.clone().map(Box::new)))
+                        .map(|(slug, f)| ((*slug).to_owned(), Readable::published(f.clone())))
                         .collect(),
                 },
                 Target::Row {
