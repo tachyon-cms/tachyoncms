@@ -4,6 +4,10 @@ use serde_json::json;
 use tachyon_core::FieldError;
 use tachyon_db::DbError;
 
+/// A write that met another's locks and was undone, which may safely run again.
+pub(crate) const TRY_AGAIN: &str =
+    "Another change to the same documents got in the way; try again.";
+
 /// Every API error, rendered as RFC 9457 `application/problem+json`.
 #[derive(Debug)]
 pub enum ApiError {
@@ -21,8 +25,11 @@ pub enum ApiError {
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
     Unique(String),
-    /// A schema change needs `"confirm": true`; carries the preview to show the user.
-    NeedsConfirmation(serde_json::Value),
+    /// A schema change needs `"confirm": true`; carries what it costs and the preview to show.
+    NeedsConfirmation {
+        detail: String,
+        preview: serde_json::Value,
+    },
     /// The cause is logged, never sent to the client.
     Internal(String),
 }
@@ -55,25 +62,26 @@ impl From<DbError> for ApiError {
             DbError::Sqlx(sqlx::Error::Database(e))
                 if matches!(e.code().as_deref(), Some("40P01" | "40001")) =>
             {
-                Self::Conflict(
-                    "Another change to the same documents got in the way; try again.".into(),
-                )
+                Self::Conflict(TRY_AGAIN.into())
             }
             DbError::Sqlx(e) => Self::Internal(e.to_string()),
         }
     }
 }
 
-impl IntoResponse for ApiError {
-    fn into_response(self) -> Response {
+impl ApiError {
+    /// The status and problem+json body this error answers with.
+    pub(crate) fn problem(self) -> (StatusCode, serde_json::Value) {
         let mut extra = None;
         let (status, title, detail, errors) = match self {
-            Self::NeedsConfirmation(preview) => {
+            Self::NeedsConfirmation { detail, preview } => {
                 extra = Some(("preview", preview));
                 (
                     StatusCode::CONFLICT,
                     "Confirmation required",
-                    Some("This change removes or retypes fields, or leaves documents that won't validate. Send it again with \"confirm\": true to go ahead.".to_owned()),
+                    Some(format!(
+                        "{detail} Send it again with \"confirm\": true to go ahead."
+                    )),
                     None,
                 )
             }
@@ -137,6 +145,13 @@ impl IntoResponse for ApiError {
         if let Some((key, value)) = extra {
             body[key] = value;
         }
+        (status, body)
+    }
+}
+
+impl IntoResponse for ApiError {
+    fn into_response(self) -> Response {
+        let (status, body) = self.problem();
         (
             status,
             [(header::CONTENT_TYPE, "application/problem+json")],

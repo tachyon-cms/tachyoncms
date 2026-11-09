@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT (SELECT count(*) FROM documents WHERE tenant_id = $1 AND collection_id = ANY($2))\n                + (SELECT count(*) FROM versions\n                   WHERE document_id IN (SELECT id FROM documents\n                                         WHERE tenant_id = $1 AND collection_id = ANY($2)))\n                AS \"rows!\"",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "rows!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e6335da72aece3ef53be7eb5bcc8a4ec6f6098ba8bf70c64d0e4864ff7dc8cc3"
+}
