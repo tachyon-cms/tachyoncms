@@ -10,7 +10,7 @@ use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
-use tachyon_db::schema_change::{self, ChangeError, Preview, Save};
+use tachyon_db::schema_change::{self, ChangeError, ConfirmationScope, Preview, Save};
 use tachyon_db::{collections, indexes};
 
 /// Every collection's schema as a pretty JSON bundle.
@@ -269,8 +269,13 @@ pub async fn run(
         bail!("{report}\n\nSome unique fields have duplicate values. Fix those documents first.");
     }
     if !yes && outcomes.iter().any(|o| o.preview.needs_confirmation) {
+        let scope = outcomes
+            .iter()
+            .map(|o| o.preview.confirmation_scope())
+            .fold(ConfirmationScope::default(), ConfirmationScope::combine);
         bail!(
-            "{report}\n\nThese changes remove or retype fields, or leave documents that won't validate. Re-run with --yes to apply them."
+            "{report}\n\n{} Re-run with --yes to apply them.",
+            scope.what()
         );
     }
     // One transaction: if anything fails, nothing went in. `yes` again here: the check

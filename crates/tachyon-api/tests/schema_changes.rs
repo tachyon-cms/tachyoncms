@@ -341,6 +341,10 @@ async fn pruning_versions_needs_confirmation(pool: PgPool) {
     assert_problem(&res, 409);
     assert_eq!(res.json["preview"]["pruned"], 2);
     assert_eq!(res.json["preview"]["needsConfirmation"], true);
+    assert_eq!(
+        res.json["detail"],
+        "This change deletes 2 old versions. Send it again with \"confirm\": true to go ahead."
+    );
     assert_eq!(count().await, 3);
     let res = put(versioned(
         json!({"maxVersions": 1}),

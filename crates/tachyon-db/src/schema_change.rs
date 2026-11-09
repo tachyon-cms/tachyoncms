@@ -57,6 +57,61 @@ pub struct Preview {
     pub collections: BTreeMap<String, Preview>,
 }
 
+/// What a confirmation prompt is actually about: data the change costs, old versions it
+/// deletes, or both. A lowered `maxVersions` costs neither fields nor documents.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ConfirmationScope {
+    /// Fields go or change type, or live documents stop validating.
+    pub fields: bool,
+    /// Old document versions the change deletes.
+    pub versions: i64,
+}
+
+impl ConfirmationScope {
+    /// Both scopes in one: either of them asking for data means asking.
+    pub fn combine(self, other: Self) -> Self {
+        Self {
+            fields: self.fields || other.fields,
+            versions: self.versions + other.versions,
+        }
+    }
+
+    /// The clause naming the cost, without the sentence that tells the caller how to go on.
+    pub fn what(&self) -> String {
+        const FIELDS: &str =
+            "This change removes or retypes fields, or leaves documents that won't validate";
+        match (self.fields, self.versions) {
+            (true, 0) => format!("{FIELDS}."),
+            (false, 0) => "This change needs confirmation.".to_owned(),
+            (true, n) => format!("{FIELDS}, and deletes {n} old {}.", versions(n)),
+            (false, n) => format!("This change deletes {n} old {}.", versions(n)),
+        }
+    }
+}
+
+fn versions(n: i64) -> &'static str {
+    if n == 1 { "version" } else { "versions" }
+}
+
+impl Preview {
+    /// What confirming this change would actually cost. A shared block reports its schemas
+    /// one level down, and their counts don't roll up into this preview's own.
+    pub fn confirmation_scope(&self) -> ConfirmationScope {
+        let mut scope = ConfirmationScope {
+            fields: self.diff.is_destructive() || self.invalid > 0,
+            versions: 0,
+        };
+        if self.collections.is_empty() {
+            scope.versions = self.pruned;
+        } else {
+            for part in self.collections.values() {
+                scope = scope.combine(part.confirmation_scope());
+            }
+        }
+        scope
+    }
+}
+
 /// Indexes the change builds and drops, labelled like `title (unique)`.
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct IndexChanges {
@@ -1084,5 +1139,77 @@ fn unique_key(value: &Value) -> String {
     match value {
         Value::Number(n) => n.as_f64().map_or_else(|| n.to_string(), |f| f.to_string()),
         other => other.to_string(),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_versions_only_scope_names_the_versions() {
+        let scope = ConfirmationScope {
+            fields: false,
+            versions: 340,
+        };
+        assert_eq!(scope.what(), "This change deletes 340 old versions.");
+        assert_eq!(
+            ConfirmationScope {
+                fields: false,
+                versions: 1,
+            }
+            .what(),
+            "This change deletes 1 old version."
+        );
+    }
+
+    #[test]
+    fn a_scope_with_fields_keeps_the_field_warning() {
+        assert_eq!(
+            ConfirmationScope {
+                fields: true,
+                versions: 0,
+            }
+            .what(),
+            "This change removes or retypes fields, or leaves documents that won't validate."
+        );
+    }
+
+    #[test]
+    fn a_scope_with_both_names_both() {
+        assert_eq!(
+            ConfirmationScope {
+                fields: true,
+                versions: 340,
+            }
+            .what(),
+            "This change removes or retypes fields, or leaves documents that won't validate, and deletes 340 old versions."
+        );
+    }
+
+    #[test]
+    fn combining_scopes_adds_versions_and_keeps_either_field_warning() {
+        let fields = ConfirmationScope {
+            fields: true,
+            versions: 0,
+        };
+        let versions = ConfirmationScope {
+            fields: false,
+            versions: 2,
+        };
+        assert_eq!(
+            fields.combine(versions),
+            ConfirmationScope {
+                fields: true,
+                versions: 2,
+            }
+        );
+        assert_eq!(
+            versions.combine(fields),
+            ConfirmationScope {
+                fields: true,
+                versions: 2,
+            }
+        );
     }
 }
