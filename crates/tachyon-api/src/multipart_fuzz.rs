@@ -8,6 +8,8 @@ use std::path::Path;
 use axum::body::Body;
 use axum::extract::Request;
 use axum::http::StatusCode;
+use futures_util::StreamExt;
+use serde_json::{Value, json};
 
 use crate::uploads::{Incoming, UploadBody};
 
@@ -72,8 +74,19 @@ const PAYLOADS: &[&str] = &[
     "\"\\u0000\"",
 ];
 
-/// One random body, and the content type it's sent with.
-fn body(r: &mut Rng) -> (String, Vec<u8>) {
+/// What a body that reads at all must give back: the first `file` part's bytes, and the
+/// first `_payload` part's JSON. Known only when the parts use the boundary the header
+/// names, and that boundary can't be mistaken for a longer one.
+#[derive(Default)]
+struct Expected {
+    known: bool,
+    file: Option<Vec<u8>>,
+    payload: Option<Value>,
+}
+
+/// One random body, the content type it's sent with, and what reading it must give.
+fn body(r: &mut Rng) -> (String, Vec<u8>, Expected) {
+    let mut expected = Expected::default();
     let boundary = r.pick(BOUNDARIES).to_owned();
     // The boundary the parts use is sometimes not the one the header names.
     let used = if r.n(10) == 0 {
@@ -87,6 +100,11 @@ fn body(r: &mut Rng) -> (String, Vec<u8>) {
         2 => format!("multipart/form-data; boundary=\"{boundary}\""),
         _ => format!("multipart/form-data; boundary={boundary}"),
     };
+    expected.known = used == boundary
+        && boundary
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-')
+        && !boundary.starts_with('-');
     let mut out = Vec::new();
     if r.n(8) == 0 {
         let len = r.n(64);
@@ -102,7 +120,8 @@ fn body(r: &mut Rng) -> (String, Vec<u8>) {
         if r.n(2) == 0 {
             disposition.push_str(&format!("; filename=\"{}\"", r.pick(FILENAMES)));
         }
-        if r.n(6) == 0 {
+        let unnamed = r.n(6) == 0;
+        if unnamed {
             disposition = "Content-Disposition: attachment".into();
         }
         out.extend_from_slice(disposition.as_bytes());
@@ -129,6 +148,14 @@ fn body(r: &mut Rng) -> (String, Vec<u8>) {
                 r.bytes(len)
             }
         };
+        match name {
+            _ if unnamed => {}
+            "file" if expected.file.is_none() => expected.file = Some(content.clone()),
+            "_payload" if expected.payload.is_none() => {
+                expected.payload = serde_json::from_slice(&content).ok();
+            }
+            _ => {}
+        }
         out.extend_from_slice(&content);
         out.extend_from_slice(b"\r\n");
     }
@@ -140,7 +167,7 @@ fn body(r: &mut Rng) -> (String, Vec<u8>) {
         let at = r.n(out.len());
         out.truncate(at);
     }
-    (kind, out)
+    (kind, out, expected)
 }
 
 /// `bytes` as a body in random chunks, the stream sometimes failing partway.
@@ -169,41 +196,80 @@ async fn multipart_fuzz() {
         std::env::temp_dir().join(format!("tachyon-multipart-fuzz-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&temp).unwrap();
     let mut r = Rng(0x7AC4_1E55_0B0D_1E5D);
-    let (mut ok, mut files) = (0, 0);
+    let (mut json, mut files, mut bad, mut big) = (0, 0, 0, 0);
     for case in 0..5_000 {
-        let (kind, bytes) = body(&mut r);
+        let (kind, bytes, expected) = body(&mut r);
+        let multipart = kind.starts_with("multipart");
         let req = Request::builder()
             .method("POST")
             .uri("/api/files")
             .header("content-type", &kind)
             .body(chunked(&mut r, bytes))
             .unwrap();
+        let payload = || expected.payload.clone().unwrap_or_else(|| json!({}));
         match UploadBody::read(req, Some(LIMIT), &temp).await {
-            Ok(UploadBody::Json(_)) => ok += 1,
+            Ok(UploadBody::Json(v)) => {
+                json += 1;
+                if multipart && expected.known {
+                    assert!(expected.file.is_none(), "case {case}: its file was dropped");
+                    assert_eq!(v, payload(), "case {case}");
+                }
+            }
             Ok(UploadBody::Upload {
+                payload: got,
                 file: Incoming::Spooled(s),
-                ..
             }) => {
-                ok += 1;
                 files += 1;
                 assert_eq!(s.file.path().parent(), Some(temp.as_path()), "case {case}");
-                assert!(s.len <= LIMIT, "case {case}");
                 let written = std::fs::read(s.file.path()).unwrap();
+                if expected.known {
+                    assert_eq!(Some(&written), expected.file.as_ref(), "case {case}");
+                    assert_eq!(got, payload(), "case {case}");
+                }
                 assert_eq!(written.len() as u64, s.len, "case {case}");
-                assert!(written.starts_with(&s.head), "case {case}");
+                assert_eq!(s.head, written[..written.len().min(8192)], "case {case}");
                 assert!(!s.name.is_empty() && !s.name.contains(['/', '\\', '\0']));
             }
             Err(e) => {
                 let (status, _) = e.problem();
-                assert!(
-                    [StatusCode::BAD_REQUEST, StatusCode::PAYLOAD_TOO_LARGE].contains(&status),
-                    "case {case}: {status}"
-                );
+                match status {
+                    StatusCode::BAD_REQUEST => bad += 1,
+                    StatusCode::PAYLOAD_TOO_LARGE => big += 1,
+                    _ => panic!("case {case}: {status}"),
+                }
             }
         }
         assert!(is_empty(&temp), "case {case} left a spool file");
     }
-    // The cases reach past the refusals.
-    assert!(ok > 100 && files > 50, "{ok} read, {files} with a file");
+    // Every outcome is reached often enough to mean something.
+    for (what, n) in [("json", json), ("file", files), ("400", bad), ("413", big)] {
+        assert!(n >= 50, "only {n} cases came out {what}");
+    }
+    std::fs::remove_dir(&temp).unwrap();
+}
+
+#[tokio::test]
+async fn a_cancelled_read_leaves_no_spool_file() {
+    let temp =
+        std::env::temp_dir().join(format!("tachyon-multipart-cancel-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&temp).unwrap();
+    let head = "--x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\n";
+    let mut first = head.as_bytes().to_vec();
+    first.extend_from_slice(&[b'a'; 1_000]);
+    // Half a file, then nothing more, ever: the client went quiet.
+    let stream = futures_util::stream::iter([Ok::<_, std::io::Error>(first)])
+        .chain(futures_util::stream::pending());
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/files")
+        .header("content-type", "multipart/form-data; boundary=x")
+        .body(Body::from_stream(stream))
+        .unwrap();
+    let mut read = Box::pin(UploadBody::read(req, Some(LIMIT), &temp));
+    let late = tokio::time::timeout(std::time::Duration::from_millis(50), &mut read).await;
+    assert!(late.is_err(), "still waiting");
+    assert!(!is_empty(&temp), "it was spooling");
+    drop(read);
+    assert!(is_empty(&temp), "the cancelled read left its spool file");
     std::fs::remove_dir(&temp).unwrap();
 }

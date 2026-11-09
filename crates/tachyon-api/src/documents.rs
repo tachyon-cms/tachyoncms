@@ -30,8 +30,8 @@ use crate::populate::{
     to_value, vouched_links,
 };
 use crate::uploads::{
-    Incoming, UploadBody, check_and_process, file_limit, focal_of, persist, refuse_server_set,
-    require_file, scope_of, server_fields, taken_or_abandoned, with_fields,
+    Incoming, UploadBody, check_and_process, file_limit, focal_of, persist, require_file, scope_of,
+    server_fields, settle_server_set, taken_or_abandoned, with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -259,12 +259,12 @@ pub async fn create(
     let copy = access.write_copy(&c)?;
     // Read only now, so a caller who may not create never gets a byte spooled.
     let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
-    let (mut body, file) = match body {
+    let (body, file) = match body {
         UploadBody::Json(v) => (v, None),
         UploadBody::Upload { payload, file } => (payload, Some(file)),
     };
     let hide = |e, body: &Value| access.hide(&c, e, Some(&merged(c.schema.data(), body, None)));
-    refuse_server_set(&c, &body, None).map_err(|e| hide(e, &body))?;
+    let mut body = settle_server_set(&c, &body, None).map_err(|e| hide(e, &body))?;
     require_file(&c, file.is_some())?;
     let checked = match (&c.schema.upload, file) {
         (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
@@ -375,25 +375,31 @@ pub async fn update(
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
     let actor = access.actor(Action::Update, &c);
-    // The lock checks again; this is so that a file is never read for nothing.
-    if let Some(a) = actor.filter(|a| a.own_only) {
-        let mine = Readable {
-            filter: None,
+    // The update rule and ownership, judged on the stored document before a byte of the body
+    // is read, so a refused caller never has a file spooled or stored. The lock judges again.
+    let own = actor.filter(|a| a.own_only).map(|a| a.id);
+    if guard.is_some() || own.is_some() {
+        let may = Readable {
+            filter: guard.clone(),
             copy,
-            owner: Some(a.id),
+            owner: own,
             otherwise: None,
         };
-        let one = HashMap::from([(c.id, mine)]);
+        let one = HashMap::from([(c.id, may)]);
         if get_many_readable(&state.pool, &[id], &one)
             .await?
             .is_empty()
         {
-            return Err(DbError::NotOwner.into());
+            return Err(match (own, &guard) {
+                (Some(_), None) => DbError::NotOwner,
+                _ => DbError::Forbidden,
+            }
+            .into());
         }
     }
     // Read only now, so a caller who may not change this document never gets a byte spooled.
     let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
-    let (mut patch, file) = match body {
+    let (sent, file) = match body {
         UploadBody::Json(v) => (v, None),
         UploadBody::Upload { payload, file } => (payload, Some(file)),
     };
@@ -401,8 +407,13 @@ pub async fn update(
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
     let stored = documents::get(&state.pool, c.id, id, copy).await?.data.0;
-    refuse_server_set(&c, &patch, Some(&stored))
-        .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, Some(&stored)))))?;
+    // Server-set fields are only compared, here and again against the locked document, and
+    // never written from the patch: the stored ones, or the new file's, stay.
+    let settle = |current: &Map<String, Value>| {
+        settle_server_set(&c, &sent, Some(current))
+            .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &sent, Some(current)))))
+    };
+    let mut patch = settle(&stored)?;
     let checked = match (&c.schema.upload, file) {
         (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
         _ => None,
@@ -413,6 +424,7 @@ pub async fn update(
     // Validated with the server-set fields the file brings; those are written in after, as
     // they are, `null`s included.
     let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
+        settle(current)?;
         access.writes(&c, &patch, Action::Update, Some(current))?;
         let input = with_fields(&patch, fields);
         let mut next = validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))

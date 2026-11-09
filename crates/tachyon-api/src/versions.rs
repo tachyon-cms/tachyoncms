@@ -26,6 +26,7 @@ use crate::params::{diff_params, no_params, page_params};
 use crate::populate::{
     check_links, link_ids, link_targets, prepare, published_links, vouched_links,
 };
+use crate::uploads::keep_server_set;
 use crate::{ApiError, AppState};
 
 /// The document a route names: one of a collection, or a global's own.
@@ -298,7 +299,11 @@ async fn restore_version(
         )
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
-        .map(|p| Prepared { file, ..p })
+        .map(|mut p| {
+            // The version's file comes back, so what describes it does too, as stored.
+            keep_server_set(c, &data, &mut p.data);
+            Prepared { file, ..p }
+        })
         .map_err(|e| access.hide(c, e, Some(&next)))
     };
     let vouched = check_links(state, access, &apply(&stored)?, &link_ids(c, &stored)).await?;

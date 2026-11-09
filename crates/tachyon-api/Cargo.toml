@@ -9,6 +9,7 @@ repository.workspace = true
 [dependencies]
 argon2.workspace = true
 base64.workspace = true
+futures-util.workspace = true
 hex.workspace = true
 multer.workspace = true
 rand.workspace = true
@@ -35,7 +36,6 @@ uuid.workspace = true
 
 [dev-dependencies]
 async-trait.workspace = true
-futures-util.workspace = true
 object_store.workspace = true
 http-body-util.workspace = true
 tower.workspace = true

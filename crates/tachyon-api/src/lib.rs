@@ -28,7 +28,7 @@ use std::time::Duration;
 use std::any::Any;
 
 use axum::Router;
-use axum::extract::{DefaultBodyLimit, Request, State};
+use axum::extract::{DefaultBodyLimit, MatchedPath, Request, State};
 use axum::http::{HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
@@ -245,15 +245,17 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
     };
     let storages: Vec<String> = state.media.storages.0.keys().cloned().collect();
     media_jobs::seed_sweep(&state.pool, &storages).await?;
-    let routes = routes.layer(axum::middleware::from_fn_with_state(
-        state.clone(),
-        auth::principal::resolve,
-    ));
-    jobs::spawn_workers(state.clone(), &options.jobs);
     let limits = TimeLimits {
         normal: Duration::from_secs(30),
         uploads: state.media.timeout,
     };
+    let routes = routes
+        .layer(axum::middleware::from_fn_with_state(limits, anonymous_wait))
+        .layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            auth::principal::resolve,
+        ));
+    jobs::spawn_workers(state.clone(), &options.jobs);
     Ok(layers(routes, limits).with_state(state))
 }
 
@@ -265,16 +267,31 @@ struct TimeLimits {
     uploads: Duration,
 }
 
-/// The first segments after `/api/` that aren't a collection's documents.
-const NOT_DOCUMENTS: &[&str] = &["access", "admin", "auth", "globals", "setup", "users"];
+/// Why a request may take the upload time limit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UploadTime {
+    /// A multipart create or update of a document.
+    File,
+    /// A create or update of a document that waits for what its file makes (`?wait=true`),
+    /// once the caller is known to be signed in (`anonymous_wait`).
+    Wait,
+}
 
-/// Whether `req` gets the upload time limit: a multipart create or update of a document, or
-/// any request with `?wait=true`.
-fn takes_upload_time(req: &Request) -> bool {
-    let wait = req
-        .uri()
-        .query()
-        .is_some_and(|q| q.split('&').any(|p| p == "wait=true"));
+/// Whether `req` may take the upload time limit, and why. Decided by the route it matched,
+/// so a route added later gets 30 s unless it's listed here.
+fn upload_time(req: &Request) -> Option<UploadTime> {
+    let route = req
+        .extensions()
+        .get::<MatchedPath>()
+        .map(MatchedPath::as_str);
+    let document = matches!(
+        (req.method(), route),
+        (&Method::POST, Some("/api/{collection}"))
+            | (&Method::PATCH, Some("/api/{collection}/{id}"))
+    );
+    if !document {
+        return None;
+    }
     let multipart = req
         .headers()
         .get(axum::http::header::CONTENT_TYPE)
@@ -284,17 +301,13 @@ fn takes_upload_time(req: &Request) -> bool {
                 .to_ascii_lowercase()
                 .starts_with("multipart/form-data")
         });
-    let parts: Vec<&str> = req
-        .uri()
-        .path()
-        .strip_prefix("/api/")
-        .map(|p| p.split('/').collect())
-        .unwrap_or_default();
-    let document = match (req.method(), parts.as_slice()) {
-        (&Method::POST, [c]) | (&Method::PATCH, [c, _]) => !NOT_DOCUMENTS.contains(c),
-        _ => false,
-    };
-    wait || (multipart && document)
+    if multipart {
+        Some(UploadTime::File)
+    } else if params::wants_wait(req.uri().query()) {
+        Some(UploadTime::Wait)
+    } else {
+        None
+    }
 }
 
 /// What every route sits behind: a body limit, a time limit and a panic guard, all answering
@@ -329,12 +342,26 @@ async fn add_security_headers(mut response: Response) -> Response {
 }
 
 async fn time_limit(State(limits): State<TimeLimits>, req: Request, next: Next) -> Response {
-    let limit = if takes_upload_time(&req) {
-        limits.uploads
-    } else {
-        limits.normal
+    let limit = match upload_time(&req) {
+        Some(_) => limits.uploads,
+        None => limits.normal,
     };
     tokio::time::timeout(limit, next.run(req))
+        .await
+        .unwrap_or_else(|_| ApiError::Timeout.into_response())
+}
+
+/// Inside `principal::resolve`: a signed-out caller's `?wait=true` keeps the normal limit,
+/// so a parameter alone can't hold a connection open for the upload limit.
+async fn anonymous_wait(State(limits): State<TimeLimits>, req: Request, next: Next) -> Response {
+    let signed_in = req
+        .extensions()
+        .get::<auth::principal::Principal>()
+        .is_some_and(|p| p.identity().is_some());
+    if upload_time(&req) != Some(UploadTime::Wait) || signed_in {
+        return next.run(req).await;
+    }
+    tokio::time::timeout(limits.normal, next.run(req))
         .await
         .unwrap_or_else(|_| ApiError::Timeout.into_response())
 }
@@ -398,11 +425,14 @@ mod tests {
         let routes = routes
             .route("/api/{collection}", post(slow).get(slow))
             .route("/api/{collection}/{id}", axum::routing::patch(slow))
-            .route("/api/globals/{slug}", axum::routing::patch(slow));
+            .route("/api/globals/{slug}", axum::routing::patch(slow))
+            .route("/api/auth/login", post(slow));
         let limits = TimeLimits {
             normal: Duration::from_millis(50),
             uploads: Duration::from_secs(5),
         };
+        // No `resolve` here, so every caller is signed out.
+        let routes = routes.layer(axum::middleware::from_fn_with_state(limits, anonymous_wait));
         layers(routes, limits)
     }
 
@@ -412,16 +442,23 @@ mod tests {
         for (method, uri, kind, status) in [
             ("POST", "/api/images", multipart, StatusCode::OK),
             ("PATCH", "/api/images/1", multipart, StatusCode::OK),
-            ("GET", "/api/images?depth=0&wait=true", "", StatusCode::OK),
+            ("POST", "/api/images?wait=true", multipart, StatusCode::OK),
             (
                 "POST",
                 "/api/images",
                 "application/json",
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            // Signed out, `wait` alone earns nothing.
+            (
+                "POST",
+                "/api/images?wait=true",
+                "application/json",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
             (
                 "GET",
-                "/api/images?wait=truly",
+                "/api/images?wait=true",
                 "",
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
@@ -431,6 +468,18 @@ mod tests {
                 multipart,
                 StatusCode::SERVICE_UNAVAILABLE,
             ),
+            (
+                "POST",
+                "/api/auth/login?wait=true",
+                multipart,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "POST",
+                "/api/nowhere/at/all",
+                multipart,
+                StatusCode::NOT_FOUND,
+            ),
         ] {
             let mut req = Request::builder().method(method).uri(uri);
             if !kind.is_empty() {
@@ -439,6 +488,61 @@ mod tests {
             let (got, _, _) = call_with(app(), req).await;
             assert_eq!(got, status, "{method} {uri} {kind}");
         }
+    }
+
+    #[tokio::test]
+    async fn a_signed_in_wait_gets_the_upload_time_limit() {
+        let (_, _, abilities) = tachyon_core::auth::builtin_roles()[0].clone();
+        let user = auth::principal::Principal::User {
+            identity: tachyon_db::auth::Identity {
+                user_id: uuid::Uuid::now_v7(),
+                role: "admin".into(),
+                abilities,
+            },
+            session: uuid::Uuid::now_v7(),
+            cookie: false,
+        };
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            "late"
+        };
+        let limits = TimeLimits {
+            normal: Duration::from_millis(50),
+            uploads: Duration::from_secs(5),
+        };
+        let routes = Router::new()
+            .route("/api/{collection}", post(slow))
+            .layer(axum::middleware::from_fn_with_state(limits, anonymous_wait))
+            .layer(axum::middleware::map_request(
+                move |mut req: Request<Body>| {
+                    req.extensions_mut().insert(user.clone());
+                    async move { req }
+                },
+            ));
+        let app = layers(routes, limits);
+        for (uri, status) in [
+            ("/api/images?wait=true", StatusCode::OK),
+            ("/api/images", StatusCode::SERVICE_UNAVAILABLE),
+        ] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "application/json");
+            assert_eq!(call_with(app.clone(), req).await.0, status, "{uri}");
+        }
+    }
+
+    #[test]
+    fn wait_is_read_as_the_handlers_read_it() {
+        let wait = |uri: &str| {
+            let req = Request::post(uri).body(Body::empty()).unwrap();
+            params::wants_wait(req.uri().query())
+        };
+        assert!(wait("/api/images?wait=true"));
+        assert!(wait("/api/images?a=1&wait=%74rue"));
+        assert!(!wait("/api/images?wait=false"));
+        assert!(!wait("/api/images?wait=truly"));
+        assert!(!wait("/api/images"));
     }
 
     #[tokio::test]

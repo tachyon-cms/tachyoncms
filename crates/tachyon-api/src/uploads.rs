@@ -12,10 +12,11 @@ use std::path::Path;
 use axum::Json;
 use axum::extract::{FromRequest, Request};
 use axum::http::header::CONTENT_TYPE;
+use futures_util::StreamExt;
 use multer::{Constraints, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
-use tachyon_core::FieldError;
 use tachyon_core::uploads::{SERVER_SET, Upload, mime_allowed, restricted, sanitize_filename};
+use tachyon_core::{Field, FieldError, FieldKind};
 use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, FileRow, NewFile};
 use tachyon_media::sniff::sniff;
@@ -31,6 +32,8 @@ use crate::{ApiError, AppState};
 const HEAD: usize = 8 * 1024;
 /// Room for the parts' boundaries and headers, past the file and the payload.
 const OVERHEAD: u64 = 64 * 1024;
+/// The most a part's headers may take; the parser buffers them whole, and keeps 32 at most.
+const HEADERS_MAX: usize = 16 * 1024;
 
 /// A create or update body: JSON, or a multipart body with a file. A multipart body without
 /// a `file` part is its `_payload` as JSON.
@@ -110,7 +113,15 @@ impl UploadBody {
             sizes = sizes.for_field("file", limit);
         }
         let constraints = Constraints::new().allowed_fields(allowed).size_limit(sizes);
-        let stream = req.into_body().into_data_stream();
+        let mut guard = HeaderGuard::new(&boundary);
+        let stream = req
+            .into_body()
+            .into_data_stream()
+            .map(move |chunk| match chunk {
+                Ok(bytes) if !guard.feed(&bytes) => Err(BoxError::from(HeadersTooLong)),
+                Ok(bytes) => Ok(bytes),
+                Err(e) => Err(BoxError::from(e)),
+            });
         let mut parts = Multipart::with_constraints(stream, boundary, constraints);
         let (mut payload, mut spool) = (None, None);
         while let Some(mut part) = parts.next_field().await.map_err(refused)? {
@@ -144,6 +155,69 @@ impl UploadBody {
     }
 }
 
+type BoxError = Box<dyn std::error::Error + Send + Sync>;
+
+#[derive(Debug, thiserror::Error)]
+#[error("a part's headers are over {HEADERS_MAX} bytes")]
+struct HeadersTooLong;
+
+/// Watches a multipart body go by and refuses it once a part's headers run past
+/// `HEADERS_MAX` bytes, since the parser would buffer them until the whole-stream cap.
+struct HeaderGuard {
+    /// `\r\n--boundary`: where a part's headers start.
+    delimiter: Vec<u8>,
+    /// The last bytes seen, enough to find a delimiter or `\r\n\r\n` split across chunks.
+    recent: Vec<u8>,
+    /// Bytes of headers seen since the last delimiter, while inside them.
+    in_headers: Option<usize>,
+    /// Past the closing delimiter: the rest is an epilogue the parser ignores.
+    done: bool,
+}
+
+impl HeaderGuard {
+    fn new(boundary: &str) -> Self {
+        Self {
+            delimiter: format!("\r\n--{boundary}").into_bytes(),
+            // The first delimiter may open the body, with no line break before it.
+            recent: b"\r\n".to_vec(),
+            in_headers: None,
+            done: false,
+        }
+    }
+
+    /// False once some part's headers are too long.
+    fn feed(&mut self, chunk: &[u8]) -> bool {
+        let keep = self.delimiter.len().max(4);
+        let last = *self.delimiter.last().expect("never empty");
+        for &b in chunk {
+            if self.done {
+                return true;
+            }
+            self.recent.push(b);
+            if self.recent.len() > 2 * keep {
+                self.recent.drain(..self.recent.len() - keep);
+            }
+            match &mut self.in_headers {
+                Some(n) => {
+                    *n += 1;
+                    if *n == 2 && self.recent.ends_with(b"--") {
+                        self.done = true;
+                    } else if self.recent.ends_with(b"\r\n\r\n") {
+                        self.in_headers = None;
+                    } else if *n > HEADERS_MAX {
+                        return false;
+                    }
+                }
+                None if b == last && self.recent.ends_with(&self.delimiter) => {
+                    self.in_headers = Some(0);
+                }
+                None => {}
+            }
+        }
+        true
+    }
+}
+
 /// The multipart parser's refusal as the API's.
 fn refused(e: multer::Error) -> ApiError {
     match e {
@@ -159,10 +233,15 @@ fn refused(e: multer::Error) -> ApiError {
         multer::Error::StreamSizeExceeded { limit } => {
             ApiError::BodyTooLarge(format!("the request body is over {limit} bytes"))
         }
-        multer::Error::UnknownField { field_name } => ApiError::BadRequest(format!(
-            "unknown part `{}`; send `file` and `_payload`",
-            field_name.unwrap_or_default()
-        )),
+        multer::Error::UnknownField {
+            field_name: Some(name),
+        } => ApiError::BadRequest(format!("unknown part `{name}`; send `file` and `_payload`")),
+        multer::Error::UnknownField { field_name: None } => {
+            ApiError::BadRequest("a part has no name; send `file` and `_payload`".into())
+        }
+        multer::Error::StreamReadFailed(e) if e.is::<HeadersTooLong>() => {
+            ApiError::BadRequest(e.to_string())
+        }
         multer::Error::StreamReadFailed(_) => {
             ApiError::BadRequest("the upload was cut off before it ended".into())
         }
@@ -240,9 +319,7 @@ pub(crate) fn server_fields(u: &Upload, f: &Checked, filename: &str) -> Map<Stri
     out.insert("width".into(), f.width.into());
     out.insert("height".into(), f.height.into());
     out.insert("sizes".into(), sizes.into());
-    if let Some(b) = &f.blurhash {
-        out.insert("blurhash".into(), b.as_str().into());
-    }
+    out.insert("blurhash".into(), f.blurhash.clone().into());
     out
 }
 
@@ -255,31 +332,80 @@ pub(crate) fn with_fields(input: &Value, fields: Option<&Map<String, Value>>) ->
     out
 }
 
-/// A 422 at each server-set field of `c` that `input` sends with a value other than the
-/// one `stored` holds (missing counts as `null`), so a read written back unchanged passes.
-pub(crate) fn refuse_server_set(
+/// `input` without the server-set fields of `c`, which only the server writes; a 422 at
+/// each one it sends with a value other than the one `stored` holds, so a read written
+/// back unchanged passes. Missing and `null` count the same, and so do the values filled
+/// on read (`url`s), which are never stored.
+pub(crate) fn settle_server_set(
     c: &Collection,
     input: &Value,
     stored: Option<&Map<String, Value>>,
-) -> Result<(), ApiError> {
-    let (Some(_), Value::Object(input)) = (&c.schema.upload, input) else {
-        return Ok(());
+) -> Result<Value, ApiError> {
+    let (Some(_), Value::Object(fields)) = (&c.schema.upload, input) else {
+        return Ok(input.clone());
     };
+    let field = |k: &str| c.schema.data().iter().find(|f| f.name == k);
     let errors: Vec<FieldError> = SERVER_SET
         .iter()
         .filter(|k| {
             let was = stored.and_then(|s| s.get(**k)).unwrap_or(&Value::Null);
-            input.get(**k).is_some_and(|v| v != was)
+            fields
+                .get(**k)
+                .is_some_and(|v| comparable(field(k), v) != comparable(field(k), was))
         })
         .map(|k| FieldError {
             path: (*k).into(),
             message: "set by the server".into(),
         })
         .collect();
-    if errors.is_empty() {
-        Ok(())
-    } else {
-        Err(ApiError::Validation(errors))
+    if !errors.is_empty() {
+        return Err(ApiError::Validation(errors));
+    }
+    let mut out = fields.clone();
+    out.retain(|k, _| !SERVER_SET.contains(&k.as_str()));
+    Ok(Value::Object(out))
+}
+
+/// `v` without what's filled on read or `null`; a group left empty is `null`.
+fn comparable(f: Option<&Field>, v: &Value) -> Value {
+    match (f.map(|f| &f.kind), v) {
+        (Some(FieldKind::Group { fields }), Value::Object(o)) => {
+            let out: Map<String, Value> = o
+                .iter()
+                .filter_map(|(k, v)| {
+                    let sub = fields.iter().find(|s| &s.name == k);
+                    if sub.is_some_and(|s| s.computed) {
+                        return None;
+                    }
+                    let v = comparable(sub, v);
+                    (!v.is_null()).then(|| (k.clone(), v))
+                })
+                .collect();
+            if out.is_empty() {
+                Value::Null
+            } else {
+                Value::Object(out)
+            }
+        }
+        _ => v.clone(),
+    }
+}
+
+/// Writes the server-set fields of `from` into `into` as they are, `null`s and absences
+/// included: they describe the file the write takes from `from`.
+pub(crate) fn keep_server_set(
+    c: &Collection,
+    from: &Map<String, Value>,
+    into: &mut Map<String, Value>,
+) {
+    if c.schema.upload.is_none() {
+        return;
+    }
+    for k in SERVER_SET {
+        match from.get(*k) {
+            Some(v) => into.insert((*k).into(), v.clone()),
+            None => into.remove(*k),
+        };
     }
 }
 
@@ -385,4 +511,42 @@ pub(crate) async fn taken_or_abandoned<T>(
         abandon(state, s.file.id).await;
     }
     result
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// `body` fed to a guard for boundary `x` in `step`-byte chunks.
+    fn passes(body: &[u8], step: usize) -> bool {
+        let mut g = HeaderGuard::new("x");
+        body.chunks(step).all(|c| g.feed(c))
+    }
+
+    #[test]
+    fn only_long_part_headers_are_refused() {
+        let long = "a".repeat(HEADERS_MAX);
+        let part = |headers: &str, content: &str| {
+            format!(
+                "--x\r\nContent-Disposition: form-data; name=\"file\"{headers}\r\n\r\n{content}\r\n"
+            )
+        };
+        // Long contents and a long epilogue are fine; so are delimiters split across chunks.
+        let fine = format!(
+            "{}--x--\r\n{long}{long}",
+            part("", &format!("{long}{long}"))
+        );
+        let bad = format!("{}--x--\r\n", part(&format!("\r\nX-Long: {long}"), "hi"));
+        for step in [1, 3, 4096] {
+            assert!(passes(fine.as_bytes(), step), "{step}");
+            assert!(!passes(bad.as_bytes(), step), "{step}");
+        }
+        // The second part's headers count on their own.
+        let second = format!(
+            "{}{}--x--\r\n",
+            part("", "hi"),
+            part(&format!("\r\nX: {long}"), "")
+        );
+        assert!(!passes(second.as_bytes(), 7));
+    }
 }

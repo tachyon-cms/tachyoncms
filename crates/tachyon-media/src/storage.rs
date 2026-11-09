@@ -230,14 +230,9 @@ impl Storage {
             out = out.with_attributes(a);
         }
         match tokio::io::copy(&mut file, &mut out).await {
-            Ok(n) => match out.shutdown().await {
-                Ok(()) => Ok(n),
-                Err(e) => {
-                    // A failed completion would leave the parts billed in the bucket.
-                    let _ = out.abort().await;
-                    Err(e.into())
-                }
-            },
+            // A writer that began shutting down can't be aborted (`abort` panics then), so
+            // parts a failed completion leaves are the bucket's lifecycle rule's to expire.
+            Ok(n) => out.shutdown().await.map(|()| n).map_err(Into::into),
             Err(e) => {
                 // Leaves no half-made multipart upload behind; the copy's error matters more.
                 let _ = out.abort().await;

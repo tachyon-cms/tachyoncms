@@ -149,6 +149,14 @@ fn draft(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
     access.copy_for(c, draft).map(|_| ())
 }
 
+/// Whether `raw` asks to wait (`wait=true`), read as every other flag is. Malformed or
+/// absent is no.
+pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
+    parse_query(raw.unwrap_or_default())
+        .ok()
+        .is_some_and(|p| flag(&p, "wait").unwrap_or(false))
+}
+
 /// Refuses any query parameter, for a write that takes none.
 pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())

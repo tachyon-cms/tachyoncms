@@ -71,7 +71,10 @@ fn text(head: &[u8]) -> &'static str {
         let html = HTML_TAGS.iter().any(|t| {
             lower.strip_prefix(t.as_bytes()).is_some_and(|rest| {
                 t.ends_with("--")
-                    || matches!(rest.first(), Some(b' ' | b'>' | b'\t' | b'\n' | b'\r'))
+                    || matches!(
+                        rest.first(),
+                        Some(b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
+                    )
             })
         });
         match (find(b"<svg"), find(b"<html")) {
@@ -115,12 +118,15 @@ mod tests {
     fn types_come_from_the_bytes() {
         let mut elf = b"\x7fELF\x02\x01\x01".to_vec();
         elf.resize(64, 0);
+        let mut macho = b"\xCF\xFA\xED\xFE".to_vec();
+        macho.resize(64, 0);
         for (head, want) in [
             (&b"\x89PNG\r\n\x1a\n\0\0\0\rIHDR"[..], "image/png"),
             (b"\xFF\xD8\xFF\xE0\0\x10JFIF", "image/jpeg"),
             (b"GIF89a\x01\0\x01\0", "image/gif"),
             (b"%PDF-1.7\n", "application/pdf"),
             (&elf, "application/x-executable"),
+            (&macho, "application/x-executable"),
             (
                 b"MZ\x90\0\x03\0\0\0",
                 "application/vnd.microsoft.portable-executable",
@@ -128,6 +134,8 @@ mod tests {
             (b"<!DOCTYPE html><p>hi", "text/html"),
             (b"  \n<html>", "text/html"),
             (b"<p>hi</p>", "text/html"),
+            (b"<script/src=x>", "text/html"),
+            (b"<body/onload=x>", "text/html"),
             (b"<!-- x --><div>", "text/html"),
             (
                 b"<svg xmlns=\"http://www.w3.org/2000/svg\"/>",

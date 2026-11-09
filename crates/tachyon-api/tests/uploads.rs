@@ -104,6 +104,29 @@ async fn collection(app: &Router, slug: &str, extra: Value) {
     ok(app, "POST", "/api/admin/collections", Some(schema)).await;
 }
 
+/// A multipart body to `uri` with a 200 kB file that's cut off halfway: a handler that reads
+/// it answers 400, so a 403 shows it was never read.
+async fn cut_off(app: &Router, method: &str, uri: &str) -> Res {
+    let (kind, body) = multipart(Some(&[b'a'; 200_000]), "a.txt", None);
+    let chunks: Vec<Result<Vec<u8>, std::io::Error>> = vec![
+        Ok(body[..body.len() / 2].to_vec()),
+        Err(std::io::Error::new(
+            std::io::ErrorKind::ConnectionReset,
+            "gone",
+        )),
+    ];
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", kind);
+    send_body(
+        app,
+        req,
+        Body::from_stream(futures_util::stream::iter(chunks)),
+    )
+    .await
+}
+
 /// Everything under `dir`, recursively.
 fn files_in(dir: &Path) -> Vec<PathBuf> {
     let mut out = Vec::new();
@@ -178,8 +201,9 @@ async fn upload_creates_a_document(pool: PgPool) {
     assert_eq!(doc["filename"], "cat.png");
     assert_eq!(doc["mimeType"], "image/png");
     assert_eq!(doc["filesize"], image.len());
-    assert_eq!(doc["width"], Value::Null);
-    assert_eq!(doc["height"], Value::Null);
+    assert_eq!(doc.get("width"), Some(&Value::Null), "{doc}");
+    assert_eq!(doc.get("height"), Some(&Value::Null), "{doc}");
+    assert_eq!(doc.get("blurhash"), Some(&Value::Null), "{doc}");
     assert_eq!(doc["focalX"], 50);
     assert_eq!(doc["focalY"], 50);
     assert_eq!(doc["alt"], "x");
@@ -232,7 +256,16 @@ async fn restricted_types_are_refused(pool: PgPool) {
     let mut elf = b"\x7fELF\x02\x01\x01\x00".to_vec();
     elf.extend_from_slice(&[0; 64]);
     let script = b"#!/bin/sh\necho hi\n".to_vec();
-    for (bytes, name) in [(&elf, "tool.bin"), (&script, "notes.txt")] {
+    let mut pe = b"MZ\x90\0\x03\0\0\0".to_vec();
+    pe.resize(64, 0);
+    let mut macho = b"\xCF\xFA\xED\xFE".to_vec();
+    macho.resize(64, 0);
+    for (bytes, name) in [
+        (&elf, "tool.bin"),
+        (&script, "notes.txt"),
+        (&pe, "a.bin"),
+        (&macho, "b.bin"),
+    ] {
         let res = upload(&app, "POST", "/api/files", Some(bytes), name, None).await;
         assert_problem(&res, 415);
         let res = upload(&app, "POST", "/api/anything", Some(bytes), name, None).await;
@@ -322,6 +355,19 @@ async fn stray_parts_are_refused(pool: PgPool) {
         (
             format!("{}{}--{b}--\r\n", part("file"), part("extra")),
             "extra",
+        ),
+        (
+            {
+                let payload = format!(
+                    "--{b}\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{{}}\r\n"
+                );
+                format!("{payload}{payload}--{b}--\r\n")
+            },
+            "one `_payload`",
+        ),
+        (
+            format!("--{b}\r\nContent-Disposition: form-data\r\n\r\nhello\r\n--{b}--\r\n"),
+            "has no name",
         ),
     ] {
         let req = Request::builder()
@@ -545,6 +591,14 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     assert_eq!(doc.status, 201, "{}", doc.json);
     let id = doc.json["id"].as_str().unwrap().to_owned();
     let old = held(&pool, &id, "published_file").await.unwrap();
+    // As an image's placeholder will be, once there are some.
+    sqlx::query(
+        "UPDATE documents SET published = published || '{\"blurhash\": \"LKO2\"}' WHERE id = $1",
+    )
+    .bind(id.parse::<Uuid>().unwrap())
+    .execute(&pool)
+    .await
+    .unwrap();
     let bigger = png(4, 4);
     let res = upload(
         &app,
@@ -559,6 +613,11 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     assert_eq!(res.json["filename"], "a.png", "the same name");
     assert_eq!(res.json["filesize"], bigger.len());
     assert_eq!(res.json["alt"], "new");
+    assert_eq!(
+        res.json.get("blurhash"),
+        Some(&Value::Null),
+        "not the old file's"
+    );
     let new = held(&pool, &id, "published_file").await.unwrap();
     assert_ne!(new, old);
     assert_eq!(state_of(&pool, new).await, "live");
@@ -567,11 +626,25 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     assert!(d.root.join(old_key).exists());
 }
 
+/// `doc` without the document's own metadata, which no PATCH writes back.
+fn writable(doc: &Value) -> Value {
+    let mut back = doc.clone();
+    for k in ["id", "createdAt", "updatedAt", "status"] {
+        back.as_object_mut().unwrap().remove(k);
+    }
+    back
+}
+
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn server_set_fields_are_refused(pool: PgPool) {
     let d = dirs();
     let app = admin(&pool, &d).await;
-    collection(&app, "images", json!({})).await;
+    collection(
+        &app,
+        "images",
+        json!({"upload": {"imageSizes": [{"name": "thumbnail", "width": 100}]}}),
+    )
+    .await;
     let res = upload(
         &app,
         "POST",
@@ -594,43 +667,70 @@ async fn server_set_fields_are_refused(pool: PgPool) {
     let res = call(&app, "PATCH", &one, Some(json!({"mimeType": "text/html"}))).await;
     assert_problem(&res, 422);
     assert_eq!(res.json["errors"][0]["path"], "mimeType");
-    // What a read gave back, unchanged, focal point included, writes fine.
+    // What a read gave back, unchanged, focal point included, writes fine; so do the values
+    // filled on read, which are never stored.
     let got = ok(&app, "GET", &one, None).await;
-    let mut back = got.clone();
-    // The document's own metadata isn't written back by any PATCH.
-    for k in ["id", "createdAt", "updatedAt", "status"] {
-        back.as_object_mut().unwrap().remove(k);
-    }
-    assert_eq!(back["width"], Value::Null, "{back}");
+    let mut back = writable(&got);
     back["alt"] = "edited".into();
+    back["url"] = "/somewhere".into();
+    back["sizes"]["thumbnail"] = json!({"url": "/somewhere-small"});
     let res = ok(&app, "PATCH", &one, Some(back)).await;
     assert_eq!(res["alt"], "edited");
     assert_eq!(res["filename"], got["filename"]);
     assert_eq!(res["focalX"], 50);
+    assert_eq!(res.get("width"), Some(&Value::Null), "{res}");
+    assert_eq!(res.get("height"), Some(&Value::Null), "{res}");
+    assert_eq!(res["sizes"], json!({"thumbnail": null}));
+    assert_eq!(res["filesize"], got["filesize"]);
+    let again = ok(&app, "GET", &one, None).await;
+    assert_eq!(again.get("width"), Some(&Value::Null), "stored as null");
+    assert_eq!(again["sizes"], json!({"thumbnail": null}));
     assert_eq!(
         held(&pool, &id, "published_file").await,
         file,
         "the same file"
     );
+    // A body read before another write replaced the file describes a file the document no
+    // longer holds: refused against the document as it is now.
+    let stale = writable(&again);
+    let res = upload(&app, "PATCH", &one, Some(&png(2, 2)), "b.png", None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = call(&app, "PATCH", &one, Some(stale)).await;
+    assert_problem(&res, 422);
+    let paths: Vec<&str> = res.json["errors"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|e| e["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.contains(&"filename"), "{paths:?}");
+    assert_eq!(ok(&app, "GET", &one, None).await["filename"], "b.png");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn uploads_obey_access(pool: PgPool) {
     let d = dirs();
     let app = admin(&pool, &d).await;
-    collection(&app, "images", json!({})).await;
-    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
-    let res = upload(
-        &viewer,
-        "POST",
-        "/api/images",
-        Some(&png(1, 1)),
-        "a.png",
-        None,
+    collection(
+        &app,
+        "images",
+        json!({"fields": [
+            {"name": "alt", "type": "text"},
+            {"name": "secret", "type": "text",
+             "access": {"create": {"role": "admin"}, "update": {"role": "admin"}}}
+        ]}),
     )
     .await;
-    assert_problem(&res, 403);
-    assert!(files_in(&d.temp).is_empty(), "nothing was spooled");
+    collection(
+        &app,
+        "locked",
+        json!({"access": {"update": {"alt": "open"}}}),
+    )
+    .await;
+    let stored = || files_in(&d.root);
+    // Each refusal comes before the body is read: reading it would be a 400.
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    assert_problem(&cut_off(&viewer, "POST", "/api/images").await, 403);
     assert_eq!(file_rows(&pool).await, 0);
     let author = as_role(&pool, &d, "author@example.com", "author").await;
     let other = as_role(&pool, &d, "other@example.com", "author").await;
@@ -645,27 +745,67 @@ async fn uploads_obey_access(pool: PgPool) {
     .await;
     assert_eq!(theirs.status, 201, "{}", theirs.json);
     let id = theirs.json["id"].as_str().unwrap();
-    let res = upload(
-        &author,
-        "PATCH",
-        &format!("/api/images/{id}"),
-        Some(&png(2, 2)),
-        "b.png",
-        None,
+    // Authors read every document here, so it's a 403 rather than a 404, as a JSON PATCH.
+    assert_problem(
+        &cut_off(&author, "PATCH", &format!("/api/images/{id}")).await,
+        403,
+    );
+    let closed = upload(
+        &app,
+        "POST",
+        "/api/locked",
+        Some(&png(1, 1)),
+        "c.png",
+        Some(&json!({"alt": "closed"})),
     )
     .await;
-    // Authors read every document here, so it's a 403 rather than a 404, as a JSON PATCH.
+    assert_eq!(closed.status, 201, "{}", closed.json);
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let at = format!("/api/locked/{}", closed.json["id"].as_str().unwrap());
+    assert_problem(&cut_off(&editor, "PATCH", &at).await, 403);
+    assert_eq!(file_rows(&pool).await, 2);
+    let before = stored();
+    // A refusal that depends on what's sent: after the body is read, before anything is
+    // reserved or stored.
+    let secret = json!({"secret": "x"});
+    let res = upload(
+        &editor,
+        "POST",
+        "/api/images",
+        Some(&png(1, 1)),
+        "s.png",
+        Some(&secret),
+    )
+    .await;
     assert_problem(&res, 403);
-    assert_eq!(file_rows(&pool).await, 1);
-    assert!(files_in(&d.temp).is_empty());
+    let res = upload(
+        &editor,
+        "PATCH",
+        &format!("/api/images/{id}"),
+        Some(&png(1, 1)),
+        "s.png",
+        Some(&secret),
+    )
+    .await;
+    assert_problem(&res, 403);
+    assert_eq!(file_rows(&pool).await, 2, "nothing reserved");
+    assert_eq!(stored(), before, "nothing stored");
+    assert!(files_in(&d.temp).is_empty(), "the spool is gone");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn restoring_a_version_brings_its_file_back(pool: PgPool) {
     let d = dirs();
     let app = admin(&pool, &d).await;
-    collection(&app, "images", json!({"versions": {"maxVersions": 10}})).await;
-    let doc = upload(&app, "POST", "/api/images", Some(&png(1, 1)), "a.png", None).await;
+    collection(
+        &app,
+        "images",
+        json!({"versions": {"maxVersions": 10},
+               "upload": {"imageSizes": [{"name": "thumbnail", "width": 100}]}}),
+    )
+    .await;
+    let image = png(1, 1);
+    let doc = upload(&app, "POST", "/api/images", Some(&image), "a.png", None).await;
     assert_eq!(doc.status, 201, "{}", doc.json);
     let id = doc.json["id"].as_str().unwrap().to_owned();
     let one = format!("/api/images/{id}");
@@ -689,6 +829,10 @@ async fn restoring_a_version_brings_its_file_back(pool: PgPool) {
     )
     .await;
     assert_eq!(restored["filename"], "a.png");
+    assert_eq!(restored["filesize"], image.len());
+    assert_eq!(restored.get("width"), Some(&Value::Null), "{restored}");
+    assert_eq!(restored.get("height"), Some(&Value::Null), "{restored}");
+    assert_eq!(restored["sizes"], json!({"thumbnail": null}));
     assert_eq!(held(&pool, &id, "published_file").await, Some(old));
     assert_eq!(state_of(&pool, old).await, "live");
 }
@@ -733,4 +877,118 @@ async fn a_scheduled_publish_carries_the_drafts_file(pool: PgPool) {
     let anon = router(&pool, &d).await;
     let live = ok(&anon, "GET", &format!("/api/images/{id}"), None).await;
     assert_eq!(live["filename"], "a.png");
+    assert_eq!(live.get("width"), Some(&Value::Null), "{live}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn endless_part_headers_are_refused(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "files", json!({"upload": {"filesizeLimit": 1000}})).await;
+    let b = common::BOUNDARY;
+    let body = format!(
+        "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nX-Long: {}\r\n\r\nhello\r\n--{b}--\r\n",
+        "a".repeat(1_000_000)
+    );
+    let req = Request::builder()
+        .method("POST")
+        .uri("/api/files")
+        .header("content-type", format!("multipart/form-data; boundary={b}"));
+    let res = send_body(&app, req, Body::from(body)).await;
+    assert_problem(&res, 400);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("16384"),
+        "{}",
+        res.json
+    );
+    assert!(files_in(&d.temp).is_empty());
+    assert_eq!(file_rows(&pool).await, 0);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_file_may_be_bigger_than_a_json_body(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "files",
+        json!({"upload": {"filesizeLimit": 12_000_000}}),
+    )
+    .await;
+    let big = vec![b'a'; 11_000_000];
+    let res = upload(&app, "POST", "/api/files", Some(&big), "big.txt", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["filesize"], 11_000_000);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_server_limit_applies_without_a_collection_one(pool: PgPool) {
+    let d = dirs();
+    let mut o = options(&d, 0);
+    o.uploads.max_file_size = 1000;
+    let app = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    assert_eq!(
+        send(&app, "POST", "/api/setup", Some(&body.to_string()))
+            .await
+            .status,
+        201
+    );
+    let app = signed_in(app, ADMIN).await;
+    collection(&app, "files", json!({})).await;
+    let res = upload(
+        &app,
+        "POST",
+        "/api/files",
+        Some(&[b'a'; 1001]),
+        "a.txt",
+        None,
+    )
+    .await;
+    assert_problem(&res, 413);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("1000"),
+        "{}",
+        res.json
+    );
+    let res = upload(
+        &app,
+        "POST",
+        "/api/files",
+        Some(&[b'a'; 1000]),
+        "a.txt",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+}
+
+#[cfg(unix)]
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_failed_store_gives_the_file_up(pool: PgPool) {
+    use std::os::unix::fs::PermissionsExt;
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "files", json!({})).await;
+    let mode = |m| std::fs::set_permissions(&d.root, std::fs::Permissions::from_mode(m)).unwrap();
+    mode(0o500);
+    let res = upload(&app, "POST", "/api/files", Some(b"hello"), "a.txt", None).await;
+    mode(0o755);
+    assert_problem(&res, 500);
+    let (file, state): (Uuid, String) = sqlx::query_as("SELECT id, state FROM files")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(state, "gone");
+    let due: bool = sqlx::query_scalar(
+        "SELECT run_at <= now() FROM jobs WHERE kind = $1 AND payload->>'file' = $2
+           AND state = 'queued'",
+    )
+    .bind(CLEANUP)
+    .bind(file.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(due, "its cleanup is due now");
+    assert!(files_in(&d.temp).is_empty());
 }
