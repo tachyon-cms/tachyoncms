@@ -701,3 +701,105 @@ async fn a_restored_file_is_renumbered_on_a_clash(pool: PgPool) {
     tx.commit().await.unwrap();
     assert_eq!(files::get(&pool, a).await.unwrap().filename, "a-1.png");
 }
+
+/// Document `doc`, just trashed, restored with both copies as stored.
+async fn restore(pool: &PgPool, c: &Collection, doc: Uuid) -> Result<(), DbError> {
+    let named = |file: FileChange| Prepared {
+        file,
+        ..Prepared::plain(json!({"filename": "a.png"}).as_object().unwrap().clone())
+    };
+    let mut tx = pool.begin().await?;
+    let copies = [
+        (DocCopy::Draft, named(FileChange::Keep)),
+        (DocCopy::Published, named(FileChange::Keep)),
+    ];
+    documents::restore_in(&mut tx, c, doc, &copies, None).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_restore_never_gives_two_files_one_new_name(pool: PgPool) {
+    let c = seed(&pool).await;
+    let a = reserve(&pool, &c, "a.png", "", None).await.id;
+    let doc = draft_with(&pool, &c, a).await;
+    publish(&pool, &c, doc).await;
+    // The replacement keeps the name: the document's own file doesn't clash.
+    let b = reserve(&pool, &c, "a.png", "", Some(doc)).await;
+    assert_eq!(b.filename, "a.png");
+    set_draft_file(&pool, &c, doc, b.id).await;
+    documents::delete(&pool, c.id, doc).await.unwrap();
+    let theirs = reserve(&pool, &c, "a.png", "", None).await;
+    assert_eq!(theirs.filename, "a.png");
+    draft_with(&pool, &c, theirs.id).await;
+
+    restore(&pool, &c, doc).await.unwrap();
+    let names = (
+        files::get(&pool, a).await.unwrap().filename,
+        files::get(&pool, b.id).await.unwrap().filename,
+    );
+    assert_eq!(
+        names,
+        ("a-1.png".into(), "a-2.png".into()),
+        "distinct, in ID order"
+    );
+    let (published, draft): (Value, Value) =
+        sqlx::query_as("SELECT published, draft FROM documents WHERE id = $1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (&published["filename"], &draft["filename"]),
+        (&json!("a-1.png"), &json!("a-2.png"))
+    );
+}
+
+/// Takes the numbering lock `files::free_name` takes for `scope` of `c`, waiting at most
+/// `timeout`.
+async fn numbering_lock(
+    tx: &mut sqlx::PgConnection,
+    c: &Collection,
+    scope: &str,
+    timeout: &str,
+) -> Result<(), sqlx::Error> {
+    sqlx::query(sqlx::AssertSqlSafe(format!(
+        "SET LOCAL lock_timeout = '{timeout}'"
+    )))
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+        .bind(format!("files:{}:{scope}", c.id))
+        .execute(&mut *tx)
+        .await?;
+    Ok(())
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_restore_takes_numbering_locks_in_scope_order(pool: PgPool) {
+    let c = seed(&pool).await;
+    // The `y` file sorts first by ID, the `x` file first by scope.
+    let y = reserve(&pool, &c, "a.png", r#"["y"]"#, None).await.id;
+    let x = reserve(&pool, &c, "a.png", r#"["x"]"#, None).await.id;
+    let doc = draft_with(&pool, &c, y).await;
+    publish(&pool, &c, doc).await;
+    set_draft_file(&pool, &c, doc, x).await;
+    documents::delete(&pool, c.id, doc).await.unwrap();
+
+    // Another writer holds `x` and will want `y` next, as a restore in the other order would.
+    let mut other = pool.begin().await.unwrap();
+    numbering_lock(&mut other, &c, r#"["x"]"#, "5s")
+        .await
+        .unwrap();
+    let restoring = tokio::spawn({
+        let (pool, c) = (pool.clone(), c.clone());
+        async move { restore(&pool, &c, doc).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // The restore waits on `x` holding nothing else, so `y` is free.
+    numbering_lock(&mut other, &c, r#"["y"]"#, "2s")
+        .await
+        .unwrap();
+    other.commit().await.unwrap();
+    restoring.await.unwrap().unwrap();
+}

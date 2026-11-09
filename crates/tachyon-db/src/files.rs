@@ -95,13 +95,15 @@ fn cleanup(id: Uuid, run_at: OffsetDateTime) -> NewJob<'static> {
 /// transaction: `a.png`, then `a-1.png`, `a-2.png`… A name is taken by the current file of
 /// another live document (either copy) or by a pending file not uploaded for `document`. A
 /// version's file and `document`'s own don't count, so an edit or a replacement keeps its
-/// name. Holds the numbering lock of the collection and scope until the transaction ends.
+/// name. Names in `also` count as taken too. Holds the numbering lock of the collection and
+/// scope until the transaction ends.
 pub(crate) async fn free_name(
     conn: &mut PgConnection,
     collection_id: Uuid,
     scope: &str,
     filename: &str,
     document: Option<Uuid>,
+    also: &HashSet<String>,
 ) -> Result<String, DbError> {
     // One numbering at a time per collection and scope, so two uploads can't pick one name.
     sqlx::query!(
@@ -112,7 +114,7 @@ pub(crate) async fn free_name(
     .await?;
     // Every name the series could reach, in one query; the first free one is picked here.
     let (head, tail) = numbered_bounds(filename);
-    let taken: HashSet<String> = sqlx::query_scalar!(
+    let mut taken: HashSet<String> = sqlx::query_scalar!(
         r#"SELECT fl.filename FROM files fl
            WHERE fl.tenant_id = $1 AND fl.collection_id = $2 AND fl.scope = $3
              AND (fl.filename = $5
@@ -135,6 +137,7 @@ pub(crate) async fn free_name(
     .await?
     .into_iter()
     .collect();
+    taken.extend(also.iter().cloned());
     if !taken.contains(filename) {
         return Ok(filename.to_owned());
     }
@@ -154,7 +157,15 @@ pub async fn reserve(
     key_of: impl Fn(Uuid, &str) -> Result<String, String>,
 ) -> Result<FileRow, DbError> {
     let mut tx = pool.begin().await?;
-    let filename = free_name(&mut tx, f.collection_id, f.scope, f.filename, f.document).await?;
+    let filename = free_name(
+        &mut tx,
+        f.collection_id,
+        f.scope,
+        f.filename,
+        f.document,
+        &HashSet::new(),
+    )
+    .await?;
     let id = Uuid::now_v7();
     let key = key_of(id, &filename).map_err(DbError::Refused)?;
     let row = sqlx::query_as!(
@@ -248,25 +259,56 @@ pub async fn go_live_in(
 
 /// Gives the files document `doc` holds (either copy), just taken out of the trash, a free
 /// name again: another live document may have taken theirs meanwhile. A renamed file's
-/// `filename` changes in both copies that hold it. True when one was renamed.
+/// `filename` changes in both copies that hold it, and never to a name another of the
+/// document's files ends with. Numbering locks are taken in scope order (`reserve` takes
+/// one), so two restores can't deadlock on them. True when one was renamed.
 pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool, DbError> {
     let held = sqlx::query!(
         r#"SELECT f.id, f.collection_id, f.scope, f.filename FROM files f
            JOIN documents d ON f.id IN (d.published_file, d.draft_file)
            WHERE d.tenant_id = $1 AND d.id = $2
-           ORDER BY f.id"#,
+           ORDER BY f.scope, f.id"#,
         DEFAULT_TENANT,
         doc,
     )
     .fetch_all(&mut *tx)
     .await?;
-    let mut renamed = false;
-    for f in held {
-        let name = free_name(&mut *tx, f.collection_id, &f.scope, &f.filename, Some(doc)).await?;
-        if name == f.filename {
-            continue;
+    // First which clash at all, so a kept name is known before a renamed one is picked.
+    let none = HashSet::new();
+    let mut clashing = Vec::new();
+    for (i, f) in held.iter().enumerate() {
+        let name = free_name(
+            &mut *tx,
+            f.collection_id,
+            &f.scope,
+            &f.filename,
+            Some(doc),
+            &none,
+        )
+        .await?;
+        if name != f.filename {
+            clashing.push(i);
         }
-        renamed = true;
+    }
+    let mut names: Vec<String> = held.iter().map(|f| f.filename.clone()).collect();
+    for &i in &clashing {
+        let f = &held[i];
+        // Every other file of the document in this scope keeps, or already got, its name.
+        let also: HashSet<String> = held
+            .iter()
+            .enumerate()
+            .filter(|&(j, g)| j != i && g.scope == f.scope && (!clashing.contains(&j) || j < i))
+            .map(|(j, _)| names[j].clone())
+            .collect();
+        let name = free_name(
+            &mut *tx,
+            f.collection_id,
+            &f.scope,
+            &f.filename,
+            Some(doc),
+            &also,
+        )
+        .await?;
         sqlx::query!(
             "UPDATE files SET filename = $3, names = array_replace(names, filename, $3)
              WHERE tenant_id = $1 AND id = $2",
@@ -292,8 +334,9 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool
         )
         .execute(&mut *tx)
         .await?;
+        names[i] = name;
     }
-    Ok(renamed)
+    Ok(!clashing.is_empty())
 }
 
 /// Turns each of `candidates` that nothing points at any more `gone`, queuing its cleanup

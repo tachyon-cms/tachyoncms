@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT f.id, f.collection_id, f.scope, f.filename FROM files f\n           JOIN documents d ON f.id IN (d.published_file, d.draft_file)\n           WHERE d.tenant_id = $1 AND d.id = $2\n           ORDER BY f.id",
+  "query": "SELECT f.id, f.collection_id, f.scope, f.filename FROM files f\n           JOIN documents d ON f.id IN (d.published_file, d.draft_file)\n           WHERE d.tenant_id = $1 AND d.id = $2\n           ORDER BY f.scope, f.id",
   "describe": {
     "columns": [
       {
@@ -61,5 +61,5 @@
       false
     ]
   },
-  "hash": "b8d9520a6f12ef10ea3ce22e1bd1a7036405ebc6678e3090f82054fec7bbcd1f"
+  "hash": "3092ca551fd24369faaf13f85600b989b24f843abfc61c0e14320fe08993318d"
 }
