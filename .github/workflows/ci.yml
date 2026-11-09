@@ -22,6 +22,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -53,4 +55,6 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo test --workspace

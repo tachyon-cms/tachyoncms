@@ -266,12 +266,15 @@ pub async fn create(
     let hide = |e, body: &Value| access.hide(&c, e, Some(&merged(c.schema.data(), body, None)));
     let mut body = settle_server_set(&c, &body, None).map_err(|e| hide(e, &body))?;
     require_file(&c, file.is_some())?;
-    let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
-        _ => None,
-    };
     from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
+    // Decoded only once the write is allowed.
+    let checked = match (&c.schema.upload, file) {
+        (Some(u), Some(Incoming::Spooled(spool))) => {
+            Some((u, check_and_process(&state, u, spool).await?))
+        }
+        _ => None,
+    };
     let targets = link_targets(&state, &c).await?;
     // Checked as the document will be, server-set fields and all, before anything is stored.
     let would = checked
@@ -414,12 +417,15 @@ pub async fn update(
             .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &sent, Some(current)))))
     };
     let mut patch = settle(&stored)?;
-    let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
-        _ => None,
-    };
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
+    // Decoded only once the write is allowed.
+    let checked = match (&c.schema.upload, file) {
+        (Some(u), Some(Incoming::Spooled(spool))) => {
+            Some((u, check_and_process(&state, u, spool).await?))
+        }
+        _ => None,
+    };
     let targets = link_targets(&state, &c).await?;
     // Validated with the server-set fields the file brings; those are written in after, as
     // they are, `null`s included.

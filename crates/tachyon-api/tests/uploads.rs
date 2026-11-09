@@ -18,6 +18,7 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_api::{JobsConfig, Options, UploadsConfig};
 use tachyon_db::files::{self, CLEANUP, NewFile};
+use tachyon_media::fixtures;
 use tachyon_media::storage::{StorageConfig, Storages, object_key};
 use time::OffsetDateTime;
 use time::format_description::well_known::Rfc3339;
@@ -201,9 +202,9 @@ async fn upload_creates_a_document(pool: PgPool) {
     assert_eq!(doc["filename"], "cat.png");
     assert_eq!(doc["mimeType"], "image/png");
     assert_eq!(doc["filesize"], image.len());
-    assert_eq!(doc.get("width"), Some(&Value::Null), "{doc}");
-    assert_eq!(doc.get("height"), Some(&Value::Null), "{doc}");
-    assert_eq!(doc.get("blurhash"), Some(&Value::Null), "{doc}");
+    assert_eq!(doc["width"], 3, "{doc}");
+    assert_eq!(doc["height"], 2, "{doc}");
+    assert!(doc["blurhash"].is_string(), "{doc}");
     assert_eq!(doc["focalX"], 50);
     assert_eq!(doc["focalY"], 50);
     assert_eq!(doc["alt"], "x");
@@ -613,11 +614,8 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     assert_eq!(res.json["filename"], "a.png", "the same name");
     assert_eq!(res.json["filesize"], bigger.len());
     assert_eq!(res.json["alt"], "new");
-    assert_eq!(
-        res.json.get("blurhash"),
-        Some(&Value::Null),
-        "not the old file's"
-    );
+    assert!(res.json["blurhash"].is_string(), "{}", res.json);
+    assert_ne!(res.json["blurhash"], "LKO2", "not the old file's");
     let new = held(&pool, &id, "published_file").await.unwrap();
     assert_ne!(new, old);
     assert_eq!(state_of(&pool, new).await, "live");
@@ -678,12 +676,12 @@ async fn server_set_fields_are_refused(pool: PgPool) {
     assert_eq!(res["alt"], "edited");
     assert_eq!(res["filename"], got["filename"]);
     assert_eq!(res["focalX"], 50);
-    assert_eq!(res.get("width"), Some(&Value::Null), "{res}");
-    assert_eq!(res.get("height"), Some(&Value::Null), "{res}");
+    assert_eq!(res["width"], 1, "{res}");
+    assert_eq!(res["height"], 1, "{res}");
     assert_eq!(res["sizes"], json!({"thumbnail": null}));
     assert_eq!(res["filesize"], got["filesize"]);
     let again = ok(&app, "GET", &one, None).await;
-    assert_eq!(again.get("width"), Some(&Value::Null), "stored as null");
+    assert_eq!(again["width"], 1);
     assert_eq!(again["sizes"], json!({"thumbnail": null}));
     assert_eq!(
         held(&pool, &id, "published_file").await,
@@ -830,8 +828,8 @@ async fn restoring_a_version_brings_its_file_back(pool: PgPool) {
     .await;
     assert_eq!(restored["filename"], "a.png");
     assert_eq!(restored["filesize"], image.len());
-    assert_eq!(restored.get("width"), Some(&Value::Null), "{restored}");
-    assert_eq!(restored.get("height"), Some(&Value::Null), "{restored}");
+    assert_eq!(restored["width"], 1, "{restored}");
+    assert_eq!(restored["height"], 1, "{restored}");
     assert_eq!(restored["sizes"], json!({"thumbnail": null}));
     assert_eq!(held(&pool, &id, "published_file").await, Some(old));
     assert_eq!(state_of(&pool, old).await, "live");
@@ -877,7 +875,7 @@ async fn a_scheduled_publish_carries_the_drafts_file(pool: PgPool) {
     let anon = router(&pool, &d).await;
     let live = ok(&anon, "GET", &format!("/api/images/{id}"), None).await;
     assert_eq!(live["filename"], "a.png");
-    assert_eq!(live.get("width"), Some(&Value::Null), "{live}");
+    assert_eq!(live["width"], 1, "{live}");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -996,5 +994,274 @@ async fn a_failed_store_gives_the_file_up(pool: PgPool) {
     .await
     .unwrap();
     assert!(due, "its cleanup is due now");
+    assert!(files_in(&d.temp).is_empty());
+}
+
+/// The bytes of the one object stored under `d`.
+fn stored(d: &Dirs) -> Vec<u8> {
+    let found = files_in(&d.root);
+    assert_eq!(found.len(), 1, "{found:?}");
+    std::fs::read(&found[0]).unwrap()
+}
+
+fn exif_in(bytes: &[u8]) -> Option<img_parts::Bytes> {
+    use img_parts::ImageEXIF;
+    img_parts::DynImage::from_bytes(bytes.to_vec().into())
+        .unwrap()
+        .and_then(|i| i.exif())
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn decompression_bomb_is_refused_before_decoding(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    // Its pixel data is junk: a decode would fail on that, not on the size.
+    let bomb = fixtures::png_header(100_000, 100_000);
+    assert!(bomb.len() < 5_000);
+    let res = upload(&app, "POST", "/api/images", Some(&bomb), "bomb.png", None).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file");
+    let message = res.json["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("10000000000") && message.contains("50000000"),
+        "{message}"
+    );
+    assert_eq!(file_rows(&pool).await, 0);
+    assert!(files_in(&d.temp).is_empty());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn frames_count_toward_the_cap(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let res = upload(
+        &app,
+        "POST",
+        "/api/images",
+        Some(&fixtures::gif(1000, 1000, 50)),
+        "fifty.gif",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(1000), &json!(1000))
+    );
+    let res = upload(
+        &app,
+        "POST",
+        "/api/images",
+        Some(&fixtures::gif(1000, 1000, 51)),
+        "more.gif",
+        None,
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file");
+    let message = res.json["errors"][0]["message"].as_str().unwrap();
+    assert!(message.contains("51000000"), "{message}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn gps_is_stripped(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    collection(&app, "originals", json!({"upload": {"withMetadata": true}})).await;
+    let jpeg = fixtures::with_exif(
+        fixtures::encoded(&fixtures::gradient(16, 8), image::ImageFormat::Jpeg),
+        fixtures::exif(None, true),
+    );
+    let res = upload(&app, "POST", "/api/images", Some(&jpeg), "gps.jpg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let kept = stored(&d);
+    assert_eq!(exif_in(&kept), None);
+    assert_eq!(res.json["filesize"], kept.len());
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(16), &json!(8))
+    );
+    for f in files_in(&d.root) {
+        std::fs::remove_file(f).unwrap();
+    }
+    let res = upload(&app, "POST", "/api/originals", Some(&jpeg), "gps.jpg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(stored(&d), jpeg, "as uploaded");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn orientation_survives_stripping(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let jpeg = fixtures::with_exif(
+        fixtures::encoded(&fixtures::gradient(400, 200), image::ImageFormat::Jpeg),
+        fixtures::exif(Some(6), false),
+    );
+    let res = upload(&app, "POST", "/api/images", Some(&jpeg), "turned.jpg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(200), &json!(400))
+    );
+    let kept = stored(&d);
+    assert_eq!(exif_in(&kept), None);
+    let upright = image::load_from_memory(&kept).unwrap();
+    assert_eq!((upright.width(), upright.height()), (200, 400));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn cmyk_jpeg_decodes(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let cmyk = fixtures::cmyk_jpeg(24, 16);
+    let res = upload(&app, "POST", "/api/images", Some(&cmyk), "print.jpg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(24), &json!(16))
+    );
+    assert!(res.json["blurhash"].is_string(), "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn transforms_apply_to_the_original(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"upload": {"resizeOptions": {"width": 100}, "formatOptions": {"format": "webp"}}}),
+    )
+    .await;
+    let png = fixtures::encoded(&fixtures::gradient(300, 200), image::ImageFormat::Png);
+    let res = upload(&app, "POST", "/api/images", Some(&png), "cat.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["mimeType"], "image/webp");
+    assert_eq!(res.json["filename"], "cat.webp");
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(100), &json!(67))
+    );
+    let kept = stored(&d);
+    assert_eq!(res.json["filesize"], kept.len());
+    assert_eq!(
+        image::guess_format(&kept).unwrap(),
+        image::ImageFormat::WebP
+    );
+    let made = image::load_from_memory(&kept).unwrap();
+    assert_eq!((made.width(), made.height()), (100, 67));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn sharp_only_options_are_422(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    let schema = json!({"slug": "images", "fields": [],
+        "upload": {"imageSizes": [{"name": "t", "width": 10, "position": "attention"}]}});
+    let res = call(&app, "POST", "/api/admin/collections", Some(schema)).await;
+    assert_problem(&res, 422);
+    // Option-type errors name their path in the message, as every schema check does.
+    let message = res.json["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.starts_with("upload.imageSizes.0.position: `attention`"),
+        "{message}"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn svg_is_sanitised(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let dirty = br#"<svg xmlns="http://www.w3.org/2000/svg" width="120" height="80" onload="alert(1)"><script>alert(2)</script><foreignObject><div/></foreignObject><a href="javascript:alert(3)"/><use href="https://x/y#a"/><rect width="1"/></svg>"#;
+    let res = upload(&app, "POST", "/api/images", Some(dirty), "logo.svg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["mimeType"], "image/svg+xml");
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&json!(120), &json!(80))
+    );
+    assert_eq!(res.json["blurhash"], Value::Null);
+    let kept = stored(&d);
+    assert_eq!(res.json["filesize"], kept.len());
+    let text = String::from_utf8(kept.clone()).unwrap();
+    for gone in [
+        "onload",
+        "script",
+        "alert",
+        "foreignObject",
+        "javascript",
+        "https://x",
+    ] {
+        assert!(!text.contains(gone), "{gone} survived: {text}");
+    }
+    assert_eq!(tachyon_media::svg::sanitize_svg(&kept).unwrap(), kept);
+    let sized = br#"<svg xmlns="http://www.w3.org/2000/svg" width="10em" height="50%"/>"#;
+    let res = upload(&app, "POST", "/api/images", Some(sized), "em.svg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(
+        (&res.json["width"], &res.json["height"]),
+        (&Value::Null, &Value::Null)
+    );
+    let other = br#"<?xml version="1.0"?><feed><svg/></feed>"#;
+    let res = upload(&app, "POST", "/api/images", Some(other), "feed.svg", None).await;
+    assert_problem(&res, 415);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn decodes_queue_for_a_permit(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let big = image::DynamicImage::ImageLuma8(image::GrayImage::from_pixel(
+        8000,
+        6000,
+        image::Luma([90]),
+    ));
+    let png = fixtures::encoded(&big, image::ImageFormat::Png);
+    drop(big);
+    let watching = Arc::new(std::sync::atomic::AtomicBool::new(true));
+    let watcher = {
+        let (watching, temp) = (watching.clone(), d.temp.clone());
+        tokio::spawn(async move {
+            let mut most = 0;
+            while watching.load(std::sync::atomic::Ordering::Relaxed) {
+                most = most.max(files_in(&temp).len());
+                tokio::time::sleep(Duration::from_millis(2)).await;
+            }
+            most
+        })
+    };
+    let uploads = (0..8).map(|i| {
+        let (app, png) = (app.clone(), &png);
+        async move {
+            upload(
+                &app,
+                "POST",
+                "/api/images",
+                Some(png),
+                &format!("{i}.png"),
+                None,
+            )
+            .await
+        }
+    });
+    let results = futures_util::future::join_all(uploads).await;
+    watching.store(false, std::sync::atomic::Ordering::Relaxed);
+    let most = watcher.await.unwrap();
+    for res in &results {
+        assert_eq!(res.status, 201, "{}", res.json);
+        assert_eq!(
+            (&res.json["width"], &res.json["height"]),
+            (&json!(8000), &json!(6000))
+        );
+    }
+    assert_eq!(tachyon_api::decodes_peak(), 2);
+    assert!(most <= 8 + 2, "{most} files in the spool directory at once");
     assert!(files_in(&d.temp).is_empty());
 }

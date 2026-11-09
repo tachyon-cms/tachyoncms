@@ -7,12 +7,25 @@ license.workspace = true
 repository.workspace = true
 
 [dependencies]
+avif-decode.workspace = true
+avif-parse.workspace = true
+blurhash.workspace = true
+fast_image_resize.workspace = true
+image.workspace = true
+img-parts.workspace = true
 infer.workspace = true
+quick-xml.workspace = true
+tachyon-core.workspace = true
+tempfile.workspace = true
+webp.workspace = true
 object_store.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util"] }
 url.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
 
 [lints]
 workspace = true

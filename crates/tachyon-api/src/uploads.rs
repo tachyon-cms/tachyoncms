@@ -24,10 +24,13 @@ use tachyon_core::uploads::{SERVER_SET, Upload, mime_allowed, restricted, saniti
 use tachyon_core::{Field, FieldError, FieldKind};
 use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, FileRow, NewFile};
+use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
 use tachyon_media::storage::object_key;
+use tachyon_media::svg::{self, SvgError};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
+use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
 use crate::documents::{JSON_LIMIT, json_body};
@@ -326,9 +329,71 @@ pub(crate) fn file_limit(state: &AppState, c: &Collection) -> Option<u64> {
     Some(u.filesize_limit.unwrap_or(state.media.max_file_size))
 }
 
+/// Images decoding at once, each holding up to `[uploads] max_pixels` in memory.
+/// shortcut: fixed count; make it an [uploads] key when a big server needs more
+pub(crate) static DECODES: Semaphore = Semaphore::const_new(2);
+/// Decodes holding a permit now, and the most there have been.
+static BUSY: AtomicUsize = AtomicUsize::new(0);
+static PEAK: AtomicUsize = AtomicUsize::new(0);
+
+/// The most decodes that have run at once in this process.
+#[doc(hidden)]
+pub fn decodes_peak() -> usize {
+    PEAK.load(Ordering::Relaxed)
+}
+
+/// A `DECODES` permit, counted while it's held.
+struct Decoding(#[allow(dead_code)] SemaphorePermit<'static>);
+
+impl Decoding {
+    async fn start() -> Self {
+        let permit = DECODES.acquire().await.expect("DECODES is never closed");
+        let now = BUSY.fetch_add(1, Ordering::Relaxed) + 1;
+        PEAK.fetch_max(now, Ordering::Relaxed);
+        Self(permit)
+    }
+}
+
+impl Drop for Decoding {
+    fn drop(&mut self) {
+        BUSY.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
+/// `work` on a blocking thread.
+async fn blocking<T: Send + 'static>(
+    work: impl FnOnce() -> T + Send + 'static,
+) -> Result<T, ApiError> {
+    tokio::task::spawn_blocking(work)
+        .await
+        .map_err(|e| ApiError::Internal(format!("an upload's processing failed: {e}")))
+}
+
+fn at_file(message: String) -> ApiError {
+    ApiError::Validation(vec![FieldError {
+        path: "file".into(),
+        message,
+    }])
+}
+
+fn image_refused(e: ImageError) -> ApiError {
+    match e {
+        ImageError::Unsupported(what) => ApiError::UnsupportedMediaType(what.into()),
+        ImageError::Internal(what) => ApiError::Internal(what),
+        e => at_file(e.to_string()),
+    }
+}
+
 /// Checks what `spool` is, by its bytes alone, against what `u` takes: a 415 saying what
-/// it looked like.
-pub(crate) fn check_and_process(u: &Upload, spool: Spool) -> Result<Checked, ApiError> {
+/// it looked like. Then makes it what's stored: an image's size is read from its headers
+/// and refused past the pixel cap before anything is decoded, then it's decoded behind
+/// `DECODES` and stripped and transformed as `u` says; an SVG is sanitised. The spool file
+/// is replaced by the result.
+pub(crate) async fn check_and_process(
+    state: &AppState,
+    u: &Upload,
+    mut spool: Spool,
+) -> Result<Checked, ApiError> {
     let mime = sniff(&spool.head);
     if !mime_allowed(&u.mime_types, mime) {
         return Err(ApiError::UnsupportedMediaType(format!(
@@ -342,14 +407,77 @@ pub(crate) fn check_and_process(u: &Upload, spool: Spool) -> Result<Checked, Api
             spool.name
         )));
     }
+    let path = spool.file.path().to_path_buf();
+    let (mut mime, mut width, mut height, mut blurhash) = (mime, None, None, None);
+    if mime == "image/svg+xml" {
+        let at = path.clone();
+        let clean = blocking(move || -> Result<svg::Sanitised, ApiError> {
+            let bytes = std::fs::read(&at)
+                .map_err(|e| ApiError::Internal(format!("can't read a spooled upload: {e}")))?;
+            let clean = svg::sanitize(&bytes).map_err(|e| match e {
+                SvgError::NotSvg => ApiError::UnsupportedMediaType(e.to_string()),
+                SvgError::Malformed(_) => at_file(e.to_string()),
+            })?;
+            std::fs::write(&at, &clean.bytes)
+                .map_err(|e| ApiError::Internal(format!("can't write a spooled upload: {e}")))?;
+            Ok(clean)
+        })
+        .await??;
+        spool.len = clean.bytes.len() as u64;
+        (width, height) = (clean.width, clean.height);
+    } else if picture::decodes(mime) {
+        let (at, head) = (path.clone(), spool.head.clone());
+        let probe = blocking(move || picture::probe(&at, &head))
+            .await?
+            .map_err(image_refused)?;
+        let max_pixels = state.media.max_pixels;
+        picture::check_cap(&probe, picture::cap(u, max_pixels)).map_err(image_refused)?;
+        let decoding = Decoding::start().await;
+        let (u, out_dir) = (u.clone(), state.media.temp_dir.clone());
+        let done = blocking(move || -> Result<picture::Processed, ImageError> {
+            let done = picture::process_original(&path, &probe, &u, max_pixels, &out_dir)?;
+            // Over the spool, so a request never holds more than its spool once the permit
+            // is given back.
+            if done.path != path {
+                std::fs::rename(&done.path, &path).map_err(|e| {
+                    let _ = std::fs::remove_file(&done.path);
+                    ImageError::Internal(format!("can't replace a spooled upload: {e}"))
+                })?;
+            }
+            Ok(done)
+        })
+        .await?
+        .map_err(image_refused)?;
+        drop(decoding);
+        if done.mime != mime {
+            spool.name = with_extension(&spool.name, done.mime);
+        }
+        spool.len = done.filesize;
+        (mime, width, height, blurhash) = (
+            done.mime,
+            Some(done.width),
+            Some(done.height),
+            done.blurhash,
+        );
+    }
     Ok(Checked {
         filesize: spool.len,
         spool,
         mime,
-        width: None,
-        height: None,
-        blurhash: None,
+        width,
+        height,
+        blurhash,
     })
+}
+
+/// `name` with the extension of `mime`, for an original re-encoded in another format.
+fn with_extension(name: &str, mime: &str) -> String {
+    let ext = match mime {
+        "image/jpeg" => "jpg",
+        other => other.rsplit('/').next().unwrap_or("bin"),
+    };
+    let stem = name.rsplit_once('.').map_or(name, |(stem, _)| stem);
+    format!("{stem}.{ext}")
 }
 
 /// The fields of `u` the server sets from file `f` named `filename`.

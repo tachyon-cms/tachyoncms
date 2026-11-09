@@ -38,6 +38,8 @@ uuid.workspace = true
 async-trait.workspace = true
 object_store.workspace = true
 http-body-util.workspace = true
+image.workspace = true
+img-parts.workspace = true
 tower.workspace = true
 
 [lints]

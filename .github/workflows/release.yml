@@ -91,6 +91,13 @@ jobs:
       - name: Install musl
         if: contains(matrix.target, 'musl')
         run: sudo apt-get update && sudo apt-get install -y musl-tools
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - name: Install nasm (Linux x86)
+        if: matrix.target == 'x86_64-unknown-linux-musl'
+        run: sudo apt-get install -y nasm
+      - name: Install nasm (macOS x86)
+        if: matrix.target == 'x86_64-apple-darwin'
+        run: brew install nasm
       # cargo-auditable records the dependency tree inside the binary, so the
       # SBOM describes exactly what was linked, not everything in Cargo.lock.
       - name: Build

@@ -42,6 +42,7 @@ pub use collections::check_upload;
 pub use error::ApiError;
 pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;
+pub use uploads::decodes_peak;
 
 #[derive(Clone)]
 pub(crate) struct AppState {
