@@ -890,17 +890,23 @@ async fn endless_part_headers_are_refused(pool: PgPool) {
         "--{b}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\nX-Long: {}\r\n\r\nhello\r\n--{b}--\r\n",
         "a".repeat(1_000_000)
     );
-    let req = Request::builder()
-        .method("POST")
-        .uri("/api/files")
-        .header("content-type", format!("multipart/form-data; boundary={b}"));
-    let res = send_body(&app, req, Body::from(body)).await;
-    assert_problem(&res, 400);
-    assert!(
-        res.json["detail"].as_str().unwrap().contains("16384"),
-        "{}",
-        res.json
-    );
+    // An empty header block that never ends, and a preamble with no boundary: the parser
+    // would buffer either until the whole-stream cap.
+    let empty = format!("--{b}\r\n\r\n{}", "a".repeat(1_000_000));
+    let preamble = "a".repeat(1_000_000);
+    for body in [body, empty, preamble] {
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/files")
+            .header("content-type", format!("multipart/form-data; boundary={b}"));
+        let res = send_body(&app, req, Body::from(body)).await;
+        assert_problem(&res, 400);
+        assert!(
+            res.json["detail"].as_str().unwrap().contains("16384"),
+            "{}",
+            res.json
+        );
+    }
     assert!(files_in(&d.temp).is_empty());
     assert_eq!(file_rows(&pool).await, 0);
 }

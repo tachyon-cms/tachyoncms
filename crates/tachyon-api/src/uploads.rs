@@ -8,11 +8,16 @@
 //! write that fails after that gives the row up, so its cleanup deletes the object at once.
 
 use std::path::Path;
+use std::pin::Pin;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::task::{Context, Poll};
 
 use axum::Json;
+use axum::body::Bytes;
 use axum::extract::{FromRequest, Request};
 use axum::http::header::CONTENT_TYPE;
-use futures_util::StreamExt;
+use futures_util::Stream;
 use multer::{Constraints, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
 use tachyon_core::uploads::{SERVER_SET, Upload, mime_allowed, restricted, sanitize_filename};
@@ -32,8 +37,12 @@ use crate::{ApiError, AppState};
 const HEAD: usize = 8 * 1024;
 /// Room for the parts' boundaries and headers, past the file and the payload.
 const OVERHEAD: u64 = 64 * 1024;
-/// The most a part's headers may take; the parser buffers them whole, and keeps 32 at most.
+/// The most a part's headers may take, with the preamble and delimiter before them; the
+/// parser buffers them whole, and keeps 32 headers at most.
 const HEADERS_MAX: usize = 16 * 1024;
+/// The most the body hands the parser at a time. It reads all that's ready at once, so this
+/// bounds how far past a part it reads while that part is read.
+const CHUNK: usize = 16 * 1024;
 
 /// A create or update body: JSON, or a multipart body with a file. A multipart body without
 /// a `file` part is its `_payload` as JSON.
@@ -113,18 +122,14 @@ impl UploadBody {
             sizes = sizes.for_field("file", limit);
         }
         let constraints = Constraints::new().allowed_fields(allowed).size_limit(sizes);
-        let mut guard = HeaderGuard::new(&boundary);
-        let stream = req
-            .into_body()
-            .into_data_stream()
-            .map(move |chunk| match chunk {
-                Ok(bytes) if !guard.feed(&bytes) => Err(BoxError::from(HeadersTooLong)),
-                Ok(bytes) => Ok(bytes),
-                Err(e) => Err(BoxError::from(e)),
-            });
+        let between = Arc::new(Between::default());
+        let budget = HEADERS_MAX + CHUNK + boundary.len();
+        let stream = Paced::new(req.into_body().into_data_stream(), between.clone(), budget);
         let mut parts = Multipart::with_constraints(stream, boundary, constraints);
         let (mut payload, mut spool) = (None, None);
-        while let Some(mut part) = parts.next_field().await.map_err(refused)? {
+        // Each part is read to its end, or refused, before the next is asked for, so only
+        // what comes between parts is counted.
+        while let Some(mut part) = between.count(parts.next_field()).await.map_err(refused)? {
             if part.name() == Some("file") {
                 if spool.is_some() {
                     return Err(ApiError::BadRequest(
@@ -161,60 +166,83 @@ type BoxError = Box<dyn std::error::Error + Send + Sync>;
 #[error("a part's headers are over {HEADERS_MAX} bytes")]
 struct HeadersTooLong;
 
-/// Watches a multipart body go by and refuses it once a part's headers run past
-/// `HEADERS_MAX` bytes, since the parser would buffer them until the whole-stream cap.
-struct HeaderGuard {
-    /// `\r\n--boundary`: where a part's headers start.
-    delimiter: Vec<u8>,
-    /// The last bytes seen, enough to find a delimiter or `\r\n\r\n` split across chunks.
-    recent: Vec<u8>,
-    /// Bytes of headers seen since the last delimiter, while inside them.
-    in_headers: Option<usize>,
-    /// Past the closing delimiter: the rest is an epilogue the parser ignores.
-    done: bool,
+/// Bytes the parser pulled while looking for the next part: its preamble, delimiter and
+/// headers, which it buffers whole.
+#[derive(Default)]
+struct Between {
+    counting: AtomicBool,
+    pulled: AtomicUsize,
 }
 
-impl HeaderGuard {
-    fn new(boundary: &str) -> Self {
+impl Between {
+    /// `next`, counting from nothing what the body hands over meanwhile.
+    async fn count<T>(&self, next: impl Future<Output = T>) -> T {
+        self.pulled.store(0, Ordering::Relaxed);
+        self.counting.store(true, Ordering::Relaxed);
+        let out = next.await;
+        self.counting.store(false, Ordering::Relaxed);
+        out
+    }
+}
+
+/// The body in pieces of at most `CHUNK` bytes, one per poll, so the parser, which takes all
+/// that's ready, never holds more than one piece past what it asked for. Fails once more than
+/// `budget` bytes arrive between parts.
+struct Paced<S> {
+    inner: S,
+    rest: Bytes,
+    /// A piece was just handed over; the next poll yields first.
+    handed: bool,
+    between: Arc<Between>,
+    budget: usize,
+}
+
+impl<S> Paced<S> {
+    fn new(inner: S, between: Arc<Between>, budget: usize) -> Self {
         Self {
-            delimiter: format!("\r\n--{boundary}").into_bytes(),
-            // The first delimiter may open the body, with no line break before it.
-            recent: b"\r\n".to_vec(),
-            in_headers: None,
-            done: false,
+            inner,
+            rest: Bytes::new(),
+            handed: false,
+            between,
+            budget,
         }
     }
+}
 
-    /// False once some part's headers are too long.
-    fn feed(&mut self, chunk: &[u8]) -> bool {
-        let keep = self.delimiter.len().max(4);
-        let last = *self.delimiter.last().expect("never empty");
-        for &b in chunk {
-            if self.done {
-                return true;
-            }
-            self.recent.push(b);
-            if self.recent.len() > 2 * keep {
-                self.recent.drain(..self.recent.len() - keep);
-            }
-            match &mut self.in_headers {
-                Some(n) => {
-                    *n += 1;
-                    if *n == 2 && self.recent.ends_with(b"--") {
-                        self.done = true;
-                    } else if self.recent.ends_with(b"\r\n\r\n") {
-                        self.in_headers = None;
-                    } else if *n > HEADERS_MAX {
-                        return false;
-                    }
-                }
-                None if b == last && self.recent.ends_with(&self.delimiter) => {
-                    self.in_headers = Some(0);
-                }
-                None => {}
+impl<S, E> Stream for Paced<S>
+where
+    S: Stream<Item = Result<Bytes, E>> + Unpin,
+    E: Into<BoxError>,
+{
+    type Item = Result<Bytes, BoxError>;
+
+    fn poll_next(mut self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = &mut *self;
+        if this.handed {
+            this.handed = false;
+            cx.waker().wake_by_ref();
+            return Poll::Pending;
+        }
+        if this.rest.is_empty() {
+            match Pin::new(&mut this.inner).poll_next(cx) {
+                Poll::Ready(Some(Ok(bytes))) => this.rest = bytes,
+                Poll::Ready(Some(Err(e))) => return Poll::Ready(Some(Err(e.into()))),
+                Poll::Ready(None) => return Poll::Ready(None),
+                Poll::Pending => return Poll::Pending,
             }
         }
-        true
+        let piece = this.rest.split_to(this.rest.len().min(CHUNK));
+        if this.between.counting.load(Ordering::Relaxed) {
+            let pulled = this
+                .between
+                .pulled
+                .fetch_add(piece.len(), Ordering::Relaxed);
+            if pulled + piece.len() > this.budget {
+                return Poll::Ready(Some(Err(BoxError::from(HeadersTooLong))));
+            }
+        }
+        this.handed = true;
+        Poll::Ready(Some(Ok(piece)))
     }
 }
 
@@ -516,37 +544,61 @@ pub(crate) async fn taken_or_abandoned<T>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::body::Body;
 
-    /// `body` fed to a guard for boundary `x` in `step`-byte chunks.
-    fn passes(body: &[u8], step: usize) -> bool {
-        let mut g = HeaderGuard::new("x");
-        body.chunks(step).all(|c| g.feed(c))
+    /// What reading `body`, sent with boundary `x`, refuses it with: its detail.
+    async fn refusal(body: Vec<u8>) -> Option<String> {
+        let temp = std::env::temp_dir().join(format!("tachyon-guard-{}", Uuid::now_v7()));
+        std::fs::create_dir_all(&temp).unwrap();
+        let req = Request::builder()
+            .header("content-type", "multipart/form-data; boundary=x")
+            .body(Body::from(body))
+            .unwrap();
+        let out = match UploadBody::read(req, Some(1_000), &temp).await {
+            Ok(_) => None,
+            Err(e) => Some(
+                e.problem().1["detail"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_owned(),
+            ),
+        };
+        std::fs::remove_dir(&temp).unwrap();
+        out
     }
 
-    #[test]
-    fn only_long_part_headers_are_refused() {
-        let long = "a".repeat(HEADERS_MAX);
-        let part = |headers: &str, content: &str| {
-            format!(
-                "--x\r\nContent-Disposition: form-data; name=\"file\"{headers}\r\n\r\n{content}\r\n"
-            )
-        };
-        // Long contents and a long epilogue are fine; so are delimiters split across chunks.
-        let fine = format!(
-            "{}--x--\r\n{long}{long}",
-            part("", &format!("{long}{long}"))
-        );
-        let bad = format!("{}--x--\r\n", part(&format!("\r\nX-Long: {long}"), "hi"));
-        for step in [1, 3, 4096] {
-            assert!(passes(fine.as_bytes(), step), "{step}");
-            assert!(!passes(bad.as_bytes(), step), "{step}");
+    fn long() -> Vec<u8> {
+        vec![b'a'; HEADERS_MAX + 3 * CHUNK]
+    }
+
+    /// Each way the parser can be kept buffering before a part begins is cut off at the budget.
+    #[tokio::test]
+    async fn every_header_block_is_bounded() {
+        let headers = format!("{HEADERS_MAX} bytes");
+        let cases: [(&str, Vec<u8>); 5] = [
+            ("a long header line", [b"--x\r\nContent-Disposition: form-data; name=\"file\"\r\nX: ".to_vec(), long()].concat()),
+            ("an empty header block, then no end", [b"--x\r\n\r\n".to_vec(), long()].concat()),
+            ("a preamble, then a long header", [b"junk--x\r\nX: ".to_vec(), long()].concat()),
+            ("a preamble and no boundary", long()),
+            ("a second part's headers", [
+                b"--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{}\r\n--x\r\nX: ".to_vec(),
+                long(),
+            ].concat()),
+        ];
+        for (what, body) in cases {
+            let detail = refusal(body).await.unwrap_or_default();
+            assert!(detail.contains(&headers), "{what}: {detail}");
         }
-        // The second part's headers count on their own.
-        let second = format!(
-            "{}{}--x--\r\n",
-            part("", "hi"),
-            part(&format!("\r\nX: {long}"), "")
+    }
+
+    /// Contents past the budget, one part after another, read fine.
+    #[tokio::test]
+    async fn contents_dont_count() {
+        let payload = format!("{{\"alt\": \"{}\"}}", "a".repeat(3 * HEADERS_MAX));
+        let body = format!(
+            "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{payload}\r\n\
+             --x\r\nContent-Disposition: form-data; name=\"file\"; filename=\"a.txt\"\r\n\r\nhi\r\n--x--\r\n"
         );
-        assert!(!passes(second.as_bytes(), 7));
+        assert_eq!(refusal(body.into_bytes()).await, None);
     }
 }
