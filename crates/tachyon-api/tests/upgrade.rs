@@ -37,7 +37,7 @@ async fn snapshot(pool: &PgPool) -> Value {
     let mut all = serde_json::Map::new();
     for table in TABLES {
         let rows: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT coalesce(jsonb_agg(to_jsonb(t) - 'copy' ORDER BY to_jsonb(t)::text), '[]')
+            "SELECT coalesce(jsonb_agg(to_jsonb(t) - 'copy' - 'published_updated_at' ORDER BY to_jsonb(t)::text), '[]')
              FROM {table} t"
         )))
         .fetch_one(pool)
@@ -174,6 +174,16 @@ async fn drafts_migration_upgrades_a_filled_database(pool: PgPool) {
     MIGRATOR.run(&pool).await.unwrap();
 
     assert_eq!(snapshot(&pool).await, before);
+    let moved: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE published_updated_at IS DISTINCT FROM updated_at",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(
+        moved, 0,
+        "the published copy last changed when the document did"
+    );
     let copies: Vec<(String, i64)> =
         sqlx::query_as("SELECT copy, count(*) FROM relations GROUP BY copy")
             .fetch_all(&pool)

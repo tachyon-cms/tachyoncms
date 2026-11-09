@@ -22,7 +22,7 @@ Pick a CMS today and you usually pick a side. Some are built for developers: typ
 We think you can have both. Here's what we're building toward:
 
 - **Fast by default.** Rust, Axum and Tokio, with published content read from a single row. We'll publish reproducible benchmarks against the popular CMSs before we claim a single number.
-- **Safe by default.** No `unsafe` code; fixed queries checked at compile time; filters and sorts built from a validated tree. Per-collection index SQL uses schema-validated field names and IDs, while request values are always bound parameters—never inserted into SQL text. Plugins run in a WebAssembly sandbox with only the permissions you approve.
+- **Safe by default.** No `unsafe` code; fixed queries checked at compile time; filters and sorts built from a validated tree. Per-collection index SQL uses schema-validated field names and IDs, while request values are always bound parameters, never written into the SQL text. Plugins run in a WebAssembly sandbox with only the permissions you approve.
 - **Easy for editors.** An admin that someone who has only used WordPress can pick up without training, from adding a content type to scheduling a post.
 
 ## What works today
@@ -347,7 +347,7 @@ What you can't read stays hidden in every format. A field you can't read isn't t
 
 ### Drafts, versions and publishing
 
-Without drafts, saving is publishing. Fix a typo in a live post and the fix is live; start a new one and the half-written version is out there too. Turn on `versions` and each document keeps two copies instead: the published one everyone reads, and a draft that only the people who may read drafts ever see. Edit the draft as often as you like. Nothing changes on the site until someone publishes it.
+Without drafts, saving is publishing. Fix a typo in a live post and the fix is live; start a new one and the half-written version is out there too. Turn on `versions` and each document keeps two copies instead: the published one everyone reads, and a draft that only the people who may read drafts ever see. Edit the draft as often as you like. Nothing changes on the site until someone publishes it. Even `updatedAt` keeps quiet: a published read shows when the published copy last changed, so nobody reading the site can tell a draft is moving.
 
 ```json
 {
