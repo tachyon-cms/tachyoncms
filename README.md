@@ -22,7 +22,7 @@ Pick a CMS today and you usually pick a side. Some are built for developers: typ
 We think you can have both. Here's what we're building toward:
 
 - **Fast by default.** Rust, Axum and Tokio, with published content read from a single row. We'll publish reproducible benchmarks against the popular CMSs before we claim a single number.
-- **Safe by default.** No `unsafe` code, fixed queries checked at compile time, filters and sorts built from a validated tree, every request value a bound parameter, and plugins that run in a WebAssembly sandbox with only the permissions you approve.
+- **Safe by default.** No `unsafe` code; fixed queries checked at compile time; filters and sorts built from a validated tree. Per-collection index SQL uses schema-validated field names and IDs, while request values are always bound parameters—never inserted into SQL text. Plugins run in a WebAssembly sandbox with only the permissions you approve.
 - **Easy for editors.** An admin that someone who has only used WordPress can pick up without training, from adding a content type to scheduling a post.
 
 ## What works today
@@ -389,7 +389,7 @@ curl -X PUT localhost:3000/api/posts/$ID/schedule \
 
 Each side takes an RFC 3339 time within the next 10 years. Leave one out and it stays as it was; send `null` and it's cancelled. `GET` on the same path shows what's pending, and `DELETE` cancels both. What a scheduled publish ships is the draft as it stood when you scheduled it, so edits made since then wait for the next publish. A new time replaces the old one, and trashing the document cancels both. Globals schedule at `/api/globals/{slug}/schedule`.
 
-Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). At most 16, fewer than the database pool's connections, and 0 turns them off. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key. Finished jobs, whether they ran, failed or were cancelled, stay in the `jobs` table for 30 days so you can see what happened. After that, the workers clear them away as they go, so a server running with `workers = 0` leaves them be.
+Workers inside the server run the schedules, two unless you set `workers` under `[jobs]` in `tachyon.toml` (`TACHYON_JOBS__WORKERS`). 0 turns them off. The most you can run is 16, and each worker can hold two of the database pool's 10 connections while it changes a schema, so with the pool as it is today the real limit is 4. When a job's time comes, it checks again that whoever scheduled it still may. If they've been removed or lost the right, the job fails and isn't retried. A schedule made with an API key runs only while that exact key is live and still belongs to the same user, so rotating or revoking the key fails everything it scheduled. That's deliberate. A key usually gets rotated because it leaked, and nothing it queued should fire afterwards. Schedule again with the new key. Finished jobs, whether they ran, failed or were cancelled, stay in the `jobs` table for 30 days so you can see what happened. After that, the workers clear them away as they go, so a server running with `workers = 0` leaves them be.
 
 #### History
 
@@ -453,6 +453,10 @@ curl -X PUT localhost:3000/api/admin/collections/posts \
 ```
 
 Renamed fields keep their data. Anything that would delete or retype data comes back first as a preview (what changes, how many documents it touches, which ones won't validate) and only goes through when you send it again with `"confirm": true`. `POST .../posts/preview` shows the same report without changing anything.
+
+A request gets 30 seconds. Carrying tens of thousands of documents across can take longer, so past 2,000 rows (documents, trashed ones too, and their versions) a change or a preview goes to a job worker instead. You get `202 Accepted` straight away, with the job in the body and a `Location` header pointing at `GET /api/admin/jobs/{id}`. Poll it. Once `state` reads `done` or `failed`, `result` holds what the request would have said: the same body as the 200, or the `status` and `problem` it would have sent back. While a change runs, writes to that collection's documents wait for it to finish.
+
+Nothing is taken on trust from when you asked. The job checks everything again against the data as it is by then, and refuses what the request would have refused: a change that loses data without `"confirm": true` fails with the 409 and a fresh preview, so you can look before you send it again. One change per schema waits at a time. Send another, large or small, and you'll get a 409 naming the job ahead of it. Somebody has to run that job, too. At least one server needs `workers` above 0 under `[jobs]`, or you can use `schema apply` from the command line, which has no time limit.
 
 Prefer files under version control? Export every content type, edit the JSON, and apply it:
 

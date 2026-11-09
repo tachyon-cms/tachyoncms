@@ -199,6 +199,63 @@ pub async fn apply(
     Ok((o.collection, o.preview))
 }
 
+/// `apply`, in the caller's transaction, which it leaves open: commit it to keep the
+/// change, or drop it to undo it, as after any error. A job uses this to mark itself done
+/// in the transaction that holds its change, so a run that lost its job can't commit.
+pub async fn apply_in(
+    conn: &mut PgConnection,
+    slug: &str,
+    new: &CollectionSchema,
+    renames: &Renames,
+    confirm: bool,
+) -> Result<(Collection, Preview), ChangeError> {
+    let save = Save {
+        slug,
+        schema: new,
+        renames,
+        new: false,
+    };
+    let o = run_in(conn, &[save], Some(confirm)).await?.remove(0);
+    Ok((o.collection, o.preview))
+}
+
+/// How many rows changing `slug` scans: documents, trashed ones included, and their
+/// versions, in it or, for a shared block, in every schema reaching it. 0 when there's no
+/// `slug`, which the change itself reports.
+pub async fn rows(pool: &PgPool, slug: &str) -> Result<i64, DbError> {
+    let stored = crate::collections::list(pool).await?;
+    let before = |s: &str| stored.iter().map(|c| &c.schema.0).find(|c| c.slug == s);
+    let Some(target) = stored.iter().find(|c| c.schema.slug == slug) else {
+        return Ok(0);
+    };
+    // Who reaches a shared block doesn't change with it, so the stored schemas say.
+    let ids: Vec<Uuid> = match target.schema.kind {
+        CollectionKind::Block => stored
+            .iter()
+            .filter(|c| c.schema.kind != CollectionKind::Block)
+            .filter(|c| {
+                c.schema
+                    .expand_placed(before)
+                    .is_ok_and(|(_, placed)| placed.iter().any(|(_, s)| s == slug))
+            })
+            .map(|c| c.id)
+            .collect(),
+        _ => vec![target.id],
+    };
+    let rows = sqlx::query_scalar!(
+        r#"SELECT (SELECT count(*) FROM documents WHERE tenant_id = $1 AND collection_id = ANY($2))
+                + (SELECT count(*) FROM versions
+                   WHERE document_id IN (SELECT id FROM documents
+                                         WHERE tenant_id = $1 AND collection_id = ANY($2)))
+                AS "rows!""#,
+        DEFAULT_TENANT,
+        &ids,
+    )
+    .fetch_one(pool)
+    .await?;
+    Ok(rows)
+}
+
 /// Several saves as one change, such as a schema file's: each sees the others' versions,
 /// so a shared block's cascade reaches a schema the file also changes as the file has it.
 pub async fn preview_all(pool: &PgPool, saves: &[Save<'_>]) -> Result<Vec<Outcome>, ChangeError> {
@@ -339,10 +396,24 @@ fn summarize(own: &SchemaDiff, reached: Vec<(String, Preview)>) -> Preview {
     }
 }
 
-// NOTE: the whole change runs in one transaction; very large collections should move to a
-// background job once the M4 job queue exists.
+/// `run_in`, in a transaction of its own: a write commits, a preview rolls back.
 async fn run(
     pool: &PgPool,
+    saves: &[Save<'_>],
+    write: Option<bool>,
+) -> Result<Vec<Outcome>, ChangeError> {
+    let mut tx = pool.begin().await?;
+    let out = run_in(&mut tx, saves, write).await?;
+    if write.is_some() {
+        tx.commit().await?;
+    }
+    Ok(out)
+}
+
+/// The whole change, in `tx`, left open for the caller. The API runs one too big for a
+/// request on a job worker (`INLINE_ROWS` in `tachyon-api`).
+async fn run_in(
+    tx: &mut PgConnection,
     saves: &[Save<'_>],
     write: Option<bool>,
 ) -> Result<Vec<Outcome>, ChangeError> {
@@ -369,11 +440,10 @@ async fn run(
         }
         crate::auth::check_users_schema(s.schema).map_err(|e| own(s.slug, e))?;
     }
-    let mut tx = pool.begin().await?;
     if write.is_some() {
         // Every schema save holds R42's lock to its commit (W1-R16), so what's read below
         // stays true until then: no other schema, shared block or role changes meanwhile.
-        crate::auth::lock_rule_roles(&mut tx).await?;
+        crate::auth::lock_rule_roles(&mut *tx).await?;
     }
     let stored = sqlx::query_as!(
         Collection,
@@ -570,7 +640,7 @@ async fn run(
             true => own(&part.slug, e),
             false => breaks(&part.slug, e),
         })?;
-        previews.push(scan(&mut tx, part, changes).await?);
+        previews.push(scan(&mut *tx, part, changes).await?);
     }
     let stored_differs: Vec<bool> = current
         .iter()
@@ -631,17 +701,17 @@ async fn run(
         return Err(ChangeError::Duplicates(Box::new(p.clone())));
     }
     for part in parts.iter().filter(|p| p.old.drafts() && !p.new.drafts()) {
-        check_no_pending_drafts(&mut tx, part.id).await?;
+        check_no_pending_drafts(&mut *tx, part.id).await?;
     }
     if !confirm && let Some(p) = out.iter().find(|p| p.needs_confirmation) {
         return Err(ChangeError::NeedsConfirmation(Box::new(p.clone())));
     }
     for s in saves {
-        crate::auth::check_rule_roles(&mut tx, s.schema).await?;
+        crate::auth::check_rule_roles(&mut *tx, s.schema).await?;
     }
     // New ones first, so links into them are kept.
     for (i, s) in saves.iter().enumerate().filter(|(_, s)| s.new) {
-        current[i] = crate::collections::insert(&mut tx, current[i].id, s.schema).await?;
+        current[i] = crate::collections::insert(&mut *tx, current[i].id, s.schema).await?;
     }
 
     // Pass 2.
@@ -652,12 +722,12 @@ async fn run(
         let part = &parts[k];
         let drafts = (part.old.drafts(), part.new.drafts());
         if drafts == (true, false) {
-            clear_drafts(&mut tx, part.id).await?;
+            clear_drafts(&mut *tx, part.id).await?;
         }
         if part.old.versions != part.new.versions {
-            prune(&mut tx, part.id, kept(&part.new), true).await?;
+            prune(&mut *tx, part.id, kept(&part.new), true).await?;
         }
-        if let Some(field) = rewrite(&mut tx, part, &targets, &previews[k].diff.links).await? {
+        if let Some(field) = rewrite(&mut *tx, part, &targets, &previews[k].diff.links).await? {
             previews[k].duplicates = vec![field];
             return Err(ChangeError::Duplicates(Box::new(entry(
                 part.owners[0],
@@ -665,7 +735,7 @@ async fn run(
             ))));
         }
         if drafts == (false, true) {
-            seed_drafts(&mut tx, part.id).await?;
+            seed_drafts(&mut *tx, part.id).await?;
         }
         if !part.saved {
             // Its fields changed with a shared block, so writes validated against the old
@@ -700,7 +770,6 @@ async fn run(
             .execute(&mut *tx)
             .await?;
     }
-    tx.commit().await?;
     Ok(outcomes(current, out))
 }
 
