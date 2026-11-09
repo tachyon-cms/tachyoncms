@@ -22,7 +22,7 @@ Pick a CMS today and you usually pick a side. Some are built for developers: typ
 We think you can have both. Here's what we're building toward:
 
 - **Fast by default.** Rust, Axum and Tokio, with published content read from a single row. We'll publish reproducible benchmarks against the popular CMSs before we claim a single number.
-- **Safe by default.** No `unsafe` code, fixed queries checked at compile time, filters and sorts built from a validated tree, every request value a bound parameter, and plugins that run in a WebAssembly sandbox with only the permissions you approve.
+- **Safe by default.** No `unsafe` code; fixed queries checked at compile time; filters and sorts built from a validated tree. Per-collection index SQL uses schema-validated field names and IDs, while request values are always bound parameters—never inserted into SQL text. Plugins run in a WebAssembly sandbox with only the permissions you approve.
 - **Easy for editors.** An admin that someone who has only used WordPress can pick up without training, from adding a content type to scheduling a post.
 
 ## What works today
