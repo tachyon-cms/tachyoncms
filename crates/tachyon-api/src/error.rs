@@ -21,8 +21,11 @@ pub enum ApiError {
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
     Unique(String),
-    /// A schema change needs `"confirm": true`; carries the preview to show the user.
-    NeedsConfirmation(serde_json::Value),
+    /// A schema change needs `"confirm": true`; carries what it costs and the preview to show.
+    NeedsConfirmation {
+        detail: String,
+        preview: serde_json::Value,
+    },
     /// The cause is logged, never sent to the client.
     Internal(String),
 }
@@ -68,12 +71,14 @@ impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
         let mut extra = None;
         let (status, title, detail, errors) = match self {
-            Self::NeedsConfirmation(preview) => {
+            Self::NeedsConfirmation { detail, preview } => {
                 extra = Some(("preview", preview));
                 (
                     StatusCode::CONFLICT,
                     "Confirmation required",
-                    Some("This change removes or retypes fields, or leaves documents that won't validate. Send it again with \"confirm\": true to go ahead.".to_owned()),
+                    Some(format!(
+                        "{detail} Send it again with \"confirm\": true to go ahead."
+                    )),
                     None,
                 )
             }

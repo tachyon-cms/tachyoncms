@@ -231,7 +231,10 @@ fn change_error(e: ChangeError) -> ApiError {
                 })
                 .collect(),
         ),
-        ChangeError::NeedsConfirmation(p) => ApiError::NeedsConfirmation(json!(*p)),
+        ChangeError::NeedsConfirmation(p) => ApiError::NeedsConfirmation {
+            detail: p.confirmation_scope().what(),
+            preview: json!(*p),
+        },
         ChangeError::PendingDrafts(message) => ApiError::Conflict(message),
         ChangeError::Db(e) => e.into(),
     }
