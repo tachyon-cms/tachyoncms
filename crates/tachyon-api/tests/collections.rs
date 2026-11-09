@@ -188,3 +188,66 @@ async fn schemas_come_back_without_default_options(pool: PgPool) {
         ]})
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn schema_names_a_configured_storage(pool: PgPool) {
+    let app = common::admin_app(pool).await;
+    let images = |upload: serde_json::Value| {
+        json!({"slug": "images", "upload": upload, "fields": []}).to_string()
+    };
+    for (upload, path, message) in [
+        (
+            json!({"storage": "nope"}),
+            "upload.storage",
+            "no storage named `nope` is configured; this server has default",
+        ),
+        (
+            json!({"disableLocalStorage": true}),
+            "upload.storage",
+            "disableLocalStorage is set, but `default` is local storage; name a bucket",
+        ),
+        (
+            json!({"staticDir": "../x"}),
+            "upload.staticDir",
+            "has to be a relative path inside the storage, without `..`",
+        ),
+        (
+            json!({"staticDir": "/etc"}),
+            "upload.staticDir",
+            "has to be a relative path inside the storage, without `..`",
+        ),
+        (
+            json!({"constructorOptions": {"limitInputPixels": 50_000_001}}),
+            "upload.constructorOptions.limitInputPixels",
+            "50000001 is above this server's limit of 50000000 (`[uploads] max_pixels`)",
+        ),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&images(upload.clone())),
+        )
+        .await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], path, "{upload}");
+        assert_eq!(res.json["errors"][0]["message"], message, "{upload}");
+    }
+    let ok = images(json!({
+        "storage": "default", "staticDir": "media/images",
+        "constructorOptions": {"limitInputPixels": 50_000_000}
+    }));
+    let res = send(&app, "POST", "/api/admin/collections", Some(&ok)).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    // A change is checked the same way.
+    let change = json!({"schema": {"slug": "images", "upload": {"storage": "nope"}, "fields": []}});
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/images",
+        Some(&change.to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "upload.storage");
+}

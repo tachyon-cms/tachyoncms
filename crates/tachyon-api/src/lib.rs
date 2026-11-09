@@ -8,6 +8,7 @@ mod error;
 mod globals;
 mod jobs;
 mod joins;
+mod media_jobs;
 mod params;
 mod populate;
 mod request_id;
@@ -16,6 +17,7 @@ mod schemas;
 mod trash;
 mod versions;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -29,6 +31,7 @@ use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
 use sqlx::PgPool;
 use tachyon_db::DbError;
+use tachyon_media::storage::Storages;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use error::ApiError;
@@ -42,6 +45,34 @@ pub(crate) struct AppState {
     pub auth: Arc<auth::AuthState>,
     /// See `Options::schema_inline_rows`.
     pub inline_rows: i64,
+    pub media: Arc<UploadsConfig>,
+}
+
+/// `[uploads]` and the `[storage.*]` they go to.
+#[derive(Debug, Clone)]
+pub struct UploadsConfig {
+    /// Bytes; a collection's `filesizeLimit` when it sets none.
+    pub max_file_size: u64,
+    /// The most pixels an image may decode to, all its frames counted.
+    pub max_pixels: u64,
+    /// Where uploads are spooled while they're checked.
+    pub temp_dir: PathBuf,
+    /// How long an upload request may take.
+    pub timeout: Duration,
+    pub storages: Arc<Storages>,
+}
+
+impl Default for UploadsConfig {
+    /// For tests: the system temp dir, and `default` storage in `./uploads`.
+    fn default() -> Self {
+        Self {
+            max_file_size: 25_000_000,
+            max_pixels: 50_000_000,
+            temp_dir: std::env::temp_dir(),
+            timeout: Duration::from_secs(600),
+            storages: Arc::default(),
+        }
+    }
 }
 
 /// How the router is set up. `Default` suits development and tests.
@@ -52,6 +83,7 @@ pub struct Options {
     /// The most rows a schema change or preview may scan inside its request; a bigger one
     /// runs on a job worker. `None` is 2,000; tests lower it.
     pub schema_inline_rows: Option<i64>,
+    pub uploads: UploadsConfig,
 }
 
 /// Why the API couldn't start.
@@ -182,7 +214,9 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         inline_rows: options
             .schema_inline_rows
             .unwrap_or(collections::INLINE_ROWS),
+        media: Arc::new(options.uploads),
     };
+    media_jobs::seed_sweep(&state.pool).await?;
     let routes = routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::principal::resolve,

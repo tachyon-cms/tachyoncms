@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM files f\n           WHERE f.tenant_id = $1 AND f.id = $2 AND f.state = 'gone'\n             AND NOT EXISTS (SELECT 1 FROM documents d\n                             WHERE d.published_file = f.id OR d.draft_file = f.id)\n             AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.file_id = f.id)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3e384d6d1cd9089bf413104d6cc9784a2f1bf29968a3a0b7c09c076cda037246"
+}

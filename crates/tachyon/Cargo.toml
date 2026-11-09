@@ -17,6 +17,7 @@ sqlx.workspace = true
 tachyon-api.workspace = true
 tachyon-core.workspace = true
 tachyon-db.workspace = true
+tachyon-media.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 url.workspace = true

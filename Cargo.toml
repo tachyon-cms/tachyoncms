@@ -12,11 +12,15 @@ repository = "https://github.com/tachyon-cms/tachyoncms"
 tachyon-core = { path = "crates/tachyon-core" }
 tachyon-db = { path = "crates/tachyon-db" }
 tachyon-api = { path = "crates/tachyon-api" }
+tachyon-media = { path = "crates/tachyon-media" }
 
 anyhow = "1.0.104"
 argon2 = { version = "0.6.0", features = ["zeroize"] }
+async-trait = "0.1.92"
 base64 = "0.23.1"
+futures-util = "0.3.34"
 hex = "0.4.3"
+object_store = { version = "0.14.2", features = ["aws"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 sha1 = "0.11.0"

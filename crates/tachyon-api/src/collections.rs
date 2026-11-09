@@ -72,7 +72,71 @@ fn saved(state: &AppState, schema: &CollectionSchema) -> Result<Vec<CollectionSc
     }
     let world = state.schemas.with_saved(schema).map_err(schema_error)?;
     world[0].check().map_err(schema_error)?;
+    check_upload(state, schema)?;
     Ok(world)
+}
+
+/// The parts of `upload` that depend on this server: the storage it names, and the pixel
+/// cap. Each a 422 at its path.
+fn check_upload(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+    let Some(u) = &schema.upload else {
+        return Ok(());
+    };
+    let refuse = |path: &str, message: String| {
+        Err(ApiError::Validation(vec![FieldError {
+            path: path.into(),
+            message,
+        }]))
+    };
+    let media = &state.media;
+    match media.storages.get(&u.storage) {
+        None => {
+            let mut names: Vec<&str> = media.storages.0.keys().map(String::as_str).collect();
+            names.sort_unstable();
+            return refuse(
+                "upload.storage",
+                format!(
+                    "no storage named `{}` is configured; this server has {}",
+                    u.storage,
+                    names.join(", ")
+                ),
+            );
+        }
+        Some(s) if u.disable_local_storage && s.is_local() => {
+            return refuse(
+                "upload.storage",
+                format!(
+                    "disableLocalStorage is set, but `{}` is local storage; name a bucket",
+                    u.storage
+                ),
+            );
+        }
+        Some(_) => {}
+    }
+    if let Some(dir) = &u.static_dir {
+        let climbs = dir.split(['/', '\\']).any(|s| s == "..");
+        let absolute = dir.starts_with(['/', '\\']) || dir.get(1..2) == Some(":");
+        if climbs || absolute || dir.contains('\0') {
+            return refuse(
+                "upload.staticDir",
+                "has to be a relative path inside the storage, without `..`".into(),
+            );
+        }
+    }
+    let limit = u
+        .constructor_options
+        .as_ref()
+        .and_then(|c| c.limit_input_pixels);
+    if let Some(limit) = limit.filter(|&l| l > media.max_pixels) {
+        return refuse(
+            "upload.constructorOptions.limitInputPixels",
+            format!(
+                "{limit} is above this server's limit of {} (`[uploads] max_pixels`)",
+                media.max_pixels
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Logged here so the cause survives even if the reload after it fails too.
@@ -587,6 +651,7 @@ mod tests {
             schemas: std::sync::Arc::new(Schemas::load(pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: INLINE_ROWS,
+            media: Default::default(),
         };
         let request = json!({
             "schema": {"slug": "posts", "fields": [{"name": "headline", "type": "text"}]},

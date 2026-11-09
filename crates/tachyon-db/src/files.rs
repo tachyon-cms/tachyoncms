@@ -472,3 +472,66 @@ pub async fn claim_pending(
     .fetch_optional(&mut *tx)
     .await?)
 }
+
+/// Turns pending file `id` `gone` once `PENDING_GRACE` has passed since it was reserved, so
+/// no document can take it while its objects are deleted. False when it isn't pending or
+/// its grace hasn't run out.
+pub async fn expire(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
+    let done = sqlx::query!(
+        r#"UPDATE files SET state = 'gone', released_at = now()
+           WHERE tenant_id = $1 AND id = $2 AND state = 'pending'
+             AND created_at + make_interval(secs => $3) <= now()"#,
+        DEFAULT_TENANT,
+        id,
+        PENDING_GRACE.as_secs_f64(),
+    )
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Deletes gone file `id`'s row, its objects deleted, unless something points at it again.
+/// The delete locks the row: call it before the cleanup job's `complete_in` (a file before
+/// its jobs, the order `release_in` and `go_live_in` take them).
+pub async fn forget_in(tx: &mut PgConnection, id: Uuid) -> Result<bool, DbError> {
+    let done = sqlx::query!(
+        r#"DELETE FROM files f
+           WHERE f.tenant_id = $1 AND f.id = $2 AND f.state = 'gone'
+             AND NOT EXISTS (SELECT 1 FROM documents d
+                             WHERE d.published_file = f.id OR d.draft_file = f.id)
+             AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.file_id = f.id)"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(done.rows_affected() == 1)
+}
+
+/// Queues again, with fresh attempts, each failed cleanup whose file is still gone or is
+/// pending past its grace: storage that was down for longer than the retries is tried
+/// again. The newest failed job per file, and none whose file already has a pending one.
+/// Returns how many.
+pub async fn requeue_cleanups_in(tx: &mut PgConnection) -> Result<u64, DbError> {
+    let done = sqlx::query!(
+        r#"UPDATE jobs SET state = 'queued', attempts = 0, run_at = now(), locked_until = NULL,
+               finished_at = NULL, result = NULL
+           WHERE id IN (
+               SELECT DISTINCT ON (j.dedupe_key) j.id FROM jobs j
+               JOIN files f ON f.tenant_id = j.tenant_id AND f.id::text = j.payload->>'file'
+               WHERE j.tenant_id = $1 AND j.kind = $2 AND j.state = 'failed'
+                 AND (f.state = 'gone'
+                      OR (f.state = 'pending'
+                          AND f.created_at + make_interval(secs => $3) <= now()))
+                 AND NOT EXISTS (SELECT 1 FROM jobs o
+                                 WHERE o.tenant_id = $1 AND o.dedupe_key = j.dedupe_key
+                                   AND o.state IN ('queued', 'running'))
+               ORDER BY j.dedupe_key, j.id DESC)"#,
+        DEFAULT_TENANT,
+        CLEANUP,
+        PENDING_GRACE.as_secs_f64(),
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(done.rows_affected())
+}

@@ -140,10 +140,11 @@ async fn a_change_at_the_threshold_runs_inline(pool: PgPool) {
     let res = call(&app, "PUT", "/api/admin/collections/posts", rename("posts")).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["collection"]["schemaVersion"], 2);
-    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind <> 'file_cleanup_sweep'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(jobs, 0);
 }
 

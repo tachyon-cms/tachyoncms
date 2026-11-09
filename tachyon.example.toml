@@ -16,3 +16,28 @@ lockout_duration = "15m"    # ...lock the account for this long
 argon2_memory_kib = 19456   # password hashing memory (OWASP baseline)
 breach_check = true         # refuse passwords known from data breaches
 allowed_origins = []        # other sites allowed to send cookie-signed changes
+
+[uploads]
+max_file_size = "25MB"          # per file, unless a collection sets filesizeLimit; MB = 1,000,000 bytes, MiB = 1,048,576
+max_pixels = 50_000_000         # the most an image may decode to, all its frames counted
+temp_dir = "/var/tmp/tachyon"   # where uploads wait while they're checked
+timeout = "10m"                 # how long one upload request may take
+
+# Where files go. A collection picks one with upload.storage; `default` is used otherwise,
+# and is ./uploads on this machine unless you set it here.
+# [storage.default]
+# adapter = "local"
+# root = "./uploads"
+
+# A bucket on S3, R2, MinIO or another S3-compatible store. Its keys come only from the
+# environment, never this file: TACHYON_STORAGE__R2__ACCESS_KEY_ID and
+# TACHYON_STORAGE__R2__SECRET_ACCESS_KEY for [storage.r2].
+# [storage.r2]
+# adapter = "s3"
+# bucket = "media"
+# endpoint = "https://<account>.r2.cloudflarestorage.com"
+# region = "auto"
+# prefix = "cms"                              # before every key, to share a bucket
+# public_url = "https://files.example.com"    # where browsers reach the bucket
+# client_uploads = false
+# signed_downloads = false                    # or true, or { mime_types = ["application/pdf"], expires_in = "2h" }

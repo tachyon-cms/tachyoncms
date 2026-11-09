@@ -1,0 +1,16 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE files SET state = 'gone', released_at = now()\n           WHERE tenant_id = $1 AND id = $2 AND state = 'pending'\n             AND created_at + make_interval(secs => $3) <= now()",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Float8"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e9318409900dad1fd8ee65ef231ee54497b9ed7ad4c1f399242227ab6b40a425"
+}

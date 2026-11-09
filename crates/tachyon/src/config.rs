@@ -1,11 +1,15 @@
+use std::collections::BTreeMap;
 use std::net::SocketAddr;
+use std::path::PathBuf;
+use std::sync::Arc;
 use std::time::Duration;
 
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
-use tachyon_api::JobsConfig;
 use tachyon_api::auth::AuthConfig;
+use tachyon_api::{JobsConfig, UploadsConfig};
+use tachyon_media::storage::{Adapter, SignedDownloads, StorageConfig, Storages, credential_var};
 
 #[derive(Debug, Deserialize)]
 pub struct Config {
@@ -18,6 +22,11 @@ pub struct Config {
     pub auth: AuthSettings,
     #[serde(default)]
     pub jobs: JobsSettings,
+    #[serde(default)]
+    pub uploads: UploadsSettings,
+    /// `[storage.<name>]`; `default` is local `./uploads` unless set here.
+    #[serde(default)]
+    pub storage: BTreeMap<String, StorageSettings>,
 }
 
 /// `[auth]` in the config file (or `TACHYON_AUTH__*` in the environment).
@@ -65,15 +74,192 @@ impl Default for JobsSettings {
     }
 }
 
+/// `[uploads]` in the config file (or `TACHYON_UPLOADS__*` in the environment).
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct UploadsSettings {
+    /// `25MB` (25,000,000 bytes) or `25MiB` (26,214,400).
+    pub max_file_size: String,
+    pub max_pixels: u64,
+    pub temp_dir: PathBuf,
+    pub timeout: String,
+}
+
+impl Default for UploadsSettings {
+    fn default() -> Self {
+        Self {
+            max_file_size: "25MB".into(),
+            max_pixels: 50_000_000,
+            temp_dir: "/var/tmp/tachyon".into(),
+            timeout: "10m".into(),
+        }
+    }
+}
+
+/// `[storage.<name>]`. Credentials aren't settings: they come only from
+/// `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID` and `..._SECRET_ACCESS_KEY`, and in the file
+/// they're an error, so a secret never sits in a config that gets copied around.
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct StorageSettings {
+    /// `local` or `s3` (also R2, MinIO and other S3-compatible stores).
+    pub adapter: String,
+    pub root: Option<PathBuf>,
+    pub bucket: Option<String>,
+    pub prefix: Option<String>,
+    pub endpoint: Option<String>,
+    pub region: Option<String>,
+    pub public_url: Option<String>,
+    #[serde(default)]
+    pub client_uploads: bool,
+    #[serde(default)]
+    pub signed_downloads: SignedSetting,
+    /// Only to name the right variable when one is found in the file.
+    access_key_id: Option<serde::de::IgnoredAny>,
+    secret_access_key: Option<serde::de::IgnoredAny>,
+}
+
+/// `signed_downloads = false | true | { mime_types = [..], expires_in = "2h" }`.
+#[derive(Debug, Deserialize)]
+#[serde(untagged)]
+pub enum SignedSetting {
+    Flag(bool),
+    Options(SignedOptions),
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(default, deny_unknown_fields)]
+pub struct SignedOptions {
+    pub mime_types: Vec<String>,
+    pub expires_in: String,
+}
+
+impl Default for SignedOptions {
+    fn default() -> Self {
+        Self {
+            mime_types: Vec::new(),
+            expires_in: "2h".into(),
+        }
+    }
+}
+
+impl Default for SignedSetting {
+    fn default() -> Self {
+        Self::Flag(false)
+    }
+}
+
+/// Environment variables that are storage credentials, which the settings never read.
+fn is_credential_var(key: &str) -> bool {
+    let key = key.to_ascii_lowercase();
+    key.starts_with("storage__")
+        && (key.ends_with("__access_key_id") || key.ends_with("__secret_access_key"))
+}
+
+/// `25MB`, `25MiB`, `512KB`, `1GB` or plain bytes. `MB` is 1,000,000 bytes, `MiB` 1,048,576.
+fn byte_size(text: &str) -> Option<u64> {
+    let t = text.trim();
+    let split = t.find(|c: char| !c.is_ascii_digit()).unwrap_or(t.len());
+    let (number, unit) = t.split_at(split);
+    let n: u64 = number.parse().ok()?;
+    let unit: u64 = match unit.trim() {
+        "" | "B" => 1,
+        "KB" => 1_000,
+        "MB" => 1_000_000,
+        "GB" => 1_000_000_000,
+        "KiB" => 1 << 10,
+        "MiB" => 1 << 20,
+        "GiB" => 1 << 30,
+        _ => return None,
+    };
+    n.checked_mul(unit).filter(|&b| b > 0)
+}
+
+/// Can files be made in `dir`? Creates it if missing.
+fn check_writable(dir: &std::path::Path) -> Result<(), String> {
+    let bad =
+        |e: std::io::Error| format!("uploads.temp_dir: can't write to {}: {e}", dir.display());
+    std::fs::create_dir_all(dir).map_err(bad)?;
+    let probe = dir.join(format!(".tachyon-probe-{}", std::process::id()));
+    std::fs::write(&probe, b"").map_err(bad)?;
+    std::fs::remove_file(&probe).map_err(bad)
+}
+
+impl StorageSettings {
+    fn to_config(&self, name: &str) -> Result<StorageConfig, String> {
+        for (key, set) in [
+            ("access_key_id", self.access_key_id.is_some()),
+            ("secret_access_key", self.secret_access_key.is_some()),
+        ] {
+            if set {
+                return Err(format!(
+                    "storage.{name}.{key} can't be in the config file; set {} in the environment instead",
+                    credential_var(name, key)
+                ));
+            }
+        }
+        let needs = |value: &Option<String>, key: &str| {
+            value.clone().ok_or_else(|| {
+                format!(
+                    "storage.{name}.{key} is required for adapter `{}`",
+                    self.adapter
+                )
+            })
+        };
+        let adapter = match self.adapter.as_str() {
+            "local" => Adapter::Local {
+                root: self.root.clone().ok_or_else(|| {
+                    format!("storage.{name}.root is required for adapter `local`")
+                })?,
+            },
+            "s3" => Adapter::S3 {
+                bucket: needs(&self.bucket, "bucket")?,
+                endpoint: self.endpoint.clone(),
+                region: self.region.clone(),
+            },
+            other => {
+                return Err(format!(
+                    "storage.{name}.adapter: `{other}` isn't one; use local or s3"
+                ));
+            }
+        };
+        let public_url = match &self.public_url {
+            None => None,
+            Some(u) => Some(web_url(u).ok_or_else(|| {
+                format!("storage.{name}.public_url must be a full web address, like https://files.example.com")
+            })?),
+        };
+        let signed_downloads = match &self.signed_downloads {
+            SignedSetting::Flag(false) => SignedDownloads::Off,
+            SignedSetting::Flag(true) => SignedDownloads::On {
+                mime_types: Vec::new(),
+                expires_in: Duration::from_secs(7200),
+            },
+            SignedSetting::Options(o) => SignedDownloads::On {
+                mime_types: o.mime_types.clone(),
+                expires_in: duration(
+                    &format!("storage.{name}.signed_downloads.expires_in"),
+                    &o.expires_in,
+                )?,
+            },
+        };
+        Ok(StorageConfig {
+            adapter,
+            prefix: self.prefix.clone(),
+            public_url,
+            client_uploads: self.client_uploads,
+            signed_downloads,
+        })
+    }
+}
+
 /// More workers than this would mostly wait on each other's database connections.
 const MAX_WORKERS: usize = 16;
 
 /// `15m`, `12h`, `7d`: a whole number and a unit.
 fn duration(name: &str, text: &str) -> Result<Duration, String> {
     let bad = || {
-        format!(
-            "auth.{name}: `{text}` isn't a duration; use a number and s, m, h or d, like 15m or 7d"
-        )
+        format!("{name}: `{text}` isn't a duration; use a number and s, m, h or d, like 15m or 7d")
     };
     let t = text.trim();
     let Some((last, _)) = t.char_indices().last() else {
@@ -231,8 +417,8 @@ impl Config {
                 a.lockout_attempts
             ));
         }
-        let session_idle = duration("session_idle", &a.session_idle)?;
-        let session_absolute = duration("session_absolute", &a.session_absolute)?;
+        let session_idle = duration("auth.session_idle", &a.session_idle)?;
+        let session_absolute = duration("auth.session_absolute", &a.session_absolute)?;
         if session_absolute < session_idle {
             return Err(format!(
                 "auth.session_absolute ({}) is shorter than auth.session_idle ({}), so the idle limit would never apply",
@@ -248,8 +434,8 @@ impl Config {
             session_idle,
             session_absolute,
             lockout_attempts: a.lockout_attempts,
-            lockout_window: duration("lockout_window", &a.lockout_window)?,
-            lockout_duration: duration("lockout_duration", &a.lockout_duration)?,
+            lockout_window: duration("auth.lockout_window", &a.lockout_window)?,
+            lockout_duration: duration("auth.lockout_duration", &a.lockout_duration)?,
             argon2_memory_kib: a.argon2_memory_kib,
             breach_check: a.breach_check,
             breach_check_url: a.breach_check_url.clone(),
@@ -278,6 +464,44 @@ impl Config {
         })
     }
 
+    /// Upload limits and the storages they go to, each storage opened (a local root is
+    /// created). Refuses, naming the key, a size or duration it can't read, `max_pixels`
+    /// of 0, a `temp_dir` it can't write to and a credential in the file.
+    pub fn uploads_config(&self) -> Result<UploadsConfig, String> {
+        let u = &self.uploads;
+        let max_file_size = byte_size(&u.max_file_size).ok_or_else(|| {
+            format!(
+                "uploads.max_file_size: `{}` isn't a size; use a number and B, KB, MB, GB, KiB, MiB or GiB, like 25MB",
+                u.max_file_size
+            )
+        })?;
+        if u.max_pixels < 1 {
+            return Err("uploads.max_pixels is 0; it has to be at least 1".into());
+        }
+        check_writable(&u.temp_dir)?;
+        let mut configs = BTreeMap::new();
+        for (name, s) in &self.storage {
+            // An environment variable's name is upper-cased from it, so keep it plain.
+            if name.is_empty()
+                || !name
+                    .bytes()
+                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
+            {
+                return Err(format!(
+                    "storage.{name}: a storage name is lowercase letters, digits and _"
+                ));
+            }
+            configs.insert(name.clone(), s.to_config(name)?);
+        }
+        Ok(UploadsConfig {
+            max_file_size,
+            max_pixels: u.max_pixels,
+            temp_dir: u.temp_dir.clone(),
+            timeout: duration("uploads.timeout", &u.timeout)?,
+            storages: Arc::new(Storages::open(&configs)?),
+        })
+    }
+
     /// Defaults, then the TOML file, then `TACHYON_*` environment variables. With no
     /// `--config`, `tachyon.toml` is read if it exists; a file named with `--config` must exist.
     // figment's own error type; this runs once at startup.
@@ -292,7 +516,12 @@ impl Config {
             .merge(Serialized::default("listen", "127.0.0.1:3000"))
             .merge(Toml::file(path))
             // TACHYON_AUTH__BREACH_CHECK=false sets [auth] breach_check.
-            .merge(Env::prefixed("TACHYON_").split("__"))
+            .merge(
+                Env::prefixed("TACHYON_")
+                    // Read by the storage itself, never kept with the settings.
+                    .filter(|k| !is_credential_var(k.as_str()))
+                    .split("__"),
+            )
             .extract()?;
         if config.database_url.trim().is_empty() {
             return Err("database_url is empty".to_owned().into());
@@ -536,7 +765,7 @@ mod tests {
             let err = Config::load(None).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth, jobs"
+                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth, jobs, uploads, storage"
             );
             // A variable that isn't a setting, such as one for another tool, is left alone.
             jail.create_file(
@@ -596,6 +825,145 @@ mod tests {
             // Clearing the whole environment would race with tests that need DATABASE_URL.
             jail.set_env("TACHYON_DATABASE_URL", "");
             assert!(Config::load(None).is_err());
+            Ok(())
+        });
+    }
+
+    /// `uploads_config` for `toml`, inside the jail: a local root is relative to the jail's
+    /// directory, and no other test moves it meanwhile.
+    fn uploads(toml: &str) -> Result<tachyon_api::UploadsConfig, String> {
+        let mut out = None;
+        Jail::expect_with(|jail| {
+            jail.create_file("tachyon.toml", toml)?;
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            out = Some(Config::load(None)?.uploads_config());
+            Ok(())
+        });
+        out.unwrap()
+    }
+
+    #[test]
+    fn uploads_and_storage_config_defaults() {
+        let u = uploads("").unwrap();
+        assert_eq!(u.max_file_size, 25_000_000);
+        assert_eq!(u.max_pixels, 50_000_000);
+        assert_eq!(u.timeout, std::time::Duration::from_secs(600));
+        assert_eq!(u.temp_dir, std::path::Path::new("/var/tmp/tachyon"));
+        let default = u.storages.get("default").unwrap();
+        assert!(default.is_local());
+        assert_eq!(u.storages.0.len(), 1);
+
+        let at = uploads;
+        assert_eq!(
+            at("[uploads]\nmax_file_size = \"25MiB\"")
+                .unwrap()
+                .max_file_size,
+            26_214_400
+        );
+        for bad in ["25 megabytes", "MB", "0MB", "-1MB", "99999999999999GB"] {
+            assert_eq!(
+                at(&format!("[uploads]\nmax_file_size = \"{bad}\"")).unwrap_err(),
+                format!(
+                    "uploads.max_file_size: `{bad}` isn't a size; use a number and B, KB, MB, GB, KiB, MiB or GiB, like 25MB"
+                ),
+            );
+        }
+        assert_eq!(
+            at("[uploads]\nmax_pixels = 0").unwrap_err(),
+            "uploads.max_pixels is 0; it has to be at least 1"
+        );
+        assert!(
+            at("[uploads]\ntimeout = \"soon\"")
+                .unwrap_err()
+                .starts_with("uploads.timeout: `soon` isn't a duration")
+        );
+        let unwritable = at("[uploads]\ntemp_dir = \"/dev/null/tachyon\"").unwrap_err();
+        assert!(
+            unwritable.starts_with("uploads.temp_dir: can't write to /dev/null/tachyon"),
+            "{unwritable}"
+        );
+
+        let root = std::env::temp_dir().join(format!("tachyon-config-{}", std::process::id()));
+        let r2 = at(&format!("[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\nendpoint = \"https://acct.r2.cloudflarestorage.com\"\nregion = \"auto\"\npublic_url = \"https://files.example.com\"\n[storage.default]\nadapter = \"local\"\nroot = \"{}\"", root.display())).unwrap();
+        assert!(root.is_dir(), "a local root is created");
+        assert!(!r2.storages.get("r2").unwrap().is_local());
+        assert!(r2.storages.get("default").unwrap().is_local());
+        assert_eq!(
+            r2.storages
+                .get("r2")
+                .unwrap()
+                .public_url("a/b.png")
+                .unwrap(),
+            "https://files.example.com/a/b.png"
+        );
+
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.create_file(
+                "tachyon.toml",
+                "[storage.r2]\nadapter = \"s3\"\nbuckt = \"media\"\n",
+            )?;
+            let err = Config::load(None).unwrap_err().to_string();
+            assert!(err.contains("unknown field: found `buckt`"), "{err}");
+            jail.create_file("tachyon.toml", "[uploads]\nmax_size = \"1MB\"\n")?;
+            let err = Config::load(None).unwrap_err().to_string();
+            assert!(err.contains("unknown field: found `max_size`"), "{err}");
+            Ok(())
+        });
+        assert_eq!(
+            at("[storage.r2]\nadapter = \"s3\"").unwrap_err(),
+            "storage.r2.bucket is required for adapter `s3`"
+        );
+        assert_eq!(
+            at("[storage.disk]\nadapter = \"ftp\"").unwrap_err(),
+            "storage.disk.adapter: `ftp` isn't one; use local or s3"
+        );
+        assert_eq!(
+            at("[storage.R2]\nadapter = \"s3\"\nbucket = \"x\"").unwrap_err(),
+            "storage.R2: a storage name is lowercase letters, digits and _"
+        );
+        let signed = at("[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\nsigned_downloads = { mime_types = [\"application/pdf\"], expires_in = \"15m\" }").unwrap();
+        assert_eq!(
+            signed.storages.get("r2").unwrap().config().signed_downloads,
+            tachyon_media::storage::SignedDownloads::On {
+                mime_types: vec!["application/pdf".into()],
+                expires_in: std::time::Duration::from_secs(900),
+            }
+        );
+    }
+
+    #[test]
+    fn credentials_only_from_env() {
+        for key in ["access_key_id", "secret_access_key"] {
+            let err = uploads(&format!(
+                "[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\n{key} = \"AKIA-in-the-file\""
+            ))
+            .unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "storage.r2.{key} can't be in the config file; set TACHYON_STORAGE__R2__{} in the environment instead",
+                    key.to_ascii_uppercase()
+                )
+            );
+            assert!(!err.contains("AKIA"), "the secret isn't echoed");
+        }
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.set_env("TACHYON_STORAGE__R2__ACCESS_KEY_ID", "AKIA-env");
+            jail.set_env("TACHYON_STORAGE__R2__SECRET_ACCESS_KEY", "secret-env");
+            jail.set_env("TACHYON_STORAGE__R2__BUCKET", "from-env");
+            jail.create_file("tachyon.toml", "[storage.r2]\nadapter = \"s3\"\n")?;
+            let config = Config::load(None)?;
+            let uploads = config.uploads_config().unwrap();
+            assert!(
+                uploads.storages.get("r2").is_some(),
+                "other keys still come from the environment"
+            );
+            assert!(
+                !format!("{config:?}").contains("AKIA-env"),
+                "credentials aren't settings"
+            );
             Ok(())
         });
     }

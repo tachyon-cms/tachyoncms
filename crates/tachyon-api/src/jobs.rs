@@ -206,6 +206,8 @@ async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
         crate::collections::SCHEMA_CHANGE | crate::collections::SCHEMA_PREVIEW => {
             crate::collections::run_job(state, job).await
         }
+        tachyon_db::files::CLEANUP => crate::media_jobs::run_cleanup(state, job).await,
+        crate::media_jobs::CLEANUP_SWEEP => crate::media_jobs::run_cleanup_sweep(state, job).await,
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]
@@ -321,6 +323,7 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let held = keep_leased(&state, &job, lease).await.unwrap();
@@ -359,6 +362,7 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let _held = keep_leased(&state, &job, lease).await.unwrap();
@@ -394,6 +398,7 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let _held = keep_leased(&state, &job, lease).await.unwrap();
@@ -422,6 +427,7 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
         };
         let job = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
         let running = RunningJobs::default();
