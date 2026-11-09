@@ -624,6 +624,21 @@ pub fn numbered(filename: &str, n: u32) -> String {
     compose(stem, &format!("-{n}"), ext)
 }
 
+/// What every `numbered(filename, n)` starts and ends with, so a lookup can find them
+/// all at once: the stem as cut for the widest number, and the extension.
+pub fn numbered_bounds(filename: &str) -> (String, String) {
+    let (stem, ext) = split(filename);
+    let ext = cut(ext, MAX_EXTENSION);
+    let tail = if ext.is_empty() {
+        String::new()
+    } else {
+        format!(".{ext}")
+    };
+    let widest = format!("-{}", u32::MAX).len() + tail.len();
+    let stem = cut(stem, MAX_FILENAME.saturating_sub(widest)).trim_start_matches('.');
+    (stem.to_owned(), tail)
+}
+
 /// The name of a size made from `filename`: `a.png` at 640×400 as WebP → `a-640x400.webp`.
 pub fn size_filename(filename: &str, width: u32, height: u32, ext: &str) -> String {
     let (stem, _) = split(filename);
@@ -1033,6 +1048,26 @@ mod tests {
         assert!(numbered(&safe, 12).len() <= 255);
         assert!(numbered(&safe, 12).ends_with("-12.png"));
         assert_eq!(size_filename("a.png", 640, 400, "webp"), "a-640x400.webp");
+        for name in [
+            "a.png".to_owned(),
+            "README".to_owned(),
+            safe.clone(),
+            format!("{}.{}", "é".repeat(200), "x".repeat(40)),
+            "...".to_owned(),
+        ] {
+            let (head, tail) = numbered_bounds(&name);
+            for n in [1, 9, 10, 99, 100, 12345, u32::MAX] {
+                let made = numbered(&name, n);
+                assert!(
+                    made.starts_with(&head) && made.ends_with(&tail),
+                    "{made:?} {head:?} {tail:?}"
+                );
+            }
+        }
+        assert_eq!(
+            numbered_bounds("a.png"),
+            ("a".to_owned(), ".png".to_owned())
+        );
         // Never a leading dot, a trailing dot or space, or empty, whatever is cut.
         let ext = "x".repeat(300);
         let long_ext = format!("a.{ext}");

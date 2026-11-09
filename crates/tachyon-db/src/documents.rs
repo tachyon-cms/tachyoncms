@@ -86,16 +86,23 @@ pub enum FileChange {
 }
 
 impl FileChange {
-    /// The copy's file after the write, `current` before it. A file it sets goes live.
+    /// The copy's file after the write, `current` before it. A file it sets goes live, and
+    /// must be one of `collection_id`'s. Both are locked first, in ID order.
     async fn apply(
         self,
         tx: &mut PgConnection,
+        collection_id: Uuid,
         current: Option<Uuid>,
     ) -> Result<Option<Uuid>, DbError> {
+        if let FileChange::Set(f) = self {
+            crate::files::lock_in(tx, &[current, Some(f)]).await?;
+        } else if self == FileChange::Clear {
+            crate::files::lock_in(tx, &[current]).await?;
+        }
         Ok(match self {
             FileChange::Keep => current,
             FileChange::Set(f) => {
-                crate::files::go_live_in(tx, f).await?;
+                crate::files::go_live_in(tx, collection_id, f).await?;
                 Some(f)
             }
             FileChange::Clear => None,
@@ -180,7 +187,7 @@ pub async fn insert_in(
 ) -> Result<Document, DbError> {
     check_schema(&mut *conn, collection_id, schema_version).await?;
     let draft = copy == DocCopy::Draft;
-    let file = doc.file.apply(&mut *conn, None).await?;
+    let file = doc.file.apply(&mut *conn, collection_id, None).await?;
     let created = sqlx::query_as!(
         Document,
         r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, draft, published_at,
@@ -365,7 +372,10 @@ pub async fn update_in<E: From<DbError>>(
     }
     check_guard(&mut *tx, id, copy, guard).await?;
     let next = apply(&current.data.0)?;
-    let file = next.file.apply(&mut *tx, current.file).await?;
+    let file = next
+        .file
+        .apply(&mut *tx, collection_id, current.file)
+        .await?;
     let doc = sqlx::query_as!(
         Document,
         r#"UPDATE documents
@@ -437,8 +447,8 @@ pub async fn lock_in(
 /// `published` and `published_at` now, and a `published` version is recorded. The
 /// published copy takes `doc`'s file, or the draft's when it keeps it, and the file it
 /// held before is released. The caller has locked the row with `lock_in`, which also
-/// checked the schema, and validated what's published. A unique clash is a `UniqueViolation`; a link to a document that's gone, a
-/// `Validation` error.
+/// checked the schema, and validated what's published. A unique clash is a
+/// `UniqueViolation`; a link to a document that's gone, a `Validation` error.
 pub async fn publish_in(
     tx: &mut PgConnection,
     c: &Collection,
@@ -457,10 +467,14 @@ pub async fn publish_in(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(DbError::NotFound)?;
-    let file = doc
-        .map_or(FileChange::Keep, |d| d.file)
-        .apply(&mut *tx, held.draft_file)
-        .await?;
+    let change = doc.map_or(FileChange::Keep, |d| d.file);
+    // The published copy's file is the one replaced: all of them at once, in ID order.
+    let set = match change {
+        FileChange::Set(f) => Some(f),
+        _ => None,
+    };
+    crate::files::lock_in(tx, &[held.published_file, held.draft_file, set]).await?;
+    let file = change.apply(&mut *tx, c.id, held.draft_file).await?;
     let published = sqlx::query_as!(
         Document,
         r#"UPDATE documents
@@ -670,8 +684,10 @@ pub fn copy_errors(c: &Collection, copy: DocCopy, errors: Vec<FieldError>) -> Ve
 /// validated against the current schema, replaces its copy and re-syncs that copy's links,
 /// so a link to a document that's gone or in the trash is a `Validation` error at its path
 /// (both copies' errors, each saying its copy). A unique clash with a live document is a
-/// `UniqueViolation`. The caller has locked it (`query::lock_trash_in`) and passes every
-/// copy it has. Returns the copy a write to `c` changes: the draft, with drafts.
+/// `UniqueViolation`. A file whose name another live document took meanwhile is renumbered
+/// as `files::reserve` numbers, its `filename` changing with it. The caller has locked it
+/// (`query::lock_trash_in`) and passes every copy it has. Returns the copy a write to `c`
+/// changes: the draft, with drafts.
 pub async fn restore_in(
     tx: &mut PgConnection,
     c: &Collection,
@@ -736,6 +752,17 @@ pub async fn restore_in(
     }
     if !errors.is_empty() {
         return Err(DbError::Validation(errors));
+    }
+    if crate::files::renumber_in(tx, id).await? {
+        let data = sqlx::query_scalar!(
+            r#"SELECT CASE WHEN $2 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
+               FROM documents WHERE id = $1"#,
+            id,
+            c.schema.drafts(),
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        return Ok(Document { data, ..doc });
     }
     Ok(doc)
 }

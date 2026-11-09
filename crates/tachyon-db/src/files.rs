@@ -8,11 +8,13 @@
 //! the old file to `release_in`, which turns it `gone` and queues its cleanup once nothing
 //! points at it.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
+use tachyon_core::uploads::{numbered, numbered_bounds};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -89,60 +91,79 @@ fn cleanup(id: Uuid, run_at: OffsetDateTime) -> NewJob<'static> {
     }
 }
 
-/// Records a `pending` file in its own transaction, under the first free name: `a.png`,
-/// then `a-1.png`, `a-2.png`… A name is taken by the current file of another live document
-/// (either copy) or by another pending file, in the same collection and `scope`; a version's
-/// file and `f.document`'s own don't count, so an edit or a replacement keeps its name. Its
-/// cleanup is queued for `PENDING_GRACE` from now. `key_of` makes the storage key from the
-/// new ID and the name; its error is `Refused`, and nothing is kept.
+/// The first free name for `filename` in `collection_id` and `scope`, inside `conn`'s
+/// transaction: `a.png`, then `a-1.png`, `a-2.png`… A name is taken by the current file of
+/// another live document (either copy) or by a pending file not uploaded for `document`. A
+/// version's file and `document`'s own don't count, so an edit or a replacement keeps its
+/// name. Holds the numbering lock of the collection and scope until the transaction ends.
+pub(crate) async fn free_name(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+    scope: &str,
+    filename: &str,
+    document: Option<Uuid>,
+) -> Result<String, DbError> {
+    // One numbering at a time per collection and scope, so two uploads can't pick one name.
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        format!("files:{collection_id}:{scope}"),
+    )
+    .execute(&mut *conn)
+    .await?;
+    // Every name the series could reach, in one query; the first free one is picked here.
+    let (head, tail) = numbered_bounds(filename);
+    let taken: HashSet<String> = sqlx::query_scalar!(
+        r#"SELECT fl.filename FROM files fl
+           WHERE fl.tenant_id = $1 AND fl.collection_id = $2 AND fl.scope = $3
+             AND (fl.filename = $5
+                  OR (starts_with(fl.filename, $6) AND right(fl.filename, length($7)) = $7))
+             AND ((fl.state = 'pending' AND (fl.document_id IS DISTINCT FROM $4 OR $4 IS NULL))
+                  OR EXISTS (
+                      SELECT 1 FROM documents d
+                      WHERE d.tenant_id = $1 AND d.collection_id = $2
+                        AND d.deleted_at IS NULL AND d.id IS DISTINCT FROM $4
+                        AND (d.published_file = fl.id OR d.draft_file = fl.id)))"#,
+        DEFAULT_TENANT,
+        collection_id,
+        scope,
+        document,
+        filename,
+        head,
+        tail,
+    )
+    .fetch_all(&mut *conn)
+    .await?
+    .into_iter()
+    .collect();
+    if !taken.contains(filename) {
+        return Ok(filename.to_owned());
+    }
+    // At most `taken.len()` numbers are taken, so this ends within that many tries.
+    Ok((1..)
+        .map(|n| numbered(filename, n))
+        .find(|name| !taken.contains(name))
+        .expect("more numbers than names taken"))
+}
+
+/// Records a `pending` file in its own transaction, under the first free name (see
+/// `free_name`). Its cleanup is queued for `PENDING_GRACE` from now. `key_of` makes the
+/// storage key from the new ID and the name; its error is `Refused`, and nothing is kept.
 pub async fn reserve(
     pool: &PgPool,
     f: &NewFile<'_>,
     key_of: impl Fn(Uuid, &str) -> Result<String, String>,
 ) -> Result<FileRow, DbError> {
     let mut tx = pool.begin().await?;
-    // One numbering at a time per collection and scope, so two uploads can't pick one name.
-    sqlx::query!(
-        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
-        format!("files:{}:{}", f.collection_id, f.scope),
-    )
-    .execute(&mut *tx)
-    .await?;
-    let mut filename = f.filename.to_owned();
-    for n in 1.. {
-        let taken = sqlx::query_scalar!(
-            r#"SELECT EXISTS (
-                   SELECT 1 FROM files fl
-                   WHERE fl.tenant_id = $1 AND fl.collection_id = $2 AND fl.scope = $3
-                     AND fl.filename = $5
-                     AND (fl.state = 'pending' OR EXISTS (
-                           SELECT 1 FROM documents d
-                           WHERE d.tenant_id = $1 AND d.collection_id = $2
-                             AND d.deleted_at IS NULL AND d.id IS DISTINCT FROM $4
-                             AND (d.published_file = fl.id OR d.draft_file = fl.id)))
-               ) AS "taken!""#,
-            DEFAULT_TENANT,
-            f.collection_id,
-            f.scope,
-            f.document,
-            filename,
-        )
-        .fetch_one(&mut *tx)
-        .await?;
-        if !taken {
-            break;
-        }
-        filename = tachyon_core::uploads::numbered(f.filename, n);
-    }
+    let filename = free_name(&mut tx, f.collection_id, f.scope, f.filename, f.document).await?;
     let id = Uuid::now_v7();
     let key = key_of(id, &filename).map_err(DbError::Refused)?;
     let row = sqlx::query_as!(
         FileRow,
         r#"INSERT INTO files (id, tenant_id, collection_id, storage, key, filename, scope,
                               mime_type, filesize, width, height, focal_x, focal_y, blurhash,
-                              names, state, issued_to, issued_key)
+                              names, state, issued_to, issued_key, document_id)
            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,
-                   ARRAY[$6], 'pending', $15, $16)
+                   ARRAY[$6], 'pending', $15, $16, $17)
            RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,
                      height, focal_x, focal_y, blurhash,
                      sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
@@ -163,6 +184,7 @@ pub async fn reserve(
         f.blurhash,
         f.issued_to.map(|(user, _)| user),
         f.issued_to.and_then(|(_, key)| key),
+        f.document,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -172,26 +194,106 @@ pub async fn reserve(
     Ok(row)
 }
 
-/// Marks file `id` live, as a document takes it, and cancels a pending file's cleanup. A
-/// file that's already gone can't be taken again: `Refused`.
-pub async fn go_live_in(tx: &mut PgConnection, id: Uuid) -> Result<(), DbError> {
+/// Locks `ids` (`None`s skipped) for a write that moves a reference between them, in ID
+/// order, so two writes trading files wait for each other instead of deadlocking.
+pub(crate) async fn lock_in(tx: &mut PgConnection, ids: &[Option<Uuid>]) -> Result<(), DbError> {
+    let ids: Vec<Uuid> = ids.iter().flatten().copied().collect();
+    if !ids.is_empty() {
+        sqlx::query!(
+            "SELECT id FROM files WHERE tenant_id = $1 AND id = ANY($2) ORDER BY id FOR UPDATE",
+            DEFAULT_TENANT,
+            &ids,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+    }
+    Ok(())
+}
+
+/// Marks file `id` of `collection_id` live, as a document of that collection takes it, and
+/// cancels a pending file's cleanup. A file that's gone, or another collection's, can't be
+/// taken: `Refused`.
+pub async fn go_live_in(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    id: Uuid,
+) -> Result<(), DbError> {
     // The row lock waits out a `release_in` deciding on it, so this sees what it decided.
-    let was = sqlx::query_scalar!(
-        "SELECT state FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE",
+    let row = sqlx::query!(
+        "SELECT state, collection_id FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE",
         DEFAULT_TENANT,
         id,
     )
     .fetch_optional(&mut *tx)
     .await?
-    .filter(|s| s != "gone")
+    .filter(|r| r.state != "gone")
     .ok_or_else(|| DbError::Refused(format!("the file `{id}` was deleted meanwhile")))?;
-    sqlx::query!("UPDATE files SET state = 'live' WHERE id = $1", id)
-        .execute(&mut *tx)
-        .await?;
-    if was == "pending" {
+    if row.collection_id != collection_id {
+        return Err(DbError::Refused(format!(
+            "the file `{id}` belongs to another collection"
+        )));
+    }
+    sqlx::query!(
+        "UPDATE files SET state = 'live' WHERE tenant_id = $1 AND id = $2",
+        DEFAULT_TENANT,
+        id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if row.state == "pending" {
         jobs::cancel(tx, &format!("{CLEANUP}:{id}")).await?;
     }
     Ok(())
+}
+
+/// Gives the files document `doc` holds (either copy), just taken out of the trash, a free
+/// name again: another live document may have taken theirs meanwhile. A renamed file's
+/// `filename` changes in both copies that hold it. True when one was renamed.
+pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool, DbError> {
+    let held = sqlx::query!(
+        r#"SELECT f.id, f.collection_id, f.scope, f.filename FROM files f
+           JOIN documents d ON f.id IN (d.published_file, d.draft_file)
+           WHERE d.tenant_id = $1 AND d.id = $2
+           ORDER BY f.id"#,
+        DEFAULT_TENANT,
+        doc,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut renamed = false;
+    for f in held {
+        let name = free_name(&mut *tx, f.collection_id, &f.scope, &f.filename, Some(doc)).await?;
+        if name == f.filename {
+            continue;
+        }
+        renamed = true;
+        sqlx::query!(
+            "UPDATE files SET filename = $3, names = array_replace(names, filename, $3)
+             WHERE tenant_id = $1 AND id = $2",
+            DEFAULT_TENANT,
+            f.id,
+            name,
+        )
+        .execute(&mut *tx)
+        .await?;
+        sqlx::query!(
+            r#"UPDATE documents SET
+                   published = CASE WHEN published_file = $3 AND published ? 'filename'
+                                    THEN jsonb_set(published, '{filename}', to_jsonb($4::text))
+                                    ELSE published END,
+                   draft = CASE WHEN draft_file = $3 AND draft ? 'filename'
+                                THEN jsonb_set(draft, '{filename}', to_jsonb($4::text))
+                                ELSE draft END
+               WHERE tenant_id = $1 AND id = $2"#,
+            DEFAULT_TENANT,
+            doc,
+            f.id,
+            name,
+        )
+        .execute(&mut *tx)
+        .await?;
+    }
+    Ok(renamed)
 }
 
 /// Turns each of `candidates` that nothing points at any more `gone`, queuing its cleanup

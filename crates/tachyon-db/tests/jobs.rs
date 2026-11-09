@@ -526,3 +526,22 @@ async fn finished_jobs_are_swept_after_30_days(pool: PgPool) {
     // Only what finished over 30 days ago goes; a recent one and a queued one stay.
     assert_eq!(left, ids[3..]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_default_attempts_match_the_column(pool: PgPool) {
+    let default: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns
+         WHERE table_name = 'jobs' AND column_name = 'max_attempts'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(default, jobs::DEFAULT_ATTEMPTS.to_string());
+    let id = add(&pool, &job(now(), None)).await;
+    let max: i32 = sqlx::query_scalar("SELECT max_attempts FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(max, jobs::DEFAULT_ATTEMPTS);
+}

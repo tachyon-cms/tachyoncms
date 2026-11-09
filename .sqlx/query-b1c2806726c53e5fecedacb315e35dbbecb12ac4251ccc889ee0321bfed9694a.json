@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "INSERT INTO files (id, tenant_id, collection_id, storage, key, filename, scope,\n                              mime_type, filesize, width, height, focal_x, focal_y, blurhash,\n                              names, state, issued_to, issued_key)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n                   ARRAY[$6], 'pending', $15, $16)\n           RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,\n                     height, focal_x, focal_y, blurhash,\n                     sizes AS \"sizes: Json<Map<String, Value>>\", names, state, created_at,\n                     issued_to, issued_key",
+  "query": "INSERT INTO files (id, tenant_id, collection_id, storage, key, filename, scope,\n                              mime_type, filesize, width, height, focal_x, focal_y, blurhash,\n                              names, state, issued_to, issued_key, document_id)\n           VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14,\n                   ARRAY[$6], 'pending', $15, $16, $17)\n           RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,\n                     height, focal_x, focal_y, blurhash,\n                     sizes AS \"sizes: Json<Map<String, Value>>\", names, state, created_at,\n                     issued_to, issued_key",
   "describe": {
     "columns": [
       {
@@ -219,6 +219,7 @@
         "Float4",
         "Text",
         "Uuid",
+        "Uuid",
         "Uuid"
       ]
     },
@@ -243,5 +244,5 @@
       true
     ]
   },
-  "hash": "866b799e840a01ed7cdcda277957d688e66437172c8260d77800de43e931e7c9"
+  "hash": "b1c2806726c53e5fecedacb315e35dbbecb12ac4251ccc889ee0321bfed9694a"
 }

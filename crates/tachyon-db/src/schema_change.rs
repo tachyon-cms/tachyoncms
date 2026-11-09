@@ -901,8 +901,9 @@ async fn prune(
     Ok(n)
 }
 
-/// Refuses turning drafts off while a document's draft isn't what's published, trashed
-/// documents included: there's no way to do it without publishing or losing that work.
+/// Refuses turning drafts off while a document's draft isn't what's published, its data or
+/// its file, trashed documents included: there's no way to do it without publishing or
+/// losing that work.
 async fn check_no_pending_drafts(
     conn: &mut PgConnection,
     collection_id: Uuid,
@@ -911,7 +912,8 @@ async fn check_no_pending_drafts(
         r#"SELECT count(*) AS "n!", count(*) FILTER (WHERE deleted_at IS NOT NULL) AS "trashed!"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2
-             AND (draft IS DISTINCT FROM published OR published IS NULL)"#,
+             AND (draft IS DISTINCT FROM published OR published IS NULL
+                  OR draft_file IS DISTINCT FROM published_file)"#,
         DEFAULT_TENANT,
         collection_id,
     )

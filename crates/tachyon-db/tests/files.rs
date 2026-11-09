@@ -313,7 +313,7 @@ async fn pending_files_expire(pool: PgPool) {
     assert_eq!(payload, json!({"file": f.id}));
 
     let mut tx = pool.begin().await.unwrap();
-    files::go_live_in(&mut tx, f.id).await.unwrap();
+    files::go_live_in(&mut tx, c.id, f.id).await.unwrap();
     tx.commit().await.unwrap();
     assert_eq!(files::get(&pool, f.id).await.unwrap().state, "live");
     let state: String = sqlx::query_scalar("SELECT state FROM jobs WHERE dedupe_key = $1")
@@ -402,7 +402,7 @@ async fn lookups_find_live_files_and_their_holders(pool: PgPool) {
         .await
         .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let refused = files::go_live_in(&mut tx, a.id).await;
+    let refused = files::go_live_in(&mut tx, c.id, a.id).await;
     assert!(matches!(refused, Err(DbError::Refused(_))), "{refused:?}");
 }
 
@@ -477,4 +477,227 @@ async fn schema_changes_keep_file_references(pool: PgPool) {
     assert_eq!(state(&pool, a).await, "gone");
     assert_eq!(cleanups(&pool, a).await, 1);
     assert_eq!(state(&pool, b).await, "live");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn many_clashes_take_the_next_number(pool: PgPool) {
+    let c = seed(&pool).await;
+    for n in 0..50 {
+        let f = reserve(&pool, &c, "image.jpg", "", None).await;
+        let want = match n {
+            0 => "image.jpg".to_owned(),
+            n => format!("image-{n}.jpg"),
+        };
+        assert_eq!(f.filename, want);
+    }
+    // Names that only look numbered don't fill a gap.
+    reserve(&pool, &c, "image-x.jpg", "", None).await;
+    reserve(&pool, &c, "image-7.png", "", None).await;
+    assert_eq!(
+        reserve(&pool, &c, "image.jpg", "", None).await.filename,
+        "image-50.jpg"
+    );
+    // A gap is filled first.
+    sqlx::query("UPDATE files SET state = 'gone' WHERE filename = 'image-3.jpg'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert_eq!(
+        reserve(&pool, &c, "image.jpg", "", None).await.filename,
+        "image-3.jpg"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_retried_replacement_keeps_its_name(pool: PgPool) {
+    let c = seed(&pool).await;
+    let a = reserve(&pool, &c, "a.png", "", None).await.id;
+    let doc = draft_with(&pool, &c, a).await;
+    // The first try's pending file is still there when the replacement is sent again.
+    assert_eq!(
+        reserve(&pool, &c, "a.png", "", Some(doc)).await.filename,
+        "a.png"
+    );
+    assert_eq!(
+        reserve(&pool, &c, "a.png", "", Some(doc)).await.filename,
+        "a.png"
+    );
+    // Anyone else's upload still clashes with both.
+    assert_eq!(
+        reserve(&pool, &c, "a.png", "", None).await.filename,
+        "a-1.png"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_file_stays_in_its_collection(pool: PgPool) {
+    let c = seed(&pool).await;
+    let other: CollectionSchema =
+        serde_json::from_value(json!({"slug": "docs", "upload": true, "fields": []})).unwrap();
+    let other = collections::create(&pool, &other).await.unwrap();
+    let theirs = reserve(&pool, &other, "a.pdf", "", None).await.id;
+    let mut tx = pool.begin().await.unwrap();
+    let refused = documents::insert_in(
+        &mut tx,
+        c.id,
+        c.schema_version,
+        None,
+        DocCopy::Draft,
+        &with_file(FileChange::Set(theirs)),
+        None,
+    )
+    .await;
+    assert!(matches!(refused, Err(DbError::Refused(_))), "{refused:?}");
+    drop(tx);
+    assert_eq!(state(&pool, theirs).await, "pending");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn swapping_files_between_documents_never_deadlocks(pool: PgPool) {
+    let c = seed(&pool).await;
+    let (a, b) = (
+        reserve(&pool, &c, "a.png", "", None).await.id,
+        reserve(&pool, &c, "b.png", "", None).await.id,
+    );
+    let (one, two) = (
+        draft_with(&pool, &c, a).await,
+        draft_with(&pool, &c, b).await,
+    );
+    // Versions hold both files, so neither is ever left without a reference mid-swap.
+    record(&pool, &c, one, DocCopy::Draft).await;
+    record(&pool, &c, two, DocCopy::Draft).await;
+    let swap = |doc: Uuid, file: Uuid| {
+        let (pool, c) = (pool.clone(), c.clone());
+        async move {
+            let mut tx = pool.begin().await?;
+            documents::update_in::<DbError>(
+                &mut tx,
+                c.id,
+                c.schema_version,
+                doc,
+                DocCopy::Draft,
+                None,
+                None,
+                |_| Ok(with_file(FileChange::Set(file))),
+            )
+            .await?;
+            // Holding the locks a moment makes the two overlap.
+            sqlx::query("SELECT pg_sleep(0.01)")
+                .execute(&mut *tx)
+                .await?;
+            tx.commit().await?;
+            Ok::<_, DbError>(())
+        }
+    };
+    for round in 0..20 {
+        let (x, y) = if round % 2 == 0 { (a, b) } else { (b, a) };
+        let (r1, r2) = tokio::join!(swap(one, y), swap(two, x));
+        assert!(r1.is_ok() && r2.is_ok(), "round {round}: {r1:?} {r2:?}");
+    }
+    assert_eq!(
+        (state(&pool, a).await, state(&pool, b).await),
+        ("live".into(), "live".into())
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_draft_with_another_file_is_pending(pool: PgPool) {
+    use tachyon_core::diff::Renames;
+    use tachyon_db::schema_change::{ChangeError, apply};
+    let c = seed(&pool).await;
+    let a = reserve(&pool, &c, "a.png", "", None).await.id;
+    let doc = draft_with(&pool, &c, a).await;
+    publish(&pool, &c, doc).await;
+    // The same JSON, another file.
+    let b = reserve(&pool, &c, "a.png", "", Some(doc)).await.id;
+    set_draft_file(&pool, &c, doc, b).await;
+    let off: CollectionSchema = serde_json::from_value(json!({
+        "slug": "images", "upload": true, "versions": {"maxVersions": 10},
+        "fields": [{"name": "alt", "type": "text"}]
+    }))
+    .unwrap();
+    let refused = apply(&pool, "images", &off, &Renames::new(), true).await;
+    assert!(
+        matches!(refused, Err(ChangeError::PendingDrafts(_))),
+        "{refused:?}"
+    );
+    assert_eq!(doc_files(&pool, doc).await, (Some(a), Some(b)));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_restored_file_is_renumbered_on_a_clash(pool: PgPool) {
+    let c = seed(&pool).await;
+    let named = |file: FileChange| Prepared {
+        file,
+        ..Prepared::plain(
+            json!({"filename": "a.png", "alt": "x"})
+                .as_object()
+                .unwrap()
+                .clone(),
+        )
+    };
+    let a = reserve(&pool, &c, "a.png", "", None).await.id;
+    let mut tx = pool.begin().await.unwrap();
+    let doc = documents::insert_in(
+        &mut tx,
+        c.id,
+        c.schema_version,
+        None,
+        DocCopy::Draft,
+        &named(FileChange::Set(a)),
+        None,
+    )
+    .await
+    .unwrap()
+    .id;
+    tx.commit().await.unwrap();
+    publish(&pool, &c, doc).await;
+    documents::delete(&pool, c.id, doc).await.unwrap();
+
+    // The name is free while it's in the trash.
+    let b = reserve(&pool, &c, "a.png", "", None).await;
+    assert_eq!(b.filename, "a.png");
+    let other = draft_with(&pool, &c, b.id).await;
+
+    let mut tx = pool.begin().await.unwrap();
+    let copies = [
+        (DocCopy::Draft, named(FileChange::Keep)),
+        (DocCopy::Published, named(FileChange::Keep)),
+    ];
+    let restored = documents::restore_in(&mut tx, &c, doc, &copies, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(restored.data["filename"], "a-1.png");
+    let f = files::get(&pool, a).await.unwrap();
+    assert_eq!(
+        (f.filename.as_str(), f.names.clone()),
+        ("a-1.png", vec!["a-1.png".to_owned()])
+    );
+    let (published, draft): (Value, Value) =
+        sqlx::query_as("SELECT published, draft FROM documents WHERE id = $1")
+            .bind(doc)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        (&published["filename"], &draft["filename"]),
+        (&json!("a-1.png"), &json!("a-1.png"))
+    );
+    assert_eq!(published["alt"], "x");
+    assert_eq!(
+        files::get(&pool, b.id).await.unwrap().filename,
+        "a.png",
+        "the other keeps it"
+    );
+    assert_eq!(doc_files(&pool, other).await.1, Some(b.id));
+
+    // Without a clash, a restore keeps the name.
+    documents::delete(&pool, c.id, doc).await.unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    documents::restore_in(&mut tx, &c, doc, &copies, None)
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(files::get(&pool, a).await.unwrap().filename, "a-1.png");
 }

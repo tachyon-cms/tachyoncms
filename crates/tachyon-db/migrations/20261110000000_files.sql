@@ -25,6 +25,9 @@ CREATE TABLE files (
     -- Who may claim a pending file uploaded straight to the bucket: a user, and their key.
     issued_to     uuid,
     issued_key    uuid,
+    -- The document a pending file was uploaded for, when it replaces that document's file:
+    -- its own pending files don't clash with it. Not a foreign key; it's only a hint.
+    document_id   uuid,
     created_at    timestamptz NOT NULL DEFAULT now(),
     released_at   timestamptz,
     FOREIGN KEY (tenant_id, collection_id) REFERENCES collections (tenant_id, id)

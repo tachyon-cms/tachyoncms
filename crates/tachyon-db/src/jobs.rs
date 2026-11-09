@@ -31,6 +31,10 @@ use crate::{DEFAULT_TENANT, DbError, map_unique};
 /// into, before `claim` sweeps it away (Ruling F-3). A finished job holds no version.
 pub const KEEP_FINISHED_DAYS: i32 = 30;
 
+/// How many runs a job gets unless it says otherwise; the `jobs.max_attempts` column's
+/// default too, which a test holds to this.
+pub const DEFAULT_ATTEMPTS: i32 = 5;
+
 /// A job to add. `dedupe_key` names what it's for, such as `publish:<document id>`; a new
 /// one replaces the pending job of the same key.
 pub struct NewJob<'a> {
@@ -43,7 +47,7 @@ pub struct NewJob<'a> {
     pub dedupe_key: Option<String>,
     pub created_by: Option<Uuid>,
     pub key_id: Option<Uuid>,
-    /// How many runs it gets; `None` takes the column's default, 5.
+    /// How many runs it gets; `None` is `DEFAULT_ATTEMPTS`.
     pub max_attempts: Option<i32>,
 }
 
@@ -103,7 +107,7 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
         r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
                              state, dedupe_key, created_by, key_id, max_attempts)
            VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10,
-                   COALESCE($11, 5))"#,
+                   $11)"#,
         id,
         DEFAULT_TENANT,
         job.kind,
@@ -114,7 +118,7 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
         job.dedupe_key,
         job.created_by,
         job.key_id,
-        job.max_attempts,
+        job.max_attempts.unwrap_or(DEFAULT_ATTEMPTS),
     )
     .execute(&mut *conn)
     .await
