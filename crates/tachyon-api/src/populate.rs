@@ -629,6 +629,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let b = collections::create(&pool, &schema(json!({"slug": "b", "fields": []})))
             .await

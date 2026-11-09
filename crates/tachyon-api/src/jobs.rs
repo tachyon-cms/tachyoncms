@@ -7,12 +7,15 @@
 //! the document can't deadlock with the job's row. It must never call
 //! `jobs::heartbeat`, which would wait forever on the row `complete_in` locked.
 //! A long handler calls `jobs::heartbeat` at least every third of `LEASE`, stops when that
-//! returns false, and calls `jobs::complete_in` only at the end.
+//! returns false, and calls `jobs::complete_in` only at the end. `keep_leased` does the
+//! heartbeats, on a connection of its own; drop what it returns before `complete_in`.
 
 use std::collections::BTreeSet;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
 use std::time::Duration;
 
+use serde_json::Value;
 use tachyon_db::jobs::{self, Job};
 use uuid::Uuid;
 
@@ -69,6 +72,74 @@ impl RunningJobs {
 pub(crate) enum JobError {
     Retry(String),
     Permanent(String),
+    /// Permanent, with the answer to keep for whoever waits on the job.
+    Failed {
+        error: String,
+        result: Value,
+    },
+}
+
+/// A long handler's lease, kept until this drops (see `keep_leased`).
+pub(crate) struct Leased {
+    beating: tokio::task::JoinHandle<()>,
+    lost: Arc<AtomicBool>,
+}
+
+impl Leased {
+    /// A heartbeat found the lease gone: another worker took the job over, or it was
+    /// cancelled. The handler should stop, as its run can no longer complete.
+    pub(crate) fn lost(&self) -> bool {
+        self.lost.load(Ordering::Relaxed)
+    }
+}
+
+impl Drop for Leased {
+    fn drop(&mut self) {
+        self.beating.abort();
+    }
+}
+
+/// Keeps `job`'s lease for a long handler: a heartbeat now, then every third of `lease`
+/// until the returned guard drops or one finds the lease gone. All of them run on one
+/// connection taken first, so a busy pool can't starve them past the lease. Without a
+/// connection to spare it's a `Retry`, before any work.
+pub(crate) async fn keep_leased(
+    state: &AppState,
+    job: &Job,
+    lease: Duration,
+) -> Result<Leased, JobError> {
+    let mut conn =
+        state.pool.acquire().await.map_err(|e| {
+            JobError::Retry(format!("no connection to keep the job's lease on: {e}"))
+        })?;
+    let lost = Arc::new(AtomicBool::new(false));
+    // The first one here, so a run that already lost the job stops before its work.
+    match jobs::heartbeat(&mut *conn, job, lease).await {
+        Ok(held) => lost.store(!held, Ordering::Relaxed),
+        Err(e) => return Err(JobError::Retry(e.to_string())),
+    }
+    let (flag, job, state) = (lost.clone(), job.clone(), state.clone());
+    let beating = tokio::spawn(async move {
+        let every = lease / 3;
+        let mut beats = tokio::time::interval_at(tokio::time::Instant::now() + every, every);
+        beats.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        while !flag.load(Ordering::Relaxed) {
+            beats.tick().await;
+            match jobs::heartbeat(&mut *conn, &job, lease).await {
+                Ok(held) => flag.store(!held, Ordering::Relaxed),
+                // The next one may get through before the lease runs out, on a fresh
+                // connection if this one has died.
+                Err(error) => {
+                    tracing::warn!(job = %job.id, %error, "couldn't extend a job's lease");
+                    if let Ok(fresh) = state.pool.acquire().await {
+                        conn.close_on_drop();
+                        conn = fresh;
+                    }
+                }
+            }
+        }
+    });
+    Ok(Leased { beating, lost })
 }
 
 /// Starts `config.workers` workers, each its own task, until the pool closes.
@@ -115,14 +186,15 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
         })
         .await
     };
-    let (error, retry) = match outcome {
+    let (error, retry, result) = match outcome {
         Ok(Ok(())) => return,
-        Ok(Err(JobError::Retry(e))) => (e, true),
-        Ok(Err(JobError::Permanent(e))) => (e, false),
-        Err(_) => ("the job's handler panicked".to_owned(), true),
+        Ok(Err(JobError::Retry(e))) => (e, true, None),
+        Ok(Err(JobError::Permanent(e))) => (e, false, None),
+        Ok(Err(JobError::Failed { error, result })) => (error, false, Some(result)),
+        Err(_) => ("the job's handler panicked".to_owned(), true, None),
     };
     tracing::warn!(job = %job.id, kind = %job.kind, attempt = job.attempts, %error, retry, "job failed");
-    if let Err(e) = jobs::fail(&state.pool, &job, &error, retry).await {
+    if let Err(e) = jobs::fail_with(&state.pool, &job, &error, retry, result.as_ref()).await {
         // Its lease runs out, and the job is claimed again.
         tracing::warn!(job = %job.id, error = %e, "couldn't record a job's failure");
     }
@@ -131,6 +203,9 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
 async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
     match job.kind.as_str() {
         "publish" | "unpublish" => crate::schedule::run(state, job).await,
+        crate::collections::SCHEMA_CHANGE | crate::collections::SCHEMA_PREVIEW => {
+            crate::collections::run_job(state, job).await
+        }
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]
@@ -143,6 +218,7 @@ async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
 mod tests {
     use serde_json::json;
     use sqlx::PgPool;
+    use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
     use tachyon_db::jobs::NewJob;
     use time::OffsetDateTime;
 
@@ -236,12 +312,115 @@ mod tests {
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_long_run_keeps_its_lease_until_it_lets_go(pool: PgPool) {
+        let lease = Duration::from_millis(600);
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let held = keep_leased(&state, &job, lease).await.unwrap();
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&pool, lease).await.unwrap().is_none(),
+            "still leased three leases on"
+        );
+        drop(held);
+        tokio::time::sleep(lease * 2).await;
+        let taken = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        assert_eq!(
+            (taken.id, taken.attempts),
+            (job.id, 2),
+            "taken over once let go"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_lease_is_kept_while_the_pool_is_full(
+        opts: PgPoolOptions,
+        connect: PgConnectOptions,
+    ) {
+        let lease = Duration::from_millis(600);
+        let pool = opts
+            .max_connections(2)
+            .acquire_timeout(Duration::from_secs(10))
+            .connect_with(connect.clone())
+            .await
+            .unwrap();
+        // Another server's workers, which the full pool doesn't hold up.
+        let other = PgPool::connect_with(connect).await.unwrap();
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let _held = keep_leased(&state, &job, lease).await.unwrap();
+        let mut busy = Vec::new();
+        while let Ok(Ok(conn)) =
+            tokio::time::timeout(Duration::from_millis(200), pool.acquire()).await
+        {
+            busy.push(conn);
+        }
+        assert_eq!(busy.len(), 1, "the heartbeats hold the other connection");
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&other, lease).await.unwrap().is_none(),
+            "still leased with the pool full"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_lease_is_kept_when_its_connection_dies(
+        opts: PgPoolOptions,
+        connect: PgConnectOptions,
+    ) {
+        let lease = Duration::from_millis(600);
+        let pool = opts
+            .max_connections(2)
+            .connect_with(connect.clone())
+            .await
+            .unwrap();
+        let other = PgPool::connect_with(connect).await.unwrap();
+        add(&pool, "test", OffsetDateTime::now_utc()).await;
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
+            auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
+        };
+        let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        let _held = keep_leased(&state, &job, lease).await.unwrap();
+        // Ends every connection but this one, the heartbeats' included.
+        let mut killer = other.acquire().await.unwrap();
+        sqlx::query(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity
+             WHERE datname = current_database() AND pid <> pg_backend_pid()",
+        )
+        .execute(&mut *killer)
+        .await
+        .unwrap();
+        drop(killer);
+        tokio::time::sleep(lease * 3).await;
+        assert!(
+            jobs::claim(&other, lease).await.unwrap().is_none(),
+            "still leased after the heartbeats' connection died"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn a_dropped_run_leaves_its_handler_listed(pool: PgPool) {
         let id = add(&pool, "test-hang", OffsetDateTime::now_utc()).await;
         let state = AppState {
             pool: pool.clone(),
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let job = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
         let running = RunningJobs::default();

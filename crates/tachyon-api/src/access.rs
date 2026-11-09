@@ -1361,6 +1361,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let viewer = builtin_roles()[3].2.clone();
         let principal = Principal::User {
@@ -1421,6 +1422,7 @@ mod tests {
             pool: pool.clone(),
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: crate::collections::INLINE_ROWS,
         };
         let principal = Principal::User {
             identity: Identity {
