@@ -10,6 +10,7 @@ use crate::schema::{
     BLOCK_ROW_KEYS, BlockDef, BlockSource, CollectionSchema, Field, FieldKind, RelationTo,
     SchemaError, data_fields,
 };
+use crate::uploads::Upload;
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`. A path
 /// into a `blocks` field names the block type: `{"layout.hero.heading": "title"}`.
@@ -51,6 +52,13 @@ pub enum Change {
     VersionsChanged {
         drafts: (bool, bool),
         max_versions: (u32, u32),
+    },
+    /// An upload collection's files change: its `imageSizes` (the sizes made from each
+    /// file), whether it has a focal point, or it stops holding files (`removed`).
+    UploadChanged {
+        sizes: bool,
+        focal_point: bool,
+        removed: bool,
     },
     /// A virtual field went. It stored nothing, so nothing is lost.
     VirtualRemoved {
@@ -128,10 +136,9 @@ pub fn diff(
         )));
     }
     // Compare what's stored, not how the admin arranges it.
-    let old_data = data_fields(&old.fields);
-    let new_data = data_fields(&new.fields);
+    let (old_data, new_data) = (old.data(), new.data());
     for from in renames.keys() {
-        if field_at(&old_data, from).is_none() {
+        if field_at(old_data, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
@@ -140,8 +147,8 @@ pub fn diff(
     let mut changes = Vec::new();
     let mut links = Vec::new();
     compare(
-        &old_data,
-        &new_data,
+        old_data,
+        new_data,
         "",
         "",
         renames,
@@ -151,9 +158,14 @@ pub fn diff(
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
     }
+    let upload = upload_change(old.uploads(), new.uploads());
+    let upload_options = upload.is_none() && old.upload != new.upload;
+    changes.extend(upload);
     if old.default_populate != new.default_populate
         || old.access != new.access
         || old.labels != new.labels
+        || old.folders != new.folders
+        || upload_options
     {
         changes.push(Change::CollectionOptionsChanged);
     }
@@ -165,6 +177,24 @@ pub fn diff(
         });
     }
     Ok(SchemaDiff { changes, links })
+}
+
+/// What changes for the files an upload collection holds, if anything does.
+fn upload_change(old: Option<&Upload>, new: Option<&Upload>) -> Option<Change> {
+    let old = old?;
+    let (sizes, focal_point, removed) = match new {
+        None => (!old.image_sizes.is_empty(), old.focal_point, true),
+        Some(new) => (
+            old.image_sizes != new.image_sizes,
+            old.focal_point != new.focal_point,
+            false,
+        ),
+    };
+    (sizes || focal_point || removed).then_some(Change::UploadChanged {
+        sizes,
+        focal_point,
+        removed,
+    })
 }
 
 fn compare(
@@ -211,7 +241,10 @@ fn compare(
                 )));
             }
             out.push(
-                if o.virtual_path.is_some() || matches!(o.kind, FieldKind::Join { .. }) {
+                if o.virtual_path.is_some()
+                    || o.computed
+                    || matches!(o.kind, FieldKind::Join { .. })
+                {
                     Change::VirtualRemoved { path: old_path }
                 } else {
                     Change::Removed {
@@ -240,7 +273,7 @@ fn compare(
             continue;
         }
         // A stored field turned virtual: what it stored goes.
-        if o.virtual_path.is_none() && n.virtual_path.is_some() {
+        if o.virtual_path.is_none() && !o.computed && (n.virtual_path.is_some() || n.computed) {
             out.push(Change::TypeChanged {
                 path: new_path,
                 from: o.kind.name(),
@@ -742,7 +775,10 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
     // Virtual values are read on the way out, never stored.
     obj.retain(|key, _| {
         fields.iter().any(|f| {
-            &f.name == key && f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. })
+            &f.name == key
+                && f.virtual_path.is_none()
+                && !f.computed
+                && !matches!(f.kind, FieldKind::Join { .. })
         })
     });
     for f in fields {
@@ -1748,5 +1784,84 @@ mod tests {
         .unwrap();
         let mut doc = json!({"l": null}).as_object().unwrap().clone();
         assert!(!relink(&[], &mut doc, &d.links), "null isn't a link");
+    }
+
+    #[test]
+    fn upload_change_is_reported() {
+        let media = |upload: Value| {
+            schema(json!({"slug": "media", "upload": upload, "fields": [
+                {"name": "alt", "type": "text"}]}))
+        };
+        let changes = |old: &CollectionSchema, new: &CollectionSchema| {
+            diff(old, new, &Renames::new()).unwrap().changes
+        };
+        let one = media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}]}));
+        let two = media(json!({"imageSizes": [{"name": "thumbnail", "width": 400},
+            {"name": "card", "width": 768}]}));
+        let c = changes(&one, &two);
+        assert!(
+            c.contains(&Change::UploadChanged {
+                sizes: true,
+                focal_point: false,
+                removed: false
+            }),
+            "{c:?}"
+        );
+        assert!(
+            c.contains(&Change::Added {
+                path: "sizes.card".into(),
+                kind: "group"
+            }),
+            "{c:?}"
+        );
+        let c = changes(
+            &one,
+            &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
+            "focalPoint": false})),
+        );
+        assert_eq!(
+            c,
+            [Change::UploadChanged {
+                sizes: false,
+                focal_point: true,
+                removed: false
+            }]
+        );
+        // Other upload options change no stored data.
+        let c = changes(
+            &one,
+            &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
+            "mimeTypes": ["image/*"]})),
+        );
+        assert_eq!(c, [Change::CollectionOptionsChanged]);
+        // Turning uploads off removes the built-in fields too.
+        let off = media(Value::Bool(false));
+        let d = diff(&one, &off, &Renames::new()).unwrap();
+        assert!(d.changes.contains(&Change::UploadChanged {
+            sizes: true,
+            focal_point: true,
+            removed: true
+        }));
+        assert!(d.changes.contains(&Change::Removed {
+            path: "filename".into(),
+            kind: "text"
+        }));
+        assert!(
+            d.changes
+                .contains(&Change::VirtualRemoved { path: "url".into() })
+        );
+        assert!(d.is_destructive());
+        // A stored `url` that becomes the built-in one loses what it stored.
+        let own_url = schema(json!({"slug": "media", "fields": [{"name": "url", "type": "text"}]}));
+        let with_upload = schema(json!({"slug": "media", "upload": true,
+            "fields": [{"name": "url", "type": "text"}]}));
+        assert!(
+            changes(&own_url, &with_upload).contains(&Change::TypeChanged {
+                path: "url".into(),
+                from: "text",
+                to: "virtual"
+            })
+        );
+        assert_eq!(changes(&one, &one), []);
     }
 }

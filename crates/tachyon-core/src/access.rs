@@ -558,7 +558,9 @@ impl Checker<'_> {
                             .into(),
                     ));
                 }
-                let written = f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. });
+                let written = f.virtual_path.is_none()
+                    && !f.computed
+                    && !matches!(f.kind, FieldKind::Join { .. });
                 for (action, rule) in [
                     ("read", &a.read),
                     ("create", &a.create),
@@ -725,10 +727,9 @@ pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3
             if peers.iter().any(|f| is_list(f)) {
                 answer[2] = answer[2] && updatable(&next, caller);
             }
-            if peers
-                .iter()
-                .any(|f| matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some())
-            {
+            if peers.iter().any(|f| {
+                matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some() || f.computed
+            }) {
                 (answer[1], answer[2]) = (false, false);
             }
             out.push((path.clone(), answer));
@@ -827,7 +828,7 @@ pub fn has_blocks(fields: &[Field]) -> bool {
 
 /// `schema` with only the fields the caller can read.
 pub fn readable_schema(schema: &CollectionSchema, caller: &Caller) -> CollectionSchema {
-    schema.with_fields(readable_fields(schema.data(), caller).into_owned())
+    schema.with_data(readable_fields(schema.data(), caller).into_owned())
 }
 
 /// Removes every field the caller can't read from `doc` of `fields` (data fields), at any

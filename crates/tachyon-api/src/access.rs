@@ -361,7 +361,7 @@ impl Access {
                 Shape {
                     named: match readable_fields(fields, &caller) {
                         Cow::Borrowed(_) => None,
-                        Cow::Owned(fields) => Some(Arc::new(c.schema.with_fields(fields))),
+                        Cow::Owned(fields) => Some(Arc::new(c.schema.with_data(fields))),
                     },
                     rows: match readable_rows(fields, &caller) {
                         Cow::Borrowed(_) => None,

@@ -188,6 +188,10 @@ pub fn merged(
 fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Value>) {
     for (key, value) in input {
         let field = fields.iter().find(|f| &f.name == key);
+        // Computed on read: what a caller sends back from a read isn't stored.
+        if field.is_some_and(|f| f.computed) {
+            continue;
+        }
         match (field.map(|f| &f.kind), value, doc.get_mut(key)) {
             (_, Value::Null, _) => {
                 doc.remove(key);
@@ -279,7 +283,7 @@ pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
 }
 
 fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
-    obj.retain(|_, v| !v.is_null());
+    obj.retain(|k, v| !v.is_null() && !fields.iter().any(|f| f.computed && &f.name == k));
     for f in fields {
         if let Some(v) = obj.get_mut(&f.name) {
             strip_nulls(f, v);

@@ -12,8 +12,16 @@ pub const DRAFTS_RESERVED_FIELD_NAME: &str = "publishedAt";
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
-    "access", "admin", "auth", "blocks", "globals", "media", "search", "graphql", "plugins",
+    "access",
+    "admin",
+    "auth",
+    "blocks",
+    "globals",
+    "search",
+    "graphql",
+    "plugins",
     "setup",
+    "upload-instructions",
 ];
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -39,6 +47,12 @@ pub struct CollectionSchema {
     /// the published one. `true` turns it on with the defaults.
     #[serde(default, deserialize_with = "versions_flag")]
     pub versions: Option<Versions>,
+    /// The collection holds files: `true` with the defaults, or upload options. See `uploads`.
+    #[serde(default, with = "upload_flag", skip_serializing_if = "Option::is_none")]
+    pub upload: Option<crate::uploads::Upload>,
+    /// Documents can be filed in folders.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folders: bool,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -56,6 +70,8 @@ impl PartialEq for CollectionSchema {
             &self.labels,
             &self.url,
             &self.versions,
+            &self.upload,
+            self.folders,
         ) == (
             &other.slug,
             other.kind,
@@ -65,7 +81,36 @@ impl PartialEq for CollectionSchema {
             &other.labels,
             &other.url,
             &other.versions,
+            &other.upload,
+            other.folders,
         )
+    }
+}
+
+/// `upload` as a flag or as options. Options equal to the defaults are written back as
+/// `true`, which means the same.
+mod upload_flag {
+    use crate::uploads::Upload;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use serde_json::Value;
+
+    pub fn serialize<S: Serializer>(u: &Option<Upload>, s: S) -> Result<S::Ok, S::Error> {
+        match u {
+            None => s.serialize_bool(false),
+            Some(u) if *u == Upload::default() => s.serialize_bool(true),
+            Some(u) => u.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Upload>, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Null | Value::Bool(false) => Ok(None),
+            Value::Bool(true) => Ok(Some(Upload::default())),
+            v @ Value::Object(_) => Upload::deserialize(v).map(Some).map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "upload is true, false or an object of upload options",
+            )),
+        }
     }
 }
 
@@ -188,6 +233,10 @@ pub struct Field {
     /// Read through a relationship instead of stored, such as `author.name`.
     #[serde(default, rename = "virtual")]
     pub virtual_path: Option<String>,
+    /// Filled on read by the server, such as an upload's `url`: never stored, and dropped
+    /// from what a write sends. Only built-in fields are; a schema can't ask for it.
+    #[serde(skip)]
+    pub computed: bool,
     /// Who may read and write this field; see `access`.
     #[serde(default)]
     pub access: Option<crate::access::FieldAccess>,
@@ -593,6 +642,7 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             virtual_path: None,
+                            computed: false,
                             access: None,
                             kind: FieldKind::Group {
                                 fields: flatten(&tab.fields),
@@ -1197,10 +1247,21 @@ impl CollectionSchema {
         self.versions.is_some()
     }
 
-    /// The data shape (see `data_fields`), worked out once per schema.
+    /// The upload options, when the collection holds files.
+    pub fn uploads(&self) -> Option<&crate::uploads::Upload> {
+        self.upload.as_ref()
+    }
+
+    /// The data shape (see `data_fields`), with the built-in upload fields when the
+    /// collection holds files, worked out once per schema.
     pub fn data(&self) -> &[Field] {
-        self.data
-            .get_or_init(|| data_fields(&self.fields).into_owned())
+        self.data.get_or_init(|| {
+            let data = data_fields(&self.fields);
+            match &self.upload {
+                Some(u) => crate::uploads::upload_fields(u, &data),
+                None => data.into_owned(),
+            }
+        })
     }
 
     /// This schema with other fields, such as only those a caller may read.
@@ -1214,8 +1275,18 @@ impl CollectionSchema {
             labels: self.labels.clone(),
             url: self.url.clone(),
             versions: self.versions.clone(),
+            upload: self.upload.clone(),
+            folders: self.folders,
             data: OnceLock::new(),
         }
+    }
+
+    /// This schema with `data` as its data fields as they are, such as only those a caller
+    /// may read: built-in fields `data` leaves out stay out.
+    pub fn with_data(&self, data: Vec<Field>) -> Self {
+        let s = self.with_fields(data.clone());
+        s.data.set(data).expect("a new schema has no data yet");
+        s
     }
 
     /// Every join field, with how to find its documents.
@@ -1485,11 +1556,15 @@ impl CollectionSchema {
 
     /// Checks the schema is usable before it's stored.
     pub fn check(&self) -> Result<(), SchemaError> {
+        // Reserved first: `upload-instructions` isn't a valid slug either, but reserved says why.
+        if RESERVED_SLUGS.contains(&self.slug.as_str()) {
+            return Err(SchemaError::ReservedSlug(self.slug.clone()));
+        }
         if !is_identifier(&self.slug, false) {
             return Err(SchemaError::InvalidSlug(self.slug.clone()));
         }
-        if RESERVED_SLUGS.contains(&self.slug.as_str()) {
-            return Err(SchemaError::ReservedSlug(self.slug.clone()));
+        if let Some(u) = &self.upload {
+            self.check_upload(u)?;
         }
         if self.url.is_some() && self.kind != CollectionKind::Collection {
             return Err(SchemaError::InvalidOption(
@@ -1563,6 +1638,31 @@ impl CollectionSchema {
         Ok(())
     }
 
+    fn check_upload(&self, u: &crate::uploads::Upload) -> Result<(), SchemaError> {
+        let bad = |m: &str| Err(SchemaError::InvalidOption(format!("upload: {m}")));
+        match self.kind {
+            CollectionKind::Block => return bad("a shared block has no documents to hold files"),
+            CollectionKind::Global => return bad("only collections can hold files"),
+            CollectionKind::Collection if self.slug == "users" => {
+                return bad("users can't hold files; make an upload collection and link to it");
+            }
+            CollectionKind::Collection => {}
+        }
+        for f in data_fields(&self.fields).iter() {
+            if let Some(kind) = crate::uploads::built_in_kind(u, &f.name)
+                && (f.kind.name() != kind || f.virtual_path.is_some())
+            {
+                return Err(SchemaError::InvalidField {
+                    field: f.name.clone(),
+                    message: format!(
+                        "is built in to upload collections as a {kind} field; it can take a label, admin options and access rules, not another type"
+                    ),
+                });
+            }
+        }
+        crate::uploads::check(u, self.data()).map_err(SchemaError::InvalidOption)
+    }
+
     fn check_url(&self, url: &str) -> Result<(), SchemaError> {
         let bad = |m: String| Err(SchemaError::InvalidOption(format!("url: {m}")));
         let mut unknown = None;
@@ -1576,7 +1676,7 @@ impl CollectionSchema {
             let virtual_field = self
                 .data()
                 .iter()
-                .any(|f| f.name == name && f.virtual_path.is_some());
+                .any(|f| f.name == name && (f.virtual_path.is_some() || f.computed));
             return bad(match virtual_field {
                 true => format!("`{{{name}}}` is virtual; a url needs a stored text or slug field"),
                 false => format!("`{{{name}}}` must name a top-level text or slug field"),
@@ -1602,6 +1702,7 @@ impl CollectionSchema {
         self.data().iter().find(|f| {
             f.name == name
                 && f.virtual_path.is_none()
+                && !f.computed
                 && matches!(f.kind, FieldKind::Text { .. } | FieldKind::Slug { .. })
         })
     }
@@ -1619,10 +1720,9 @@ impl CollectionSchema {
 
     /// The text that names `doc`: its first stored top-level text field.
     pub fn title_of(&self, doc: &Map<String, Value>) -> Option<String> {
-        let f = self
-            .data()
-            .iter()
-            .find(|f| f.virtual_path.is_none() && matches!(f.kind, FieldKind::Text { .. }))?;
+        let f = self.data().iter().find(|f| {
+            f.virtual_path.is_none() && !f.computed && matches!(f.kind, FieldKind::Text { .. })
+        })?;
         Some(doc.get(&f.name)?.as_str()?.to_owned())
     }
 
@@ -1699,6 +1799,9 @@ impl CollectionSchema {
     /// before parsing `input`; unknown keys are left to `reject_unknown_options`.
     pub fn check_option_types(input: &Value) -> Result<(), SchemaError> {
         let bad = |m: &str| Err(SchemaError::InvalidOption(m.into()));
+        if let Some(u) = input.get("upload") {
+            crate::uploads::check_raw(u).map_err(SchemaError::InvalidOption)?;
+        }
         let versions = match input.get("versions") {
             None | Some(Value::Null | Value::Bool(_)) => return Ok(()),
             Some(Value::Object(v)) => v,
@@ -1736,10 +1839,18 @@ impl CollectionSchema {
     /// misspelt `maxLenght`. Every option this model understands survives a round trip,
     /// so anything missing after re-serialising is unknown.
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
-        let known = serde_json::to_value(self).expect("schemas always serialize");
+        let mut known = serde_json::to_value(self).expect("schemas always serialize");
+        // Written only when on, but `false` is a known value too.
+        known["upload"] = match &self.upload {
+            Some(u) => serde_json::to_value(u).expect("upload options always serialize"),
+            None => Value::Bool(false),
+        };
+        known["folders"] = Value::Bool(self.folders);
         unknown_key(input, &known, "")?;
-        if let Some(v) = input.get("versions") {
-            unknown_deep(v, &known["versions"], "versions")?;
+        for option in ["versions", "upload"] {
+            if let Some(v) = input.get(option) {
+                unknown_deep(v, &known[option], option)?;
+            }
         }
         unknown_in_fields(&self.fields, input.get("fields"), "fields")
     }
@@ -1761,6 +1872,12 @@ fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaEr
 /// `path`. Where `known` holds a flag for an object given as input (`"drafts": true` for
 /// `{}`), that object's keys are all unknown.
 fn unknown_deep(input: &Value, known: &Value, path: &str) -> Result<(), SchemaError> {
+    if let (Value::Array(input), Value::Array(known)) = (input, known) {
+        for (i, (v, k)) in input.iter().zip(known).enumerate() {
+            unknown_deep(v, k, &format!("{path}.{i}"))?;
+        }
+        return Ok(());
+    }
     let Value::Object(input) = input else {
         return Ok(());
     };
@@ -2083,7 +2200,7 @@ fn field_steps<'a>(
     Some(steps)
 }
 
-fn is_identifier(s: &str, allow_upper: bool) -> bool {
+pub(crate) fn is_identifier(s: &str, allow_upper: bool) -> bool {
     let ok = |c: char| c.is_ascii_lowercase() || (allow_upper && c.is_ascii_uppercase());
     let mut chars = s.chars();
     s.len() <= 64
@@ -4053,5 +4170,350 @@ mod tests {
         assert!(!s.versioned());
         assert_eq!(s.reject_unknown_options(&off), Ok(()));
         assert_eq!(schema(serde_json::to_value(&s).unwrap()), s);
+    }
+
+    #[test]
+    fn upload_option_parses_and_round_trips() {
+        use crate::uploads::{
+            Fit, ImageFormat, PasteUrl, Position as Crop, SkipSafeFetch, Upload, UrlPattern,
+        };
+        let on = json!({"slug": "media", "upload": true, "fields": []});
+        let s = schema(on.clone());
+        assert_eq!(s.uploads(), Some(&Upload::default()));
+        assert_eq!(s.reject_unknown_options(&on), Ok(()));
+        assert_eq!(CollectionSchema::check_option_types(&on), Ok(()));
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(serde_json::to_value(&s).unwrap()["upload"], json!(true));
+        assert_eq!(s.to_compact_json()["upload"], json!(true));
+        assert_eq!(schema(s.to_compact_json()), s);
+        // Off is written back as nothing.
+        let plain = schema(json!({"slug": "posts", "upload": false, "fields": []}));
+        assert_eq!(plain.uploads(), None);
+        let compact = plain.to_compact_json();
+        assert!(compact.get("upload").is_none() && compact.get("folders").is_none());
+        assert_ne!(plain, s);
+
+        let every = json!({"slug": "media", "folders": true, "fields": [
+            {"name": "alt", "type": "text"}
+        ], "upload": {
+            "storage": "s3", "mimeTypes": ["image/*", "application/pdf"],
+            "filesizeLimit": 5_000_000,
+            "imageSizes": [
+                {"name": "thumbnail", "width": 400, "height": 300, "fit": "inside",
+                 "position": "center", "withoutEnlargement": true,
+                 "formatOptions": {"format": "webp", "options": {"quality": 80}},
+                 "crop": "left top"},
+                {"name": "card", "width": 768}
+            ],
+            "adminThumbnail": "thumbnail", "crop": false, "focalPoint": false,
+            "formatOptions": {"format": "jpg", "options": {"quality": 90, "progressive": true}},
+            "resizeOptions": {"width": 2000, "fit": "contain", "position": "north"},
+            "trimOptions": {"background": "#fff", "threshold": 10},
+            "withMetadata": true,
+            "constructorOptions": {"limitInputPixels": 1_000_000, "failOn": "error"},
+            "staticDir": "media", "disableLocalStorage": true,
+            "filesRequiredOnCreate": false, "filenameCompoundIndex": ["filename", "alt"],
+            "pasteURL": {"allowList": [{"protocol": "https", "hostname": "example.com",
+                "port": "443", "pathname": "/img/*", "search": ""}]},
+            "skipSafeFetch": [{"hostname": "localhost"}],
+            "allowRestrictedFileTypes": true, "bulkUpload": true, "displayPreview": true,
+            "hideFileInputOnCreate": true, "hideRemoveFile": true, "cacheTags": true,
+            "modifyResponseHeaders": {"X-Robots-Tag": "noindex"}
+        }});
+        assert_eq!(CollectionSchema::check_option_types(&every), Ok(()));
+        let s = schema(every.clone());
+        assert_eq!(s.reject_unknown_options(&every), Ok(()));
+        assert_eq!(s.check(), Ok(()));
+        assert!(s.folders);
+        let u = s.uploads().unwrap();
+        assert_eq!(u.storage, "s3");
+        assert_eq!(u.image_sizes[0].fit, Fit::Inside);
+        assert_eq!(u.image_sizes[0].position, Crop::Centre);
+        assert_eq!(u.image_sizes[0].crop, Some(Crop::LeftTop));
+        assert_eq!(u.image_sizes[1].fit, Fit::Cover);
+        assert_eq!(u.format_options.as_ref().unwrap().format, ImageFormat::Jpeg);
+        assert_eq!(u.resize_options.as_ref().unwrap().position, Crop::Top);
+        assert_eq!(
+            u.skip_safe_fetch,
+            SkipSafeFetch::AllowList(vec![UrlPattern {
+                protocol: None,
+                hostname: "localhost".into(),
+                port: None,
+                pathname: None,
+                search: None,
+            }])
+        );
+        assert!(matches!(&u.paste_url, PasteUrl::AllowList(l) if l[0].hostname == "example.com"));
+        let again = schema(s.to_compact_json());
+        assert_eq!(again, s);
+        assert_eq!(again.reject_unknown_options(&s.to_compact_json()), Ok(()));
+
+        let off = schema(json!({"slug": "media", "upload": {"pasteURL": false}, "fields": []}));
+        assert_eq!(off.uploads().unwrap().paste_url, PasteUrl::Off);
+        assert_eq!(off.to_compact_json()["upload"]["pasteURL"], json!(false));
+        assert_eq!(schema(off.to_compact_json()), off);
+
+        // Unknown keys are named by their path, at any depth.
+        for (upload, want) in [
+            (json!({"sizesx": []}), "upload: unknown option `sizesx`"),
+            (
+                json!({"imageSizes": [{"name": "t", "width": 1, "kernel": "x"}]}),
+                "upload.imageSizes.0: unknown option `kernel`",
+            ),
+            (
+                json!({"constructorOptions": {"sequentialRead": true}}),
+                "upload.constructorOptions: unknown option `sequentialRead`",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "a.com", "x": 1}]}}),
+                "upload.pasteURL.allowList.0: unknown option `x`",
+            ),
+        ] {
+            let input = json!({"slug": "media", "fields": [], "upload": upload});
+            assert_eq!(
+                CollectionSchema::check_option_types(&input),
+                Ok(()),
+                "{input}"
+            );
+            assert_eq!(
+                schema(input.clone())
+                    .reject_unknown_options(&input)
+                    .unwrap_err()
+                    .to_string(),
+                want
+            );
+        }
+        // Sharp-only values and bad shapes are refused by path, before parsing.
+        for (upload, want) in [
+            (
+                json!({"constructorOptions": {"limitInputPixels": false}}),
+                "upload.constructorOptions.limitInputPixels: ",
+            ),
+            (
+                json!({"imageSizes": [{"name": "t", "width": 1, "position": "attention"}]}),
+                "upload.imageSizes.0.position: `attention`",
+            ),
+            (
+                json!({"resizeOptions": {"position": "entropy"}}),
+                "upload.resizeOptions.position: ",
+            ),
+            (
+                json!({"imageSizes": [{"name": "t", "fit": "squash"}]}),
+                "upload: unknown variant `squash`",
+            ),
+            (json!("yes"), "upload: must be true, false or an object"),
+        ] {
+            let input = json!({"slug": "media", "fields": [], "upload": upload});
+            let err = CollectionSchema::check_option_types(&input)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with(want), "{err}");
+        }
+
+        // Rules `check` applies.
+        let refused = |v: Value| schema(v).check().unwrap_err().to_string();
+        for (v, want) in [
+            (
+                json!({"slug": "site", "kind": "global", "upload": true, "fields": []}),
+                "upload: only collections",
+            ),
+            (
+                json!({"slug": "cta", "kind": "block", "upload": true, "fields": []}),
+                "upload: a shared block",
+            ),
+            (
+                json!({"slug": "users", "upload": true, "fields": []}),
+                "upload: users can't",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "width": 1}, {"name": "a", "height": 1}]}, "fields": []}),
+                "upload.imageSizes.1.name: `a` is used by another size",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a-b", "width": 1}]}, "fields": []}),
+                "upload.imageSizes.0.name: `a-b` must start",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a"}]}, "fields": []}),
+                "upload.imageSizes.0: needs a width",
+            ),
+            (
+                json!({"slug": "media", "upload": {"adminThumbnail": "thumb"}, "fields": []}),
+                "upload.adminThumbnail: `thumb`",
+            ),
+            (
+                json!({"slug": "media", "upload": {"filenameCompoundIndex": ["url"]}, "fields": []}),
+                "upload.filenameCompoundIndex.0: `url`",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"Content-Type": "text/html"}}, "fields": []}),
+                "upload.modifyResponseHeaders.Content-Type: the server sets",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"SET-COOKIE": "a=b"}}, "fields": []}),
+                "upload.modifyResponseHeaders.SET-COOKIE: the server sets",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"X-A": "a\r\nSet-Cookie: b"}}, "fields": []}),
+                "upload.modifyResponseHeaders.X-A: a header value",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"X A": "a"}}, "fields": []}),
+                "upload.modifyResponseHeaders.X A: isn't a valid header name",
+            ),
+        ] {
+            let err = refused(v);
+            assert!(err.starts_with(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn built_in_fields_merge_and_cant_be_retyped() {
+        let s = schema(json!({"slug": "media",
+        "upload": {"imageSizes": [{"name": "thumbnail", "width": 400}]},
+        "fields": [
+            {"name": "alt", "type": "text", "required": true},
+            {"type": "row", "fields": [
+                {"name": "filename", "type": "text", "label": "File name", "maxLength": 3}
+            ]}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let names: Vec<&str> = s.data().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "alt",
+                "filename",
+                "mimeType",
+                "filesize",
+                "width",
+                "height",
+                "focalX",
+                "focalY",
+                "url",
+                "thumbnailURL",
+                "sizes",
+                "blurhash"
+            ]
+        );
+        let filename = &s.data()[1];
+        assert_eq!(filename.label.as_deref(), Some("File name"));
+        assert_eq!(filename.kind.name(), "text");
+        assert!(filename.admin.read_only && !filename.computed);
+        // The built-in's own options win: a filename isn't cut to 3 characters.
+        assert!(matches!(
+            filename.kind,
+            FieldKind::Text {
+                max_length: None,
+                ..
+            }
+        ));
+        let at = |path: &str| find_field(s.data(), path).unwrap_or_else(|| panic!("{path}"));
+        assert!(at("url").computed && at("thumbnailURL").computed);
+        assert!(at("sizes.thumbnail.url").computed);
+        assert!(at("sizes.thumbnail.formats.webp.url").computed);
+        assert!(!at("sizes.thumbnail.formats.avif.filesize").computed);
+        assert_eq!(at("focalX").default, Some(json!(50)));
+        assert!(matches!(
+            at("focalY").kind,
+            FieldKind::Number {
+                min: Some(0.0),
+                max: Some(100.0),
+                ..
+            }
+        ));
+        // Readable data that leaves a built-in out keeps it out.
+        let cut: Vec<Field> = s
+            .data()
+            .iter()
+            .filter(|f| f.name != "filename")
+            .cloned()
+            .collect();
+        assert!(s.with_data(cut).data().iter().all(|f| f.name != "filename"));
+
+        // Computed values are dropped from a write, at any depth, and never filtered on.
+        let stored = crate::validate_document(
+            s.data(),
+            &json!({
+                "alt": "A cat", "url": "/x", "thumbnailURL": "/y", "filename": "cat.png",
+                "sizes": {"thumbnail": {"url": "/z", "width": 400,
+                    "formats": {"webp": {"url": "/w", "width": 400}}}}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            Value::Object(stored),
+            json!({
+                "alt": "A cat", "filename": "cat.png", "focalX": 50, "focalY": 50,
+                "sizes": {"thumbnail": {"width": 400, "formats": {"webp": {"width": 400}}}}
+            })
+        );
+        let migrated = crate::diff::migrate_document(
+            s.data(),
+            &Default::default(),
+            json!({"alt": "a", "url": "/x"}).as_object().unwrap(),
+        );
+        assert!(!migrated.contains_key("url"));
+        for path in ["url", "sizes.thumbnail.url"] {
+            let filter = crate::query::parse_filter(s.data(), &json!({path: {"equals": "/x"}}));
+            assert!(
+                filter
+                    .unwrap_err()
+                    .to_string()
+                    .contains("worked out when it's read"),
+                "{path}"
+            );
+            assert!(crate::query::parse_sort(s.data(), path).is_err(), "{path}");
+        }
+        // A `url` placed first still isn't the title: it isn't stored.
+        let url_first = schema(json!({"slug": "media", "upload": true, "fields": [
+            {"name": "url", "type": "text", "label": "Link"}]}));
+        assert!(url_first.data()[0].computed);
+        assert_eq!(
+            url_first.title_of(
+                json!({"url": "/x", "filename": "a.png"})
+                    .as_object()
+                    .unwrap()
+            ),
+            Some("a.png".into())
+        );
+
+        // A built-in field keeps its type.
+        for f in [
+            json!({"name": "filename", "type": "number"}),
+            json!({"name": "sizes", "type": "json"}),
+            json!({"name": "url", "type": "text", "virtual": "author.name"}),
+        ] {
+            let name = f["name"].as_str().unwrap().to_owned();
+            let err = schema(json!({"slug": "media", "upload": true, "fields": [f]}))
+                .check()
+                .unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::InvalidField { field, message }
+                if *field == name && message.contains("built in to upload collections")),
+                "{err}"
+            );
+        }
+        // Without `upload`, those names are a collection's own.
+        assert_eq!(
+            schema(json!({"slug": "posts", "fields": [
+            {"name": "filename", "type": "number"}]}))
+            .check(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reserved_slugs_moved() {
+        assert_eq!(
+            schema(json!({"slug": "media", "fields": []})).check(),
+            Ok(())
+        );
+        assert_eq!(
+            schema(json!({"slug": "upload-instructions", "fields": []})).check(),
+            Err(SchemaError::ReservedSlug("upload-instructions".into()))
+        );
+        assert!(!RESERVED_SLUGS.contains(&"folders"));
     }
 }

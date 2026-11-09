@@ -87,6 +87,19 @@ fn changes(p: &Preview) -> String {
             Change::CollectionOptionsChanged => "update collection options".to_owned(),
             Change::VersionsChanged { .. } => "update versions and drafts".to_owned(),
             Change::VirtualRemoved { path } => format!("remove {path} (it stored nothing)"),
+            Change::UploadChanged { removed: true, .. } => {
+                "stop holding files, deleting every file's details".to_owned()
+            }
+            Change::UploadChanged {
+                sizes, focal_point, ..
+            } => {
+                let what = match (sizes, focal_point) {
+                    (true, true) => "image sizes and focal point",
+                    (true, false) => "image sizes",
+                    _ => "focal point",
+                };
+                format!("change the {what} of uploaded files")
+            }
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")
             }

@@ -9,6 +9,7 @@ pub mod query;
 pub mod richtext;
 pub mod schema;
 pub mod select;
+pub mod uploads;
 pub mod validate;
 pub mod virtuals;
 

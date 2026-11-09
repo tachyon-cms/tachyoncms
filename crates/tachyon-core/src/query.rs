@@ -654,6 +654,11 @@ fn resolve(
         let rest = segments[i + 1..].join(".");
         let last = rest.is_empty();
         match &f.kind {
+            _ if f.computed => {
+                return Err(format!(
+                    "`{full}` is worked out when it's read, so it can't be filtered or sorted by"
+                ));
+            }
             _ if last && f.virtual_path.is_some() => {
                 let source = f.virtual_path.as_deref().expect("checked above");
                 let root = Scope {
