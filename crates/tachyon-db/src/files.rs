@@ -490,6 +490,28 @@ pub async fn expire(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
     Ok(done.rows_affected() == 1)
 }
 
+/// Gives up pending file `id`, reserved by a write that then failed: it turns `gone`, so
+/// nothing can take it, and its cleanup is due now instead of after the grace. False when
+/// it wasn't pending.
+pub async fn abandon(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
+    let mut tx = pool.begin().await?;
+    let done = sqlx::query!(
+        "UPDATE files SET state = 'gone', released_at = now()
+         WHERE tenant_id = $1 AND id = $2 AND state = 'pending'",
+        DEFAULT_TENANT,
+        id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    if done.rows_affected() == 0 {
+        return Ok(false);
+    }
+    // `enqueue` replaces the queued cleanup that `reserve` made.
+    jobs::enqueue(&mut tx, &cleanup(id, OffsetDateTime::now_utc())).await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
 /// Deletes gone file `id`'s row, its objects deleted, unless something points at it again.
 /// The delete locks the row: call it before the cleanup job's `complete_in` (a file before
 /// its jobs, the order `release_in` and `go_live_in` take them).

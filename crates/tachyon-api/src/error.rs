@@ -18,7 +18,10 @@ pub enum ApiError {
     Unauthorized(String),
     /// Credentials that work, for someone who may not do this.
     Forbidden(String),
-    BodyTooLarge,
+    /// Says what was over which limit, in bytes.
+    BodyTooLarge(String),
+    /// A file of a type this collection doesn't take; says what it looked like.
+    UnsupportedMediaType(String),
     /// The request ran past its time limit.
     Timeout,
     Conflict(String),
@@ -95,10 +98,16 @@ impl ApiError {
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
             Self::Unauthorized(d) => (StatusCode::UNAUTHORIZED, "Unauthorized", Some(d), None),
             Self::Forbidden(d) => (StatusCode::FORBIDDEN, "Forbidden", Some(d), None),
-            Self::BodyTooLarge => (
+            Self::BodyTooLarge(d) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Content too large",
-                Some("the request body is over 10 MB".to_owned()),
+                Some(d),
+                None,
+            ),
+            Self::UnsupportedMediaType(d) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Unsupported media type",
+                Some(d),
                 None,
             ),
             Self::Timeout => (

@@ -9,12 +9,15 @@ mod globals;
 mod jobs;
 mod joins;
 mod media_jobs;
+#[cfg(test)]
+mod multipart_fuzz;
 mod params;
 mod populate;
 mod request_id;
 mod schedule;
 mod schemas;
 mod trash;
+mod uploads;
 mod versions;
 
 use std::collections::BTreeMap;
@@ -26,7 +29,7 @@ use std::any::Any;
 
 use axum::Router;
 use axum::extract::{DefaultBodyLimit, Request, State};
-use axum::http::HeaderValue;
+use axum::http::{HeaderValue, Method};
 use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{delete, get, post, put};
@@ -247,15 +250,59 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         auth::principal::resolve,
     ));
     jobs::spawn_workers(state.clone(), &options.jobs);
-    Ok(layers(routes, Duration::from_secs(30)).with_state(state))
+    let limits = TimeLimits {
+        normal: Duration::from_secs(30),
+        uploads: state.media.timeout,
+    };
+    Ok(layers(routes, limits).with_state(state))
+}
+
+/// How long a request may take: `uploads` for one that may carry a file or waits for its
+/// sizes, `normal` for the rest.
+#[derive(Debug, Clone, Copy)]
+struct TimeLimits {
+    normal: Duration,
+    uploads: Duration,
+}
+
+/// The first segments after `/api/` that aren't a collection's documents.
+const NOT_DOCUMENTS: &[&str] = &["access", "admin", "auth", "globals", "setup", "users"];
+
+/// Whether `req` gets the upload time limit: a multipart create or update of a document, or
+/// any request with `?wait=true`.
+fn takes_upload_time(req: &Request) -> bool {
+    let wait = req
+        .uri()
+        .query()
+        .is_some_and(|q| q.split('&').any(|p| p == "wait=true"));
+    let multipart = req
+        .headers()
+        .get(axum::http::header::CONTENT_TYPE)
+        .and_then(|v| v.to_str().ok())
+        .is_some_and(|v| {
+            v.trim_start()
+                .to_ascii_lowercase()
+                .starts_with("multipart/form-data")
+        });
+    let parts: Vec<&str> = req
+        .uri()
+        .path()
+        .strip_prefix("/api/")
+        .map(|p| p.split('/').collect())
+        .unwrap_or_default();
+    let document = match (req.method(), parts.as_slice()) {
+        (&Method::POST, [c]) | (&Method::PATCH, [c, _]) => !NOT_DOCUMENTS.contains(c),
+        _ => false,
+    };
+    wait || (multipart && document)
 }
 
 /// What every route sits behind: a body limit, a time limit and a panic guard, all answering
 /// in problem+json with the request's ID. Outermost last.
-fn layers<S: Clone + Send + Sync + 'static>(routes: Router<S>, limit: Duration) -> Router<S> {
+fn layers<S: Clone + Send + Sync + 'static>(routes: Router<S>, limit: TimeLimits) -> Router<S> {
     routes
         .fallback(|| async { ApiError::NotFound })
-        .layer(DefaultBodyLimit::max(10 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(documents::JSON_LIMIT))
         .layer(CatchPanicLayer::custom(|panic: Box<dyn Any + Send>| {
             let message = panic
                 .downcast_ref::<&str>()
@@ -281,7 +328,12 @@ async fn add_security_headers(mut response: Response) -> Response {
     response
 }
 
-async fn time_limit(State(limit): State<Duration>, req: Request, next: Next) -> Response {
+async fn time_limit(State(limits): State<TimeLimits>, req: Request, next: Next) -> Response {
+    let limit = if takes_upload_time(&req) {
+        limits.uploads
+    } else {
+        limits.normal
+    };
     tokio::time::timeout(limit, next.run(req))
         .await
         .unwrap_or_else(|_| ApiError::Timeout.into_response())
@@ -298,10 +350,14 @@ mod tests {
     use tower::ServiceExt;
 
     async fn call(app: Router, uri: &str) -> (StatusCode, String, Value) {
-        let res = app
-            .oneshot(Request::get(uri).body(Body::empty()).unwrap())
-            .await
-            .unwrap();
+        call_with(app, Request::get(uri)).await
+    }
+
+    async fn call_with(
+        app: Router,
+        req: axum::http::request::Builder,
+    ) -> (StatusCode, String, Value) {
+        let res = app.oneshot(req.body(Body::empty()).unwrap()).await.unwrap();
         let status = res.status();
         let kind = res
             .headers()
@@ -335,7 +391,54 @@ mod tests {
                     "unreachable"
                 }),
             );
-        layers(routes, Duration::from_millis(50))
+        let slow = || async {
+            tokio::time::sleep(Duration::from_millis(300)).await;
+            "late"
+        };
+        let routes = routes
+            .route("/api/{collection}", post(slow).get(slow))
+            .route("/api/{collection}/{id}", axum::routing::patch(slow))
+            .route("/api/globals/{slug}", axum::routing::patch(slow));
+        let limits = TimeLimits {
+            normal: Duration::from_millis(50),
+            uploads: Duration::from_secs(5),
+        };
+        layers(routes, limits)
+    }
+
+    #[tokio::test]
+    async fn uploads_get_the_upload_time_limit() {
+        let multipart = "multipart/form-data; boundary=x";
+        for (method, uri, kind, status) in [
+            ("POST", "/api/images", multipart, StatusCode::OK),
+            ("PATCH", "/api/images/1", multipart, StatusCode::OK),
+            ("GET", "/api/images?depth=0&wait=true", "", StatusCode::OK),
+            (
+                "POST",
+                "/api/images",
+                "application/json",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "GET",
+                "/api/images?wait=truly",
+                "",
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "PATCH",
+                "/api/globals/site",
+                multipart,
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let mut req = Request::builder().method(method).uri(uri);
+            if !kind.is_empty() {
+                req = req.header("content-type", kind);
+            }
+            let (got, _, _) = call_with(app(), req).await;
+            assert_eq!(got, status, "{method} {uri} {kind}");
+        }
     }
 
     #[tokio::test]

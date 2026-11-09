@@ -2,10 +2,10 @@
 
 use axum::Json;
 use axum::extract::rejection::{JsonRejection, PathRejection};
-use axum::extract::{Path, RawQuery, State};
+use axum::extract::{Path, RawQuery, Request, State};
 use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 
 use tachyon_core::auth::Action;
@@ -16,9 +16,9 @@ use tachyon_core::{CollectionKind, FieldError, merged, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
-use tachyon_db::documents::{self, Document};
+use tachyon_db::documents::{self, Document, FileChange};
 use tachyon_db::indexes::{IndexKind, index_name};
-use tachyon_db::query::{self, ListQuery, get_many_readable};
+use tachyon_db::query::{self, ListQuery, Readable, get_many_readable};
 use tachyon_db::versions::record_version;
 use uuid::Uuid;
 
@@ -28,6 +28,10 @@ use crate::params::{Format, Joins, autosave_param, list_params, no_params, read_
 use crate::populate::{
     Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
     to_value, vouched_links,
+};
+use crate::uploads::{
+    Incoming, UploadBody, check_and_process, file_limit, focal_of, persist, refuse_server_set,
+    require_file, scope_of, server_fields, taken_or_abandoned, with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -99,10 +103,15 @@ pub(crate) fn parse_id(id: &str) -> Result<Uuid, ApiError> {
     id.parse().map_err(|_| ApiError::NotFound)
 }
 
+/// The most a JSON body, or a `_payload`, may hold.
+pub(crate) const JSON_LIMIT: usize = 10 * 1024 * 1024;
+
 pub(crate) fn json_body(body: Result<Json<Value>, JsonRejection>) -> Result<Value, ApiError> {
     body.map(|Json(v)| v).map_err(|e| {
         if e.status() == StatusCode::PAYLOAD_TOO_LARGE {
-            ApiError::BodyTooLarge
+            ApiError::BodyTooLarge(format!(
+                "the request body is over {JSON_LIMIT} bytes (10 MiB)"
+            ))
         } else {
             ApiError::BadRequest(e.body_text())
         }
@@ -238,7 +247,7 @@ pub async fn create(
     access: Access,
     path: Result<Path<String>, PathRejection>,
     RawQuery(raw): RawQuery,
-    body: Result<Json<Value>, JsonRejection>,
+    req: Request,
 ) -> Result<(StatusCode, Json<Value>), ApiError> {
     let Path(slug) = path.map_err(|_| ApiError::NotFound)?;
     let c = collection(&state, &slug)?;
@@ -248,22 +257,55 @@ pub async fn create(
     }
     no_params(raw.as_deref())?;
     let copy = access.write_copy(&c)?;
-    let mut body = json_body(body)?;
+    // Read only now, so a caller who may not create never gets a byte spooled.
+    let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
+    let (mut body, file) = match body {
+        UploadBody::Json(v) => (v, None),
+        UploadBody::Upload { payload, file } => (payload, Some(file)),
+    };
+    let hide = |e, body: &Value| access.hide(&c, e, Some(&merged(c.schema.data(), body, None)));
+    refuse_server_set(&c, &body, None).map_err(|e| hide(e, &body))?;
+    require_file(&c, file.is_some())?;
+    let checked = match (&c.schema.upload, file) {
+        (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
+        _ => None,
+    };
     from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
     let targets = link_targets(&state, &c).await?;
-    let prepared = validate_document_in(mode_for(copy), c.schema.data(), &body, None)
+    // Checked as the document will be, server-set fields and all, before anything is stored.
+    let would = checked
+        .as_ref()
+        .map(|(u, f)| server_fields(u, f, &f.spool.name));
+    let input = with_fields(&body, would.as_ref());
+    let mut prepared = validate_document_in(mode_for(copy), c.schema.data(), &input, None)
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &c, data))
-        .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &body, None))))?;
+        .map_err(|e| hide(e, &input))?;
     check_links(&state, &access, &prepared, &[]).await?;
+    let stored = match &checked {
+        Some((u, f)) => {
+            let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
+            Some(persist(&state, &c, u, f, &scope, focal, None).await?)
+        }
+        None => None,
+    };
+    if let Some(s) = &stored {
+        prepared.data.extend(s.fields.clone());
+        prepared.file = FileChange::Set(s.file.id);
+    }
     let by = access.actor(Action::Create, &c).map(|a| a.id);
-    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
-        .await
-        .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
-    record(&mut tx, &c, &doc, copy, by, false).await?;
-    tx.commit().await.map_err(DbError::from)?;
+    let doc = taken_or_abandoned(&state, stored.as_ref(), async {
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
+            .await
+            .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+        record(&mut tx, &c, &doc, copy, by, false).await?;
+        // Where the file's sizes will be queued: in the transaction that takes it.
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(doc)
+    })
+    .await?;
     Ok((
         StatusCode::CREATED,
         respond(&state, &access, c, &doc, copy, 1).await?,
@@ -319,7 +361,7 @@ pub async fn update(
     access: Access,
     path: Result<Path<(String, String)>, PathRejection>,
     RawQuery(raw): RawQuery,
-    body: Result<Json<Value>, JsonRejection>,
+    req: Request,
 ) -> Result<Json<Value>, ApiError> {
     let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
     // Checked again later; here so a key's 403 comes before a malformed ID's 404.
@@ -332,47 +374,98 @@ pub async fn update(
     let guard = access
         .write_guard(&state.pool, Action::Update, &c, id)
         .await?;
-    let mut patch = json_body(body)?;
+    let actor = access.actor(Action::Update, &c);
+    // The lock checks again; this is so that a file is never read for nothing.
+    if let Some(a) = actor.filter(|a| a.own_only) {
+        let mine = Readable {
+            filter: None,
+            copy,
+            owner: Some(a.id),
+            otherwise: None,
+        };
+        let one = HashMap::from([(c.id, mine)]);
+        if get_many_readable(&state.pool, &[id], &one)
+            .await?
+            .is_empty()
+        {
+            return Err(DbError::NotOwner.into());
+        }
+    }
+    // Read only now, so a caller who may not change this document never gets a byte spooled.
+    let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
+    let (mut patch, file) = match body {
+        UploadBody::Json(v) => (v, None),
+        UploadBody::Upload { payload, file } => (payload, Some(file)),
+    };
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
     let stored = documents::get(&state.pool, c.id, id, copy).await?.data.0;
+    refuse_server_set(&c, &patch, Some(&stored))
+        .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, Some(&stored)))))?;
+    let checked = match (&c.schema.upload, file) {
+        (Some(u), Some(Incoming::Spooled(spool))) => Some((u, check_and_process(u, spool)?)),
+        _ => None,
+    };
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     let targets = link_targets(&state, &c).await?;
-    let apply = |current: &Map<String, Value>| {
+    // Validated with the server-set fields the file brings; those are written in after, as
+    // they are, `null`s included.
+    let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
         access.writes(&c, &patch, Action::Update, Some(current))?;
-        validate_document_in(mode_for(copy), c.schema.data(), &patch, Some(current))
+        let input = with_fields(&patch, fields);
+        let mut next = validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))
             .map_err(ApiError::Validation)
             .and_then(|data| prepare(&targets, &c, data))
             .map_err(|e| {
-                let doc = merged(c.schema.data(), &patch, Some(current));
+                let doc = merged(c.schema.data(), &input, Some(current));
                 access.hide(&c, e, Some(&doc))
-            })
+            })?;
+        next.data.extend(fields.cloned().unwrap_or_default());
+        Ok::<_, ApiError>(next)
     };
+    let would = checked
+        .as_ref()
+        .map(|(u, f)| server_fields(u, f, &f.spool.name));
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
-    let vouched = check_links(&state, &access, &apply(&stored)?, &link_ids(&c, &stored)).await?;
-    let actor = access.actor(Action::Update, &c);
-    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let doc = documents::update_in(
-        &mut tx,
-        c.id,
-        c.schema_version,
-        id,
-        copy,
-        actor,
-        guard.as_ref(),
-        |current| {
-            let next = apply(current)?;
-            vouched_links(&next, &link_ids(&c, current), &vouched)?;
-            Ok(next)
-        },
-    )
-    .await
-    .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
-    record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
-    tx.commit().await.map_err(DbError::from)?;
+    let dry = apply(&stored, would.as_ref())?;
+    let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
+    let saved = match &checked {
+        Some((u, f)) => {
+            let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));
+            Some(persist(&state, &c, u, f, &scope, focal, Some(id)).await?)
+        }
+        None => None,
+    };
+    let doc = taken_or_abandoned(&state, saved.as_ref(), async {
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        let doc = documents::update_in(
+            &mut tx,
+            c.id,
+            c.schema_version,
+            id,
+            copy,
+            actor,
+            guard.as_ref(),
+            |current| {
+                let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
+                vouched_links(&next, &link_ids(&c, current), &vouched)?;
+                if let Some(s) = &saved {
+                    next.file = FileChange::Set(s.file.id);
+                }
+                Ok(next)
+            },
+        )
+        .await
+        .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
+        record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
+        // Where the file's sizes will be queued: in the transaction that takes it.
+        tx.commit().await.map_err(DbError::from)?;
+        Ok(doc)
+    })
+    .await?;
     respond(&state, &access, c, &doc, copy, 1).await
 }
 
