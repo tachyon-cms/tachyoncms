@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "UPDATE documents\n           SET published = CASE WHEN $6 THEN published ELSE $4::jsonb END,\n               draft = CASE WHEN $6 THEN $4::jsonb ELSE draft END,\n               published_updated_at = CASE WHEN $6 THEN published_updated_at ELSE now() END,\n               updated_at = now(), updated_by = COALESCE($5, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3\n           RETURNING id, status, created_at, updated_at,\n                     CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,\n                     CASE WHEN $6 THEN draft ELSE published END AS \"data!: Json<Map<String, Value>>\"",
+  "query": "UPDATE documents\n           SET published = NULL, published_file = NULL, status = 'draft', published_at = NULL,\n               updated_at = now(), updated_by = COALESCE($4, updated_by)\n           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n             AND draft IS NOT NULL\n           RETURNING id, status, created_at, updated_at, published_at, deleted_at,\n                     draft AS \"data!: Json<Map<String, Value>>\"",
   "describe": {
     "columns": [
       {
@@ -51,7 +51,12 @@
         "ordinal": 4,
         "name": "published_at",
         "type_info": "Timestamptz",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_at"
+          }
+        }
       },
       {
         "ordinal": 5,
@@ -68,7 +73,12 @@
         "ordinal": 6,
         "name": "data!: Json<Map<String, Value>>",
         "type_info": "Jsonb",
-        "origin": "Expression"
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "draft"
+          }
+        }
       }
     ],
     "parameters": {
@@ -76,9 +86,7 @@
         "Uuid",
         "Uuid",
         "Uuid",
-        "Jsonb",
-        "Uuid",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
@@ -86,10 +94,10 @@
       false,
       false,
       false,
-      null,
       true,
-      null
+      true,
+      true
     ]
   },
-  "hash": "ff726b878bf0faea75dfde167cab51b0b6bfa004f62cd2edb251c020fe2d0ea8"
+  "hash": "c912be3eb6f7f7cbde0e6e26d2896522ecbf571b2c31c6fb7687e167f2f80a95"
 }

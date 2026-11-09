@@ -31,6 +31,7 @@ async fn enqueue(pool: &PgPool) -> Uuid {
         dedupe_key: None,
         created_by: None,
         key_id: None,
+        max_attempts: None,
     };
     jobs::enqueue(&mut pool.acquire().await.unwrap(), &job)
         .await

@@ -15,7 +15,7 @@ use tachyon_core::{CollectionKind, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
-use tachyon_db::documents::{self, Document};
+use tachyon_db::documents::{self, Document, FileChange, Prepared};
 use tachyon_db::versions;
 use uuid::Uuid;
 
@@ -274,10 +274,10 @@ async fn restore_version(
     }
     no_params(raw.as_deref())?;
     let drafts = access.versions_of(&state.pool, c, d.id).await?;
-    let data = stored_version(state, &d, &vid, drafts)
-        .await?
-        .data
-        .unwrap_or_default();
+    let v = stored_version(state, &d, &vid, drafts).await?;
+    // The copy gets the version's stored file back too.
+    let file = v.file_id.map_or(FileChange::Clear, FileChange::Set);
+    let data = v.data.unwrap_or_default();
     let copy = access.write_copy(c)?;
     let guard = match d.global() {
         true => access.global_guard(c)?,
@@ -298,6 +298,7 @@ async fn restore_version(
         )
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
+        .map(|p| Prepared { file, ..p })
         .map_err(|e| access.hide(c, e, Some(&next)))
     };
     let vouched = check_links(state, access, &apply(&stored)?, &link_ids(c, &stored)).await?;

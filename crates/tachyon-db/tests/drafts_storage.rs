@@ -5,7 +5,7 @@ use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::diff::Renames;
 use tachyon_core::query::{Filter, Target, parse_filter_with, parse_query};
-use tachyon_db::documents::{self, Prepared, Relation};
+use tachyon_db::documents::{self, FileChange, Prepared, Relation};
 use tachyon_db::query::{self, JoinQuery, ListQuery, Readable};
 use tachyon_db::schema_change::{ChangeError, apply};
 use tachyon_db::{DEFAULT_TENANT, DbError, DocCopy, collections};
@@ -77,10 +77,20 @@ async fn post(pool: &PgPool, s: &Seed, title: &str, author: Uuid) -> Uuid {
         collection_id: s.authors,
         id: author,
     }];
-    documents::insert(pool, s.posts, 1, None, &Prepared { data, relations })
-        .await
-        .unwrap()
-        .id
+    documents::insert(
+        pool,
+        s.posts,
+        1,
+        None,
+        &Prepared {
+            data,
+            relations,
+            file: FileChange::Keep,
+        },
+    )
+    .await
+    .unwrap()
+    .id
 }
 
 async fn copies(pool: &PgPool, id: Uuid) -> (Option<Value>, Option<Value>) {
@@ -582,9 +592,19 @@ async fn notes(pool: &PgPool, s: &Seed, links: &[(&str, Uuid)]) -> (Uuid, Collec
             collection_id: s.posts,
             id: *to,
         }];
-        documents::insert(pool, c, 1, None, &Prepared { data, relations })
-            .await
-            .unwrap();
+        documents::insert(
+            pool,
+            c,
+            1,
+            None,
+            &Prepared {
+                data,
+                relations,
+                file: FileChange::Keep,
+            },
+        )
+        .await
+        .unwrap();
     }
     (c, schema)
 }
@@ -837,7 +857,11 @@ async fn owner_narrows_reads(pool: PgPool) {
             s.posts,
             1,
             None,
-            &Prepared { data, relations },
+            &Prepared {
+                data,
+                relations,
+                file: FileChange::Keep,
+            },
             Some(by),
         )
         .await
@@ -986,6 +1010,7 @@ async fn draft_writes_leave_the_published_copy_alone(pool: PgPool) {
             collection_id: s.authors,
             id: author,
         }],
+        file: FileChange::Keep,
     };
     let mut tx = pool.begin().await.unwrap();
     let doc = documents::insert_in(

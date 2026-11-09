@@ -337,6 +337,7 @@ async fn queue(
             Principal::Key { key, .. } => Some(*key),
             _ => None,
         },
+        max_attempts: None,
     };
     let mut conn = state.pool.acquire().await.map_err(DbError::from)?;
     let id = match jobs::add(&mut conn, &job).await {
@@ -600,6 +601,7 @@ mod tests {
             dedupe_key: Some("schema:posts".into()),
             created_by: Some(user),
             key_id: None,
+            max_attempts: None,
         };
         let id = jobs::add(&mut pool.acquire().await.unwrap(), &new)
             .await

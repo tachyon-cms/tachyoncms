@@ -37,7 +37,7 @@ async fn snapshot(pool: &PgPool) -> Value {
     let mut all = serde_json::Map::new();
     for table in TABLES {
         let rows: Value = sqlx::query_scalar(sqlx::AssertSqlSafe(format!(
-            "SELECT coalesce(jsonb_agg(to_jsonb(t) - 'copy' - 'published_updated_at' ORDER BY to_jsonb(t)::text), '[]')
+            "SELECT coalesce(jsonb_agg(to_jsonb(t) - 'copy' - 'published_updated_at' - 'published_file' - 'draft_file' ORDER BY to_jsonb(t)::text), '[]')
              FROM {table} t"
         )))
         .fetch_one(pool)
@@ -195,6 +195,13 @@ async fn drafts_migration_upgrades_a_filled_database(pool: PgPool) {
         .await
         .unwrap();
     assert_eq!(drafts, 0);
+    let with_files: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM documents WHERE published_file IS NOT NULL OR draft_file IS NOT NULL",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(with_files, 0, "nothing held a file before uploads");
 
     // A version or job naming the post under another collection is refused (23503 is a
     // foreign key violation).

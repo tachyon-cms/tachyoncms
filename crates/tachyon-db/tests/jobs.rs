@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::json;
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
-use tachyon_db::documents::{self, Prepared};
+use tachyon_db::documents::{self, FileChange, Prepared};
 use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_db::{DbError, collections};
 use time::OffsetDateTime;
@@ -21,6 +21,7 @@ fn job(run_at: OffsetDateTime, key: Option<&str>) -> NewJob<'static> {
         dedupe_key: key.map(str::to_owned),
         created_by: None,
         key_id: None,
+        max_attempts: None,
     }
 }
 
@@ -68,6 +69,7 @@ async fn enqueue_replaces_pending_by_key(pool: PgPool) {
     let prepared = Prepared {
         data: serde_json::Map::new(),
         relations: Vec::new(),
+        file: FileChange::Keep,
     };
     let doc = documents::insert(&pool, posts, 1, None, &prepared)
         .await

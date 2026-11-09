@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE files f SET state = 'gone', released_at = now()\n           WHERE f.tenant_id = $1 AND f.id = ANY($2) AND f.state = 'live'\n             AND NOT EXISTS (SELECT 1 FROM documents d\n                             WHERE d.published_file = f.id OR d.draft_file = f.id)\n             AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.file_id = f.id)\n           RETURNING f.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1e918a2fe33e7335bd84d13beb684955004c1c7e60a0f9b2961ce82ca294c46a"
+}

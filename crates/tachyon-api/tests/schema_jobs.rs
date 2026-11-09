@@ -369,6 +369,7 @@ async fn the_job_route_shows_only_schema_jobs_to_schema_admins(pool: PgPool) {
         dedupe_key: None,
         created_by: None,
         key_id: None,
+        max_attempts: None,
     };
     let other = jobs::enqueue(&mut pool.acquire().await.unwrap(), &schedule)
         .await
@@ -467,6 +468,7 @@ async fn a_job_that_failed_without_an_answer_still_has_one(pool: PgPool) {
         dedupe_key: None,
         created_by: None,
         key_id: None,
+        max_attempts: None,
     };
     let mut conn = pool.acquire().await.unwrap();
     // Nobody queued it, so it fails on its first run.

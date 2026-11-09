@@ -6,7 +6,7 @@ use tachyon_core::CollectionSchema;
 use tachyon_core::diff::Renames;
 use tachyon_db::DocCopy;
 use tachyon_db::collections;
-use tachyon_db::documents::{self, Prepared, Relation};
+use tachyon_db::documents::{self, FileChange, Prepared, Relation};
 use tachyon_db::schema_change::{ChangeError, apply, preview};
 use uuid::Uuid;
 
@@ -63,10 +63,20 @@ async fn seed(pool: &PgPool) -> Seed {
         collection_id: authors,
         id: ann,
     }];
-    let post = documents::insert(pool, posts_id, 1, None, &Prepared { data, relations })
-        .await
-        .unwrap()
-        .id;
+    let post = documents::insert(
+        pool,
+        posts_id,
+        1,
+        None,
+        &Prepared {
+            data,
+            relations,
+            file: FileChange::Keep,
+        },
+    )
+    .await
+    .unwrap()
+    .id;
     Seed {
         posts: posts_id,
         post,

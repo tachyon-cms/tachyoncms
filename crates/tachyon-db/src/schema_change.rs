@@ -858,7 +858,7 @@ async fn prune(
     // The same rows either way; counting stays a plain SELECT, so a preview runs on a
     // read-only transaction or a replica.
     let n = if delete {
-        sqlx::query!(
+        let dropped: Vec<Option<Uuid>> = sqlx::query_scalar!(
             r#"DELETE FROM versions WHERE id IN (
                    SELECT id FROM (
                        SELECT id, row_number() OVER (
@@ -868,16 +868,18 @@ async fn prune(
                    WHERE n > $3 AND NOT EXISTS (
                        SELECT 1 FROM jobs j
                        WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
-                         AND j.payload->>'version' = ranked.id::text))"#,
+                         AND j.payload->>'version' = ranked.id::text))
+               RETURNING file_id"#,
             DEFAULT_TENANT,
             collection_id,
             keep,
         )
-        .execute(&mut *conn)
-        .await?
-        .rows_affected()
-        .try_into()
-        .unwrap_or(i64::MAX)
+        .fetch_all(&mut *conn)
+        .await?;
+        let n = dropped.len().try_into().unwrap_or(i64::MAX);
+        let files: Vec<Uuid> = dropped.into_iter().flatten().collect();
+        crate::files::release_in(conn, &files).await?;
+        n
     } else {
         sqlx::query_scalar!(
             r#"SELECT count(*) AS "n!" FROM (
@@ -946,9 +948,10 @@ fn rewritten(
         .unwrap_or(migrated)
 }
 
-/// Drafts turned off: every draft goes, with its links, and every scheduled publish or
-/// unpublish is cancelled. Nothing is lost, since `check_no_pending_drafts` found each draft
-/// the same as what's published.
+/// Drafts turned off: every draft goes, with its links and its file reference (released
+/// when nothing else holds it), and every scheduled publish or unpublish is cancelled.
+/// Nothing is lost, since `check_no_pending_drafts` found each draft the same as what's
+/// published.
 async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
         "DELETE FROM relations r USING documents d
@@ -958,13 +961,19 @@ async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<()
     )
     .execute(&mut *conn)
     .await?;
-    sqlx::query!(
-        "UPDATE documents SET draft = NULL WHERE tenant_id = $1 AND collection_id = $2",
+    let files: Vec<Option<Uuid>> = sqlx::query_scalar!(
+        "WITH old AS (SELECT id, draft_file FROM documents
+                      WHERE tenant_id = $1 AND collection_id = $2 FOR NO KEY UPDATE)
+         UPDATE documents d SET draft = NULL, draft_file = NULL FROM old
+         WHERE d.id = old.id
+         RETURNING old.draft_file",
         DEFAULT_TENANT,
         collection_id,
     )
-    .execute(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
+    let files: Vec<Uuid> = files.into_iter().flatten().collect();
+    crate::files::release_in(conn, &files).await?;
     // Publishing needs drafts, so what's scheduled could only fail; documents first, then
     // their jobs, the order every write locks them in.
     sqlx::query!(
@@ -979,11 +988,12 @@ async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<()
     Ok(())
 }
 
-/// Drafts turned on: every document's draft starts as its published copy, links included,
-/// trashed documents too.
+/// Drafts turned on: every document's draft starts as its published copy, links and file
+/// included, trashed documents too.
 async fn seed_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
-        "UPDATE documents SET draft = published WHERE tenant_id = $1 AND collection_id = $2",
+        "UPDATE documents SET draft = published, draft_file = published_file
+         WHERE tenant_id = $1 AND collection_id = $2",
         DEFAULT_TENANT,
         collection_id,
     )

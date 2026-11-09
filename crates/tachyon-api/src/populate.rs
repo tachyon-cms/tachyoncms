@@ -15,7 +15,7 @@ use tachyon_core::{
 };
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
-use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
+use tachyon_db::documents::{Document, FileChange, MISSING_LINK, Prepared, Relation};
 use tachyon_db::query::{self, Readable, get_many_readable};
 use uuid::Uuid;
 
@@ -80,6 +80,7 @@ pub(crate) fn prepare(
     Ok(Prepared {
         data,
         relations: found,
+        file: FileChange::Keep,
     })
 }
 

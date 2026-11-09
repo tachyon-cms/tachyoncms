@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH old AS (SELECT id, draft_file FROM documents\n                      WHERE tenant_id = $1 AND collection_id = $2 FOR NO KEY UPDATE)\n         UPDATE documents d SET draft = NULL, draft_file = NULL FROM old\n         WHERE d.id = old.id\n         RETURNING old.draft_file",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "draft_file",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "draft_file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "f0669d6b9cfe273946535ba790c6a5473f3da674b1fef8c9aef4900d830a0910"
+}

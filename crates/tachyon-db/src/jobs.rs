@@ -43,6 +43,8 @@ pub struct NewJob<'a> {
     pub dedupe_key: Option<String>,
     pub created_by: Option<Uuid>,
     pub key_id: Option<Uuid>,
+    /// How many runs it gets; `None` takes the column's default, 5.
+    pub max_attempts: Option<i32>,
 }
 
 /// A queued or running job. `attempts` counts this run, once claimed.
@@ -99,8 +101,9 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
     let id = Uuid::now_v7();
     sqlx::query!(
         r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
-                             state, dedupe_key, created_by, key_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10)"#,
+                             state, dedupe_key, created_by, key_id, max_attempts)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10,
+                   COALESCE($11, 5))"#,
         id,
         DEFAULT_TENANT,
         job.kind,
@@ -111,6 +114,7 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
         job.dedupe_key,
         job.created_by,
         job.key_id,
+        job.max_attempts,
     )
     .execute(&mut *conn)
     .await

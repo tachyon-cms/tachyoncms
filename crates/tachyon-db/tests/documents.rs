@@ -2,7 +2,7 @@ use serde_json::{Map, Value, json};
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_db::DocCopy;
-use tachyon_db::documents::{Prepared, Relation};
+use tachyon_db::documents::{FileChange, Prepared, Relation};
 use tachyon_db::query::{self, ListQuery, Readable};
 use tachyon_db::{DbError, collections, documents};
 use uuid::Uuid;
@@ -189,6 +189,7 @@ async fn link(
         &Prepared {
             data: data(title),
             relations,
+            file: FileChange::Keep,
         },
     )
     .await
@@ -290,6 +291,7 @@ async fn deleting_the_linker_frees_the_target_and_self_links_never_block(pool: P
         &Prepared {
             data: data("me"),
             relations: vec![rel],
+            file: FileChange::Keep,
         },
     )
     .await
@@ -346,6 +348,7 @@ async fn saving_documents_that_link_to_each_other_at_once_never_deadlocks(pool: 
             collection_id: posts,
             id: to,
         }],
+        file: FileChange::Keep,
     };
     for _ in 0..10 {
         let (ra, rb) = tokio::join!(

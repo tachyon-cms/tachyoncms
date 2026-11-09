@@ -1,0 +1,42 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT published_file, draft_file FROM documents\n         WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           AND draft IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "published_file",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "published_file"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "draft_file",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "draft_file"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true,
+      true
+    ]
+  },
+  "hash": "6a54e5b1ed97092d00765e9856c0d75917f324f5d7a1c1b36159058982bfbf46"
+}

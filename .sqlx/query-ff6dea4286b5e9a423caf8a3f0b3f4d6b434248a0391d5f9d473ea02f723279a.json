@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM versions WHERE id IN (\n                   SELECT id FROM versions\n                   WHERE tenant_id = $1 AND document_id = $2\n                   ORDER BY created_at DESC, id DESC OFFSET $3\n               ) AND NOT EXISTS (\n                   SELECT 1 FROM jobs j\n                   WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')\n                     AND j.payload->>'version' = versions.id::text)\n               RETURNING file_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "file_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "ff6dea4286b5e9a423caf8a3f0b3f4d6b434248a0391d5f9d473ea02f723279a"
+}

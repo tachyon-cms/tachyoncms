@@ -55,11 +55,13 @@ pub struct Relation {
     pub id: Uuid,
 }
 
-/// A validated document ready to write, with the links it holds.
+/// A validated document ready to write, with the links it holds and what happens to the
+/// stored file of the copy it's written to.
 #[derive(Debug, Clone)]
 pub struct Prepared {
     pub data: Map<String, Value>,
     pub relations: Vec<Relation>,
+    pub file: FileChange,
 }
 
 impl Prepared {
@@ -67,8 +69,52 @@ impl Prepared {
         Self {
             data,
             relations: Vec::new(),
+            file: FileChange::Keep,
         }
     }
+}
+
+/// What a write does to its copy's stored file (`files`). A file it drops is released.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileChange {
+    /// Leaves it as it is. Publishing takes the draft's.
+    Keep,
+    /// Points the copy at this file, which goes live.
+    Set(Uuid),
+    /// Points the copy at no file.
+    Clear,
+}
+
+impl FileChange {
+    /// The copy's file after the write, `current` before it. A file it sets goes live.
+    async fn apply(
+        self,
+        tx: &mut PgConnection,
+        current: Option<Uuid>,
+    ) -> Result<Option<Uuid>, DbError> {
+        Ok(match self {
+            FileChange::Keep => current,
+            FileChange::Set(f) => {
+                crate::files::go_live_in(tx, f).await?;
+                Some(f)
+            }
+            FileChange::Clear => None,
+        })
+    }
+}
+
+/// Releases `old`, a copy's file before a write, unless the write kept it.
+async fn release_old(
+    tx: &mut PgConnection,
+    old: Option<Uuid>,
+    new: Option<Uuid>,
+) -> Result<(), DbError> {
+    if let Some(old) = old
+        && Some(old) != new
+    {
+        crate::files::release_in(tx, &[old]).await?;
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -134,12 +180,15 @@ pub async fn insert_in(
 ) -> Result<Document, DbError> {
     check_schema(&mut *conn, collection_id, schema_version).await?;
     let draft = copy == DocCopy::Draft;
+    let file = doc.file.apply(&mut *conn, None).await?;
     let created = sqlx::query_as!(
         Document,
-        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, draft, published_at, created_by, updated_by)
+        r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, draft, published_at,
+                                  created_by, updated_by, published_file, draft_file)
            VALUES ($1, $2, $3, CASE WHEN $6 THEN 'draft' ELSE 'published' END,
                    CASE WHEN $6 THEN NULL ELSE $4::jsonb END, CASE WHEN $6 THEN $4::jsonb END,
-                   CASE WHEN $6 THEN NULL ELSE now() END, $5, $5)
+                   CASE WHEN $6 THEN NULL ELSE now() END, $5, $5,
+                   CASE WHEN $6 THEN NULL ELSE $7::uuid END, CASE WHEN $6 THEN $7::uuid END)
            RETURNING id, status, created_at, updated_at,
                      CASE WHEN draft IS NOT NULL THEN published_at END AS published_at, deleted_at,
                      CASE WHEN $6 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>""#,
@@ -149,6 +198,7 @@ pub async fn insert_in(
         Json(&doc.data) as _,
         actor,
         draft,
+        file,
     )
     .fetch_one(&mut *conn)
     .await
@@ -293,7 +343,7 @@ pub async fn update_in<E: From<DbError>>(
     let draft = copy == DocCopy::Draft;
     let current = sqlx::query!(
         r#"SELECT CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>",
-                  created_by
+                  created_by, CASE WHEN $4 THEN draft_file ELSE published_file END AS file
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND CASE WHEN $4 THEN draft ELSE published END IS NOT NULL
@@ -315,11 +365,14 @@ pub async fn update_in<E: From<DbError>>(
     }
     check_guard(&mut *tx, id, copy, guard).await?;
     let next = apply(&current.data.0)?;
+    let file = next.file.apply(&mut *tx, current.file).await?;
     let doc = sqlx::query_as!(
         Document,
         r#"UPDATE documents
            SET published = CASE WHEN $6 THEN published ELSE $4::jsonb END,
                draft = CASE WHEN $6 THEN $4::jsonb ELSE draft END,
+               published_file = CASE WHEN $6 THEN published_file ELSE $7::uuid END,
+               draft_file = CASE WHEN $6 THEN $7::uuid ELSE draft_file END,
                published_updated_at = CASE WHEN $6 THEN published_updated_at ELSE now() END,
                updated_at = now(), updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
@@ -332,11 +385,13 @@ pub async fn update_in<E: From<DbError>>(
         Json(&next.data) as _,
         actor.map(|a| a.id),
         draft,
+        file,
     )
     .fetch_one(&mut *tx)
     .await
     .map_err(map_unique)?;
     sync_relations(&mut *tx, id, copy, &next.relations).await?;
+    release_old(&mut *tx, current.file, file).await?;
     Ok(doc)
 }
 
@@ -379,9 +434,10 @@ pub async fn lock_in(
 
 /// Publishes document `id` of `c`, a collection with drafts, inside `tx`: `doc` (the
 /// stored draft and its links when `None`) becomes the published copy, the status
-/// `published` and `published_at` now, and a `published` version is recorded. The caller
-/// has locked the row with `lock_in`, which also checked the schema, and validated what's
-/// published. A unique clash is a `UniqueViolation`; a link to a document that's gone, a
+/// `published` and `published_at` now, and a `published` version is recorded. The
+/// published copy takes `doc`'s file, or the draft's when it keeps it, and the file it
+/// held before is released. The caller has locked the row with `lock_in`, which also
+/// checked the schema, and validated what's published. A unique clash is a `UniqueViolation`; a link to a document that's gone, a
 /// `Validation` error.
 pub async fn publish_in(
     tx: &mut PgConnection,
@@ -390,10 +446,26 @@ pub async fn publish_in(
     doc: Option<&Prepared>,
     by: Option<Uuid>,
 ) -> Result<Document, DbError> {
+    let held = sqlx::query!(
+        "SELECT published_file, draft_file FROM documents
+         WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+           AND draft IS NOT NULL",
+        DEFAULT_TENANT,
+        c.id,
+        id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or(DbError::NotFound)?;
+    let file = doc
+        .map_or(FileChange::Keep, |d| d.file)
+        .apply(&mut *tx, held.draft_file)
+        .await?;
     let published = sqlx::query_as!(
         Document,
         r#"UPDATE documents
            SET published = COALESCE($4::jsonb, draft), status = 'published',
+               published_file = $6,
                published_at = now(), published_updated_at = now(), updated_at = now(),
                updated_by = COALESCE($5, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
@@ -405,6 +477,7 @@ pub async fn publish_in(
         id,
         doc.map(|d| Json(&d.data)) as _,
         by,
+        file,
     )
     .fetch_optional(&mut *tx)
     .await
@@ -431,21 +504,23 @@ pub async fn publish_in(
     }
     // Drafts imply versions, so a collection that publishes always keeps a history to add to.
     crate::versions::record_version(tx, id, c, DocCopy::Published, &published.data.0, by).await?;
+    release_old(tx, held.published_file, file).await?;
     Ok(published)
 }
 
 /// Takes document `id` of `c` off the site inside `tx`: no published copy or links, status
 /// `draft`, never published as far as reads tell. The draft stays as it is, and documents
-/// that link here keep their links. The caller has locked the row (`lock_in`). Returns the
-/// draft. One that isn't published is `Refused`, and nothing is written.
+/// that link here keep their links; the published copy's file is released. The caller has
+/// locked the row (`lock_in`). Returns the draft. One that isn't published is `Refused`,
+/// and nothing is written.
 pub async fn unpublish_in(
     tx: &mut PgConnection,
     c: &Collection,
     id: Uuid,
     by: Option<Uuid>,
 ) -> Result<Document, DbError> {
-    let published = sqlx::query_scalar!(
-        r#"SELECT published IS NOT NULL AS "published!" FROM documents
+    let held = sqlx::query!(
+        r#"SELECT published IS NOT NULL AS "published!", published_file FROM documents
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND draft IS NOT NULL"#,
         DEFAULT_TENANT,
@@ -455,13 +530,13 @@ pub async fn unpublish_in(
     .fetch_optional(&mut *tx)
     .await?
     .ok_or(DbError::NotFound)?;
-    if !published {
+    if !held.published {
         return Err(DbError::Refused(format!("`{id}` isn't published")));
     }
     let draft = sqlx::query_as!(
         Document,
         r#"UPDATE documents
-           SET published = NULL, status = 'draft', published_at = NULL,
+           SET published = NULL, published_file = NULL, status = 'draft', published_at = NULL,
                updated_at = now(), updated_by = COALESCE($4, updated_by)
            WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
              AND draft IS NOT NULL
@@ -481,6 +556,7 @@ pub async fn unpublish_in(
     )
     .execute(&mut *tx)
     .await?;
+    release_old(tx, held.published_file, None).await?;
     Ok(draft)
 }
 
@@ -665,9 +741,10 @@ pub async fn restore_in(
 }
 
 /// Deletes the trashed documents of `collection_id` among `ids` for good inside `tx`,
-/// with their versions and jobs, and returns how many went. Links to them from other
-/// trashed documents go first; a restore of those then says the link's target is gone.
-/// The caller has locked them (`query::lock_trash_in`).
+/// with their versions and jobs, and returns how many went. The files they and their
+/// versions held are released. Links to them from other trashed documents go first; a
+/// restore of those then says the link's target is gone. The caller has locked them
+/// (`query::lock_trash_in`).
 pub async fn purge_in(
     tx: &mut PgConnection,
     collection_id: Uuid,
@@ -686,7 +763,19 @@ pub async fn purge_in(
     )
     .execute(&mut *tx)
     .await?;
-    Ok(sqlx::query!(
+    let held: Vec<Uuid> = sqlx::query_scalar!(
+        r#"SELECT f AS "f!" FROM documents d,
+                  unnest(ARRAY[d.published_file, d.draft_file]
+                         || ARRAY(SELECT v.file_id FROM versions v WHERE v.document_id = d.id)) AS f
+           WHERE d.tenant_id = $1 AND d.collection_id = $2 AND d.id = ANY($3)
+             AND d.deleted_at IS NOT NULL AND f IS NOT NULL"#,
+        DEFAULT_TENANT,
+        collection_id,
+        ids,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let purged = sqlx::query!(
         "DELETE FROM documents
          WHERE tenant_id = $1 AND collection_id = $2 AND id = ANY($3) AND deleted_at IS NOT NULL",
         DEFAULT_TENANT,
@@ -695,7 +784,9 @@ pub async fn purge_in(
     )
     .execute(&mut *tx)
     .await?
-    .rows_affected())
+    .rows_affected();
+    crate::files::release_in(tx, &held).await?;
+    Ok(purged)
 }
 
 /// Refuses the write unless the locked document's `copy` matches `guard`.

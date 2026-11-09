@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT v.id, v.kind, v.created_at, v.created_by FROM versions v\n           JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id\n           WHERE v.tenant_id = $1 AND v.document_id = $2 AND d.deleted_at IS NULL\n             AND ($5 OR v.kind = 'published')\n           ORDER BY v.created_at DESC, v.id DESC\n           LIMIT $3 OFFSET $4",
+  "query": "SELECT v.id, v.kind, v.created_at, v.created_by, v.file_id,\n                  v.data AS \"data!: Json<Map<String, Value>>\"\n           FROM versions v\n           JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id\n           WHERE v.tenant_id = $1 AND v.document_id = $2 AND v.id = $3\n             AND d.deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -46,23 +46,45 @@
             "name": "created_by"
           }
         }
+      },
+      {
+        "ordinal": 4,
+        "name": "file_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "file_id"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "data!: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "data"
+          }
+        }
       }
     ],
     "parameters": {
       "Left": [
         "Uuid",
         "Uuid",
-        "Int8",
-        "Int8",
-        "Bool"
+        "Uuid"
       ]
     },
     "nullable": [
       false,
       false,
       false,
-      true
+      true,
+      true,
+      false
     ]
   },
-  "hash": "a01b427e9edfe3db2787d5e215e1af6034c73c2cec84379ce366e5b62f0e8d61"
+  "hash": "e025c407b368b10bd44f4cdacc35da7efbcc6073a2c1bbe697be7b62db84be7c"
 }

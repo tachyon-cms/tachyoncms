@@ -3,7 +3,7 @@ use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
 use tachyon_core::query::{Cursor, Filter, Sort, parse_filter, parse_query, parse_sort};
 use tachyon_db::DocCopy;
-use tachyon_db::documents::{self, Prepared};
+use tachyon_db::documents::{self, FileChange, Prepared};
 use tachyon_db::query::{self, ListQuery, Readable};
 use tachyon_db::{DbError, collections};
 use uuid::Uuid;
@@ -627,10 +627,20 @@ mod joins {
             })
             .collect();
         let data = json!({"title": title}).as_object().unwrap().clone();
-        documents::insert(pool, f.posts, 1, None, &Prepared { data, relations })
-            .await
-            .unwrap()
-            .id
+        documents::insert(
+            pool,
+            f.posts,
+            1,
+            None,
+            &Prepared {
+                data,
+                relations,
+                file: FileChange::Keep,
+            },
+        )
+        .await
+        .unwrap()
+        .id
     }
 
     fn titles(pages: &HashMap<Uuid, query::Page>, parent: Uuid) -> Vec<String> {
