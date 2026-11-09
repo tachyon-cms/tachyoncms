@@ -111,10 +111,14 @@ pub fn credential_var(storage: &str, key: &str) -> String {
 
 impl Storage {
     /// Opens storage `name`. A local root is created if missing and canonicalised. Bucket
-    /// credentials come only from `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID` and
-    /// `..._SECRET_ACCESS_KEY`; without them the store falls back to the machine's own
-    /// credentials (an instance role).
+    /// credentials come only from `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID`,
+    /// `..._SECRET_ACCESS_KEY` and, for temporary ones, `..._SESSION_TOKEN`. Without them an
+    /// AWS bucket falls back to the machine's own (an instance role); a bucket with an
+    /// `endpoint` (R2, MinIO) has none, so there they're required.
     pub fn open(name: &str, c: &StorageConfig) -> Result<Storage, String> {
+        if let Some(prefix) = &c.prefix {
+            check_prefix(prefix).map_err(|e| format!("storage.{name}.prefix: {e}"))?;
+        }
         let (store, signer): (Arc<dyn ObjectStore>, Option<Arc<dyn Signer>>) = match &c.adapter {
             Adapter::Local { root } => {
                 std::fs::create_dir_all(root).map_err(|e| {
@@ -141,16 +145,25 @@ impl Storage {
                 if let Some(region) = region {
                     b = b.with_region(region);
                 }
-                for (key, set) in [
-                    (
-                        "access_key_id",
-                        AmazonS3Builder::with_access_key_id as fn(_, String) -> _,
-                    ),
-                    ("secret_access_key", AmazonS3Builder::with_secret_access_key),
-                ] {
-                    if let Ok(value) = std::env::var(credential_var(name, key)) {
-                        b = set(b, value);
-                    }
+                let var = |key: &str| std::env::var(credential_var(name, key)).ok();
+                let (id, secret) = (var("access_key_id"), var("secret_access_key"));
+                // Only AWS itself has an instance role to fall back on; elsewhere a missing
+                // key would surface as a metadata-service timeout on every request.
+                if endpoint.is_some() && (id.is_none() || secret.is_none()) {
+                    return Err(format!(
+                        "storage.{name}: set {} and {} in the environment; a bucket with an endpoint needs its keys",
+                        credential_var(name, "access_key_id"),
+                        credential_var(name, "secret_access_key"),
+                    ));
+                }
+                if let Some(id) = id {
+                    b = b.with_access_key_id(id);
+                }
+                if let Some(secret) = secret {
+                    b = b.with_secret_access_key(secret);
+                }
+                if let Some(token) = var("session_token") {
+                    b = b.with_token(token);
                 }
                 let s3 = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
                 (s3.clone(), Some(s3))
@@ -199,7 +212,7 @@ impl Storage {
     /// `key` under this storage's prefix, refused if it could leave it.
     fn key(&self, key: &str) -> Result<Key, StorageError> {
         let full = match &self.config.prefix {
-            Some(p) => format!("{}/{key}", p.trim_matches('/')),
+            Some(p) => format!("{p}/{key}"),
             None => key.to_owned(),
         };
         checked(&full)
@@ -217,10 +230,14 @@ impl Storage {
             out = out.with_attributes(a);
         }
         match tokio::io::copy(&mut file, &mut out).await {
-            Ok(n) => {
-                out.shutdown().await?;
-                Ok(n)
-            }
+            Ok(n) => match out.shutdown().await {
+                Ok(()) => Ok(n),
+                Err(e) => {
+                    // A failed completion would leave the parts billed in the bucket.
+                    let _ = out.abort().await;
+                    Err(e.into())
+                }
+            },
             Err(e) => {
                 // Leaves no half-made multipart upload behind; the copy's error matters more.
                 let _ = out.abort().await;
@@ -257,21 +274,43 @@ impl Storage {
 
     /// Where a browser can fetch `key` straight from the bucket, when `public_url` is set.
     pub fn public_url(&self, key: &str) -> Option<String> {
-        let base = self.config.public_url.as_ref()?;
+        let mut url = self.config.public_url.clone()?;
         let key = self.key(key).ok()?;
-        Some(format!("{}/{key}", base.as_str().trim_end_matches('/')))
+        // Each segment percent-encoded, so `#`, `%` or a space in a name stays in the path.
+        url.path_segments_mut()
+            .ok()?
+            .pop_if_empty()
+            .extend(key.as_ref().split('/'));
+        Some(url.into())
+    }
+}
+
+/// Whether every `/`-separated segment of `path` is a plain name: none empty, `.` or
+/// `..`, and no NUL or backslash anywhere. Keys, a storage's `prefix` and a collection's
+/// `staticDir` all follow it.
+fn plain_segments(path: &str) -> bool {
+    !path.contains(['\0', '\\'])
+        && path
+            .split('/')
+            .all(|s| !s.is_empty() && s != "." && s != "..")
+}
+
+/// A key prefix (a storage's `prefix`, a collection's `staticDir`): plain segments, such as
+/// `media/images`.
+pub fn check_prefix(prefix: &str) -> Result<(), String> {
+    if plain_segments(prefix) && Key::parse(prefix).is_ok_and(|k| k.as_ref() == prefix) {
+        Ok(())
+    } else {
+        Err(format!(
+            "`{prefix}` has to be a relative path of plain names, like media/images: no empty, `.` or `..` parts, no leading or trailing /, and no backslash"
+        ))
     }
 }
 
 /// `key` as a store path, refused unless every segment is a plain name.
 fn checked(key: &str) -> Result<Key, StorageError> {
     let bad = || StorageError::BadKey(format!("`{key}` isn't a safe storage key"));
-    if key.contains('\0')
-        || key.contains('\\')
-        || key
-            .split('/')
-            .any(|s| s.is_empty() || s == "." || s == "..")
-    {
+    if !plain_segments(key) {
         return Err(bad());
     }
     let parsed = Key::parse(key).map_err(|_| bad())?;
@@ -282,15 +321,24 @@ fn checked(key: &str) -> Result<Key, StorageError> {
     Ok(parsed)
 }
 
-/// The key of an uploaded original: `{collection}/{file id}/{filename}`. Sizes go under the
-/// same prefix. A name that could climb out of it is refused.
-pub fn object_key(collection: &str, file: Uuid, filename: &str) -> Result<String, StorageError> {
+/// The key of an uploaded original: `{staticDir}/{collection}/{file id}/{filename}`, without
+/// the first part when the collection sets no `staticDir`. Sizes go under the same prefix.
+/// A name or directory that could climb out of it is refused.
+pub fn object_key(
+    static_dir: Option<&str>,
+    collection: &str,
+    file: Uuid,
+    filename: &str,
+) -> Result<String, StorageError> {
     if filename.contains(['/', '\\', '\0']) || filename == ".." || filename == "." {
         return Err(StorageError::BadKey(format!(
             "`{filename}` isn't a safe file name"
         )));
     }
-    let key = format!("{collection}/{file}/{filename}");
+    let key = match static_dir {
+        Some(dir) => format!("{dir}/{collection}/{file}/{filename}"),
+        None => format!("{collection}/{file}/{filename}"),
+    };
     checked(&key)?;
     Ok(key)
 }
@@ -335,6 +383,10 @@ mod tests {
     #[test]
     fn keys_are_plain_segments() {
         assert!(checked("a/b/c.png").is_ok());
+        assert!(check_prefix("media/images").is_ok());
+        for bad in ["", ".", "a//b", "./x", "x/", "/x", "a\\b", "../x", "a\0"] {
+            assert!(check_prefix(bad).is_err(), "{bad:?}");
+        }
         for bad in ["../x", "a/../b", "a//b", "/a", "a/", "a\0b", "a\\b", "./a"] {
             assert!(checked(bad).is_err(), "{bad:?}");
         }

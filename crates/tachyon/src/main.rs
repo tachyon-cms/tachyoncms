@@ -145,13 +145,18 @@ async fn main() -> anyhow::Result<()> {
             }
             SchemaCommand::Diff { .. } => {
                 let (text, renames) = schema_input.expect("read before connecting");
-                println!("{}", schema_cmd::run(&pool, &text, &renames, None).await?);
+                let uploads = config.uploads_config().map_err(anyhow::Error::msg)?;
+                println!(
+                    "{}",
+                    schema_cmd::run(&pool, &uploads, &text, &renames, None).await?
+                );
             }
             SchemaCommand::Apply { yes, .. } => {
                 let (text, renames) = schema_input.expect("read before connecting");
+                let uploads = config.uploads_config().map_err(anyhow::Error::msg)?;
                 println!(
                     "{}",
-                    schema_cmd::run(&pool, &text, &renames, Some(yes)).await?
+                    schema_cmd::run(&pool, &uploads, &text, &renames, Some(yes)).await?
                 );
             }
         },

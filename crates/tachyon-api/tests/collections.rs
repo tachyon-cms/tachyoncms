@@ -207,16 +207,6 @@ async fn schema_names_a_configured_storage(pool: PgPool) {
             "disableLocalStorage is set, but `default` is local storage; name a bucket",
         ),
         (
-            json!({"staticDir": "../x"}),
-            "upload.staticDir",
-            "has to be a relative path inside the storage, without `..`",
-        ),
-        (
-            json!({"staticDir": "/etc"}),
-            "upload.staticDir",
-            "has to be a relative path inside the storage, without `..`",
-        ),
-        (
             json!({"constructorOptions": {"limitInputPixels": 50_000_001}}),
             "upload.constructorOptions.limitInputPixels",
             "50000001 is above this server's limit of 50000000 (`[uploads] max_pixels`)",
@@ -232,6 +222,24 @@ async fn schema_names_a_configured_storage(pool: PgPool) {
         assert_problem(&res, 422);
         assert_eq!(res.json["errors"][0]["path"], path, "{upload}");
         assert_eq!(res.json["errors"][0]["message"], message, "{upload}");
+    }
+    for dir in ["../x", "/etc", "a//b", "./x", "x/", "a\\b", "", "."] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&images(json!({ "staticDir": dir }))),
+        )
+        .await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], "upload.staticDir", "{dir:?}");
+        assert_eq!(
+            res.json["errors"][0]["message"],
+            format!(
+                "`{dir}` has to be a relative path of plain names, like media/images: no empty, `.` or `..` parts, no leading or trailing /, and no backslash"
+            ),
+            "{dir:?}"
+        );
     }
     let ok = images(json!({
         "storage": "default", "staticDir": "media/images",

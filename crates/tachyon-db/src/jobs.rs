@@ -143,7 +143,8 @@ pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, D
 /// out. Rows another worker holds are skipped, not waited for. A job that lost its lease
 /// on its last attempt fails here instead, so one that kills its worker every time stops
 /// being retried; one whose run still holds its row is left to that run.
-/// Finished jobs older than `KEEP_FINISHED_DAYS` are deleted here too, a batch at a time.
+/// Finished jobs older than `KEEP_FINISHED_DAYS` are deleted here too, a batch at a time,
+/// except failed file cleanups whose objects are still in storage.
 pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
     sqlx::query!(
         r#"UPDATE jobs SET state = 'failed', locked_until = NULL, finished_at = clock_timestamp(),
@@ -163,6 +164,13 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
                SELECT id FROM jobs
                WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')
                  AND finished_at < now() - make_interval(days => $2)
+                 -- A failed cleanup is the only record of objects left in storage, so it's
+                 -- kept until the sweep gets it done, unless its file is live again.
+                 AND NOT (kind = 'file_cleanup' AND state = 'failed'
+                          AND (NOT payload ? 'file'
+                               OR EXISTS (SELECT 1 FROM files f
+                                          WHERE f.id::text = jobs.payload->>'file'
+                                            AND f.state <> 'live')))
                LIMIT 100
                FOR UPDATE SKIP LOCKED)"#,
         DEFAULT_TENANT,

@@ -9,6 +9,7 @@ use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
 use tachyon_api::auth::AuthConfig;
 use tachyon_api::{JobsConfig, UploadsConfig};
+use tachyon_db::files::PENDING_GRACE;
 use tachyon_media::storage::{Adapter, SignedDownloads, StorageConfig, Storages, credential_var};
 
 #[derive(Debug, Deserialize)]
@@ -117,6 +118,7 @@ pub struct StorageSettings {
     /// Only to name the right variable when one is found in the file.
     access_key_id: Option<serde::de::IgnoredAny>,
     secret_access_key: Option<serde::de::IgnoredAny>,
+    session_token: Option<serde::de::IgnoredAny>,
 }
 
 /// `signed_downloads = false | true | { mime_types = [..], expires_in = "2h" }`.
@@ -153,7 +155,9 @@ impl Default for SignedSetting {
 fn is_credential_var(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
     key.starts_with("storage__")
-        && (key.ends_with("__access_key_id") || key.ends_with("__secret_access_key"))
+        && ["__access_key_id", "__secret_access_key", "__session_token"]
+            .iter()
+            .any(|c| key.ends_with(c))
 }
 
 /// `25MB`, `25MiB`, `512KB`, `1GB` or plain bytes. `MB` is 1,000,000 bytes, `MiB` 1,048,576.
@@ -190,6 +194,7 @@ impl StorageSettings {
         for (key, set) in [
             ("access_key_id", self.access_key_id.is_some()),
             ("secret_access_key", self.secret_access_key.is_some()),
+            ("session_token", self.session_token.is_some()),
         ] {
             if set {
                 return Err(format!(
@@ -481,23 +486,32 @@ impl Config {
         check_writable(&u.temp_dir)?;
         let mut configs = BTreeMap::new();
         for (name, s) in &self.storage {
-            // An environment variable's name is upper-cased from it, so keep it plain.
-            if name.is_empty()
-                || !name
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_')
-            {
+            // Environment variables are named from it, upper-cased and split on `__`.
+            let plain = name
+                .bytes()
+                .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_');
+            if !plain || name.contains("__") || name.starts_with('_') || name.ends_with('_') {
                 return Err(format!(
-                    "storage.{name}: a storage name is lowercase letters, digits and _"
+                    "storage.{name}: a storage name is lowercase letters and digits, with single _ between them"
                 ));
             }
             configs.insert(name.clone(), s.to_config(name)?);
+        }
+        let timeout = duration("uploads.timeout", &u.timeout)?;
+        // A reserved upload not taken within the grace is cleaned up, so a request still
+        // streaming by then would lose its file and leave the object behind.
+        if timeout >= PENDING_GRACE {
+            return Err(format!(
+                "uploads.timeout is {}; it has to be under {} min, after which an unfinished upload is cleaned up",
+                u.timeout,
+                PENDING_GRACE.as_secs() / 60
+            ));
         }
         Ok(UploadsConfig {
             max_file_size,
             max_pixels: u.max_pixels,
             temp_dir: u.temp_dir.clone(),
-            timeout: duration("uploads.timeout", &u.timeout)?,
+            timeout,
             storages: Arc::new(Storages::open(&configs)?),
         })
     }
@@ -832,10 +846,21 @@ mod tests {
     /// `uploads_config` for `toml`, inside the jail: a local root is relative to the jail's
     /// directory, and no other test moves it meanwhile.
     fn uploads(toml: &str) -> Result<tachyon_api::UploadsConfig, String> {
+        uploads_with(toml, &[])
+    }
+
+    /// `uploads`, with `env` set too.
+    fn uploads_with(
+        toml: &str,
+        env: &[(&str, &str)],
+    ) -> Result<tachyon_api::UploadsConfig, String> {
         let mut out = None;
         Jail::expect_with(|jail| {
             jail.create_file("tachyon.toml", toml)?;
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            for (k, v) in env {
+                jail.set_env(k, v);
+            }
             out = Some(Config::load(None)?.uploads_config());
             Ok(())
         });
@@ -884,7 +909,11 @@ mod tests {
         );
 
         let root = std::env::temp_dir().join(format!("tachyon-config-{}", std::process::id()));
-        let r2 = at(&format!("[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\nendpoint = \"https://acct.r2.cloudflarestorage.com\"\nregion = \"auto\"\npublic_url = \"https://files.example.com\"\n[storage.default]\nadapter = \"local\"\nroot = \"{}\"", root.display())).unwrap();
+        let keys = [
+            ("TACHYON_STORAGE__R2__ACCESS_KEY_ID", "id"),
+            ("TACHYON_STORAGE__R2__SECRET_ACCESS_KEY", "secret"),
+        ];
+        let r2 = uploads_with(&format!("[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\nendpoint = \"https://acct.r2.cloudflarestorage.com\"\nregion = \"auto\"\npublic_url = \"https://files.example.com\"\n[storage.default]\nadapter = \"local\"\nroot = \"{}\"", root.display()), &keys).unwrap();
         assert!(root.is_dir(), "a local root is created");
         assert!(!r2.storages.get("r2").unwrap().is_local());
         assert!(r2.storages.get("default").unwrap().is_local());
@@ -918,9 +947,43 @@ mod tests {
             at("[storage.disk]\nadapter = \"ftp\"").unwrap_err(),
             "storage.disk.adapter: `ftp` isn't one; use local or s3"
         );
+        for name in ["R2", "r__2", "_r2", "r2_", "r-2"] {
+            assert_eq!(
+                at(&format!(
+                    "[storage.\"{name}\"]\nadapter = \"s3\"\nbucket = \"x\""
+                ))
+                .unwrap_err(),
+                format!(
+                    "storage.{name}: a storage name is lowercase letters and digits, with single _ between them"
+                )
+            );
+        }
+        assert!(at("[storage.old_r2]\nadapter = \"s3\"\nbucket = \"x\"").is_ok());
+        for timeout in ["1h", "60m", "2h"] {
+            assert_eq!(
+                at(&format!("[uploads]\ntimeout = \"{timeout}\"")).unwrap_err(),
+                format!(
+                    "uploads.timeout is {timeout}; it has to be under 60 min, after which an unfinished upload is cleaned up"
+                )
+            );
+        }
         assert_eq!(
-            at("[storage.R2]\nadapter = \"s3\"\nbucket = \"x\"").unwrap_err(),
-            "storage.R2: a storage name is lowercase letters, digits and _"
+            at("[uploads]\ntimeout = \"59m\"").unwrap().timeout,
+            std::time::Duration::from_secs(59 * 60)
+        );
+        // R2 and MinIO have no instance role to fall back on.
+        let r2 =
+            "[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\nendpoint = \"http://127.0.0.1:9000\"";
+        for env in [&keys[..1], &keys[1..], &[]] {
+            assert_eq!(
+                uploads_with(r2, env).unwrap_err(),
+                "storage.r2: set TACHYON_STORAGE__R2__ACCESS_KEY_ID and TACHYON_STORAGE__R2__SECRET_ACCESS_KEY in the environment; a bucket with an endpoint needs its keys"
+            );
+        }
+        assert!(uploads_with(r2, &keys).is_ok());
+        assert_eq!(
+            at("[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\nprefix = \"a//b\"").unwrap_err(),
+            "storage.r2.prefix: `a//b` has to be a relative path of plain names, like media/images: no empty, `.` or `..` parts, no leading or trailing /, and no backslash"
         );
         let signed = at("[storage.r2]\nadapter = \"s3\"\nbucket = \"m\"\nsigned_downloads = { mime_types = [\"application/pdf\"], expires_in = \"15m\" }").unwrap();
         assert_eq!(
@@ -934,7 +997,7 @@ mod tests {
 
     #[test]
     fn credentials_only_from_env() {
-        for key in ["access_key_id", "secret_access_key"] {
+        for key in ["access_key_id", "secret_access_key", "session_token"] {
             let err = uploads(&format!(
                 "[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\n{key} = \"AKIA-in-the-file\""
             ))
@@ -952,6 +1015,7 @@ mod tests {
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
             jail.set_env("TACHYON_STORAGE__R2__ACCESS_KEY_ID", "AKIA-env");
             jail.set_env("TACHYON_STORAGE__R2__SECRET_ACCESS_KEY", "secret-env");
+            jail.set_env("TACHYON_STORAGE__R2__SESSION_TOKEN", "token-env");
             jail.set_env("TACHYON_STORAGE__R2__BUCKET", "from-env");
             jail.create_file("tachyon.toml", "[storage.r2]\nadapter = \"s3\"\n")?;
             let config = Config::load(None)?;
@@ -961,7 +1025,9 @@ mod tests {
                 "other keys still come from the environment"
             );
             assert!(
-                !format!("{config:?}").contains("AKIA-env"),
+                !["AKIA-env", "secret-env", "token-env"]
+                    .iter()
+                    .any(|c| format!("{config:?}").contains(c)),
                 "credentials aren't settings"
             );
             Ok(())

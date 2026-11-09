@@ -30,7 +30,8 @@ use crate::auth::authorize;
 use crate::auth::principal::Principal;
 use crate::documents::json_body;
 use crate::jobs::{JobError, LEASE, keep_leased};
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, UploadsConfig};
+use tachyon_media::storage::check_prefix;
 
 /// The most rows (documents, trashed ones included, and their versions) a schema change or
 /// preview scans inside its request; a bigger one runs on a job worker.
@@ -72,23 +73,23 @@ fn saved(state: &AppState, schema: &CollectionSchema) -> Result<Vec<CollectionSc
     }
     let world = state.schemas.with_saved(schema).map_err(schema_error)?;
     world[0].check().map_err(schema_error)?;
-    check_upload(state, schema)?;
+    check_upload(&state.media, schema).map_err(|e| ApiError::Validation(vec![e]))?;
     Ok(world)
 }
 
-/// The parts of `upload` that depend on this server: the storage it names, and the pixel
-/// cap. Each a 422 at its path.
-fn check_upload(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiError> {
+/// The parts of `upload` that depend on this server: the storage it names, `staticDir` and
+/// the pixel cap. The error is at its path, such as `upload.storage`. The schema routes and
+/// `tachyon schema apply` both run it.
+pub fn check_upload(media: &UploadsConfig, schema: &CollectionSchema) -> Result<(), FieldError> {
     let Some(u) = &schema.upload else {
         return Ok(());
     };
     let refuse = |path: &str, message: String| {
-        Err(ApiError::Validation(vec![FieldError {
+        Err(FieldError {
             path: path.into(),
             message,
-        }]))
+        })
     };
-    let media = &state.media;
     match media.storages.get(&u.storage) {
         None => {
             let mut names: Vec<&str> = media.storages.0.keys().map(String::as_str).collect();
@@ -113,15 +114,11 @@ fn check_upload(state: &AppState, schema: &CollectionSchema) -> Result<(), ApiEr
         }
         Some(_) => {}
     }
-    if let Some(dir) = &u.static_dir {
-        let climbs = dir.split(['/', '\\']).any(|s| s == "..");
-        let absolute = dir.starts_with(['/', '\\']) || dir.get(1..2) == Some(":");
-        if climbs || absolute || dir.contains('\0') {
-            return refuse(
-                "upload.staticDir",
-                "has to be a relative path inside the storage, without `..`".into(),
-            );
-        }
+    // The same rule every storage key follows, so a saved staticDir can't fail every upload.
+    if let Some(dir) = &u.static_dir
+        && let Err(message) = check_prefix(dir)
+    {
+        return refuse("upload.staticDir", message);
     }
     let limit = u
         .constructor_options

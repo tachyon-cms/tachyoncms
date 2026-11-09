@@ -508,30 +508,73 @@ pub async fn forget_in(tx: &mut PgConnection, id: Uuid) -> Result<bool, DbError>
     Ok(done.rows_affected() == 1)
 }
 
-/// Queues again, with fresh attempts, each failed cleanup whose file is still gone or is
-/// pending past its grace: storage that was down for longer than the retries is tried
-/// again. The newest failed job per file, and none whose file already has a pending one.
-/// Returns how many.
-pub async fn requeue_cleanups_in(tx: &mut PgConnection) -> Result<u64, DbError> {
+/// Queues again, with fresh attempts, each failed cleanup still worth trying on one of
+/// `storages` (the configured ones): a file's whose file is still gone or pending past its
+/// grace, and every `{"keys"}` one. Storage that was down for longer than the retries is
+/// tried again. The newest failed job per dedupe key, and none whose key already has a
+/// pending one. Returns how many.
+pub async fn requeue_cleanups_in(
+    tx: &mut PgConnection,
+    storages: &[String],
+) -> Result<u64, DbError> {
     let done = sqlx::query!(
         r#"UPDATE jobs SET state = 'queued', attempts = 0, run_at = now(), locked_until = NULL,
                finished_at = NULL, result = NULL
            WHERE id IN (
-               SELECT DISTINCT ON (j.dedupe_key) j.id FROM jobs j
-               JOIN files f ON f.tenant_id = j.tenant_id AND f.id::text = j.payload->>'file'
+               SELECT DISTINCT ON (coalesce(j.dedupe_key, j.id::text)) j.id FROM jobs j
+               LEFT JOIN files f ON f.tenant_id = j.tenant_id AND f.id::text = j.payload->>'file'
                WHERE j.tenant_id = $1 AND j.kind = $2 AND j.state = 'failed'
-                 AND (f.state = 'gone'
-                      OR (f.state = 'pending'
-                          AND f.created_at + make_interval(secs => $3) <= now()))
+                 AND CASE WHEN j.payload ? 'file' THEN
+                          f.storage = ANY($4)
+                          AND (f.state = 'gone'
+                               OR (f.state = 'pending'
+                                   AND f.created_at + make_interval(secs => $3) <= now()))
+                     ELSE j.payload->>'storage' = ANY($4) END
                  AND NOT EXISTS (SELECT 1 FROM jobs o
                                  WHERE o.tenant_id = $1 AND o.dedupe_key = j.dedupe_key
                                    AND o.state IN ('queued', 'running'))
-               ORDER BY j.dedupe_key, j.id DESC)"#,
+               ORDER BY coalesce(j.dedupe_key, j.id::text), j.id DESC)"#,
         DEFAULT_TENANT,
         CLEANUP,
         PENDING_GRACE.as_secs_f64(),
+        storages,
     )
     .execute(&mut *tx)
     .await?;
     Ok(done.rows_affected())
+}
+
+/// How many gone or pending files sit on a storage not among `storages`: their cleanups
+/// can't run until it's configured again.
+pub async fn on_unknown_storage(pool: &PgPool, storages: &[String]) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM files
+           WHERE tenant_id = $1 AND state <> 'live' AND NOT storage = ANY($2)"#,
+        DEFAULT_TENANT,
+        storages,
+    )
+    .fetch_one(pool)
+    .await?)
+}
+
+/// Whether `key` on `storage` is still served: a file that isn't gone sits in the key's
+/// directory and lists its last part among its names, as a size remade under a name a
+/// cleanup was queued for does.
+pub async fn key_in_use(pool: &PgPool, storage: &str, key: &str) -> Result<bool, DbError> {
+    let Some((dir, name)) = key.rsplit_once('/') else {
+        return Ok(false);
+    };
+    Ok(sqlx::query_scalar!(
+        r#"SELECT EXISTS (
+               SELECT 1 FROM files
+               WHERE tenant_id = $1 AND storage = $2 AND state <> 'gone'
+                 AND starts_with(key, $3 || '/') AND strpos(substr(key, length($3) + 2), '/') = 0
+                 AND $4 = ANY(names)) AS "used!""#,
+        DEFAULT_TENANT,
+        storage,
+        dir,
+        name,
+    )
+    .fetch_one(pool)
+    .await?)
 }

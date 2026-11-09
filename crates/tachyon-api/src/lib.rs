@@ -34,6 +34,7 @@ use tachyon_db::DbError;
 use tachyon_media::storage::Storages;
 use tower_http::catch_panic::CatchPanicLayer;
 
+pub use collections::check_upload;
 pub use error::ApiError;
 pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;
@@ -216,7 +217,8 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             .unwrap_or(collections::INLINE_ROWS),
         media: Arc::new(options.uploads),
     };
-    media_jobs::seed_sweep(&state.pool).await?;
+    let storages: Vec<String> = state.media.storages.0.keys().cloned().collect();
+    media_jobs::seed_sweep(&state.pool, &storages).await?;
     let routes = routes.layer(axum::middleware::from_fn_with_state(
         state.clone(),
         auth::principal::resolve,

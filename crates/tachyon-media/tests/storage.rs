@@ -20,8 +20,8 @@ fn source(bytes: &[u8]) -> PathBuf {
 /// Puts, reads part back, copies, heads and deletes; then the objects are gone.
 async fn round_trip(storage: &Storage) {
     let id = Uuid::now_v7();
-    let key = object_key("images", id, "a.png").unwrap();
-    let copy = object_key("images", id, "a-10x10.png").unwrap();
+    let key = object_key(None, "images", id, "a.png").unwrap();
+    let copy = object_key(None, "images", id, "a-10x10.png").unwrap();
     let from = source(b"0123456789");
     assert_eq!(
         storage.put_file(&key, &from, "image/png").await.unwrap(),
@@ -47,10 +47,10 @@ async fn round_trip(storage: &Storage) {
 async fn local_store_stays_under_root() {
     let id = Uuid::now_v7();
     for bad in ["../x", "a/b", "..", "a\0b", "a\\b"] {
-        assert!(object_key("images", id, bad).is_err(), "{bad:?}");
+        assert!(object_key(None, "images", id, bad).is_err(), "{bad:?}");
     }
     assert_eq!(
-        object_key("images", id, "a.png").unwrap(),
+        object_key(None, "images", id, "a.png").unwrap(),
         format!("images/{id}/a.png")
     );
 
@@ -72,13 +72,63 @@ async fn local_store_stays_under_root() {
 }
 
 #[tokio::test]
+async fn a_static_dir_goes_before_the_collection() {
+    let root = temp_root();
+    let storage = Storage::open("default", &StorageConfig::local(&root)).unwrap();
+    let id = Uuid::now_v7();
+    let key = object_key(Some("media/images"), "images", id, "a.png").unwrap();
+    assert_eq!(key, format!("media/images/images/{id}/a.png"));
+    storage
+        .put_file(&key, &source(b"x"), "image/png")
+        .await
+        .unwrap();
+    assert!(
+        root.join("media/images/images")
+            .join(id.to_string())
+            .join("a.png")
+            .is_file()
+    );
+    for bad in ["../x", "/x", "a//b", "x/", ""] {
+        assert!(
+            object_key(Some(bad), "images", id, "a.png").is_err(),
+            "{bad:?}"
+        );
+    }
+}
+
+#[test]
+fn a_bad_prefix_stops_startup() {
+    for bad in ["", "/", "a//b", "../x", "x/"] {
+        let mut c = StorageConfig::local(temp_root());
+        c.prefix = Some(bad.into());
+        let err = Storage::open("disk", &c).unwrap_err();
+        assert!(err.starts_with("storage.disk.prefix: "), "{bad:?}: {err}");
+    }
+}
+
+#[test]
+fn public_urls_encode_each_segment() {
+    let mut c = StorageConfig::local(temp_root());
+    c.public_url = Some("https://cdn.example.com/media/".parse().unwrap());
+    let storage = Storage::open("default", &c).unwrap();
+    assert_eq!(
+        storage.public_url("docs/1/report #2 100%.pdf").unwrap(),
+        "https://cdn.example.com/media/docs/1/report%20%232%20100%25.pdf"
+    );
+    assert_eq!(
+        storage.public_url("docs/1/café.png").unwrap(),
+        "https://cdn.example.com/media/docs/1/caf%C3%A9.png"
+    );
+}
+
+#[tokio::test]
 async fn a_prefix_goes_before_every_key() {
     let root = temp_root();
     let mut c = StorageConfig::local(&root);
     c.prefix = Some("site-a".into());
     c.public_url = Some("https://files.example.com/".parse().unwrap());
     let storage = Storage::open("default", &c).unwrap();
-    let key = object_key("images", Uuid::now_v7(), "a.png").unwrap();
+    let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
     storage
         .put_file(&key, &source(b"x"), "image/png")
         .await

@@ -826,3 +826,69 @@ async fn a_restore_takes_numbering_locks_in_scope_order(pool: PgPool) {
     other.commit().await.unwrap();
     restoring.await.unwrap().unwrap();
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn failed_cleanups_outlive_the_job_purge(pool: PgPool) {
+    let c = seed(&pool).await;
+    let gone = reserve(&pool, &c, "gone.png", "", None).await;
+    let live = reserve(&pool, &c, "live.png", "", None).await;
+    let mut tx = pool.begin().await.unwrap();
+    files::go_live_in(&mut tx, c.id, live.id).await.unwrap();
+    tx.commit().await.unwrap();
+    sqlx::query("UPDATE files SET state = 'gone' WHERE id = $1")
+        .bind(gone.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    let mut add = async |kind: &str, payload: Value| {
+        let id = tachyon_db::jobs::add(
+            &mut conn,
+            &tachyon_db::jobs::NewJob {
+                kind,
+                document_id: None,
+                collection_id: None,
+                payload,
+                run_at: time::OffsetDateTime::now_utc(),
+                dedupe_key: None,
+                created_by: None,
+                key_id: None,
+                max_attempts: None,
+            },
+        )
+        .await
+        .unwrap();
+        // Failed for good, longer ago than jobs are kept.
+        sqlx::query(
+            "UPDATE jobs SET state = 'failed', finished_at = now() - interval '31 days' WHERE id = $1",
+        )
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+        id
+    };
+    let for_gone = add(CLEANUP, json!({ "file": gone.id })).await;
+    let for_keys = add(
+        CLEANUP,
+        json!({"keys": ["a/b/c.png"], "storage": "default"}),
+    )
+    .await;
+    let for_live = add(CLEANUP, json!({ "file": live.id })).await;
+    let other = add("publish", json!({})).await;
+    drop(conn);
+    tachyon_db::jobs::claim(&pool, std::time::Duration::from_secs(60))
+        .await
+        .unwrap();
+    let left: Vec<Uuid> =
+        sqlx::query_scalar("SELECT id FROM jobs WHERE state = 'failed' ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        left,
+        [for_gone, for_keys],
+        "kept while their objects may be in storage"
+    );
+    assert!(!left.contains(&for_live) && !left.contains(&other));
+}
