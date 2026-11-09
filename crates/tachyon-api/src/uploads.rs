@@ -123,13 +123,24 @@ impl UploadBody {
         }
         let constraints = Constraints::new().allowed_fields(allowed).size_limit(sizes);
         let between = Arc::new(Between::default());
-        let budget = HEADERS_MAX + CHUNK + boundary.len();
+        // What's pulled while a part is looked for: the rest of its delimiter line, its
+        // header lines and blank line, and what's left of the last piece. The exact limit is
+        // checked on the parsed lines below; this bounds what the parser buffers meanwhile.
+        let budget = HEADERS_MAX + CHUNK + boundary.len() + 16;
         let stream = Paced::new(req.into_body().into_data_stream(), between.clone(), budget);
         let mut parts = Multipart::with_constraints(stream, boundary, constraints);
         let (mut payload, mut spool) = (None, None);
         // Each part is read to its end, or refused, before the next is asked for, so only
         // what comes between parts is counted.
         while let Some(mut part) = between.count(parts.next_field()).await.map_err(refused)? {
+            let lines: usize = part
+                .headers()
+                .iter()
+                .map(|(name, value)| name.as_str().len() + ": ".len() + value.len() + 2)
+                .sum();
+            if lines > HEADERS_MAX {
+                return Err(ApiError::BadRequest(HeadersTooLong.to_string()));
+            }
             if part.name() == Some("file") {
                 if spool.is_some() {
                     return Err(ApiError::BadRequest(
@@ -163,7 +174,7 @@ impl UploadBody {
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
 
 #[derive(Debug, thiserror::Error)]
-#[error("a part's headers are over {HEADERS_MAX} bytes")]
+#[error("a part's header lines are over {HEADERS_MAX} bytes")]
 struct HeadersTooLong;
 
 /// Bytes the parser pulled while looking for the next part: its preamble, delimiter and
@@ -179,9 +190,17 @@ impl Between {
     async fn count<T>(&self, next: impl Future<Output = T>) -> T {
         self.pulled.store(0, Ordering::Relaxed);
         self.counting.store(true, Ordering::Relaxed);
-        let out = next.await;
-        self.counting.store(false, Ordering::Relaxed);
-        out
+        let _stop = Stop(self);
+        next.await
+    }
+}
+
+/// Stops counting when `count` ends, finished or dropped midway.
+struct Stop<'a>(&'a Between);
+
+impl Drop for Stop<'_> {
+    fn drop(&mut self) {
+        self.0.counting.store(false, Ordering::Relaxed);
     }
 }
 
@@ -589,6 +608,33 @@ mod tests {
             let detail = refusal(body).await.unwrap_or_default();
             assert!(detail.contains(&headers), "{what}: {detail}");
         }
+    }
+
+    /// A part whose header lines (`Name: value\r\n` each) take exactly `bytes`.
+    fn headers_of(bytes: usize) -> Vec<u8> {
+        let disposition = "Content-Disposition: form-data; name=\"_payload\"\r\n";
+        let pad = bytes - disposition.len() - "X-Pad: \r\n".len();
+        let block = format!("{disposition}X-Pad: {}\r\n", "a".repeat(pad));
+        assert_eq!(block.len(), bytes);
+        format!("--x\r\n{block}\r\n{{}}\r\n--x--\r\n").into_bytes()
+    }
+
+    #[tokio::test]
+    async fn the_header_limit_is_exact() {
+        assert_eq!(refusal(headers_of(HEADERS_MAX)).await, None);
+        let detail = refusal(headers_of(HEADERS_MAX + 1))
+            .await
+            .unwrap_or_default();
+        assert!(detail.contains("over 16384 bytes"), "{detail}");
+    }
+
+    #[tokio::test]
+    async fn a_dropped_wait_stops_counting() {
+        let between = Between::default();
+        let wait = between.count(std::future::pending::<()>());
+        let late = tokio::time::timeout(std::time::Duration::from_millis(10), wait).await;
+        assert!(late.is_err());
+        assert!(!between.counting.load(Ordering::Relaxed));
     }
 
     /// Contents past the budget, one part after another, read fine.
