@@ -795,7 +795,30 @@ async fn a_restore_takes_numbering_locks_in_scope_order(pool: PgPool) {
         let (pool, c) = (pool.clone(), c.clone());
         async move { restore(&pool, &c, doc).await }
     });
-    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    // Wait until the restore is blocked on an advisory lock, failing if it never is.
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+    loop {
+        let waiting: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_stat_activity
+             WHERE datname = current_database() AND wait_event_type = 'Lock'
+               AND wait_event = 'advisory'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        if waiting > 0 {
+            break;
+        }
+        assert!(
+            !restoring.is_finished(),
+            "the restore never waited for the `x` lock"
+        );
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the restore didn't block within 10 s"
+        );
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
     // The restore waits on `x` holding nothing else, so `y` is free.
     numbering_lock(&mut other, &c, r#"["y"]"#, "2s")
         .await
