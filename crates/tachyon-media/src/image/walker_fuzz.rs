@@ -1,12 +1,14 @@
 //! Seeded mutation fuzz for the container walkers: valid files with their lengths,
 //! offsets and bytes broken at random. No walker may panic or take long, and whatever one
-//! strips must walk again with nothing left to strip.
+//! strips must walk again with nothing left to strip. Structure-aware cases set the
+//! declared sizes and offsets to their edges and run the real probe as well.
 
 use std::time::{Duration, Instant};
 
-use super::{avif, gif, ico, jpeg};
+use super::{avif, gif, ico, jpeg, probe};
 use crate::fixtures::{
-    avif_with_exif, encoded, exif, gradient, ico_of, moving_gif, rgba, with_exif,
+    avif_extents, avif_set_extent, avif_with_exif, encoded, exif, gradient, iccp_bomb_png,
+    ico_around, ico_of, moving_gif, rgba, with_exif,
 };
 use ::image::ImageFormat as Codec;
 
@@ -159,5 +161,97 @@ fn avif_parser_fuzz() {
                 }
             }
         }
+    });
+}
+
+/// `bytes` probed the way an upload is, from a file.
+fn probe_bytes(bytes: &[u8]) -> Result<super::Probe, super::ImageError> {
+    let dir = std::env::temp_dir().join(format!("tachyon-fuzz-{}", uuid::Uuid::now_v7()));
+    std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join("in");
+    std::fs::write(&path, bytes).unwrap();
+    let out = probe(&path, &bytes[..bytes.len().min(8192)]);
+    std::fs::remove_dir_all(&dir).unwrap();
+    out
+}
+
+/// Runs `check` on each of `cases` within the step budget.
+fn each(name: &str, cases: Vec<Vec<u8>>, check: impl Fn(&[u8])) {
+    for (i, input) in cases.iter().enumerate() {
+        let start = Instant::now();
+        check(input);
+        let took = start.elapsed();
+        assert!(
+            took < Duration::from_millis(250),
+            "{name} case {i} took {took:?}"
+        );
+    }
+}
+
+/// Every icon entry's declared size set to 8, 33 (a PNG's signature and IHDR), one under
+/// and one over, and its offset pointed past the end. One seed is a trap: its PNG entry
+/// is followed by a 256 MiB iCCP bomb that only a reader ignoring the declared size
+/// reaches, and inflating it takes far longer than the budget.
+#[test]
+fn icon_sizes_fuzz() {
+    let mut trap = ico_around(&iccp_bomb_png(256 << 20));
+    trap[14..18].copy_from_slice(&33u32.to_le_bytes());
+    let seeds = [
+        ico_of(&[
+            encoded(&rgba(2, 2), Codec::Png),
+            encoded(&rgba(4, 4), Codec::Png),
+        ]),
+        trap,
+    ];
+    let mut cases = Vec::new();
+    for seed in &seeds {
+        let count = usize::from(u16::from_le_bytes([seed[4], seed[5]]));
+        for e in 0..count {
+            let at = 6 + 16 * e;
+            let size = u32::from_le_bytes(seed[at + 8..at + 12].try_into().unwrap());
+            for s in [8, 33, size.saturating_sub(1), size + 1] {
+                let mut b = seed.clone();
+                b[at + 8..at + 12].copy_from_slice(&s.to_le_bytes());
+                cases.push(b);
+            }
+            let mut b = seed.clone();
+            b[at + 12..at + 16].copy_from_slice(&(seed.len() as u32 + 1).to_le_bytes());
+            cases.push(b);
+            if e == 1 {
+                // The second entry over the first.
+                let mut b = seed.clone();
+                b.copy_within(6 + 12..6 + 16, at + 12);
+                cases.push(b);
+            }
+        }
+    }
+    each("icon sizes", cases, |input| {
+        if let Ok(icon) = ico::walk(input) {
+            let _ = ico::strip(input, &icon);
+        }
+        let _ = probe_bytes(input);
+    });
+}
+
+/// Every `iloc` extent's offset and length set to each of 0, the file's length, one past
+/// it and `u32::MAX`.
+#[test]
+fn avif_extents_fuzz() {
+    let seed = avif_with_exif(8, 8, exif(None, true));
+    let n = avif_extents(&seed).len();
+    let edge = [0, seed.len() as u32, seed.len() as u32 + 1, u32::MAX];
+    let mut cases = Vec::new();
+    for e in 0..n {
+        for &off in &edge {
+            for &len in &edge {
+                cases.push(avif_set_extent(seed.clone(), e, off, len));
+            }
+        }
+    }
+    each("avif extents", cases, |input| {
+        if let Ok(m) = avif::meta(input) {
+            let _ = avif::strip(input, &m);
+        }
+        let _ = probe_bytes(input);
     });
 }

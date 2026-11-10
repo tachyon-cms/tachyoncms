@@ -216,6 +216,18 @@ fn from_image(e: ::image::ImageError) -> ImageError {
 /// What the file starting with `head` at `path` is, how big and how many frames, from its
 /// headers: no pixel buffer is made, and metadata is read within `HEADER_ALLOC`.
 pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
+    unpanicked(|| probe_unguarded(path, head))
+}
+
+/// `work`, a panic in it (a parser or decoder bug some file reaches) taken as a file that
+/// can't be read rather than a failed request. Nothing here starts a thread, so every
+/// panic unwinds through this.
+fn unpanicked<T>(work: impl FnOnce() -> Result<T, ImageError>) -> Result<T, ImageError> {
+    std::panic::catch_unwind(std::panic::AssertUnwindSafe(work))
+        .unwrap_or_else(|_| Err(ImageError::Corrupt("decoding it failed".into())))
+}
+
+fn probe_unguarded(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     let format = match avif::brand(head) {
         Some(avif::Brand::Avif) => InputFormat::Avif,
         Some(avif::Brand::AnimatedAvif) => {
@@ -267,11 +279,21 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
             (p.width, p.height, p.frames, p.pixels) =
                 (walked.width, walked.height, walked.frames, walked.pixels);
         }
-        InputFormat::Webp | InputFormat::Ico | InputFormat::Png => {
+        InputFormat::Ico => {
             let bytes = read()?;
-            if format == InputFormat::Ico {
-                ico::walk(&bytes)?;
-            }
+            let icon = ico::walk(&bytes)?;
+            let e = icon.largest().ok_or_else(no_icon)?;
+            // Only the entry's declared bytes are read, as decoding reads them.
+            let slice = bytes.get(e.start..e.end).ok_or_else(no_icon)?;
+            (p.width, p.height) = if e.is_png() {
+                let (w, h, _, _) = headers(Cursor::new(slice), InputFormat::Png)?;
+                (w, h)
+            } else {
+                (e.width, e.height)
+            };
+        }
+        InputFormat::Webp | InputFormat::Png => {
+            let bytes = read()?;
             let icc;
             (p.width, p.height, p.orientation, icc) = headers(Cursor::new(&bytes), format)?;
             // The PNG decoder drops a profile over `HEADER_ALLOC` without a word; the
@@ -300,7 +322,11 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     Ok(p)
 }
 
-pub(super) fn avif_error(e: avif_parse::Error) -> ImageError {
+pub(super) fn no_icon() -> ImageError {
+    ImageError::Corrupt("this icon holds no image".into())
+}
+
+fn avif_error(e: avif_parse::Error) -> ImageError {
     match e {
         avif_parse::Error::UnexpectedEOF => ImageError::Truncated,
         e => corrupt(e),
@@ -416,7 +442,7 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
     let mut meta = Meta::default();
     let (mut frames, loops) = match p.format {
         InputFormat::Avif => {
-            let mut img = avif(&avif::as_avif(bytes))?;
+            let mut img = avif(&avif::as_avif(bytes), p.pixels)?;
             // A backstop: the probe bounded what the decoder could make.
             if img.width() > p.width || img.height() > p.height {
                 return Err(ImageError::Corrupt(
@@ -478,6 +504,27 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
                 .collect::<Result<Vec<_>, ImageError>>()?;
             (frames, webp_info(bytes).loops)
         }
+        InputFormat::Ico => {
+            let icon = ico::walk(bytes)?;
+            let e = icon.largest().ok_or_else(no_icon)?;
+            let slice = bytes.get(e.start..e.end).ok_or_else(no_icon)?;
+            let img = if e.is_png() {
+                let mut reader = ImageReader::with_format(Cursor::new(slice), Codec::Png);
+                reader.limits(limits);
+                let mut decoder = reader.into_decoder().map_err(from_image)?;
+                meta.icc = decoder.icc_profile().ok().flatten();
+                DynamicImage::from_decoder(decoder).map_err(from_image)?
+            } else {
+                DynamicImage::ImageRgba8(ico::decode_bitmap(slice, cap)?)
+            };
+            (
+                vec![Shown {
+                    image: img,
+                    delay_ms: 0,
+                }],
+                None,
+            )
+        }
         _ => {
             let mut reader = ImageReader::with_format(Cursor::new(bytes), codec(p.format));
             reader.limits(limits);
@@ -509,10 +556,12 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
     })
 }
 
-fn avif(bytes: &[u8]) -> Result<DynamicImage, ImageError> {
+/// `bytes` decoded on this thread, rav1d refusing a frame over `pixels`.
+fn avif(bytes: &[u8], pixels: u64) -> Result<DynamicImage, ImageError> {
     use avif_decode::Image;
     let image = avif::guarded(|| {
-        avif_decode::Decoder::from_avif(bytes)
+        let limit = u32::try_from(pixels).unwrap_or(u32::MAX).max(1);
+        avif_decode::Decoder::from_avif_limited(bytes, limit)
             .and_then(|d| d.to_image())
             .map_err(|e| match e {
                 avif_decode::Error::Avif(e) => avif_error(e),
@@ -576,6 +625,16 @@ pub fn process_original(
     out_dir: &Path,
 ) -> Result<Processed, ImageError> {
     let _working = Working::start();
+    unpanicked(|| process_unguarded(input, probe, u, max_pixels, out_dir))
+}
+
+fn process_unguarded(
+    input: &Path,
+    probe: &Probe,
+    u: &Upload,
+    max_pixels: u64,
+    out_dir: &Path,
+) -> Result<Processed, ImageError> {
     let cap = cap(u, max_pixels);
     check_cap(probe, cap)?;
     let strict = u
@@ -634,11 +693,9 @@ pub fn process_original(
         }
         .filter(|s| s[..] != bytes[..])
     };
-    let (path, filesize) = match stripped {
-        Some(b) => write_new(out_dir, &b)?,
-        None => (input.to_path_buf(), bytes.len() as u64),
-    };
     let first = decoded.as_ref().and_then(|d| d.frames.first());
+    // Worked out before the file is written, so nothing after it can fail and leave it.
+    let hash = first.and_then(|f| blurhash(&f.image));
     let (width, height) = first.map_or_else(
         || {
             if probe.orientation >= 5 {
@@ -649,13 +706,17 @@ pub fn process_original(
         },
         |f| (f.image.width(), f.image.height()),
     );
+    let (path, filesize) = match stripped {
+        Some(b) => write_new(out_dir, &b)?,
+        None => (input.to_path_buf(), bytes.len() as u64),
+    };
     Ok(Processed {
         path,
         mime: mime_of(probe.format),
         width,
         height,
         filesize,
-        blurhash: first.and_then(|f| blurhash(&f.image)),
+        blurhash: hash,
     })
 }
 
@@ -692,6 +753,7 @@ fn transform_and_encode(
     // Every frame comes out the size of the first, so all of them together are held to
     // the cap before any but the first is made.
     let cap = cap(u, max_pixels);
+    let count = frames.len() as u64;
     for (i, f) in frames.iter_mut().enumerate() {
         if let Some(r) = &u.resize_options {
             f.image = resize(
@@ -706,7 +768,7 @@ fn transform_and_encode(
         }
         if i == 0 {
             let total = u64::from(f.image.width()) * u64::from(f.image.height());
-            let total = total.saturating_mul(probe.frames.max(1).into());
+            let total = total.saturating_mul(count);
             if total > cap {
                 return Err(ImageError::Corrupt(format!(
                     "the transformed image would be {total} pixels, all its frames counted; \
@@ -1903,7 +1965,7 @@ mod tests {
     #[test]
     fn animations_carry_their_metadata() {
         let xmp = b"<x:xmpmeta>where</x:xmpmeta>";
-        let icc = vec![7u8; 600];
+        let icc = crate::fixtures::fake_icc(600);
         let source = gif::with_meta(&moving_gif(4, 4, 3), Some(&icc), Some(xmp));
         // Without withMetadata the profile stays and the XMP goes.
         let out = run(&source, &json(serde_json::json!({}))).unwrap();
@@ -1948,5 +2010,141 @@ mod tests {
         assert_eq!((out.width, out.height), (8, 8));
         let d = dir();
         assert!(probe(&file(&d, &kept), &kept).is_ok());
+    }
+
+    /// An icon whose one entry declares only the PNG's signature and IHDR (33 bytes), with
+    /// the rest of the PNG, a 32 MiB iCCP bomb first, straight after it.
+    fn short_entry_icon() -> Vec<u8> {
+        let mut ico = ico_around(&iccp_bomb_png(32 << 20));
+        ico[14..18].copy_from_slice(&33u32.to_le_bytes());
+        ico
+    }
+
+    #[test]
+    fn an_icon_entry_is_read_within_its_declared_size() {
+        let ico = short_entry_icon();
+        let d = dir();
+        let got = probe(&file(&d, &ico), &ico);
+        assert!(got.is_err(), "{got:?}");
+        assert!(run(&ico, &json(serde_json::json!({}))).is_err());
+    }
+
+    #[test]
+    fn overlapping_icon_entries_are_refused() {
+        let png = encoded(&crate::fixtures::rgba(4, 4), Codec::Png);
+        let mut ico = ico_of(&[png.clone(), png]);
+        // The second entry starts where the first does and runs 4 bytes past it.
+        let first = u32::from_le_bytes([ico[18], ico[19], ico[20], ico[21]]);
+        let size = u32::from_le_bytes([ico[14], ico[15], ico[16], ico[17]]);
+        ico[30..34].copy_from_slice(&(size + 4).to_le_bytes());
+        ico[34..38].copy_from_slice(&first.to_le_bytes());
+        let d = dir();
+        assert!(probe(&file(&d, &ico), &ico).is_err());
+    }
+
+    #[test]
+    fn a_bitmap_icon_decodes_from_its_own_bytes() {
+        let ico = crate::fixtures::bitmap_icon();
+        let d = dir();
+        let input = file(&d, &ico);
+        let p = probe(&input, &ico).unwrap();
+        assert_eq!((p.width, p.height), (2, 2));
+        let decoded = decode(&ico, &p, 100, false, false).unwrap();
+        let img = decoded.frames[0].image.to_rgba8();
+        assert_eq!(img.get_pixel(0, 0).0, [0, 0, 255, 0], "blue, masked out");
+        assert_eq!(img.get_pixel(1, 0).0, [9, 9, 9, 255]);
+        assert_eq!(img.get_pixel(0, 1).0, [255, 0, 0, 255]);
+        assert_eq!(img.get_pixel(1, 1).0, [0, 255, 0, 255]);
+    }
+
+    #[test]
+    fn a_panic_while_decoding_is_a_corrupt_file() {
+        let found = crate::fixtures::avif_that_panics();
+        assert!(
+            found.is_some() || !cfg!(debug_assertions),
+            "no panicking input found"
+        );
+        let Some(avif) = found else {
+            return; // a release build: avif-parse's assertion is compiled out
+        };
+        let d = dir();
+        let input = file(&d, &avif);
+        let got = probe(&input, &avif);
+        assert!(matches!(got, Err(ImageError::Corrupt(_))), "{got:?}");
+        let fake = Probe {
+            width: 8,
+            height: 8,
+            frames: 1,
+            orientation: 1,
+            format: InputFormat::Avif,
+            pixels: 64,
+            strip_by_encoding: false,
+        };
+        let got = process_original(&input, &fake, &json(serde_json::json!({})), 1000, &d);
+        assert!(matches!(got, Err(ImageError::Corrupt(_))), "{got:?}");
+    }
+
+    /// The guard above catches panics only while they unwind.
+    #[test]
+    fn no_profile_aborts_on_panic() {
+        for manifest in [
+            include_str!("../../../../Cargo.toml"),
+            include_str!("../../Cargo.toml"),
+        ] {
+            let squashed: String = manifest.chars().filter(|c| !c.is_whitespace()).collect();
+            assert!(
+                !squashed.contains("panic=\"abort\""),
+                "a profile sets panic = abort"
+            );
+        }
+    }
+
+    #[test]
+    fn ravifs_layout_takes_a_profile() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let with = avif::with_icc(&avif, &crate::fixtures::fake_icc(100))
+            .expect("ravif's container layout changed: avif::with_icc needs updating");
+        assert_eq!(
+            avif::meta(&with).unwrap().icc.map(|(s, e)| e - s),
+            Some(100)
+        );
+        let d = dir();
+        assert!(probe(&file(&d, &with), &with).is_ok());
+    }
+
+    #[test]
+    fn gif_strip_keeps_only_what_decoding_needs() {
+        let mut g = moving_gif(2, 2, 2);
+        let mut extra = b"\x21\x01\x0Cplain text!!\x00".to_vec(); // plain text
+        extra.extend_from_slice(b"\x21\x99\x02zz\x00"); // unknown label
+        extra.extend_from_slice(b"\x21\xFF\x0BNETSCAPE2.0\x05\x01\x00\x00hi\x00"); // padded loop
+        extra.extend_from_slice(b"\x21\xFF\x0BICCRGBG1012\x04junk\x00"); // not a profile
+        let table = if g[10] & 0x80 != 0 {
+            3 << ((g[10] & 7) + 1)
+        } else {
+            0
+        };
+        g.splice(13 + table..13 + table, extra);
+        let walked = gif::walk(&g, true).unwrap();
+        let out = &walked.stripped;
+        for gone in [&b"plain"[..], b"zz", b"hi", b"junk"] {
+            assert!(!has(out, gone), "{:?} kept", String::from_utf8_lossy(gone));
+        }
+        assert_eq!(walked.icc, None);
+        assert_eq!(gif::walk(out, false).unwrap().frames, 2);
+    }
+
+    #[test]
+    fn gif_xmp_needs_its_exact_trailer() {
+        let g = gif::with_meta(&moving_gif(2, 2, 2), None, Some(b"<x/>"));
+        assert_eq!(
+            gif::walk(&g, false).unwrap().xmp.as_deref(),
+            Some(&b"<x/>"[..])
+        );
+        // A packet whose bytes would end the sub-block walk early isn't written.
+        let steering = [4u8, b'a', b'b', b'c', b'd', 0, 0x2C, 1, 2];
+        let g = gif::with_meta(&moving_gif(2, 2, 2), None, Some(&steering));
+        assert_eq!(gif::walk(&g, false).unwrap().xmp, None);
+        assert_eq!(gif::walk(&g, false).unwrap().frames, 2);
     }
 }

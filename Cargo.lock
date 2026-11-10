@@ -264,8 +264,6 @@ dependencies = [
 [[package]]
 name = "avif-decode"
 version = "3.0.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "1eee11893966d77d3e18c66fdcfb1c30e2d8df050346609c775ce8eec3390344"
 dependencies = [
  "avif-parse",
  "bytemuck",

@@ -308,6 +308,12 @@ struct Box4 {
 }
 
 fn boxes(data: &[u8], from: usize, to: usize) -> Vec<Box4> {
+    walk_boxes(data, from, to).0
+}
+
+/// The boxes from `from` to `to`, and whether they reach `to` exactly: a walk that stops
+/// on a box it can't follow may have missed some.
+fn walk_boxes(data: &[u8], from: usize, to: usize) -> (Vec<Box4>, bool) {
     let mut out = Vec::new();
     let to = to.min(data.len());
     let mut i = from;
@@ -331,7 +337,7 @@ fn boxes(data: &[u8], from: usize, to: usize) -> Vec<Box4> {
         out.push(Box4 { kind, body, end });
         i = end;
     }
-    out
+    (out, i == to.min(data.len()))
 }
 
 fn find(list: &[Box4], kind: &[u8; 4]) -> Option<Box4> {
@@ -432,12 +438,15 @@ pub(super) fn meta(data: &[u8]) -> Result<Meta, ImageError> {
     let Some(meta) = find(&top, b"meta") else {
         return Ok(m);
     };
-    let inner = boxes(data, meta.body + 4, meta.end);
+    let (inner, whole) = walk_boxes(data, meta.body + 4, meta.end);
+    // A metadata item past where the walk stopped would go unseen: fail closed.
+    m.unresolved |= !whole;
     let primary = find(&inner, b"pitm").and_then(|b| {
         let wide = if *data.get(b.body)? == 0 { 2 } else { 4 };
         read(data, &mut (b.body + 4), wide, b.end)
     });
-    let wanted = metadata_items(data, &inner)?;
+    let (wanted, seen_all) = metadata_items(data, &inner)?;
+    m.unresolved |= !seen_all;
     let located = locations(data, &inner, &wanted)?;
     for (id, exif) in wanted {
         match located.iter().find(|(i, _)| *i == id) {
@@ -456,20 +465,26 @@ pub(super) fn meta(data: &[u8]) -> Result<Meta, ImageError> {
     Ok(m)
 }
 
-/// The `Exif` items and the `mime` items holding XMP: (id, is EXIF).
-fn metadata_items(data: &[u8], inner: &[Box4]) -> Result<Vec<(u64, bool)>, ImageError> {
+/// The `Exif` items and the `mime` items holding XMP: (id, is EXIF), and whether every
+/// item `iinf` counts was seen.
+type Wanted = (Vec<(u64, bool)>, bool);
+
+fn metadata_items(data: &[u8], inner: &[Box4]) -> Result<Wanted, ImageError> {
     let Some(iinf) = find(inner, b"iinf") else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), true));
     };
     let Some(&version) = data.get(iinf.body) else {
-        return Ok(Vec::new());
+        return Ok((Vec::new(), false));
     };
     let count_bytes = if version == 0 { 2 } else { 4 };
+    let Some(count) = read(data, &mut (iinf.body + 4), count_bytes, iinf.end) else {
+        return Ok((Vec::new(), false));
+    };
+    let (entries, whole) = walk_boxes(data, iinf.body + 4 + count_bytes, iinf.end);
+    let infes: Vec<&Box4> = entries.iter().filter(|b| &b.kind == b"infe").collect();
+    let seen_all = whole && infes.len() as u64 == count;
     let mut out = Vec::new();
-    for infe in boxes(data, iinf.body + 4 + count_bytes, iinf.end)
-        .iter()
-        .filter(|b| &b.kind == b"infe")
-    {
+    for infe in infes {
         let Some(&version) = data.get(infe.body) else {
             continue;
         };
@@ -502,7 +517,7 @@ fn metadata_items(data: &[u8], inner: &[Box4]) -> Result<Vec<(u64, bool)>, Image
             }
         }
     }
-    Ok(out)
+    Ok((out, seen_all))
 }
 
 /// An item id and its byte ranges, `None` when they can't be found.
@@ -750,7 +765,14 @@ pub(super) fn with_icc(data: &[u8], icc: &[u8]) -> Option<Vec<u8>> {
     let iloc_ok = *data.get(iloc.body)? == 0
         && *data.get(iloc.body + 4)? >> 4 == 4
         && *data.get(iloc.body + 5)? >> 4 == 0;
-    if !ipma_ok || !iloc_ok || mdat.body < meta.end {
+    // The primary item must be the first `ipma` entry, the one the index goes on.
+    let pitm = find(&inner, b"pitm")?;
+    if *data.get(pitm.body)? != 0 {
+        return None;
+    }
+    let primary = read(data, &mut (pitm.body + 4), 2, pitm.end)?;
+    let first = read(data, &mut (ipma.body + 8), 2, ipma.end)?;
+    if !ipma_ok || !iloc_ok || mdat.body < meta.end || primary != first {
         return None;
     }
     let count = boxes(data, ipco.body, ipco.end).len();
@@ -959,5 +981,14 @@ mod tests {
         let m = meta(&good).unwrap();
         assert!(!m.unresolved);
         assert_eq!(m.items[0].ranges, vec![(10, 14)]);
+    }
+
+    #[test]
+    fn a_short_iinf_count_is_unresolved() {
+        let mut data = synthetic(0, &[(10, 4)]);
+        // iinf says 2 entries; it holds 1.
+        let at = data.windows(4).position(|w| w == b"iinf").unwrap() + 4 + 4;
+        data[at + 1] = 2;
+        assert!(meta(&data).unwrap().unresolved);
     }
 }

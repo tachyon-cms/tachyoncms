@@ -1,0 +1,81 @@
+# avif-decode 3.0.0, vendored for TachyonCMS with one change: `Decoder::from_avif_limited`
+# decodes on the calling thread (rav1d's `n_threads = 1`, so no worker thread exists for a
+# panic to escape from) and holds rav1d to a frame size limit. Everything else is as
+# published. Upstream: https://github.com/kornelski/avif-decode
+[package]
+edition = "2024"
+rust-version = "1.98"
+name = "avif-decode"
+version = "3.0.0"
+authors = ["Kornel <kornel@geekhood.net>"]
+build = false
+autolib = false
+autobins = false
+autoexamples = false
+autotests = false
+autobenches = false
+description = "Convert AVIF images to PNG or decompressed pixel data"
+homepage = "https://lib.rs/avif-decode"
+readme = "README.md"
+keywords = [
+    "av1",
+    "rav1d",
+    "decoder",
+    "heif",
+]
+categories = ["multimedia::images"]
+license = "BSD-3-Clause"
+repository = "https://github.com/kornelski/avif-decode"
+
+[package.metadata.docs.rs]
+targets = ["x86_64-unknown-linux-gnu"]
+rustdoc-args = ["--generate-link-to-definition"]
+
+[badges.maintenance]
+status = "passively-maintained"
+
+[features]
+binary = ["dep:lodepng"]
+default = []
+
+[lib]
+name = "avif_decode"
+path = "src/lib.rs"
+
+[dependencies.avif-parse]
+version = "2.1.0"
+
+[dependencies.bytemuck]
+version = "1.25"
+
+[dependencies.imgref]
+version = "1.12.3"
+
+[dependencies.lodepng]
+version = "3.12.2"
+optional = true
+
+[dependencies.log]
+version = "0.4.34"
+
+[dependencies.quick-error]
+version = "2.0.1"
+
+[dependencies.rgb]
+version = "0.8.53"
+features = ["bytemuck"]
+default-features = false
+
+[dependencies.yuv]
+version = "0.8.19"
+
+[target.'cfg(any(target_arch = "x86", target_arch = "x86_64"))'.dependencies.rav1d]
+version = "1.1.0"
+
+[target.'cfg(not(any(target_arch = "x86", target_arch = "x86_64")))'.dependencies.rav1d]
+version = "1.1.0"
+features = [
+    "bitdepth_8",
+    "bitdepth_16",
+]
+default-features = false

@@ -69,19 +69,54 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
                 let (Some(label), Some(end)) = (at(i + 1), sub_blocks(i + 2)) else {
                     break;
                 };
-                let id = bytes.get(i + 3..i + 14).filter(|_| label == 0xFF);
-                let looping = id.is_some_and(|id| id == b"NETSCAPE2.0" || id == b"ANIMEXTS1.0");
-                if id == Some(ICC_ID) {
-                    icc = Some(sub_block_data(bytes, i + 14, end));
-                }
-                // XMP is written raw, ended by a 257-byte "magic trailer" and a zero, so
-                // that it walks as sub-blocks.
-                if id == Some(XMP_ID) && end >= i + 14 + 258 {
-                    xmp = bytes.get(i + 14..end - 258).map(<[u8]>::to_vec);
-                }
-                // A colour profile isn't private: it stays with the looping extensions.
-                if label != 0xFE && (label != 0xFF || looping || id == Some(ICC_ID)) {
-                    keep(&mut out, start, end);
+                let id = bytes
+                    .get(i + 3..i + 14)
+                    .filter(|_| label == 0xFF && at(i + 2) == Some(11));
+                let data = || sub_block_data(bytes, i + 14, end);
+                // What's kept is rebuilt, so no payload rides along unchecked: graphic
+                // control blocks of their fixed shape, the loop count, and a profile that
+                // looks like one. Comments, plain text and anything else go.
+                let rebuilt: Option<Vec<u8>> = match (label, id) {
+                    (0xF9, _) => bytes
+                        .get(start..end)
+                        .filter(|b| b.len() == 8 && b[2] == 4 && b[7] == 0)
+                        .map(<[u8]>::to_vec),
+                    (0xFF, Some(id)) if id == b"NETSCAPE2.0" || id == b"ANIMEXTS1.0" => {
+                        let d = data();
+                        (d.len() == 3 && d[0] == 1).then(|| {
+                            let mut b = vec![0x21, 0xFF, 11];
+                            b.extend_from_slice(id);
+                            b.extend_from_slice(&[3, 1, d[1], d[2], 0]);
+                            b
+                        })
+                    }
+                    (0xFF, Some(id)) if id == ICC_ID => {
+                        let d = data();
+                        let plausible = d.get(36..40) == Some(b"acsp")
+                            && d.get(..4).is_some_and(|n| {
+                                u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize == d.len()
+                            });
+                        plausible.then(|| {
+                            let b = extension(ICC_ID, &d);
+                            icc = Some(d);
+                            b
+                        })
+                    }
+                    (0xFF, Some(id)) if id == XMP_ID => {
+                        // Written raw, ended by a 257-byte "magic trailer" and a zero so it
+                        // walks as sub-blocks; taken only with that exact trailer.
+                        let packet = end
+                            .checked_sub(258)
+                            .filter(|&t| t >= i + 14 && bytes.get(t..end) == Some(&trailer()[..]));
+                        xmp = packet
+                            .and_then(|t| bytes.get(i + 14..t))
+                            .map(<[u8]>::to_vec);
+                        None
+                    }
+                    _ => None,
+                };
+                if let (true, Some(b)) = (strip, rebuilt) {
+                    out.extend_from_slice(&b);
                 }
                 i = end;
             }
@@ -131,6 +166,38 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
     })
 }
 
+/// The XMP "magic trailer": 1, 255 down to 0, then the block terminator.
+fn trailer() -> Vec<u8> {
+    let mut t = vec![1];
+    t.extend((0..=255u8).rev());
+    t.push(0);
+    t
+}
+
+/// An application extension `id` carrying `data` as sub-blocks.
+fn extension(id: &[u8], data: &[u8]) -> Vec<u8> {
+    let mut out = vec![0x21, 0xFF, 11];
+    out.extend_from_slice(id);
+    for block in data.chunks(255) {
+        out.push(block.len() as u8);
+        out.extend_from_slice(block);
+    }
+    out.push(0);
+    out
+}
+
+/// Whether `data` walks as sub-blocks ending exactly at its last byte.
+fn walks_as_sub_blocks(data: &[u8]) -> bool {
+    let mut at = 0;
+    while let Some(&n) = data.get(at) {
+        at += 1 + usize::from(n);
+        if n == 0 {
+            return at == data.len();
+        }
+    }
+    false
+}
+
 /// The data of the sub-blocks from `at` to `end`, joined.
 fn sub_block_data(bytes: &[u8], mut at: usize, end: usize) -> Vec<u8> {
     let mut out = Vec::new();
@@ -158,21 +225,15 @@ pub(super) fn with_meta(bytes: &[u8], icc: Option<&[u8]>, xmp: Option<&[u8]>) ->
     let at = at.min(bytes.len());
     let mut out = bytes[..at].to_vec();
     if let Some(icc) = icc {
-        out.extend_from_slice(&[0x21, 0xFF, 11]);
-        out.extend_from_slice(ICC_ID);
-        for block in icc.chunks(255) {
-            out.push(block.len() as u8);
-            out.extend_from_slice(block);
-        }
-        out.push(0);
+        out.extend(extension(ICC_ID, icc));
     }
-    if let Some(xmp) = xmp {
+    // Raw XMP steers the sub-block walk; it's written only if, trailer and all, it walks
+    // to its own end and can't open blocks of its own.
+    let packet = xmp.map(|x| [x, &trailer()[..]].concat());
+    if let Some(packet) = packet.filter(|p| walks_as_sub_blocks(p)) {
         out.extend_from_slice(&[0x21, 0xFF, 11]);
         out.extend_from_slice(XMP_ID);
-        out.extend_from_slice(xmp);
-        out.push(1);
-        out.extend((0..=255u8).rev());
-        out.push(0);
+        out.extend_from_slice(&packet);
     }
     out.extend_from_slice(&bytes[at..]);
     out

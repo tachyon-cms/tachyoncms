@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.2.0"
@@ -60,3 +61,8 @@ uuid = { version = "1.28.0", features = ["v7", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# One change to avif-decode: a decoder on the calling thread with a frame size limit (see
+# vendor/avif-decode/Cargo.toml).
+[patch.crates-io]
+avif-decode = { path = "vendor/avif-decode" }

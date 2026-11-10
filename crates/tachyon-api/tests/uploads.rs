@@ -1327,3 +1327,17 @@ async fn a_cancelled_upload_keeps_its_permit_until_the_work_ends(pool: PgPool) {
     let ran = tachyon_media::image::working_peak();
     assert!(ran <= 2, "{ran} decodes ran at once");
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_file_that_panics_a_decoder_is_a_422(pool: PgPool) {
+    let Some(avif) = fixtures::avif_that_panics() else {
+        return; // a release build: the parser's assertion is compiled out
+    };
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let res = upload(&app, "POST", "/api/images", Some(&avif), "x.avif", None).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file");
+    assert!(files_in(&d.temp).is_empty());
+}

@@ -602,3 +602,54 @@ pub fn ico_of(pngs: &[Vec<u8>]) -> Vec<u8> {
     }
     out
 }
+
+/// `len` bytes shaped like an ICC profile: its size first and `acsp` at 36.
+pub fn fake_icc(len: usize) -> Vec<u8> {
+    let mut icc = vec![7u8; len];
+    icc[..4].copy_from_slice(&(len as u32).to_be_bytes());
+    icc[36..40].copy_from_slice(b"acsp");
+    icc
+}
+
+/// An AVIF that makes avif-parse panic in a debug build (one of its debug assertions), found
+/// by trying single-byte changes to a valid file in order. `None` in a release build.
+pub fn avif_that_panics() -> Option<Vec<u8>> {
+    let seed = avif_with_exif(8, 8, exif(None, true));
+    let quiet = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {}));
+    let mut found = None;
+    'search: for at in 0..seed.len() {
+        for v in [0x00u8, 0xFF, 0x01, 0x10] {
+            let mut b = seed.clone();
+            b[at] = v;
+            if std::panic::catch_unwind(|| avif_parse::read_avif(&mut b.as_slice())).is_err() {
+                found = Some(b);
+                break 'search;
+            }
+        }
+    }
+    std::panic::set_hook(quiet);
+    found
+}
+
+/// A bitmap icon entry: 2×2, 24 bits, the top-left pixel masked out.
+pub fn bitmap_icon() -> Vec<u8> {
+    let mut dib = Vec::new();
+    for v in [40u32, 2, 4] {
+        dib.extend_from_slice(&v.to_le_bytes());
+    }
+    dib.extend_from_slice(&1u16.to_le_bytes());
+    dib.extend_from_slice(&24u16.to_le_bytes());
+    dib.extend_from_slice(&[0; 24]);
+    // Rows bottom to top, 2 pixels of BGR each, padded to 8 bytes.
+    dib.extend_from_slice(&[0, 0, 255, 0, 255, 0, 0, 0]); // bottom: red, green
+    dib.extend_from_slice(&[255, 0, 0, 9, 9, 9, 0, 0]); // top: blue, grey
+    // The AND mask, bottom to top, 4 bytes a row: the top row's first pixel is clear.
+    dib.extend_from_slice(&[0, 0, 0, 0, 0x80, 0, 0, 0]);
+    let mut out = vec![0, 0, 1, 0, 1, 0];
+    out.extend_from_slice(&[2, 2, 0, 0, 1, 0, 24, 0]);
+    out.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+    out.extend_from_slice(&22u32.to_le_bytes());
+    out.extend_from_slice(&dib);
+    out
+}
