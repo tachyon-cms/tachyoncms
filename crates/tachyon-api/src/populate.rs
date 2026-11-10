@@ -67,6 +67,7 @@ pub(crate) fn prepare(
             Some(&collection_id) => found.push(Relation {
                 path: r.path,
                 at: r.at,
+                field: r.field,
                 collection_id,
                 id: r.id,
             }),
@@ -87,42 +88,15 @@ pub(crate) fn prepare(
 }
 
 /// The links a stored document holds, as `(field, ID)`: the field is the link's schema
-/// path, list indexes dropped (`attachments`, `links.author`), so a list keeps its links
-/// whatever their order. A block row's index becomes its `blockType` (`layout.gallery.file`),
-/// so same-named fields of different block types stay apart. Rich text nodes share their
-/// field's name.
+/// position (`RelationRef::field`), so a list keeps its links whatever their order and
+/// same-named fields of different block types stay apart.
 pub(crate) type Held = HashSet<(String, Uuid)>;
-
-/// The field of the link at `path` in `data`, as `Held` names it.
-fn field_of(data: &Map<String, Value>, path: &str) -> String {
-    let mut out: Vec<&str> = Vec::new();
-    // `None` is `data` itself; a path that leaves the data just drops its indexes.
-    let mut at: Option<&Value> = None;
-    for segment in path.split('.') {
-        let next = match at {
-            None => data.get(segment),
-            Some(Value::Object(o)) => o.get(segment),
-            Some(Value::Array(rows)) => segment.parse::<usize>().ok().and_then(|i| rows.get(i)),
-            Some(_) => None,
-        };
-        if !segment.bytes().all(|b| b.is_ascii_digit()) {
-            out.push(segment);
-        } else if let Some(t) = next
-            .and_then(|row| row.get("blockType"))
-            .and_then(Value::as_str)
-        {
-            out.push(t);
-        }
-        at = next.or(Some(&Value::Null));
-    }
-    out.join(".")
-}
 
 /// The links `data` of `c` holds (see `Held`).
 pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Held {
     relations(c.schema.data(), data)
         .into_iter()
-        .map(|r| (field_of(data, &r.path), r.id))
+        .map(|r| (r.field, r.id))
         .collect()
 }
 
@@ -285,7 +259,7 @@ pub(crate) async fn check_links(
     let mut ids: Vec<Uuid> = next
         .relations
         .iter()
-        .filter(|r| !before.contains(&(field_of(&next.data, &r.path), r.id)))
+        .filter(|r| !before.contains(&(r.field.clone(), r.id)))
         .map(|r| r.id)
         .collect();
     ids.sort_unstable();
@@ -483,7 +457,7 @@ pub(crate) fn vouched_links(
         .relations
         .iter()
         .filter(|r| {
-            !before.contains(&(field_of(&next.data, &r.path), r.id))
+            !before.contains(&(r.field.clone(), r.id))
                 && !vouched.contains(&(r.id, r.collection_id))
         })
         .map(|r| FieldError {

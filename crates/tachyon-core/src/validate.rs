@@ -960,6 +960,11 @@ pub struct RelationRef {
     /// nodes (`body.content.0.content.1.marks.0.attrs.doc.value`) where `path` counts
     /// references (`body.0`).
     pub at: String,
+    /// The link's schema position, built from the schema rather than the data: list
+    /// indexes become `[]` (`rows.[].x.a`), a block row's index its `blockType`
+    /// (`layout.gallery.file`), and rich text's link nodes share their field's name. No
+    /// value a document holds can make two positions share one name.
+    pub field: String,
     pub relation_to: String,
     pub id: Uuid,
     /// The field's `maxDepth`, if it caps population.
@@ -975,11 +980,13 @@ const ANY: RelationTo = RelationTo::Many(Vec::new());
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
     let fields: &[Field] = &data_fields(fields);
     /// `at`: where validation names `obj`, which differs from `prefix` inside rich text.
+    /// `key`: the schema position of `obj` (`RelationRef::field`).
     fn walk(
         fields: &[Field],
         obj: &Map<String, Value>,
         prefix: &str,
         at: &str,
+        key: &str,
         out: &mut Vec<RelationRef>,
     ) {
         for f in fields {
@@ -988,6 +995,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
             };
             let path = join(prefix, &f.name);
             let named = join(at, &f.name);
+            let field = join(key, &f.name);
             let max_depth = f.kind.link().and_then(|l| l.max_depth);
             let filter_options = match &f.kind {
                 FieldKind::Upload { filter_options, .. } => filter_options.as_ref(),
@@ -1006,6 +1014,7 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 Some(RelationRef {
                     path,
                     at,
+                    field: field.clone(),
                     relation_to: slug.to_owned(),
                     id: Uuid::try_parse(id).ok()?,
                     max_depth,
@@ -1029,14 +1038,21 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     }
                 }
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    walk(fields, inner, &path, &named, out)
+                    walk(fields, inner, &path, &named, &field, out)
                 }
                 (FieldKind::Array { .. } | FieldKind::Blocks { .. }, Value::Array(rows)) => {
                     for (i, row) in rows.iter().enumerate() {
                         if let Value::Object(inner) = row {
                             let row = format!("{path}.{i}");
                             let row_at = format!("{named}.{i}");
-                            walk(row_fields(&f.kind, inner), inner, &row, &row_at, out);
+                            // Only a blocks row's `blockType` picks its schema; an array
+                            // row's is a plain field, whatever its name.
+                            let row_key = match &f.kind {
+                                FieldKind::Blocks { .. } => join(&field, block_type(inner)),
+                                _ => format!("{field}.[]"),
+                            };
+                            let fields = row_fields(&f.kind, inner);
+                            walk(fields, inner, &row, &row_at, &row_key, out);
                         }
                     }
                 }
@@ -1052,11 +1068,13 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                             crate::richtext::Item::Block(attrs) => {
                                 if let Some(Value::Object(inner)) = attrs.get("fields") {
                                     let fields_at = format!("{node}.fields");
+                                    let node_key = join(&field, block_type(attrs));
                                     walk(
                                         node_fields(&f.kind, attrs),
                                         inner,
                                         &here,
                                         &fields_at,
+                                        &node_key,
                                         out,
                                     );
                                 }
@@ -1069,8 +1087,13 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
         }
     }
     let mut out = Vec::new();
-    walk(fields, doc, "", "", &mut out);
+    walk(fields, doc, "", "", "", &mut out);
     out
+}
+
+/// The block type a validated block row or node names; `""` only before validation.
+fn block_type(row: &Map<String, Value>) -> &str {
+    row.get("blockType").and_then(Value::as_str).unwrap_or("")
 }
 
 /// Replaces each relationship ID with `f(path, id)` wherever `f` returns a value. Paths are

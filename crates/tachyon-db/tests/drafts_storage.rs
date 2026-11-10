@@ -74,6 +74,7 @@ async fn post(pool: &PgPool, s: &Seed, title: &str, author: Uuid) -> Uuid {
     let relations = vec![Relation {
         path: "author".into(),
         at: "author".into(),
+        field: "author".into(),
         collection_id: s.authors,
         id: author,
     }];
@@ -589,6 +590,7 @@ async fn notes(pool: &PgPool, s: &Seed, links: &[(&str, Uuid)]) -> (Uuid, Collec
         let relations = vec![Relation {
             path: "post".into(),
             at: "post".into(),
+            field: "post".into(),
             collection_id: s.posts,
             id: *to,
         }];
@@ -849,6 +851,7 @@ async fn owner_narrows_reads(pool: PgPool) {
         let relations = vec![Relation {
             path: "author".into(),
             at: "author".into(),
+            field: "author".into(),
             collection_id: s.authors,
             id: s.ann,
         }];
@@ -1007,6 +1010,7 @@ async fn draft_writes_leave_the_published_copy_alone(pool: PgPool) {
         relations: vec![Relation {
             path: "author".into(),
             at: "author".into(),
+            field: "author".into(),
             collection_id: s.authors,
             id: author,
         }],

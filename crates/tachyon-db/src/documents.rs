@@ -51,6 +51,8 @@ pub struct Relation {
     pub path: String,
     /// Where validation names the link, for errors about it (`RelationRef::at`).
     pub at: String,
+    /// The link's schema position (`RelationRef::field`).
+    pub field: String,
     pub collection_id: Uuid,
     pub id: Uuid,
 }

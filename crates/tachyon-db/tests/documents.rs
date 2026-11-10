@@ -177,6 +177,7 @@ async fn link(
         .map(|(i, (collection_id, id))| Relation {
             path: format!("refs.{i}"),
             at: format!("refs.{i}"),
+            field: format!("refs.{i}"),
             collection_id: *collection_id,
             id: *id,
         })
@@ -280,6 +281,7 @@ async fn deleting_the_linker_frees_the_target_and_self_links_never_block(pool: P
     let rel = Relation {
         path: "self".into(),
         at: "self".into(),
+        field: "self".into(),
         collection_id: posts,
         id: me,
     };
@@ -345,6 +347,7 @@ async fn saving_documents_that_link_to_each_other_at_once_never_deadlocks(pool: 
         relations: vec![Relation {
             path: "refs.0".into(),
             at: "refs.0".into(),
+            field: "refs.0".into(),
             collection_id: posts,
             id: to,
         }],

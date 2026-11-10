@@ -719,3 +719,89 @@ async fn hidden_links_stay_in_their_block_type(pool: PgPool) {
     let res = send(&editor, "PATCH", &url, Some(&same.to_string())).await;
     assert_eq!(res.status, 200, "{}", res.json);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_links_keep_their_schema_position(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "media", "upload": true, "access": {"read": {"role": ["admin"]}},
+               "fields": []}),
+    )
+    .await;
+    // A row's own `blockType` text field mustn't make its key collide with another position.
+    let row_fields = |nested: Value| {
+        json!([
+            {"name": "blockType", "type": "text"},
+            {"name": "a", "type": "upload", "relationTo": "media"},
+            {"name": "x", "type": "group", "fields": [
+                {"name": "a", "type": "upload", "relationTo": "media",
+                 "filterOptions": {"mimeType": {"like": "image"}}}
+            ]},
+            {"name": "b", "type": "group", "fields": [
+                {"name": "a", "type": "upload", "relationTo": "media"}
+            ]},
+            {"name": "nested", "type": "array", "fields": nested}
+        ])
+    };
+    schema(
+        &app,
+        json!({"slug": "posts", "access": {"read": true}, "fields": [
+            {"name": "rows", "type": "array", "fields": row_fields(row_fields(json!([])))},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "doc", "fields": [
+                    {"name": "file", "type": "upload", "relationTo": "media"}
+                ]}
+            ]}
+        ]}),
+    )
+    .await;
+    let x = put(&app, "media", &pdf(), "terms.pdf").await["id"].clone();
+    let rows = json!([
+        {"blockType": "x", "a": x},
+        {"blockType": "b", "a": x},
+        {"nested": [{"blockType": "x", "a": x}]}
+    ]);
+    let post = ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"rows": rows, "layout": [{"blockType": "doc", "file": x}]}),
+    )
+    .await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(router(&pool, &d).await, "editor@example.com").await;
+    let patch = |body: Value| {
+        let (editor, url) = (editor.clone(), url.clone());
+        async move { send(&editor, "PATCH", &url, Some(&body.to_string())).await }
+    };
+
+    // Into the filtered `x.a`, the unfiltered `b.a`, and the filtered `x.a` of a nested row.
+    for (rows, at) in [
+        (json!([{"x": {"a": x}}]), "rows.0.x.a"),
+        (json!([{"b": {"a": x}}]), "rows.0.b.a"),
+        (
+            json!([{"nested": [{"x": {"a": x}}]}]),
+            "rows.0.nested.0.x.a",
+        ),
+    ] {
+        let res = patch(json!({"rows": rows})).await;
+        assert_problem(&res, 422);
+        assert_eq!(paths(&res), vec![(at.into(), MISSING_LINK.into())], "{at}");
+    }
+    // Unchanged, and reordered, the rows and blocks keep their hidden links.
+    let flat = ok(&editor, "GET", &format!("{url}?depth=0"), json!(null)).await;
+    let res = patch(json!({"rows": flat["rows"], "layout": flat["layout"]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let reordered: Vec<Value> = flat["rows"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .rev()
+        .cloned()
+        .collect();
+    let res = patch(json!({"rows": reordered})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}

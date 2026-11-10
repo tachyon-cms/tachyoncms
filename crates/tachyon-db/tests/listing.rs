@@ -622,6 +622,7 @@ mod joins {
             .map(|(path, id)| Relation {
                 path: (*path).to_owned(),
                 at: (*path).to_owned(),
+                field: (*path).to_owned(),
                 collection_id: f.categories,
                 id: *id,
             })

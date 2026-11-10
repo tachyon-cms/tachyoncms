@@ -1078,6 +1078,7 @@ async fn rewrite(
                             Some(Relation {
                                 path: r.path,
                                 at: r.at,
+                                field: r.field,
                                 collection_id: *targets.get(&r.relation_to)?,
                                 id: r.id,
                             })
