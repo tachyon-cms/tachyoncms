@@ -157,6 +157,27 @@ pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
         .is_some_and(|p| flag(&p, "wait").unwrap_or(false))
 }
 
+/// A file read's `?draft` (worked out as a document read's is) and `?id`, the document
+/// holding it, taken only where `filenameCompoundIndex` lets documents share a name.
+pub(crate) fn file_params(
+    raw: Option<&str>,
+    c: &Collection,
+    access: &Access,
+) -> Result<(bool, Option<uuid::Uuid>), ApiError> {
+    let shared = c
+        .schema
+        .upload
+        .as_ref()
+        .is_some_and(|u| u.filename_compound_index.is_some());
+    let allowed: &[&str] = if shared { &["draft", "id"] } else { &["draft"] };
+    let params = params(raw, allowed)?;
+    draft(&params, c, access)?;
+    let id = single(&params, "id")?
+        .map(|id| uuid::Uuid::try_parse(id).map_err(|_| bad("`id` must be a document ID")))
+        .transpose()?;
+    Ok((flag(&params, "draft")?, id))
+}
+
 /// Refuses any query parameter, for a write that takes none.
 pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())

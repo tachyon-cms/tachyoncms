@@ -16,11 +16,12 @@ use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document, FileChange, Prepared};
-use tachyon_db::versions;
+use tachyon_db::{files, versions};
 use uuid::Uuid;
 
 use crate::access::Access;
 use crate::documents::{collection, mode_for, parse_id, record, unique_error};
+use crate::files::{direct_urls, fill_upload_urls};
 use crate::globals::global;
 use crate::params::{diff_params, no_params, page_params};
 use crate::populate::{
@@ -207,7 +208,14 @@ async fn version(
 ) -> Result<versions::Version, ApiError> {
     let mut v = stored_version(state, d, vid, drafts).await?;
     if let Some(data) = v.data.take() {
-        v.data = Some(stripped(access, &d.c, data));
+        let mut data = stripped(access, &d.c, data);
+        // The version's own file, which it links to as the document did then.
+        let key = match (v.file_id, direct_urls(access, &d.c)) {
+            (Some(file), true) => Some(files::get(&state.pool, file).await?.key),
+            _ => None,
+        };
+        fill_upload_urls(state, access, &d.c, d.id, &mut data, key.as_deref());
+        v.data = Some(data);
     }
     Ok(v)
 }

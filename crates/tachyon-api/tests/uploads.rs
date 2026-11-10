@@ -209,6 +209,11 @@ async fn upload_creates_a_document(pool: PgPool) {
     assert_eq!(doc["focalY"], 50);
     assert_eq!(doc["alt"], "x");
     assert_eq!(doc["sizes"], json!({"thumbnail": null}));
+    assert_eq!(doc["url"], "http://localhost:3000/api/images/file/cat.png");
+    assert_eq!(
+        doc["thumbnailURL"], doc["url"],
+        "an image is its own thumbnail"
+    );
     let id = doc["id"].as_str().unwrap();
     let file = held(&pool, id, "published_file").await.expect("a file");
     let row = files::get(&pool, file).await.unwrap();
@@ -591,6 +596,8 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     let doc = upload(&app, "POST", "/api/images", Some(&png(1, 1)), "a.png", None).await;
     assert_eq!(doc.status, 201, "{}", doc.json);
     let id = doc.json["id"].as_str().unwrap().to_owned();
+    let url = doc.json["url"].clone();
+    assert_eq!(url, "http://localhost:3000/api/images/file/a.png");
     let old = held(&pool, &id, "published_file").await.unwrap();
     // As an image's placeholder will be, once there are some.
     sqlx::query(
@@ -612,6 +619,7 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     .await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["filename"], "a.png", "the same name");
+    assert_eq!(res.json["url"], url, "the same url");
     assert_eq!(res.json["filesize"], bigger.len());
     assert_eq!(res.json["alt"], "new");
     assert!(res.json["blurhash"].is_string(), "{}", res.json);
@@ -622,6 +630,17 @@ async fn replace_keeps_the_old_file_for_versions(pool: PgPool) {
     assert_eq!(state_of(&pool, old).await, "live", "a version holds it");
     let old_key = files::get(&pool, old).await.unwrap().key;
     assert!(d.root.join(old_key).exists());
+    // A `url` sent back is dropped: it's worked out on read, never stored.
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/images/{id}"),
+        Some(json!({"url": "https://elsewhere.test/x.png", "thumbnailURL": "/y"})),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["url"], url);
+    assert_eq!(res.json["thumbnailURL"], url);
 }
 
 /// `doc` without the document's own metadata, which no PATCH writes back.

@@ -24,6 +24,8 @@ pub enum ApiError {
     UnsupportedMediaType(String),
     /// The request ran past its time limit.
     Timeout,
+    /// A `Range` that starts past the end of a file of this many bytes.
+    RangeNotSatisfiable(u64),
     Conflict(String),
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
@@ -116,6 +118,12 @@ impl ApiError {
                 Some("the request took too long; try again".to_owned()),
                 None,
             ),
+            Self::RangeNotSatisfiable(size) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Range not satisfiable",
+                Some(format!("the file has {size} bytes")),
+                None,
+            ),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
             Self::Unique(_) => (
                 StatusCode::CONFLICT,
@@ -160,13 +168,21 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let range = match self {
+            Self::RangeNotSatisfiable(size) => Some(format!("bytes */{size}")),
+            _ => None,
+        };
         let (status, body) = self.problem();
-        (
+        let mut res = (
             status,
             [(header::CONTENT_TYPE, "application/problem+json")],
             body.to_string(),
         )
-            .into_response()
+            .into_response();
+        if let Some(range) = range.and_then(|r| r.parse().ok()) {
+            res.headers_mut().insert(header::CONTENT_RANGE, range);
+        }
+        res
     }
 }
 

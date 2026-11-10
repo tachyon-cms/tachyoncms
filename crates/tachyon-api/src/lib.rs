@@ -5,6 +5,7 @@ pub mod auth;
 mod collections;
 mod documents;
 mod error;
+mod files;
 mod globals;
 mod jobs;
 mod joins;
@@ -204,6 +205,8 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             get(trash::list).delete(trash::empty),
         )
         .route("/api/{collection}/trash/{id}", delete(trash::purge))
+        // `GET` answers `HEAD` too.
+        .route("/api/{collection}/file/{filename}", get(files::serve))
         .route("/api/{collection}/trash/{id}/restore", post(trash::restore))
         .route(
             "/api/{collection}/{id}",

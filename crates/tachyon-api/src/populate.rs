@@ -356,6 +356,7 @@ pub(crate) async fn fill_virtuals_each(
     items: &mut [(Value, Arc<Collection>)],
     selects: &[Option<&Select>],
 ) -> Result<(), ApiError> {
+    crate::files::fill_urls(state, access, items).await?;
     let wanted: Vec<Vec<VirtualField>> = items
         .iter()
         .zip(selects)

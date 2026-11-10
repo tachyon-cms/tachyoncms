@@ -343,6 +343,30 @@ impl Access {
         &self.schemas
     }
 
+    /// How a signed-out caller would read, to decide what may be cached or linked publicly.
+    pub(crate) fn anonymous(&self) -> Access {
+        Access {
+            principal: Principal::Anonymous,
+            user: None,
+            schemas: self.schemas.clone(),
+            drafts: OnceLock::new(),
+            linked: OnceLock::new(),
+            visible: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether the caller may read every document of `c`: its read is an unconditional
+    /// `Allow`, not a filter.
+    pub(crate) fn reads_every_document(&self, c: &Collection) -> bool {
+        matches!(self.allows(Action::Read, c), Compiled::Allow)
+    }
+
+    /// Whether the caller may do `action` to some document of `c`, if only where a filter
+    /// matches.
+    pub(crate) fn permits_any(&self, action: Action, c: &Collection) -> bool {
+        !matches!(self.allows(action, c), Compiled::Deny)
+    }
+
     pub(crate) fn caller(&self) -> Caller<'_> {
         Caller {
             user: self.user.as_ref(),
@@ -506,6 +530,15 @@ impl Access {
             }
             None if self.by_role_in(action, slug, scoped) == Decision::Deny => Compiled::Deny,
             None => Compiled::Allow,
+        }
+    }
+
+    /// A refusal that mustn't say why: sign in first when signed out (Ruling F-6), else a
+    /// 404, as for what isn't there.
+    pub(crate) fn hidden(&self) -> ApiError {
+        match self.principal {
+            Principal::Anonymous => self.refuse(),
+            _ => ApiError::NotFound,
         }
     }
 

@@ -416,6 +416,22 @@ pub async fn by_name(
     .await?)
 }
 
+/// The storage key of the file each of `docs` holds in its published copy, by document.
+pub async fn published_keys(
+    pool: &PgPool,
+    docs: &[Uuid],
+) -> Result<std::collections::HashMap<Uuid, String>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT d.id, f.key FROM documents d JOIN files f ON f.id = d.published_file
+           WHERE d.tenant_id = $1 AND d.id = ANY($2)"#,
+        DEFAULT_TENANT,
+        docs,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.key)).collect())
+}
+
 /// Live documents whose copy holds `file` as its current file, once per copy.
 pub async fn holders(pool: &PgPool, file: Uuid) -> Result<Vec<(Uuid, DocCopy)>, DbError> {
     let rows = sqlx::query!(
