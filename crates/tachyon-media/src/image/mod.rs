@@ -8,7 +8,10 @@
 
 mod avif;
 mod gif;
+mod ico;
 mod jpeg;
+#[cfg(test)]
+mod walker_fuzz;
 
 use std::io::{BufRead, BufReader, Cursor, Seek, Write};
 use std::path::{Path, PathBuf};
@@ -64,8 +67,8 @@ pub struct Probe {
     pub format: InputFormat,
     /// The most pixels decoding may make, all frames counted: what the cap is held to.
     pub pixels: u64,
-    /// Whether the metadata can only be removed by re-encoding: a TIFF, or an icon whose
-    /// PNG carries chunks outside the kept ones.
+    /// Whether the metadata can only be removed by re-encoding: a TIFF, or an AVIF whose
+    /// metadata items can't all be located.
     pub strip_by_encoding: bool,
 }
 
@@ -110,6 +113,40 @@ thread_local! {
 fn decode_started() {
     #[cfg(test)]
     DECODES_STARTED.with(|c| c.set(c.get() + 1));
+}
+
+/// `process_original` calls running now, and the most there have been in this process:
+/// counted apart from any permit, so a test can see how many really ran at once.
+static WORKING: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+static WORKING_PEAK: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The most `process_original` calls that have run at once.
+#[doc(hidden)]
+pub fn working_peak() -> usize {
+    WORKING_PEAK.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// `process_original` calls running now.
+#[doc(hidden)]
+pub fn working_now() -> usize {
+    WORKING.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+struct Working;
+
+impl Working {
+    fn start() -> Self {
+        use std::sync::atomic::Ordering::Relaxed;
+        let now = WORKING.fetch_add(1, Relaxed) + 1;
+        WORKING_PEAK.fetch_max(now, Relaxed);
+        Working
+    }
+}
+
+impl Drop for Working {
+    fn drop(&mut self) {
+        WORKING.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+    }
 }
 
 /// The types `probe` reads, HEIC among them only to refuse it by name.
@@ -211,15 +248,19 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     match format {
         InputFormat::Avif => {
             let bytes = read()?;
-            let parsed =
-                avif_parse::read_avif(&mut &avif::as_avif(&bytes)[..]).map_err(avif_error)?;
-            let (w, h, bound) = avif::decode_bound(&parsed.primary_item)?;
-            let (aw, ah, alpha) = match &parsed.alpha_item {
+            let parsed = avif::parse(&bytes)?;
+            let (w, h) = avif::decode_bound(&parsed.primary_item)?;
+            let (aw, ah) = match &parsed.alpha_item {
                 Some(a) => avif::decode_bound(a)?,
-                None => (0, 0, 0),
+                None => (0, 0),
             };
-            (p.width, p.height, p.pixels) = (w.max(aw), h.max(ah), bound.max(alpha));
-            p.orientation = avif::meta(&bytes).orientation;
+            let pixels = |w: u32, h: u32| u64::from(w) * u64::from(h);
+            (p.width, p.height) = (w.max(aw), h.max(ah));
+            p.pixels = pixels(w, h).max(pixels(aw, ah));
+            let meta = avif::meta(&bytes)?;
+            p.orientation = meta.orientation;
+            // Metadata that can't be found can't be blanked: the picture is re-encoded.
+            p.strip_by_encoding = meta.unresolved;
         }
         InputFormat::Gif => {
             let walked = gif::walk(&read()?, false)?;
@@ -229,13 +270,17 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
         InputFormat::Webp | InputFormat::Ico | InputFormat::Png => {
             let bytes = read()?;
             if format == InputFormat::Ico {
-                p.strip_by_encoding = icon_needs_encoding(&bytes)?;
+                ico::walk(&bytes)?;
             }
             let icc;
             (p.width, p.height, p.orientation, icc) = headers(Cursor::new(&bytes), format)?;
             // The PNG decoder drops a profile over `HEADER_ALLOC` without a word; the
             // file is refused instead, so a decode never inflates it with a larger limit.
-            if format == InputFormat::Png && !icc && png_chunks(&bytes)?.contains(b"iCCP") {
+            let has_iccp = || {
+                let mut budget = usize::MAX;
+                ico::png_chunks(&bytes, &mut budget).map(|c| c.iter().any(|(k, _, _)| k == b"iCCP"))
+            };
+            if format == InputFormat::Png && !icc && has_iccp()? {
                 return Err(ImageError::Corrupt(
                     "its colour profile is broken or larger than allowed".into(),
                 ));
@@ -255,7 +300,7 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     Ok(p)
 }
 
-fn avif_error(e: avif_parse::Error) -> ImageError {
+pub(super) fn avif_error(e: avif_parse::Error) -> ImageError {
     match e {
         avif_parse::Error::UnexpectedEOF => ImageError::Truncated,
         e => corrupt(e),
@@ -297,58 +342,6 @@ fn headers<R: BufRead + Seek>(
     let orientation = decoder.orientation().map_or(1, |o| o.to_exif()).clamp(1, 8);
     let icc = decoder.icc_profile().ok().flatten().is_some();
     Ok((w, h, orientation, icc))
-}
-
-/// The chunk types of PNG `bytes`, in order.
-fn png_chunks(bytes: &[u8]) -> Result<Vec<[u8; 4]>, ImageError> {
-    let cut = || ImageError::Corrupt("a PNG chunk is cut off".into());
-    let mut out = Vec::new();
-    let mut i = 8;
-    while i < bytes.len() {
-        let h = bytes.get(i..i + 8).ok_or_else(cut)?;
-        let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
-        out.push([h[4], h[5], h[6], h[7]]);
-        if &h[4..8] == b"IEND" {
-            break;
-        }
-        i = i.checked_add(12 + len).ok_or_else(cut)?;
-    }
-    Ok(out)
-}
-
-/// Whether the icon `bytes` has a PNG entry carrying chunks outside `PNG_KEEP`. Refuses
-/// one with compressed metadata (`iCCP`, `zTXt`, `iTXt`): the icon decoder inflates those
-/// without a limit.
-fn icon_needs_encoding(bytes: &[u8]) -> Result<bool, ImageError> {
-    let cut = || ImageError::Corrupt("the icon's directory is cut off".into());
-    let count = usize::from(u16::from_le_bytes(
-        bytes
-            .get(4..6)
-            .ok_or_else(cut)?
-            .try_into()
-            .map_err(|_| cut())?,
-    ));
-    let mut needs = false;
-    for e in 0..count {
-        let entry = bytes.get(6 + 16 * e..22 + 16 * e).ok_or_else(cut)?;
-        let size = u32::from_le_bytes(entry[8..12].try_into().map_err(|_| cut())?) as usize;
-        let offset = u32::from_le_bytes(entry[12..16].try_into().map_err(|_| cut())?) as usize;
-        let data = bytes
-            .get(offset..offset.saturating_add(size))
-            .ok_or_else(cut)?;
-        if !data.starts_with(b"\x89PNG\r\n\x1a\n") {
-            continue;
-        }
-        for kind in png_chunks(data)? {
-            if matches!(&kind, b"iCCP" | b"zTXt" | b"iTXt") {
-                return Err(ImageError::Corrupt(
-                    "an icon's PNG carries compressed metadata".into(),
-                ));
-            }
-            needs |= !PNG_KEEP.contains(&&kind);
-        }
-    }
-    Ok(needs)
 }
 
 /// What a WebP's chunks say.
@@ -423,12 +416,21 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
     let mut meta = Meta::default();
     let (mut frames, loops) = match p.format {
         InputFormat::Avif => {
-            let img = avif(&avif::as_avif(bytes))?;
+            let mut img = avif(&avif::as_avif(bytes))?;
             // A backstop: the probe bounded what the decoder could make.
             if img.width() > p.width || img.height() > p.height {
                 return Err(ImageError::Corrupt(
                     "the AVIF decodes larger than its header says".into(),
                 ));
+            }
+            let m = avif::meta(bytes)?;
+            // The clean aperture applies before `irot` and `imir`.
+            if let Some((x, y, w, h)) = m.clap.and_then(|c| c.rect(img.width(), img.height())) {
+                img = img.crop_imm(x, y, w, h);
+            }
+            meta.icc = m.icc.and_then(|(s, e)| bytes.get(s..e)).map(<[u8]>::to_vec);
+            if keep {
+                (meta.exif, meta.xmp) = m.exif_and_xmp(bytes);
             }
             (
                 vec![Shown {
@@ -441,6 +443,11 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
         InputFormat::Gif => {
             // Four bytes a pixel, for each frame the decoder holds.
             let (shown, loops) = gif::frames(bytes, all, cap.saturating_mul(4))?;
+            let walked = gif::walk(bytes, false)?;
+            meta.icc = walked.icc;
+            if keep {
+                meta.xmp = walked.xmp;
+            }
             let frames = shown
                 .into_iter()
                 .map(|s| Shown {
@@ -453,6 +460,11 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
         InputFormat::Webp if all && p.frames > 1 => {
             let mut d = WebPDecoder::new(Cursor::new(bytes)).map_err(from_image)?;
             d.set_limits(limits).map_err(from_image)?;
+            meta.icc = d.icc_profile().ok().flatten();
+            if keep {
+                meta.exif = d.exif_metadata().ok().flatten();
+                meta.xmp = d.xmp_metadata().ok().flatten();
+            }
             let frames = d
                 .into_frames()
                 .map(|f| {
@@ -499,12 +511,14 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
 
 fn avif(bytes: &[u8]) -> Result<DynamicImage, ImageError> {
     use avif_decode::Image;
-    let image = avif_decode::Decoder::from_avif(bytes)
-        .and_then(|d| d.to_image())
-        .map_err(|e| match e {
-            avif_decode::Error::Avif(e) => avif_error(e),
-            e => corrupt(e),
-        })?;
+    let image = avif::guarded(|| {
+        avif_decode::Decoder::from_avif(bytes)
+            .and_then(|d| d.to_image())
+            .map_err(|e| match e {
+                avif_decode::Error::Avif(e) => avif_error(e),
+                e => corrupt(e),
+            })
+    })?;
     let bad = || ImageError::Corrupt("the AVIF's planes don't match its size".into());
     Ok(match image {
         Image::Rgb8(i) => {
@@ -561,6 +575,7 @@ pub fn process_original(
     max_pixels: u64,
     out_dir: &Path,
 ) -> Result<Processed, ImageError> {
+    let _working = Working::start();
     let cap = cap(u, max_pixels);
     check_cap(probe, cap)?;
     let strict = u
@@ -613,7 +628,8 @@ pub fn process_original(
         match probe.format {
             InputFormat::Jpeg => walked_jpeg.map(|j| j.stripped),
             InputFormat::Gif => walked_gif.map(|g| g.stripped),
-            InputFormat::Avif => avif::strip(&bytes, &avif::meta(&bytes)),
+            InputFormat::Avif => avif::strip(&bytes, &avif::meta(&bytes)?),
+            InputFormat::Ico => ico::strip(&bytes, &ico::walk(&bytes)?),
             f => strip(f, &bytes)?,
         }
         .filter(|s| s[..] != bytes[..])
@@ -673,8 +689,11 @@ fn transform_and_encode(
             }
         }
     }
-    if let Some(r) = &u.resize_options {
-        for f in &mut frames {
+    // Every frame comes out the size of the first, so all of them together are held to
+    // the cap before any but the first is made.
+    let cap = cap(u, max_pixels);
+    for (i, f) in frames.iter_mut().enumerate() {
+        if let Some(r) = &u.resize_options {
             f.image = resize(
                 &f.image,
                 r.width,
@@ -682,8 +701,18 @@ fn transform_and_encode(
                 r.fit,
                 r.position,
                 r.without_enlargement.unwrap_or(false),
-                max_pixels,
+                cap,
             )?;
+        }
+        if i == 0 {
+            let total = u64::from(f.image.width()) * u64::from(f.image.height());
+            let total = total.saturating_mul(probe.frames.max(1).into());
+            if total > cap {
+                return Err(ImageError::Corrupt(format!(
+                    "the transformed image would be {total} pixels, all its frames counted; \
+                     the limit is {cap}"
+                )));
+            }
         }
     }
     let (out, options) = match &u.format_options {
@@ -705,21 +734,22 @@ fn transform_and_encode(
             .map(|e| upright_exif(&e)),
         xmp: meta.xmp.filter(|_| u.with_metadata),
     };
+    let first = &frames[0].image;
+    let (width, height, hash) = (first.width(), first.height(), blurhash(first));
     let encoded = match out {
         InputFormat::Gif | InputFormat::Webp if frames.len() > 1 => {
-            encode_animation(&frames, loops, out, &options)?
+            encode_animation(frames, loops, out, &options, &meta)?
         }
         _ => encode_to(&frames[0].image, out, &options, &meta)?,
     };
     let (path, filesize) = write_new(out_dir, &encoded)?;
-    let first = &frames[0].image;
     Ok(Processed {
         path,
         mime: mime_of(out),
-        width: first.width(),
-        height: first.height(),
+        width,
+        height,
         filesize,
-        blurhash: blurhash(first),
+        blurhash: hash,
     })
 }
 
@@ -826,8 +856,9 @@ fn failed(e: impl std::fmt::Display) -> ImageError {
 
 /// `img` encoded as `format` with `o`'s quality, losslessness, effort and progressive
 /// where the format takes them, and `meta` where it holds it. Defaults follow the usual
-/// ones: JPEG and WebP 80, AVIF 50, effort 4. AVIF re-encodes are 8-bit and carry EXIF
-/// only; GIF, BMP and ICO carry no metadata; TIFF carries the ICC profile only.
+/// ones: JPEG and WebP 80, AVIF 50, effort 4. AVIF re-encodes are 8-bit and carry the
+/// profile and EXIF (ravif writes no XMP item); GIF carries the profile and XMP as
+/// application extensions; TIFF carries the profile; BMP and ICO carry nothing.
 fn encode_to(
     img: &DynamicImage,
     format: InputFormat,
@@ -893,18 +924,7 @@ fn encode_to(
             let memory = encoder
                 .encode_advanced(&webp_config(o)?)
                 .map_err(|e| failed(format!("{e:?}")))?;
-            let mut webp = img_parts::webp::WebP::from_bytes(Bytes::copy_from_slice(&memory))
-                .map_err(failed)?;
-            if let Some(xmp) = &meta.xmp {
-                webp.chunks_mut().push(img_parts::riff::RiffChunk::new(
-                    *b"XMP ",
-                    img_parts::riff::RiffContent::Data(xmp.clone().into()),
-                ));
-            }
-            webp.set_icc_profile(meta.icc.clone().map(Into::into));
-            // Last: it also rewrites the VP8X flags to the chunks there are.
-            webp.set_exif(meta.exif.clone().map(Into::into));
-            out = webp.encoder().bytes().to_vec();
+            out = webp_with_meta(&memory, meta)?;
         }
         InputFormat::Avif => {
             let speed = 10u8.saturating_sub(o.effort.unwrap_or(4)).clamp(1, 10);
@@ -922,10 +942,21 @@ fn encode_to(
             DynamicImage::ImageRgba8(img.to_rgba8())
                 .write_with_encoder(e)
                 .map_err(failed)?;
+            // ravif writes no profile; it's added to the container after.
+            if let Some(with) = meta
+                .icc
+                .as_deref()
+                .and_then(|icc| avif::with_icc(&out, icc))
+            {
+                out = with;
+            }
         }
-        InputFormat::Gif => GifEncoder::new(&mut out)
-            .encode_frame(Frame::new(img.to_rgba8()))
-            .map_err(failed)?,
+        InputFormat::Gif => {
+            GifEncoder::new(&mut out)
+                .encode_frame(Frame::new(img.to_rgba8()))
+                .map_err(failed)?;
+            out = gif::with_meta(&out, meta.icc.as_deref(), meta.xmp.as_deref());
+        }
         InputFormat::Tiff => {
             let mut cursor = Cursor::new(Vec::new());
             let mut e = TiffEncoder::new(&mut cursor);
@@ -953,37 +984,62 @@ fn webp_config(o: &EncodeOptions) -> Result<webp::WebPConfig, ImageError> {
     Ok(c)
 }
 
-/// `frames` as an animated GIF or WebP, with their delays and `loops`.
+/// `frames` as an animated GIF or WebP, with their delays, `loops` and `meta` where the
+/// format holds it (GIF: the profile and XMP; WebP: all three). Frames are handed over as
+/// they are, RGBA already, not copied.
 fn encode_animation(
-    frames: &[Shown],
+    frames: Vec<Shown>,
     loops: Option<u16>,
     format: InputFormat,
     o: &EncodeOptions,
+    meta: &Meta,
 ) -> Result<Vec<u8>, ImageError> {
     let mut out = Vec::new();
-    let rgba: Vec<RgbaImage> = frames.iter().map(|f| f.image.to_rgba8()).collect();
     if format == InputFormat::Gif {
         let mut e = GifEncoder::new(&mut out);
         e.set_repeat(loops.map_or(Repeat::Infinite, Repeat::Finite))
             .map_err(failed)?;
-        e.encode_frames(rgba.into_iter().zip(frames).map(|(img, f)| {
-            Frame::from_parts(img, 0, 0, Delay::from_numer_denom_ms(f.delay_ms, 1))
+        e.encode_frames(frames.into_iter().map(|f| {
+            let delay = Delay::from_numer_denom_ms(f.delay_ms, 1);
+            Frame::from_parts(f.image.into_rgba8(), 0, 0, delay)
         }))
         .map_err(failed)?;
         drop(e);
-        return Ok(out);
+        return Ok(gif::with_meta(
+            &out,
+            meta.icc.as_deref(),
+            meta.xmp.as_deref(),
+        ));
     }
+    let delays: Vec<u32> = frames.iter().map(|f| f.delay_ms).collect();
+    let rgba: Vec<RgbaImage> = frames.into_iter().map(|f| f.image.into_rgba8()).collect();
     let config = webp_config(o)?;
     let (w, h) = rgba[0].dimensions();
     let mut e = webp::AnimEncoder::new(w, h, &config);
     e.set_loop_count(loops.map_or(0, i32::from));
     let mut at = 0i32;
-    for (img, f) in rgba.iter().zip(frames) {
+    for (img, delay) in rgba.iter().zip(delays) {
         e.add_frame(webp::AnimFrame::from_rgba(img, w, h, at));
-        at = at.saturating_add(i32::try_from(f.delay_ms).unwrap_or(i32::MAX));
+        at = at.saturating_add(i32::try_from(delay).unwrap_or(i32::MAX));
     }
     let memory = e.try_encode().map_err(|e| failed(format!("{e:?}")))?;
-    Ok(memory.to_vec())
+    webp_with_meta(&memory, meta)
+}
+
+/// The WebP `bytes` with `meta`'s profile, EXIF and XMP as chunks.
+fn webp_with_meta(bytes: &[u8], meta: &Meta) -> Result<Vec<u8>, ImageError> {
+    let mut webp =
+        img_parts::webp::WebP::from_bytes(Bytes::copy_from_slice(bytes)).map_err(failed)?;
+    if let Some(xmp) = &meta.xmp {
+        webp.chunks_mut().push(img_parts::riff::RiffChunk::new(
+            *b"XMP ",
+            img_parts::riff::RiffContent::Data(xmp.clone().into()),
+        ));
+    }
+    webp.set_icc_profile(meta.icc.clone().map(Into::into));
+    // Last: it also rewrites the VP8X flags to the chunks there are.
+    webp.set_exif(meta.exif.clone().map(Into::into));
+    Ok(webp.encoder().bytes().to_vec())
 }
 
 /// The colour `t` trims: its `background`, else `img`'s top-left pixel.
@@ -1153,8 +1209,9 @@ pub fn blurhash(img: &DynamicImage) -> Option<String> {
 mod tests {
     use super::*;
     use crate::fixtures::{
-        avif_rotated, avif_two_headers, avif_with_exif, cmyk_jpeg, encoded, exif, gif, gradient,
-        iccp_bomb_png, ico_around, png_header, png_icc_turned, tiff_with_description, with_exif,
+        avif_cropped, avif_rotated, avif_set_extent, avif_two_frames, avif_two_headers,
+        avif_with_exif, cmyk_jpeg, encoded, exif, gif, gradient, iccp_bomb_png, ico_around, ico_of,
+        ico_repeating, moving_gif, png_header, png_icc_turned, tiff_with_description, with_exif,
     };
     use ::image::{GrayImage, Luma, RgbImage};
     use tachyon_core::uploads::{ConstructorOptions, FormatOptions, ResizeOptions};
@@ -1773,5 +1830,123 @@ mod tests {
             let u = json(serde_json::json!({"constructorOptions": {"failOn": level}}));
             assert_eq!(run(cut, &u), Err(ImageError::Truncated), "{level}");
         }
+    }
+
+    #[test]
+    fn animated_output_is_held_to_the_cap() {
+        let u = json(serde_json::json!({
+            "resizeOptions": {"width": 100},
+            "constructorOptions": {"limitInputPixels": 50_000}
+        }));
+        // Ten 10×10 frames come in at 1,000 pixels; ten 100×100 frames would go out at 100,000.
+        let got = run(&moving_gif(10, 10, 10), &u);
+        assert!(got.is_err(), "{:?}", got.map(|p| (p.width, p.height)));
+    }
+
+    #[test]
+    fn an_icon_repeating_one_png_is_refused() {
+        let png = encoded(&crate::fixtures::rgba(4, 4), Codec::Png);
+        let ico = ico_repeating(&png, 300);
+        let d = dir();
+        assert!(probe(&file(&d, &ico), &ico).is_err());
+    }
+
+    #[test]
+    fn unresolvable_avif_metadata_isnt_stored() {
+        let avif = avif_with_exif(20, 12, exif(None, true));
+        let extents = crate::fixtures::avif_extents(&avif);
+        let at = extents
+            .iter()
+            .position(|e| avif.get(e.1 + 4..e.1 + 8) == Some(b"MM\0\x2a"))
+            .expect("the EXIF item");
+        let lost = avif_set_extent(avif, at, 1 << 30, 10);
+        let got = run(&lost, &json(serde_json::json!({})));
+        if let Ok(out) = got {
+            assert!(!has(&stored(&out), b"MM\0\x2a"), "the EXIF was stored");
+        }
+    }
+
+    #[test]
+    fn an_avif_item_with_two_frames_is_refused() {
+        let avif = avif_two_frames(16, 16);
+        let d = dir();
+        let got = probe(&file(&d, &avif), &avif);
+        assert!(got.is_err(), "{got:?}");
+    }
+
+    #[test]
+    fn a_clean_aperture_crops() {
+        let avif = avif_cropped(20, 12, 10, 6);
+        let out = run(&avif, &json(serde_json::json!({}))).unwrap();
+        assert_eq!((out.width, out.height), (10, 6));
+        let u = json(serde_json::json!({"formatOptions": {"format": "png"}}));
+        let out = run(&avif, &u).unwrap();
+        let made = ::image::load_from_memory(&stored(&out)).unwrap();
+        assert_eq!((made.width(), made.height()), (10, 6));
+    }
+
+    #[test]
+    fn an_avif_reencode_keeps_the_profile() {
+        let png = png_icc_turned(8, 4, 300);
+        let u = json(serde_json::json!({"formatOptions": {"format": "avif"}}));
+        let out = run(&png, &u).unwrap();
+        let kept = stored(&out);
+        let m = avif::meta(&kept).unwrap();
+        let (s, e) = m.icc.expect("a colr prof");
+        assert_eq!(e - s, 300);
+        // It still decodes.
+        let d = dir();
+        let p = probe(&file(&d, &kept), &kept).unwrap();
+        assert_eq!((p.width, p.height), (4, 8));
+    }
+
+    #[test]
+    fn animations_carry_their_metadata() {
+        let xmp = b"<x:xmpmeta>where</x:xmpmeta>";
+        let icc = vec![7u8; 600];
+        let source = gif::with_meta(&moving_gif(4, 4, 3), Some(&icc), Some(xmp));
+        // Without withMetadata the profile stays and the XMP goes.
+        let out = run(&source, &json(serde_json::json!({}))).unwrap();
+        let walked = gif::walk(&stored(&out), false).unwrap();
+        assert_eq!(
+            (walked.icc.as_deref(), walked.xmp.as_deref()),
+            (Some(&icc[..]), None)
+        );
+        let u = json(serde_json::json!({
+            "withMetadata": true,
+            "resizeOptions": {"width": 2},
+            "formatOptions": {"format": "webp"}
+        }));
+        let out = run(&source, &u).unwrap();
+        let webp = img_parts::webp::WebP::from_bytes(stored(&out).into()).unwrap();
+        assert_eq!(webp_info(&stored(&out)).frames, 3);
+        assert_eq!(webp.icc_profile().as_deref(), Some(&icc[..]));
+        assert!(webp.chunk_by_id(*b"XMP ").is_some());
+        let as_gif = json(serde_json::json!({"withMetadata": true, "resizeOptions": {"width": 2}}));
+        let out = run(&source, &as_gif).unwrap();
+        let walked = gif::walk(&stored(&out), false).unwrap();
+        assert_eq!(walked.frames, 3);
+        assert_eq!(walked.xmp.as_deref(), Some(&xmp[..]));
+        assert_eq!(walked.icc.as_deref(), Some(&icc[..]));
+    }
+
+    #[test]
+    fn an_icon_keeps_every_entry() {
+        let small = encoded(&crate::fixtures::rgba(4, 4), Codec::Png);
+        let big = encoded(&crate::fixtures::rgba(8, 8), Codec::Png);
+        let mut p = img_parts::png::Png::from_bytes(big.into()).unwrap();
+        let at = p.chunks().len() - 1;
+        p.chunks_mut().insert(
+            at,
+            img_parts::png::PngChunk::new(*b"tEXt", Bytes::from_static(b"GPS\0secret")),
+        );
+        let ico = ico_of(&[small, p.encoder().bytes().to_vec()]);
+        let out = run(&ico, &json(serde_json::json!({}))).unwrap();
+        let kept = stored(&out);
+        assert!(!has(&kept, b"secret"));
+        assert_eq!(u16::from_le_bytes([kept[4], kept[5]]), 2, "both entries");
+        assert_eq!((out.width, out.height), (8, 8));
+        let d = dir();
+        assert!(probe(&file(&d, &kept), &kept).is_ok());
     }
 }

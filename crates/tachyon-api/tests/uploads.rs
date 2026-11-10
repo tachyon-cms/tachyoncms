@@ -1300,31 +1300,30 @@ async fn a_cancelled_upload_keeps_its_permit_until_the_work_ends(pool: PgPool) {
             })
         })
         .collect();
-    // Every request is spooled and the first decodes are under way: then the clients go.
-    until("all six are spooled", async || files_in(&d.temp).len() >= 6).await;
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // Two decodes are under way, the rest wait for a permit: then the clients go, and two
+    // more uploads come in while the abandoned work still runs.
+    until("two decodes run", async || {
+        tachyon_media::image::working_now() >= 2
+    })
+    .await;
     for t in &tasks {
         t.abort();
     }
-    for i in 0..2 {
-        let res = upload(
-            &app,
-            "POST",
-            "/api/images",
-            Some(&png),
-            &format!("late{i}.png"),
-            None,
-        )
-        .await;
+    let late = (0..2).map(|i| {
+        let (app, png) = (app.clone(), png.clone());
+        async move {
+            let name = format!("late{i}.png");
+            upload(&app, "POST", "/api/images", Some(&png), &name, None).await
+        }
+    });
+    for res in futures_util::future::join_all(late).await {
         assert_eq!(res.status, 201, "{}", res.json);
     }
     until("the abandoned work has cleaned up", async || {
         files_in(&d.temp).is_empty()
     })
     .await;
-    assert!(
-        tachyon_api::decodes_peak() <= 2,
-        "{}",
-        tachyon_api::decodes_peak()
-    );
+    // Counted inside the work itself, apart from the permit: what really ran at once.
+    let ran = tachyon_media::image::working_peak();
+    assert!(ran <= 2, "{ran} decodes ran at once");
 }

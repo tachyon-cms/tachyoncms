@@ -335,6 +335,25 @@ fn grow(data: &mut [u8], at: usize, by: usize) {
 
 /// A `w`×`h` AVIF whose primary item carries an `irot` of `quarter_turns` anticlockwise.
 pub fn avif_rotated(w: u32, h: u32, quarter_turns: u8) -> Vec<u8> {
+    avif_with_property(
+        w,
+        h,
+        &[0, 0, 0, 9, b'i', b'r', b'o', b't', quarter_turns & 3],
+    )
+}
+
+/// A `w`×`h` AVIF with a clean aperture of `cw`×`ch`, centred.
+pub fn avif_cropped(w: u32, h: u32, cw: u32, ch: u32) -> Vec<u8> {
+    let mut clap = vec![0, 0, 0, 40];
+    clap.extend_from_slice(b"clap");
+    for v in [cw, 1, ch, 1, 0, 1, 0, 1] {
+        clap.extend_from_slice(&v.to_be_bytes());
+    }
+    avif_with_property(w, h, &clap)
+}
+
+/// A `w`×`h` AVIF whose primary item carries the property box `property` as well.
+pub fn avif_with_property(w: u32, h: u32, property: &[u8]) -> Vec<u8> {
     let mut data = encoded(&gradient(w, h), Codec::Avif);
     let meta = boxes(&data, 0, data.len())
         .into_iter()
@@ -355,18 +374,18 @@ pub fn avif_rotated(w: u32, h: u32, quarter_turns: u8) -> Vec<u8> {
     let n = usize::from(data[n_at]);
     let (ipco_end, ipma_insert) = (ipco.3, n_at + 1 + n);
     let (meta_at, iprp_at, ipco_at, ipma_at) = (meta.1, iprp.1, ipco.1, ipma.1);
-    // irot after the existing properties, and its index after the item's others.
-    let irot = [0, 0, 0, 9, b'i', b'r', b'o', b't', quarter_turns & 3];
+    // The property after the existing ones, and its index after the item's others.
+    let by = property.len() + 1;
     data.insert(ipma_insert, 0x80 | (count as u8 + 1));
     data[n_at] += 1;
     grow(&mut data, ipma_at, 1);
-    data.splice(ipco_end..ipco_end, irot);
-    grow(&mut data, ipco_at, 9);
-    grow(&mut data, iprp_at, 10);
-    grow(&mut data, meta_at, 10);
-    // The picture moved 10 bytes on: so do its extents.
+    data.splice(ipco_end..ipco_end, property.iter().copied());
+    grow(&mut data, ipco_at, property.len());
+    grow(&mut data, iprp_at, by);
+    grow(&mut data, meta_at, by);
+    // The picture moved on: so do its extents.
     let (field, off, _) = first_extent(&data);
-    data[field..field + 4].copy_from_slice(&((off + 10) as u32).to_be_bytes());
+    data[field..field + 4].copy_from_slice(&((off + by) as u32).to_be_bytes());
     data
 }
 
@@ -427,4 +446,159 @@ pub fn png_icc_turned(w: u32, h: u32, icc_len: usize) -> Vec<u8> {
         .insert(1, img_parts::png::PngChunk::new(*b"iCCP", body.into()));
     png.set_exif(Some(exif(Some(6), false).into()));
     png.encoder().bytes().to_vec()
+}
+
+/// Every extent `iloc` gives, in order: the item id, where its (offset, length) fields are,
+/// and their values. Like `first_extent`, for 4-byte fields and no base offset.
+fn all_extents(data: &[u8]) -> Vec<(u32, usize, usize, usize)> {
+    let meta = boxes(data, 0, data.len())
+        .into_iter()
+        .find(|b| &b.0 == b"meta")
+        .unwrap();
+    let iloc = boxes(data, meta.2 + 4, meta.3)
+        .into_iter()
+        .find(|b| &b.0 == b"iloc")
+        .unwrap();
+    let body = iloc.2;
+    let version = data[body];
+    assert_eq!((data[body + 4], data[body + 5] >> 4), (0x44, 0));
+    let wide = if version < 2 { 2 } else { 4 };
+    let num = |j: usize, n: usize| {
+        data[j..j + n]
+            .iter()
+            .fold(0usize, |v, &b| v << 8 | b as usize)
+    };
+    let mut i = body + 6;
+    let count = num(i, wide);
+    i += wide;
+    let mut out = Vec::new();
+    for _ in 0..count {
+        let id = num(i, wide) as u32;
+        i += wide;
+        if version >= 1 {
+            i += 2;
+        }
+        i += 2;
+        let n = num(i, 2);
+        i += 2;
+        for _ in 0..n {
+            out.push((id, i, num(i, 4), num(i + 4, 4)));
+            i += 8;
+        }
+    }
+    out
+}
+
+/// Every iloc extent of `data`: (item id, offset, length), with the fields' position
+/// second.
+pub fn avif_extents(data: &[u8]) -> Vec<(u32, usize, usize)> {
+    all_extents(data)
+        .into_iter()
+        .map(|(id, _, off, len)| (id, off, len))
+        .collect()
+}
+
+/// `data` with the `index`th extent rewritten to `offset` and `length`.
+pub fn avif_set_extent(mut data: Vec<u8>, index: usize, offset: u32, length: u32) -> Vec<u8> {
+    let (_, at, _, _) = all_extents(&data)[index];
+    data[at..at + 4].copy_from_slice(&offset.to_be_bytes());
+    data[at + 4..at + 8].copy_from_slice(&length.to_be_bytes());
+    data
+}
+
+/// The OBUs of an AV1 item: (type, start, end).
+fn obus(item: &[u8]) -> Vec<(u8, usize, usize)> {
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < item.len() {
+        let header = item[i];
+        let mut j = i + 1 + usize::from(header & 4 != 0);
+        let (mut size, mut shift) = (0usize, 0);
+        loop {
+            let b = item[j];
+            j += 1;
+            size |= usize::from(b & 0x7F) << shift;
+            shift += 7;
+            if b & 0x80 == 0 {
+                break;
+            }
+        }
+        out.push(((header >> 3) & 0xF, i, j + size));
+        i = j + size;
+    }
+    out
+}
+
+/// A `w`×`h` AVIF whose item holds its frame OBU twice.
+pub fn avif_two_frames(w: u32, h: u32) -> Vec<u8> {
+    let mut data = encoded(&gradient(w, h), Codec::Avif);
+    let (field, off, len) = first_extent(&data);
+    let item = data[off..off + len].to_vec();
+    let (_, start, end) = obus(&item)
+        .into_iter()
+        .find(|o| o.0 == 6 || o.0 == 3)
+        .expect("a frame OBU");
+    let frame = item[start..end].to_vec();
+    data[field + 4..field + 8].copy_from_slice(&((len + frame.len()) as u32).to_be_bytes());
+    let mdat = boxes(&data, 0, data.len())
+        .into_iter()
+        .find(|b| &b.0 == b"mdat")
+        .unwrap();
+    grow(&mut data, mdat.1, frame.len());
+    data.splice(off + len..off + len, frame);
+    data
+}
+
+/// A GIF of `frames` different `w`×`h` frames.
+pub fn moving_gif(w: u32, h: u32, frames: usize) -> Vec<u8> {
+    use ::image::codecs::gif::{GifEncoder, Repeat};
+    use ::image::{Delay, Frame};
+    let mut out = Vec::new();
+    {
+        let mut e = GifEncoder::new(&mut out);
+        e.set_repeat(Repeat::Infinite).unwrap();
+        for f in 0..frames {
+            let v = (f * 255 / frames.max(1)) as u8;
+            let img = RgbaImage::from_pixel(w, h, Rgba([v, 255 - v, 0, 255]));
+            e.encode_frame(Frame::from_parts(
+                img,
+                0,
+                0,
+                Delay::from_numer_denom_ms(100, 1),
+            ))
+            .unwrap();
+        }
+    }
+    out
+}
+
+/// An ICO with `entries` directory entries, all pointing at `png`.
+pub fn ico_repeating(png: &[u8], entries: u16) -> Vec<u8> {
+    let mut out = vec![0, 0, 1, 0];
+    out.extend_from_slice(&entries.to_le_bytes());
+    let at = 6 + 16 * u32::from(entries);
+    for _ in 0..entries {
+        out.extend_from_slice(&[png[19], png[23], 0, 0, 1, 0, 32, 0]);
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(&at.to_le_bytes());
+    }
+    out.extend_from_slice(png);
+    out
+}
+
+/// An ICO of `pngs`, each its own entry.
+pub fn ico_of(pngs: &[Vec<u8>]) -> Vec<u8> {
+    let mut out = vec![0, 0, 1, 0];
+    out.extend_from_slice(&(pngs.len() as u16).to_le_bytes());
+    let mut at = 6 + 16 * pngs.len();
+    for png in pngs {
+        out.extend_from_slice(&[png[19], png[23], 0, 0, 1, 0, 32, 0]);
+        out.extend_from_slice(&(png.len() as u32).to_le_bytes());
+        out.extend_from_slice(&(at as u32).to_le_bytes());
+        at += png.len();
+    }
+    for png in pngs {
+        out.extend_from_slice(png);
+    }
+    out
 }

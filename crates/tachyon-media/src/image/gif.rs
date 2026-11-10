@@ -21,7 +21,13 @@ pub(super) struct Walked {
     /// Whether the trailer was reached; a file that stops after a whole frame is still
     /// read, as browsers read it.
     pub ends: bool,
+    /// An ICC profile (`ICCRGBG1012`) and XMP packet (`XMP DataXMP`) the file carries.
+    pub icc: Option<Vec<u8>>,
+    pub xmp: Option<Vec<u8>>,
 }
+
+const ICC_ID: &[u8] = b"ICCRGBG1012";
+const XMP_ID: &[u8] = b"XMP DataXMP";
 
 /// Walks `bytes`. A file that stops before its first whole frame is `Truncated`.
 pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
@@ -54,6 +60,7 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
         }
     };
     let (mut frames, mut pixels, mut ends) = (0u32, 0u64, false);
+    let (mut icc, mut xmp) = (None, None);
     loop {
         let start = i;
         let Some(kind) = at(i) else { break };
@@ -62,10 +69,18 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
                 let (Some(label), Some(end)) = (at(i + 1), sub_blocks(i + 2)) else {
                     break;
                 };
-                let looping = bytes
-                    .get(i + 3..i + 14)
-                    .is_some_and(|id| id == b"NETSCAPE2.0" || id == b"ANIMEXTS1.0");
-                if label != 0xFE && (label != 0xFF || looping) {
+                let id = bytes.get(i + 3..i + 14).filter(|_| label == 0xFF);
+                let looping = id.is_some_and(|id| id == b"NETSCAPE2.0" || id == b"ANIMEXTS1.0");
+                if id == Some(ICC_ID) {
+                    icc = Some(sub_block_data(bytes, i + 14, end));
+                }
+                // XMP is written raw, ended by a 257-byte "magic trailer" and a zero, so
+                // that it walks as sub-blocks.
+                if id == Some(XMP_ID) && end >= i + 14 + 258 {
+                    xmp = bytes.get(i + 14..end - 258).map(<[u8]>::to_vec);
+                }
+                // A colour profile isn't private: it stays with the looping extensions.
+                if label != 0xFE && (label != 0xFF || looping || id == Some(ICC_ID)) {
                     keep(&mut out, start, end);
                 }
                 i = end;
@@ -111,7 +126,56 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
         pixels,
         stripped: out,
         ends,
+        icc,
+        xmp,
     })
+}
+
+/// The data of the sub-blocks from `at` to `end`, joined.
+fn sub_block_data(bytes: &[u8], mut at: usize, end: usize) -> Vec<u8> {
+    let mut out = Vec::new();
+    while at < end {
+        let n = usize::from(bytes[at]);
+        if n == 0 {
+            break;
+        }
+        out.extend_from_slice(bytes.get(at + 1..at + 1 + n).unwrap_or_default());
+        at += 1 + n;
+    }
+    out
+}
+
+/// The GIF `bytes` (as an encoder made them) with `icc` and `xmp` as application
+/// extensions after the screen descriptor.
+pub(super) fn with_meta(bytes: &[u8], icc: Option<&[u8]>, xmp: Option<&[u8]>) -> Vec<u8> {
+    let Some(&packed) = bytes.get(10) else {
+        return bytes.to_vec();
+    };
+    let mut at = 13;
+    if packed & 0x80 != 0 {
+        at += 3 << ((packed & 7) + 1);
+    }
+    let at = at.min(bytes.len());
+    let mut out = bytes[..at].to_vec();
+    if let Some(icc) = icc {
+        out.extend_from_slice(&[0x21, 0xFF, 11]);
+        out.extend_from_slice(ICC_ID);
+        for block in icc.chunks(255) {
+            out.push(block.len() as u8);
+            out.extend_from_slice(block);
+        }
+        out.push(0);
+    }
+    if let Some(xmp) = xmp {
+        out.extend_from_slice(&[0x21, 0xFF, 11]);
+        out.extend_from_slice(XMP_ID);
+        out.extend_from_slice(xmp);
+        out.push(1);
+        out.extend((0..=255u8).rev());
+        out.push(0);
+    }
+    out.extend_from_slice(&bytes[at..]);
+    out
 }
 
 /// A frame as it's shown, with how long, in milliseconds.

@@ -51,7 +51,13 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
                 ends: false,
             });
         };
-        let end = i + 2 + usize::from(u16::from_be_bytes([len[0], len[1]]));
+        let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
+        if len < 2 {
+            return Err(ImageError::Corrupt(format!(
+                "a JPEG segment's length is {len}, shorter than the length itself"
+            )));
+        }
+        let end = i + 2 + len;
         let Some(segment) = bytes.get(i..end) else {
             return Ok(Walked {
                 stripped: out,
@@ -59,12 +65,15 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
             });
         };
         let body = &segment[4.min(segment.len())..];
+        // What decoding uses, and nothing else: frames (not JPG, 0xC8), Huffman and
+        // arithmetic tables, quantisation tables, restart interval, scans, DNL, EXP.
         let keep = match marker {
             0xE0 => body.starts_with(b"JFIF\0"),
             0xE2 => body.starts_with(b"ICC_PROFILE\0"),
             0xEE => body.starts_with(b"Adobe"),
-            0xE1..=0xEF | 0xFE => false,
-            _ => true,
+            0xC8 => false,
+            0xC0..=0xCF | 0xDA..=0xDD | 0xDF => true,
+            _ => false,
         };
         if keep {
             out.extend_from_slice(segment);
@@ -129,5 +138,27 @@ mod tests {
         jpeg.extend_from_slice(&[1, 2, 3]);
         assert!(!walk(&jpeg).unwrap().ends);
         assert!(!walk(&jpeg[..5]).unwrap().ends);
+    }
+
+    #[test]
+    fn markers_decoding_doesnt_use_go() {
+        let mut jpeg = vec![0xFF, 0xD8];
+        jpeg.extend(segment(0xDB, &[0; 65]));
+        jpeg.extend(segment(0x02, b"hidden in a reserved marker"));
+        jpeg.extend(segment(0xF5, b"hidden in a JPGn marker"));
+        jpeg.extend(segment(0xC8, b"hidden in JPG"));
+        jpeg.extend(segment(0xDA, b"\x01\x01\x00\x00\x3F\x00"));
+        jpeg.extend_from_slice(&[1, 0xFF, 0xD9]);
+        let w = walk(&jpeg).unwrap();
+        assert!(!String::from_utf8_lossy(&w.stripped).contains("hidden"));
+        assert!(w.ends);
+    }
+
+    #[test]
+    fn a_length_shorter_than_itself_is_refused() {
+        let mut jpeg = vec![0xFF, 0xD8, 0xFF, 0xDB, 0x00, 0x01, 0xFF, 0xD9];
+        assert!(walk(&jpeg).is_err());
+        jpeg[5] = 0;
+        assert!(walk(&jpeg).is_err());
     }
 }
