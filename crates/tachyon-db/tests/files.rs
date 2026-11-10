@@ -993,3 +993,87 @@ async fn a_size_write_waits_out_a_schema_change(pool: PgPool) {
         files::SizeLock::Live { schema_version, .. } if schema_version == c.schema_version
     ));
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_write_never_waits_on_a_users_file_or_version_locks(pool: PgPool) {
+    let c = seed(&pool).await;
+    let f = reserve(&pool, &c, "a.png", "", None).await;
+    let doc = draft_with(&pool, &c, f.id).await;
+    let version = record(&pool, &c, doc, DocCopy::Draft).await;
+    sqlx::query("UPDATE versions SET file_id = $2 WHERE id = $1")
+        .bind(version)
+        .bind(f.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    for sql in [
+        // As `lock_in` does, taking a file a restore points the document at.
+        "SELECT id FROM files WHERE id = $1 FOR UPDATE",
+        // As a prune does, deleting the version holding it.
+        "SELECT id FROM versions WHERE file_id = $1 FOR UPDATE",
+    ] {
+        let mut user = pool.begin().await.unwrap();
+        sqlx::query(sql)
+            .bind(f.id)
+            .execute(&mut *user)
+            .await
+            .unwrap();
+        let mut tx = pool.begin().await.unwrap();
+        let lock = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            files::lock_for_size_in(&mut tx, c.id, f.id),
+        )
+        .await
+        .expect("it doesn't wait")
+        .unwrap();
+        assert!(matches!(lock, files::SizeLock::Busy), "{sql}: {lock:?}");
+        drop(tx);
+        user.commit().await.unwrap();
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_deferred_job_keeps_its_attempts_up_to_a_cap(pool: PgPool) {
+    use tachyon_db::jobs::{self, MAX_DEFERRALS, NewJob};
+    let job = NewJob {
+        kind: "image_sizes",
+        document_id: None,
+        collection_id: None,
+        payload: json!({"file": Uuid::now_v7()}),
+        run_at: time::OffsetDateTime::now_utc(),
+        dedupe_key: None,
+        created_by: None,
+        key_id: None,
+        max_attempts: Some(1),
+    };
+    let id = jobs::enqueue(&mut pool.acquire().await.unwrap(), &job)
+        .await
+        .unwrap();
+    let lease = std::time::Duration::from_secs(60);
+    for n in 0..MAX_DEFERRALS {
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE id = $1")
+            .bind(id)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let claimed = jobs::claim(&pool, lease).await.unwrap().unwrap();
+        assert_eq!(claimed.attempts, 1, "deferral {n} spent nothing");
+        assert!(
+            jobs::defer(&pool, &claimed, std::time::Duration::ZERO, "busy")
+                .await
+                .unwrap()
+        );
+    }
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE id = $1")
+        .bind(id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let claimed = jobs::claim(&pool, lease).await.unwrap().unwrap();
+    assert!(
+        !jobs::defer(&pool, &claimed, std::time::Duration::ZERO, "busy")
+            .await
+            .unwrap(),
+        "past the cap it must spend an attempt"
+    );
+}

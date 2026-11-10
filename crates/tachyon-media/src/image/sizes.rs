@@ -243,10 +243,19 @@ mod tests {
     use ::image::{DynamicImage, ImageFormat as Codec, Rgb, RgbImage};
     use serde_json::json;
 
+    /// A fresh directory, removed when the test's thread ends: what's made in it may
+    /// outlive the helper that made it.
     fn dir() -> PathBuf {
-        let d = std::env::temp_dir().join(format!("tachyon-sizes-{}", uuid::Uuid::now_v7()));
-        std::fs::create_dir_all(&d).unwrap();
-        d
+        thread_local! {
+            static DIRS: std::cell::RefCell<Vec<tempfile::TempDir>> = const { std::cell::RefCell::new(Vec::new()) };
+        }
+        let d = tempfile::Builder::new()
+            .prefix("tachyon-sizes-")
+            .tempdir()
+            .unwrap();
+        let path = d.path().to_owned();
+        DIRS.with_borrow_mut(|dirs| dirs.push(d));
+        path
     }
 
     fn size(v: Value) -> ImageSize {

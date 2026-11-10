@@ -126,7 +126,10 @@ pub async fn restore(
     // names with nothing locked, and tried again, until it commits with every name it
     // renames already copied.
     let mut copied = crate::media_jobs::Copied::default();
-    for _ in 0..crate::media_jobs::RESTORE_TRIES {
+    // A round whose names are the last round's, its new renames only sizes a job filled
+    // meanwhile, is progress: it's bounded on its own, by `SIZE_ROUNDS`.
+    let (mut tries, mut size_rounds, mut last_names) = (0, 0, None);
+    while tries < crate::media_jobs::RESTORE_TRIES && size_rounds < crate::media_jobs::SIZE_ROUNDS {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
         for (copy, p, _) in &locked {
@@ -154,6 +157,16 @@ pub async fn restore(
             })?;
         if !copied.covers(&renamed) {
             drop(tx);
+            let names: Vec<(Uuid, String)> = renamed
+                .iter()
+                .map(|r| (r.file, r.filename.clone()))
+                .collect();
+            if last_names.as_ref() == Some(&names) {
+                size_rounds += 1;
+            } else {
+                tries += 1;
+            }
+            last_names = Some(names);
             copied.copy(&state, &renamed).await?;
             continue;
         }

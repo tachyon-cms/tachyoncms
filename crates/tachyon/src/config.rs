@@ -947,6 +947,7 @@ mod tests {
                 .unwrap(),
             "https://files.example.com/a/b.png"
         );
+        std::fs::remove_dir_all(&root).unwrap();
 
         Jail::expect_with(|jail| {
             jail.set_env("TACHYON_DATABASE_URL", "postgres://env");

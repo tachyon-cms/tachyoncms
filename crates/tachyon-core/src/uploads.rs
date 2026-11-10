@@ -646,13 +646,22 @@ pub fn size_filename(filename: &str, width: u32, height: u32, ext: &str) -> Stri
     compose(stem, &format!("-{width}x{height}"), ext)
 }
 
+/// `name` (a size's file name) with `-<size>` before its extension, for a size whose
+/// output would otherwise share another size's name without being the same image:
+/// `a-100x100.png` for `right` → `a-100x100-right.png`.
+pub fn suffixed_size_filename(name: &str, size: &str) -> String {
+    let (stem, ext) = split(name);
+    compose(stem, &format!("-{size}"), ext)
+}
+
 /// `sizes` (a file's `sizes`, each entry with its `formats`) named after `filename`, as a
-/// file renamed to it has them, and each name changed as (old, new).
+/// file renamed to it has them, and each name changed as (old, new). A name suffixed with
+/// its size's name (`suffixed_size_filename`) keeps the suffix.
 pub fn rename_sizes(
     sizes: &mut serde_json::Map<String, Value>,
     filename: &str,
 ) -> Vec<(String, String)> {
-    fn rename(entry: &mut Value, filename: &str, changed: &mut Vec<(String, String)>) {
+    fn rename(entry: &mut Value, size: &str, filename: &str, changed: &mut Vec<(String, String)>) {
         let dimension = |k: &str| {
             entry
                 .get(k)
@@ -665,18 +674,24 @@ pub fn rename_sizes(
         let Some(old) = entry.get("filename").and_then(Value::as_str) else {
             return;
         };
-        let new = size_filename(filename, w, h, split(old).1);
+        let ext = split(old).1;
+        let plain = size_filename(filename, w, h, ext);
+        let new = if split(old).0.ends_with(&format!("-{w}x{h}-{size}")) {
+            suffixed_size_filename(&plain, size)
+        } else {
+            plain
+        };
         if new != old {
             changed.push((old.to_owned(), new.clone()));
             entry["filename"] = new.into();
         }
     }
     let mut changed = Vec::new();
-    for entry in sizes.values_mut() {
-        rename(entry, filename, &mut changed);
+    for (size, entry) in sizes.iter_mut() {
+        rename(entry, size, filename, &mut changed);
         if let Some(Value::Object(formats)) = entry.get_mut("formats") {
             for f in formats.values_mut() {
-                rename(f, filename, &mut changed);
+                rename(f, size, filename, &mut changed);
             }
         }
     }
@@ -1090,6 +1105,14 @@ mod tests {
             "a-1-40x30.avif"
         );
         assert_eq!(sizes["big"]["filename"], Value::Null);
+        let mut suffixed = json!({"right": {"width": 4, "height": 4,
+                                            "filename": suffixed_size_filename("a-4x4.png", "right")}});
+        assert_eq!(suffixed["right"]["filename"], "a-4x4-right.png");
+        rename_sizes(suffixed.as_object_mut().unwrap(), "b.png");
+        assert_eq!(
+            suffixed["right"]["filename"], "b-4x4-right.png",
+            "keeps its suffix"
+        );
         assert_eq!(sizes["pending"], Value::Null);
     }
 

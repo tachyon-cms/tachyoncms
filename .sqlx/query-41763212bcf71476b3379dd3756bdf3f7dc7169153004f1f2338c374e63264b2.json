@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,\n                  height, focal_x, focal_y, blurhash,\n                  sizes AS \"sizes: Json<Map<String, Value>>\", names, state, created_at,\n                  issued_to, issued_key\n           FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE",
+  "query": "SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,\n                  height, focal_x, focal_y, blurhash,\n                  sizes AS \"sizes: Json<Map<String, Value>>\", names, state, created_at,\n                  issued_to, issued_key\n           FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE NOWAIT",
   "describe": {
     "columns": [
       {
@@ -229,5 +229,5 @@
       true
     ]
   },
-  "hash": "f22740f0f721a1bb3ab218589ebac89d1b825c0fdf8750ca47772db3bf9de5c6"
+  "hash": "41763212bcf71476b3379dd3756bdf3f7dc7169153004f1f2338c374e63264b2"
 }

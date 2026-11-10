@@ -1,20 +1,37 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use tachyon_media::storage::{Adapter, Storage, StorageConfig, object_key};
 use uuid::Uuid;
 
+/// A path in a fresh directory under the system's temp dir, removed on drop.
+struct Temp {
+    _dir: tempfile::TempDir,
+    path: PathBuf,
+}
+
+impl std::ops::Deref for Temp {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        &self.path
+    }
+}
+
 /// A fresh directory under the system's temp dir.
-fn temp_root() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tachyon-media-{}", Uuid::now_v7()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+fn temp_root() -> Temp {
+    let dir = tempfile::Builder::new()
+        .prefix("tachyon-media-")
+        .tempdir()
+        .unwrap();
+    let path = dir.path().to_owned();
+    Temp { _dir: dir, path }
 }
 
 /// A file holding `bytes`, to put.
-fn source(bytes: &[u8]) -> PathBuf {
-    let path = temp_root().join("source");
+fn source(bytes: &[u8]) -> Temp {
+    let Temp { _dir, path } = temp_root();
+    let path = path.join("source");
     std::fs::write(&path, bytes).unwrap();
-    path
+    Temp { _dir, path }
 }
 
 /// Puts, reads part back, copies, heads and deletes; then the objects are gone.
@@ -54,7 +71,8 @@ async fn local_store_stays_under_root() {
         format!("images/{id}/a.png")
     );
 
-    let root = temp_root().join("not-there-yet");
+    let base = temp_root();
+    let root = base.join("not-there-yet");
     let storage = Storage::open("default", &StorageConfig::local(&root)).unwrap();
     assert!(storage.is_local());
     assert!(root.is_dir(), "the root is created");
@@ -74,7 +92,7 @@ async fn local_store_stays_under_root() {
 #[tokio::test]
 async fn a_static_dir_goes_before_the_collection() {
     let root = temp_root();
-    let storage = Storage::open("default", &StorageConfig::local(&root)).unwrap();
+    let storage = Storage::open("default", &StorageConfig::local(&*root)).unwrap();
     let id = Uuid::now_v7();
     let key = object_key(Some("media/images"), "images", id, "a.png").unwrap();
     assert_eq!(key, format!("media/images/images/{id}/a.png"));
@@ -99,7 +117,8 @@ async fn a_static_dir_goes_before_the_collection() {
 #[test]
 fn a_bad_prefix_stops_startup() {
     for bad in ["", "/", "a//b", "../x", "x/"] {
-        let mut c = StorageConfig::local(temp_root());
+        let root = temp_root();
+        let mut c = StorageConfig::local(&*root);
         c.prefix = Some(bad.into());
         let err = Storage::open("disk", &c).unwrap_err();
         assert!(err.starts_with("storage.disk.prefix: "), "{bad:?}: {err}");
@@ -108,7 +127,8 @@ fn a_bad_prefix_stops_startup() {
 
 #[test]
 fn public_urls_encode_each_segment() {
-    let mut c = StorageConfig::local(temp_root());
+    let root = temp_root();
+    let mut c = StorageConfig::local(&*root);
     c.public_url = Some("https://cdn.example.com/media/".parse().unwrap());
     let storage = Storage::open("default", &c).unwrap();
     assert_eq!(
@@ -124,7 +144,7 @@ fn public_urls_encode_each_segment() {
 #[tokio::test]
 async fn a_prefix_goes_before_every_key() {
     let root = temp_root();
-    let mut c = StorageConfig::local(&root);
+    let mut c = StorageConfig::local(&*root);
     c.prefix = Some("site-a".into());
     c.public_url = Some("https://files.example.com/".parse().unwrap());
     let storage = Storage::open("default", &c).unwrap();

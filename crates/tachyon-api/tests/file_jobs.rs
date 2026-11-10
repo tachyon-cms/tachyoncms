@@ -105,25 +105,38 @@ impl ObjectStore for Flaky {
     }
 }
 
-fn temp_root() -> PathBuf {
-    let dir = std::env::temp_dir().join(format!("tachyon-file-jobs-{}", Uuid::now_v7()));
-    std::fs::create_dir_all(&dir).unwrap();
-    dir
+/// A fresh directory, removed on drop.
+struct Temp(tempfile::TempDir);
+
+impl std::ops::Deref for Temp {
+    type Target = Path;
+    fn deref(&self) -> &Path {
+        self.0.path()
+    }
+}
+
+fn temp_root() -> Temp {
+    Temp(
+        tempfile::Builder::new()
+            .prefix("tachyon-file-jobs-")
+            .tempdir()
+            .unwrap(),
+    )
 }
 
 /// `default` storage in a fresh directory, its deletes failing `fails` times.
-fn storage(fails: usize) -> (Arc<Storage>, PathBuf) {
+fn storage(fails: usize) -> (Arc<Storage>, Temp) {
     named("default", fails)
 }
 
 /// Storage `name` in a fresh directory, its deletes failing `fails` times.
-fn named(name: &str, fails: usize) -> (Arc<Storage>, PathBuf) {
+fn named(name: &str, fails: usize) -> (Arc<Storage>, Temp) {
     let root = temp_root();
     let store = Flaky {
-        inner: LocalFileSystem::new_with_prefix(&root).unwrap(),
+        inner: LocalFileSystem::new_with_prefix(&*root).unwrap(),
         fails: AtomicUsize::new(fails),
     };
-    let storage = Storage::with_store(name, Arc::new(store), None, StorageConfig::local(&root));
+    let storage = Storage::with_store(name, Arc::new(store), None, StorageConfig::local(&*root));
     (Arc::new(storage), root)
 }
 
@@ -201,7 +214,8 @@ async fn stored(pool: &PgPool, c: &Collection, storage: &Storage, name: &str) ->
         .execute(pool)
         .await
         .unwrap();
-    let source = temp_root().join("source");
+    let dir = temp_root();
+    let source = dir.join("source");
     std::fs::write(&source, b"png").unwrap();
     for key in [file.key.clone(), sibling(&file.key, &size)] {
         storage.put_file(&key, &source, "image/png").await.unwrap();
@@ -647,7 +661,8 @@ async fn keys_cleanups_delete_only_the_named_keys(pool: PgPool) {
     // A live file whose size a stale cleanup still names.
     let b = stored(&pool, &c, &default, "b.png").await;
     holding(&pool, &c, b.id).await;
-    let source = temp_root().join("source");
+    let dir = temp_root();
+    let source = dir.join("source");
     std::fs::write(&source, b"x").unwrap();
     let (stale, kept) = ("images/x/stale.png", "images/x/kept.png");
     for s in [&default, &other] {
@@ -715,7 +730,7 @@ async fn a_missing_files_cleanup_is_done(pool: PgPool) {
 async fn the_sweep_requeues_only_what_still_waits(pool: PgPool) {
     // Storage stays down, so whatever is queued again can only fail and wait again.
     let (storage, _root) = storage(usize::MAX);
-    let (old, _) = named("old", 0);
+    let (old, _old_root) = named("old", 0);
     let c = seed(&pool).await;
     // An expired reservation whose cleanup failed.
     let p = stored(&pool, &c, &storage, "p.png").await;

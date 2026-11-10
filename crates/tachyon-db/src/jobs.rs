@@ -139,6 +139,32 @@ pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, D
     Ok(done.rows_affected() > 0)
 }
 
+/// Adds `job` in place of a queued job with its `dedupe_key`, leaving a running one be:
+/// then nothing is added, and it's false.
+pub async fn replace_queued(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<bool, DbError> {
+    // A savepoint (or a transaction, outside one), so a clash leaves the caller's open.
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query!(
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+           WHERE tenant_id = $1 AND dedupe_key = $2 AND state = 'queued'"#,
+        DEFAULT_TENANT,
+        job.dedupe_key,
+    )
+    .execute(&mut *tx)
+    .await?;
+    match add(&mut tx, job).await {
+        Ok(_) => {
+            tx.commit().await?;
+            Ok(true)
+        }
+        Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
+            tx.rollback().await?;
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Leases one job for `lease`: a queued one that's due, or a running one whose lease ran
 /// out. Rows another worker holds are skipped, not waited for. A job that lost its lease
 /// on its last attempt fails here instead, so one that kills its worker every time stops
@@ -292,6 +318,32 @@ pub async fn fail_with(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// How often `defer` puts a job back before it must spend its attempts.
+pub const MAX_DEFERRALS: i32 = 20;
+
+/// Queues `job` again, due after `after`, without spending the attempt this run took:
+/// it was held off by other work (a schema change, a user's write), not failing. Counted in
+/// the payload's `deferred`; false, and nothing done, once that reaches `MAX_DEFERRALS`
+/// or when this run no longer holds the job.
+pub async fn defer(pool: &PgPool, job: &Job, after: Duration, why: &str) -> Result<bool, DbError> {
+    let done = sqlx::query!(
+        r#"UPDATE jobs SET state = 'queued', attempts = attempts - 1, locked_until = NULL,
+               run_at = now() + make_interval(secs => $3), last_error = $4,
+               payload = jsonb_set(payload, '{deferred}',
+                   to_jsonb(coalesce((payload->>'deferred')::int, 0) + 1))
+           WHERE id = $1 AND attempts = $2 AND state = 'running'
+             AND coalesce((payload->>'deferred')::int, 0) < $5"#,
+        job.id,
+        job.attempts,
+        after.as_secs_f64(),
+        why,
+        MAX_DEFERRALS,
+    )
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
 }
 
 /// `document_id`'s queued and running jobs, soonest first.

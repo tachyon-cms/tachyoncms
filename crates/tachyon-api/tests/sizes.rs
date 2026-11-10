@@ -38,13 +38,19 @@ use uuid::Uuid;
 struct Dirs {
     temp: PathBuf,
     root: PathBuf,
+    /// Removed, with everything in it, when the test is done.
+    _base: tempfile::TempDir,
 }
 
 fn dirs() -> Dirs {
-    let base = std::env::temp_dir().join(format!("tachyon-sizes-{}", Uuid::now_v7()));
+    let base = tempfile::Builder::new()
+        .prefix("tachyon-sizes-")
+        .tempdir()
+        .unwrap();
     let d = Dirs {
-        temp: base.join("spool"),
-        root: base.join("store"),
+        temp: base.path().join("spool"),
+        root: base.path().join("store"),
+        _base: base,
     };
     std::fs::create_dir_all(&d.temp).unwrap();
     std::fs::create_dir_all(&d.root).unwrap();
@@ -435,8 +441,7 @@ async fn sizes_reach_drafts_published_and_versions(pool: PgPool) {
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn wait_without_workers_answers_anyway(pool: PgPool) {
     let d = dirs();
-    // Room for an upload waiting on a decode permit while other tests make sizes.
-    let app = admin_with(&pool, &d, 0, Duration::from_secs(5)).await;
+    let app = admin_with(&pool, &d, 0, Duration::from_secs(2)).await;
     collection(
         &app,
         "images",
@@ -454,7 +459,7 @@ async fn wait_without_workers_answers_anyway(pool: PgPool) {
     )
     .await;
     assert_eq!(res.status, 201, "{}", res.json);
-    assert!(started.elapsed() < Duration::from_secs(5));
+    assert!(started.elapsed() < Duration::from_secs(2));
     assert_eq!(res.json["sizes"], json!({"thumb": null}));
     assert_eq!(jobs_in(&pool, "queued").await, 1);
     // Nothing to wait for, a JSON write answers at once.
@@ -948,7 +953,7 @@ async fn a_size_that_cant_be_made_leaves_the_rest(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn sizes_with_the_same_output_share_an_object(pool: PgPool) {
+async fn only_the_same_image_shares_an_object(pool: PgPool) {
     let d = dirs();
     let app = admin(&pool, &d, 1).await;
     collection(
@@ -956,24 +961,46 @@ async fn sizes_with_the_same_output_share_an_object(pool: PgPool) {
         "images",
         json!({"imageSizes": [
             {"name": "left", "width": 100, "height": 100, "position": "left"},
-            {"name": "right", "width": 100, "height": 100, "position": "right"}
+            {"name": "right", "width": 100, "height": 100, "position": "right"},
+            {"name": "again", "width": 100, "height": 100, "position": "left"}
         ]}),
         json!({}),
     )
     .await;
+    let halves = RgbImage::from_fn(400, 100, |x, _| {
+        if x < 200 {
+            Rgb([255, 0, 0])
+        } else {
+            Rgb([0, 0, 255])
+        }
+    });
     let res = post(
         &app,
         "/api/images?wait=true",
-        &png(fixtures::gradient(400, 100)),
+        &png(DynamicImage::ImageRgb8(halves)),
         "a.png",
         None,
     )
     .await;
     assert_eq!(res.status, 201, "{}", res.json);
-    let (left, right) = (&res.json["sizes"]["left"], &res.json["sizes"]["right"]);
-    assert_eq!(left["filename"], "a-100x100.png");
-    assert_eq!(left, right, "one object, described the same");
-    serves(&app, right).await;
+    let sizes = &res.json["sizes"];
+    assert_eq!(sizes["left"]["filename"], "a-100x100.png", "{sizes}");
+    assert_eq!(sizes["again"], sizes["left"], "the same image, one object");
+    assert_eq!(sizes["right"]["filename"], "a-100x100-right.png", "{sizes}");
+    assert_eq!(
+        sizes["right"]["formats"]["webp"]["filename"],
+        "a-100x100-right.webp"
+    );
+    for (size, red) in [("left", true), ("right", false)] {
+        serves(&app, &sizes[size]).await;
+        let (_, _, body) = fetch(&app, &sizes[size]["url"]).await;
+        let [r, _, b] = image::load_from_memory(&body)
+            .unwrap()
+            .to_rgb8()
+            .get_pixel(50, 50)
+            .0;
+        assert_eq!(r > 200 && b < 50, red, "{size}: {r} {b}");
+    }
     let file = files::get(&pool, held(&pool, res.json["id"].as_str().unwrap()).await)
         .await
         .unwrap();
@@ -981,4 +1008,259 @@ async fn sizes_with_the_same_output_share_an_object(pool: PgPool) {
     names.sort();
     names.dedup();
     assert_eq!(names.len(), file.names.len(), "{:?}", file.names);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_verify_run_makes_a_lost_size_again(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d, 1).await;
+    collection(
+        &app,
+        "images",
+        json!({"imageSizes": [{"name": "thumb", "width": 50}]}),
+        json!({}),
+    )
+    .await;
+    let res = post(
+        &app,
+        "/api/images?wait=true",
+        &png(fixtures::gradient(200, 100)),
+        "a.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let thumb = res.json["sizes"]["thumb"].clone();
+    let file = files::get(&pool, held(&pool, res.json["id"].as_str().unwrap()).await)
+        .await
+        .unwrap();
+    let dir = d.root.join(file.key.rsplit_once('/').unwrap().0);
+    let lost = dir.join("a-50x25.webp");
+    // As a cleanup's late delete would, after the size was recorded.
+    std::fs::remove_file(&lost).unwrap();
+    let due: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'image_sizes' AND state = 'queued'
+           AND payload->>'verify' = 'true' AND run_at > now() + interval '30 seconds'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(due, 1, "a verify run is queued, after the delete timeout");
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'image_sizes' AND state = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    until("the size is stored again", async || lost.exists()).await;
+    until("the verify run is done", async || {
+        jobs_in(&pool, "done").await == 2
+    })
+    .await;
+    serves(&app, &thumb).await;
+}
+
+/// Queues a size job for `file`, as an upload does.
+async fn size_job(pool: &PgPool, file: Uuid) {
+    let c: Uuid = sqlx::query_scalar("SELECT collection_id FROM files WHERE id = $1")
+        .bind(file)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    tachyon_db::jobs::enqueue(
+        &mut conn,
+        &tachyon_db::jobs::NewJob {
+            kind: "image_sizes",
+            document_id: None,
+            collection_id: Some(c),
+            payload: json!({ "file": file }),
+            run_at: time::OffsetDateTime::now_utc(),
+            dedupe_key: Some(format!("image_sizes:{file}")),
+            created_by: None,
+            key_id: None,
+            max_attempts: None,
+        },
+    )
+    .await
+    .unwrap();
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_job_queued_after_a_verify_run_leaves_it(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d, 1).await;
+    collection(
+        &app,
+        "images",
+        json!({"imageSizes": [{"name": "thumb", "width": 50}]}),
+        json!({}),
+    )
+    .await;
+    let res = post(
+        &app,
+        "/api/images?wait=true",
+        &png(fixtures::gradient(200, 100)),
+        "a.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let file = held(&pool, res.json["id"].as_str().unwrap()).await;
+    // The verify run is waiting; a size job for the file comes in, as an upload's does.
+    size_job(&pool, file).await;
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'image_sizes' AND state = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    until("both jobs are done", async || {
+        jobs_in(&pool, "done").await == 3
+    })
+    .await;
+    let verified: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'image_sizes' AND state = 'done'
+           AND payload->>'verify' = 'true'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(verified, 1, "the verify run ran too");
+    assert_eq!(jobs_in(&pool, "cancelled").await, 0);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_verify_run_and_a_size_job_at_once_fill_every_size(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d, 2).await;
+    collection(
+        &app,
+        "images",
+        json!({"imageSizes": [{"name": "thumb", "width": 50}, {"name": "card", "width": 100}]}),
+        json!({}),
+    )
+    .await;
+    let res = post(
+        &app,
+        "/api/images?wait=true",
+        &png(fixtures::gradient(200, 100)),
+        "a.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let file = held(&pool, res.json["id"].as_str().unwrap()).await;
+    let key = files::get(&pool, file).await.unwrap().key;
+    let dir = d.root.join(key.rsplit_once('/').unwrap().0);
+    // Work for each: the verify run finds `thumb` gone, the size job finds `card` unmade.
+    std::fs::remove_file(dir.join("a-50x25.webp")).unwrap();
+    sqlx::query("UPDATE files SET sizes = jsonb_set(sizes, '{card}', 'null') WHERE id = $1")
+        .bind(file)
+        .execute(&pool)
+        .await
+        .unwrap();
+    size_job(&pool, file).await;
+    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = 'image_sizes' AND state = 'queued'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    until("both jobs are done", async || {
+        // What stored a size queues a later verify run of its own; that one isn't due.
+        let due: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE kind = 'image_sizes'
+               AND state IN ('queued', 'running') AND run_at <= now() + interval '30 seconds'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        jobs_in(&pool, "done").await >= 3 && due == 0
+    })
+    .await;
+    // A queued verify run a later one replaced is cancelled before it starts; no run is.
+    let ended: Vec<(String, Value, Option<String>)> = sqlx::query_as(
+        "SELECT state, payload, last_error FROM jobs WHERE kind = 'image_sizes'
+           AND (state = 'failed' OR state = 'cancelled' AND attempts > 0)",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert!(ended.is_empty(), "{ended:?}");
+    let sizes = files::get(&pool, file).await.unwrap().sizes;
+    for name in ["thumb", "card"] {
+        assert!(!sizes[name].is_null(), "{name}: {sizes:?}");
+        assert!(
+            dir.join(sizes[name]["filename"].as_str().unwrap()).exists(),
+            "{name}"
+        );
+    }
+    let doc = ok(
+        &app,
+        "GET",
+        &format!("/api/images/{}", res.json["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    serves(&app, &doc["sizes"]["thumb"]).await;
+    serves(&app, &doc["sizes"]["card"]).await;
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_version_restore_racing_a_job_succeeds(pool: PgPool) {
+    let d = dirs();
+    let (gate, app) = gated(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"imageSizes": [{"name": "thumb", "width": 50}]}),
+        json!({"versions": {"maxVersions": 2}}),
+    )
+    .await;
+    let res = post(
+        &app,
+        "/api/images",
+        &png(fixtures::gradient(200, 100)),
+        "a.png",
+        None,
+    )
+    .await;
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    let a = held(&pool, &id).await;
+    until_waiting(&gate, 1).await;
+    let res = upload(
+        &app,
+        "PATCH",
+        &format!("/api/images/{id}"),
+        Some(&png(fixtures::gradient(300, 300))),
+        "b.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let versions = ok(&app, "GET", &format!("/api/images/{id}/versions"), None).await;
+    let first = versions["docs"].as_array().unwrap().last().unwrap()["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    // The job locks as the restore takes A back and prunes the version holding it.
+    gate.open.send_replace(true);
+    let restored = ok(
+        &app,
+        "POST",
+        &format!("/api/images/{id}/versions/{first}/restore"),
+        None,
+    )
+    .await;
+    assert_eq!(restored["filename"], "a.png");
+    assert_eq!(held(&pool, &id).await, a);
+    until("A's job is done", async || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM jobs WHERE kind = 'image_sizes' AND state = 'done'
+               AND payload->>'file' = $1",
+        )
+        .bind(a.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+            >= 1
+    })
+    .await;
+    let doc = ok(&app, "GET", &format!("/api/images/{id}"), None).await;
+    assert_eq!(doc["sizes"]["thumb"]["filename"], "a-50x25.png", "{doc}");
 }

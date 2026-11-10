@@ -28,13 +28,19 @@ use uuid::Uuid;
 struct Dirs {
     temp: PathBuf,
     root: PathBuf,
+    /// Removed, with everything in it, when the test is done.
+    _base: tempfile::TempDir,
 }
 
 fn dirs() -> Dirs {
-    let base = std::env::temp_dir().join(format!("tachyon-uploads-{}", Uuid::now_v7()));
+    let base = tempfile::Builder::new()
+        .prefix("tachyon-uploads-")
+        .tempdir()
+        .unwrap();
     let d = Dirs {
-        temp: base.join("spool"),
-        root: base.join("store"),
+        temp: base.path().join("spool"),
+        root: base.path().join("store"),
+        _base: base,
     };
     std::fs::create_dir_all(&d.temp).unwrap();
     std::fs::create_dir_all(&d.root).unwrap();

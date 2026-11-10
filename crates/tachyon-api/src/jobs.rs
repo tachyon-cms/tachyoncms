@@ -77,7 +77,13 @@ pub(crate) enum JobError {
         error: String,
         result: Value,
     },
+    /// Held off by other work, such as a schema change or a user's write: run again soon
+    /// without spending an attempt, `MAX_DEFERRALS` times at most, then as a `Retry`.
+    Defer(String),
 }
+
+/// How long a deferred job waits before it's run again.
+const DEFER: Duration = Duration::from_secs(2);
 
 /// A long handler's lease, kept until this drops (see `keep_leased`).
 pub(crate) struct Leased {
@@ -188,6 +194,15 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
     };
     let (error, retry, result) = match outcome {
         Ok(Ok(())) => return,
+        Ok(Err(JobError::Defer(why))) => match jobs::defer(&state.pool, &job, DEFER, &why).await {
+            Ok(true) => return,
+            // Deferred too often: it spends an attempt now.
+            Ok(false) => (why, true, None),
+            Err(e) => {
+                tracing::warn!(job = %job.id, error = %e, "couldn't defer a job");
+                (why, true, None)
+            }
+        },
         Ok(Err(JobError::Retry(e))) => (e, true, None),
         Ok(Err(JobError::Permanent(e))) => (e, false, None),
         Ok(Err(JobError::Failed { error, result })) => (error, false, Some(result)),

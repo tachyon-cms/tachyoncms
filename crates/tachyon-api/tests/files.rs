@@ -27,14 +27,20 @@ struct Dirs {
     temp: PathBuf,
     root: PathBuf,
     r2: PathBuf,
+    /// Removed, with everything in it, when the test is done.
+    _base: tempfile::TempDir,
 }
 
 fn dirs() -> Dirs {
-    let base = std::env::temp_dir().join(format!("tachyon-files-{}", Uuid::now_v7()));
+    let base = tempfile::Builder::new()
+        .prefix("tachyon-files-")
+        .tempdir()
+        .unwrap();
     let d = Dirs {
-        temp: base.join("spool"),
-        root: base.join("store"),
-        r2: base.join("r2"),
+        temp: base.path().join("spool"),
+        root: base.path().join("store"),
+        r2: base.path().join("r2"),
+        _base: base,
     };
     for dir in [&d.temp, &d.root, &d.r2] {
         std::fs::create_dir_all(dir).unwrap();

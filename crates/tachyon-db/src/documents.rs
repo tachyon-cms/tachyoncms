@@ -110,6 +110,46 @@ impl FileChange {
     }
 }
 
+/// `data` as the copy taking file `f` (a `FileChange::Set`, its row locked) should hold it:
+/// each size `data` lists takes the entry the file's row has, when a job has made it. The
+/// `data` came from elsewhere (a version, a draft), read before the lock, and a size job
+/// may have filled the file's sizes since; with the file locked, none can now until this
+/// write commits, and the job then writes this copy too. `None` when there's nothing to
+/// take.
+async fn with_filled_sizes(
+    tx: &mut PgConnection,
+    change: FileChange,
+    data: &Map<String, Value>,
+) -> Result<Option<Map<String, Value>>, DbError> {
+    let (FileChange::Set(f), Some(Value::Object(sizes))) = (change, data.get("sizes")) else {
+        return Ok(None);
+    };
+    let filled = sqlx::query_scalar!(
+        r#"SELECT sizes AS "sizes: Json<Map<String, Value>>" FROM files
+           WHERE tenant_id = $1 AND id = $2"#,
+        DEFAULT_TENANT,
+        f,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .map(|s| s.0)
+    .unwrap_or_default();
+    let mut sizes = sizes.clone();
+    let mut changed = false;
+    for (k, v) in &filled {
+        if !v.is_null() && sizes.contains_key(k) && sizes.get(k) != Some(v) {
+            sizes.insert(k.clone(), v.clone());
+            changed = true;
+        }
+    }
+    if !changed {
+        return Ok(None);
+    }
+    let mut out = data.clone();
+    out.insert("sizes".into(), Value::Object(sizes));
+    Ok(Some(out))
+}
+
 /// Releases `old`, a copy's file before a write, unless the write kept it.
 async fn release_old(
     tx: &mut PgConnection,
@@ -188,6 +228,7 @@ pub async fn insert_in(
     check_schema(&mut *conn, collection_id, schema_version).await?;
     let draft = copy == DocCopy::Draft;
     let file = doc.file.apply(&mut *conn, collection_id, None).await?;
+    let filled = with_filled_sizes(&mut *conn, doc.file, &doc.data).await?;
     let created = sqlx::query_as!(
         Document,
         r#"INSERT INTO documents (id, tenant_id, collection_id, status, published, draft, published_at,
@@ -202,7 +243,7 @@ pub async fn insert_in(
         id.unwrap_or_else(Uuid::now_v7),
         DEFAULT_TENANT,
         collection_id,
-        Json(&doc.data) as _,
+        Json(filled.as_ref().unwrap_or(&doc.data)) as _,
         actor,
         draft,
         file,
@@ -376,6 +417,7 @@ pub async fn update_in<E: From<DbError>>(
         .file
         .apply(&mut *tx, collection_id, current.file)
         .await?;
+    let filled = with_filled_sizes(&mut *tx, next.file, &next.data).await?;
     let doc = sqlx::query_as!(
         Document,
         r#"UPDATE documents
@@ -392,7 +434,7 @@ pub async fn update_in<E: From<DbError>>(
         DEFAULT_TENANT,
         collection_id,
         id,
-        Json(&next.data) as _,
+        Json(filled.as_ref().unwrap_or(&next.data)) as _,
         actor.map(|a| a.id),
         draft,
         file,
@@ -475,6 +517,10 @@ pub async fn publish_in(
     };
     crate::files::lock_in(tx, &[held.published_file, held.draft_file, set]).await?;
     let file = change.apply(&mut *tx, c.id, held.draft_file).await?;
+    let filled = match doc {
+        Some(d) => with_filled_sizes(&mut *tx, change, &d.data).await?,
+        None => None,
+    };
     let published = sqlx::query_as!(
         Document,
         r#"UPDATE documents
@@ -489,7 +535,7 @@ pub async fn publish_in(
         DEFAULT_TENANT,
         c.id,
         id,
-        doc.map(|d| Json(&d.data)) as _,
+        doc.map(|d| Json(filled.as_ref().unwrap_or(&d.data))) as _,
         by,
         file,
     )

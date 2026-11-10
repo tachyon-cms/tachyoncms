@@ -262,6 +262,8 @@ pub async fn go_live_in(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Renamed {
     pub file: Uuid,
+    /// The original's new name.
+    pub filename: String,
     pub storage: String,
     pub key: String,
     /// (old, new) for each size and copy, the original's own name not among them: its
@@ -393,6 +395,7 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<Vec<
         .await?;
         renamed.push(Renamed {
             file: f.id,
+            filename: name.clone(),
             storage: row.storage,
             key: row.key,
             sizes: moved,
@@ -465,8 +468,16 @@ pub enum SizeLock {
     },
     /// Pending, gone or deleted: no size may be written.
     Released,
-    /// A document took the file between the locks: roll back and lock again.
+    /// A document took the file between the locks: roll back and lock again later.
     Moved,
+    /// A user's write holds the file or one of its versions: roll back, so it can go on,
+    /// and lock again later.
+    Busy,
+}
+
+/// Whether `e` is Postgres refusing a `NOWAIT` lock someone else holds.
+fn lock_taken(e: &sqlx::Error) -> bool {
+    matches!(e, sqlx::Error::Database(d) if d.code().as_deref() == Some("55P03"))
 }
 
 /// Locks file `id` of `collection_id`, and everything a size written to it changes, in the
@@ -474,7 +485,10 @@ pub enum SizeLock {
 /// rewrites documents whole, waits or is waited for), the documents holding it in ID
 /// order, the versions holding it, then the file `FOR NO KEY UPDATE`, which a `{"keys"}`
 /// cleanup's `FOR SHARE` waits on. Should a document have taken the file before its lock,
-/// it's `Moved`.
+/// it's `Moved`. The versions and the file are taken `NOWAIT`: a document write may hold
+/// the file before its versions (`lock_in`, then a prune) or after (a prune, then
+/// `release_in`), so the job never waits on either while it holds what that write needs;
+/// it's `Busy`, and the transaction must be rolled back.
 pub async fn lock_for_size_in(
     tx: &mut PgConnection,
     collection_id: Uuid,
@@ -498,25 +512,34 @@ pub async fn lock_for_size_in(
     )
     .fetch_all(&mut *tx)
     .await?;
-    sqlx::query!(
-        "SELECT id FROM versions WHERE tenant_id = $1 AND file_id = $2 ORDER BY id FOR UPDATE",
+    let versions = sqlx::query!(
+        "SELECT id FROM versions WHERE tenant_id = $1 AND file_id = $2
+         ORDER BY id FOR UPDATE NOWAIT",
         DEFAULT_TENANT,
         id,
     )
     .fetch_all(&mut *tx)
-    .await?;
+    .await;
+    match versions {
+        Err(e) if lock_taken(&e) => return Ok(SizeLock::Busy),
+        other => other?,
+    };
     let file = sqlx::query_as!(
         FileRow,
         r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
                   height, focal_x, focal_y, blurhash,
                   sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
                   issued_to, issued_key
-           FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE"#,
+           FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE NOWAIT"#,
         DEFAULT_TENANT,
         id,
     )
     .fetch_optional(&mut *tx)
-    .await?;
+    .await;
+    let file = match file {
+        Err(e) if lock_taken(&e) => return Ok(SizeLock::Busy),
+        other => other?,
+    };
     let Some(file) = file.filter(|f| f.state == "live") else {
         return Ok(SizeLock::Released);
     };
