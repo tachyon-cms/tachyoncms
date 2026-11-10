@@ -668,3 +668,54 @@ async fn hidden_links_stay_in_their_field(pool: PgPool) {
     let res = patch(json!({"attachments": [y, x]})).await;
     assert_eq!(res.status, 200, "{}", res.json);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_links_stay_in_their_block_type(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "media", "upload": true, "access": {"read": {"role": ["admin"]}},
+               "fields": []}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "posts", "access": {"read": true}, "fields": [
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "gallery", "fields": [
+                    {"name": "file", "type": "upload", "relationTo": "media",
+                     "filterOptions": {"mimeType": {"like": "image"}}}
+                ]},
+                {"slug": "doc", "fields": [
+                    {"name": "file", "type": "upload", "relationTo": "media"}
+                ]}
+            ]}
+        ]}),
+    )
+    .await;
+    let x = put(&app, "media", &pdf(), "terms.pdf").await["id"].clone();
+    let post = ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"layout": [{"blockType": "doc", "file": x}]}),
+    )
+    .await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(router(&pool, &d).await, "editor@example.com").await;
+
+    let moved = json!({"layout": [{"blockType": "gallery", "file": x}]});
+    let res = send(&editor, "PATCH", &url, Some(&moved.to_string())).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        paths(&res),
+        vec![("layout.0.file".into(), MISSING_LINK.into())]
+    );
+
+    let flat = ok(&editor, "GET", &format!("{url}?depth=0"), json!(null)).await;
+    let same = json!({"layout": flat["layout"]});
+    let res = send(&editor, "PATCH", &url, Some(&same.to_string())).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
