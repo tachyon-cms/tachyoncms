@@ -4392,6 +4392,14 @@ mod tests {
                 "upload.imageSizes.0: needs a width",
             ),
             (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "width": 0, "height": 10}]}, "fields": []}),
+                "upload.imageSizes.0.width: must be at least 1",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "height": 0}]}, "fields": []}),
+                "upload.imageSizes.0.height: must be at least 1",
+            ),
+            (
                 json!({"slug": "media", "upload": {"adminThumbnail": "thumb"}, "fields": []}),
                 "upload.adminThumbnail: `thumb`",
             ),

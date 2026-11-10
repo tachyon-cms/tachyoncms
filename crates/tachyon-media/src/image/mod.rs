@@ -31,7 +31,7 @@ use tachyon_core::uploads::{
     EncodeOptions, FailOn, Fit, ImageFormat, Position, TrimOptions, Upload,
 };
 
-pub use sizes::{SizeOut, make_size, size_format};
+pub use sizes::{Made, Original, SizeOut, size_format};
 
 /// The most a header read may allocate: ICC profiles and text chunks, never pixels.
 const HEADER_ALLOC: u64 = 16 * 1024 * 1024;

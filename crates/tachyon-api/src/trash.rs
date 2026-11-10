@@ -122,45 +122,57 @@ pub async fn restore(
         }
     }
     errors.check()?;
-    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
-    for (copy, p, _) in &locked {
-        if let Err(e) = vouched_links(p, &[], &vouched) {
-            errors.add(&c, *copy, e)?;
-        }
-    }
-    errors.check()?;
-    let by = access.user_id();
-    let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
-    let (doc, renamed) = documents::restore_in(&mut tx, &c, id, &copies, by)
-        .await
-        .map_err(|e| {
-            let e = match e {
-                // Only published copies are unique.
-                DbError::UniqueViolation(_) => match unique_error(&c, e.into()) {
-                    ApiError::Validation(v) => {
-                        ApiError::Validation(copy_errors(&c, DocCopy::Published, v))
-                    }
-                    e => e,
-                },
-                e => e.into(),
-            };
-            access.hide(&c, e, None)
-        })?;
-    if c.schema.versioned() {
-        for (copy, p, changed) in &locked {
-            if *changed {
-                record_version(&mut tx, id, &c, *copy, &p.data, by).await?;
+    // A restore that renames a file's sizes is rolled back, their objects copied to the new
+    // names with nothing locked, and tried again, until it commits with every name it
+    // renames already copied.
+    let mut copied = crate::media_jobs::Copied::default();
+    for _ in 0..crate::media_jobs::RESTORE_TRIES {
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
+        for (copy, p, _) in &locked {
+            if let Err(e) = vouched_links(p, &[], &vouched) {
+                errors.add(&c, *copy, e)?;
             }
         }
+        errors.check()?;
+        let by = access.user_id();
+        let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
+        let (doc, renamed) = documents::restore_in(&mut tx, &c, id, &copies, by)
+            .await
+            .map_err(|e| {
+                let e = match e {
+                    // Only published copies are unique.
+                    DbError::UniqueViolation(_) => match unique_error(&c, e.into()) {
+                        ApiError::Validation(v) => {
+                            ApiError::Validation(copy_errors(&c, DocCopy::Published, v))
+                        }
+                        e => e,
+                    },
+                    e => e.into(),
+                };
+                access.hide(&c, e, None)
+            })?;
+        if !copied.covers(&renamed) {
+            drop(tx);
+            copied.copy(&state, &renamed).await?;
+            continue;
+        }
+        if c.schema.versioned() {
+            for (copy, p, changed) in &locked {
+                if *changed {
+                    record_version(&mut tx, id, &c, *copy, &p.data, by).await?;
+                }
+            }
+        }
+        // The old names' objects go once the new names are seen.
+        crate::media_jobs::forget_old_in(&mut tx, &renamed).await?;
+        // A failed commit leaves the copies to the cleanup queued before they were made.
+        tx.commit().await.map_err(DbError::from)?;
+        return respond(&state, &access, c, &doc, read.copy, 1).await;
     }
-    // A renamed file's sizes move to their new names before the names are seen.
-    crate::media_jobs::move_sizes_in(&state, &mut tx, &renamed).await?;
-    if let Err(e) = tx.commit().await {
-        crate::media_jobs::forget_moved(&state, &renamed).await;
-        return Err(DbError::from(e).into());
-    }
-    respond(&state, &access, c, &doc, read.copy, 1).await
+    Err(ApiError::Conflict(
+        "its files were renamed while it was being restored; try again".into(),
+    ))
 }
 
 /// Each copy's 422 errors, gathered so a restore reports both copies at once.

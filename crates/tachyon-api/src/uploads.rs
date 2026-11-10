@@ -528,7 +528,8 @@ pub(crate) fn with_fields(input: &Value, fields: Option<&Map<String, Value>>) ->
 /// `input` without the server-set fields of `c`, which only the server writes; a 422 at
 /// each one it sends with a value other than the one `stored` holds, so a read written
 /// back unchanged passes. Missing and `null` count the same, and so do the values filled
-/// on read (`url`s), which are never stored.
+/// on read (`url`s), which are never stored. `sizes` is the server's alone, like `url`:
+/// dropped unread, since a job may fill it between a client's read and its write.
 pub(crate) fn settle_server_set(
     c: &Collection,
     input: &Value,
@@ -540,6 +541,7 @@ pub(crate) fn settle_server_set(
     let field = |k: &str| c.schema.data().iter().find(|f| f.name == k);
     let errors: Vec<FieldError> = SERVER_SET
         .iter()
+        .filter(|k| **k != "sizes")
         .filter(|k| {
             let was = stored.and_then(|s| s.get(**k)).unwrap_or(&Value::Null);
             fields

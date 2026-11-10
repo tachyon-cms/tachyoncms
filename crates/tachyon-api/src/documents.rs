@@ -342,7 +342,10 @@ async fn waited(
 ) -> Document {
     const EVERY: std::time::Duration = std::time::Duration::from_millis(200);
     let Some(job) = sizes else { return doc };
-    let until = deadline.map(|d| d - std::time::Duration::from_secs(1));
+    // Without a time limit on the request (a router built without one), 30 s at most.
+    let deadline = deadline
+        .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+    let until = Some(deadline - std::time::Duration::from_secs(1));
     loop {
         match jobs::status(&state.pool, job).await {
             Ok(Some(s)) if !matches!(s.state.as_str(), "queued" | "running") => break,

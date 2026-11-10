@@ -910,8 +910,10 @@ async fn a_size_being_written_holds_off_a_keys_cleanup(pool: PgPool) {
     let doc = draft_with(&pool, &c, f.id).await;
     let key = format!("images/{}/a-4x3.png", f.id);
     let mut writing = pool.begin().await.unwrap();
-    let locked = files::lock_live_in(&mut writing, f.id).await.unwrap();
-    assert_eq!(locked.map(|l| l.id), Some(f.id));
+    let locked = files::lock_for_size_in(&mut writing, c.id, f.id)
+        .await
+        .unwrap();
+    assert!(matches!(locked, files::SizeLock::Live { ref file, .. } if file.id == f.id));
     let checking = {
         let (pool, key) = (pool.clone(), key.clone());
         tokio::spawn(async move {
@@ -936,7 +938,10 @@ async fn a_size_being_written_holds_off_a_keys_cleanup(pool: PgPool) {
     assert_eq!(row.sizes["thumb"], entry);
     // The same name again isn't listed twice.
     let mut tx = pool.begin().await.unwrap();
-    files::lock_live_in(&mut tx, f.id).await.unwrap().unwrap();
+    assert!(matches!(
+        files::lock_for_size_in(&mut tx, c.id, f.id).await.unwrap(),
+        files::SizeLock::Live { .. }
+    ));
     files::fill_size_in(&mut tx, f.id, "thumb", &entry, &["a-4x3.png".into()])
         .await
         .unwrap();
@@ -951,5 +956,40 @@ async fn a_size_being_written_holds_off_a_keys_cleanup(pool: PgPool) {
     )
     .await;
     let mut tx = pool.begin().await.unwrap();
-    assert!(files::lock_live_in(&mut tx, f.id).await.unwrap().is_none());
+    assert!(matches!(
+        files::lock_for_size_in(&mut tx, c.id, f.id).await.unwrap(),
+        files::SizeLock::Released
+    ));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_write_waits_out_a_schema_change(pool: PgPool) {
+    let c = seed(&pool).await;
+    let f = reserve(&pool, &c, "a.png", "", None).await;
+    draft_with(&pool, &c, f.id).await;
+    // As a schema change's rewrite holds it while it reads and writes documents whole.
+    let mut change = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM collections WHERE id = $1 FOR UPDATE")
+        .bind(c.id)
+        .execute(&mut *change)
+        .await
+        .unwrap();
+    let writing = {
+        let pool = pool.clone();
+        let (c, f) = (c.id, f.id);
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.unwrap();
+            files::lock_for_size_in(&mut tx, c, f).await.unwrap()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(
+        !writing.is_finished(),
+        "the size waits for the schema change"
+    );
+    change.commit().await.unwrap();
+    assert!(matches!(
+        writing.await.unwrap(),
+        files::SizeLock::Live { schema_version, .. } if schema_version == c.schema_version
+    ));
 }

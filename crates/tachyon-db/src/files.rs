@@ -454,12 +454,42 @@ pub async fn get<'e>(conn: impl sqlx::PgExecutor<'e>, id: Uuid) -> Result<FileRo
     .ok_or(DbError::NotFound)
 }
 
-/// Locks file `id` to write one of its sizes, in the caller's transaction, and returns it
-/// while it's live; `None` once it's pending, gone or deleted. The documents holding it are
-/// locked first, as a document write takes them before its files. Store a size's objects
-/// only while this holds the row: a `{"keys"}` cleanup waits on it before it decides.
-pub async fn lock_live_in(tx: &mut PgConnection, id: Uuid) -> Result<Option<FileRow>, DbError> {
-    sqlx::query!(
+/// What `lock_for_size_in` found.
+#[derive(Debug)]
+pub enum SizeLock {
+    /// The file is live and locked, with everything that describes it; the collection
+    /// was at `schema_version`.
+    Live {
+        file: Box<FileRow>,
+        schema_version: i32,
+    },
+    /// Pending, gone or deleted: no size may be written.
+    Released,
+    /// A document took the file between the locks: roll back and lock again.
+    Moved,
+}
+
+/// Locks file `id` of `collection_id`, and everything a size written to it changes, in the
+/// order every write takes them: the collection `FOR KEY SHARE` (a schema change, which
+/// rewrites documents whole, waits or is waited for), the documents holding it in ID
+/// order, the versions holding it, then the file `FOR NO KEY UPDATE`, which a `{"keys"}`
+/// cleanup's `FOR SHARE` waits on. Should a document have taken the file before its lock,
+/// it's `Moved`.
+pub async fn lock_for_size_in(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    id: Uuid,
+) -> Result<SizeLock, DbError> {
+    let Some(schema_version) = sqlx::query_scalar!(
+        "SELECT schema_version FROM collections WHERE id = $1 FOR KEY SHARE",
+        collection_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    else {
+        return Ok(SizeLock::Released);
+    };
+    let holders = sqlx::query_scalar!(
         "SELECT id FROM documents
          WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2)
          ORDER BY id FOR NO KEY UPDATE",
@@ -468,28 +498,51 @@ pub async fn lock_live_in(tx: &mut PgConnection, id: Uuid) -> Result<Option<File
     )
     .fetch_all(&mut *tx)
     .await?;
-    Ok(sqlx::query_as!(
+    sqlx::query!(
+        "SELECT id FROM versions WHERE tenant_id = $1 AND file_id = $2 ORDER BY id FOR UPDATE",
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let file = sqlx::query_as!(
         FileRow,
         r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
                   height, focal_x, focal_y, blurhash,
                   sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
                   issued_to, issued_key
-           FROM files WHERE tenant_id = $1 AND id = $2 FOR UPDATE"#,
+           FROM files WHERE tenant_id = $1 AND id = $2 FOR NO KEY UPDATE"#,
         DEFAULT_TENANT,
         id,
     )
     .fetch_optional(&mut *tx)
-    .await?
-    .filter(|f| f.state == "live"))
+    .await?;
+    let Some(file) = file.filter(|f| f.state == "live") else {
+        return Ok(SizeLock::Released);
+    };
+    // With the file locked no other document can take it, so this set is final.
+    let now = sqlx::query_scalar!(
+        "SELECT id FROM documents
+         WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2) ORDER BY id",
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    if now.iter().any(|d| !holders.contains(d)) {
+        return Ok(SizeLock::Moved);
+    }
+    Ok(SizeLock::Live {
+        file: Box::new(file),
+        schema_version,
+    })
 }
 
 /// Writes size `name` of file `id` as `entry` everywhere the file's described: its row,
 /// where `new_names` join the names it's served under, each document copy holding it,
 /// trashed ones too, and each version holding it (call 1). Matched by file ID, so a size
-/// made for a file a document has since replaced lands only where that file still is. A
-/// version another write has locked, which only a prune deleting it does, is left out
-/// rather than waited on. Call it under `lock_live_in`. Returns how many documents and
-/// versions hold it.
+/// made for a file a document has since replaced lands only where that file still is.
+/// Call it under `lock_for_size_in`. Returns how many documents and versions hold it.
 pub async fn fill_size_in(
     tx: &mut PgConnection,
     id: Uuid,
@@ -535,9 +588,7 @@ pub async fn fill_size_in(
         r#"UPDATE versions SET data = jsonb_set(data, '{sizes}',
                CASE WHEN jsonb_typeof(data->'sizes') = 'object' THEN data->'sizes' ELSE '{}' END
                || jsonb_build_object($3::text, $4::jsonb))
-           WHERE id IN (SELECT id FROM versions
-                        WHERE tenant_id = $1 AND file_id = $2 AND data ? 'sizes'
-                        ORDER BY id FOR UPDATE SKIP LOCKED)"#,
+           WHERE tenant_id = $1 AND file_id = $2 AND data ? 'sizes'"#,
         DEFAULT_TENANT,
         id,
         name,
@@ -548,12 +599,15 @@ pub async fn fill_size_in(
     Ok(docs.rows_affected() + versions.rows_affected())
 }
 
-/// Queues the deletion of `keys` on `storage`, objects no row may record; each is kept if
-/// a file serves it by the time the cleanup runs (`key_in_use_in`).
+/// Queues the deletion of `keys` on `storage`, objects no row may record yet, due at
+/// `run_at`; each is kept if a file serves it by the time the cleanup runs
+/// (`key_in_use_in`). Queued for `PENDING_GRACE` ahead before objects are stored, it's what
+/// removes them should the write that was to record them never commit.
 pub async fn queue_key_cleanup(
     conn: &mut PgConnection,
     storage: &str,
     keys: &[String],
+    run_at: OffsetDateTime,
 ) -> Result<Uuid, DbError> {
     jobs::enqueue(
         conn,
@@ -562,7 +616,7 @@ pub async fn queue_key_cleanup(
             document_id: None,
             collection_id: None,
             payload: json!({ "keys": keys, "storage": storage }),
-            run_at: OffsetDateTime::now_utc(),
+            run_at,
             dedupe_key: None,
             created_by: None,
             key_id: None,
@@ -782,8 +836,10 @@ pub async fn on_unknown_storage(pool: &PgPool, storages: &[String]) -> Result<i6
 
 /// Whether `key` on `storage` is still served: a file that isn't gone sits in the key's
 /// directory and lists its last part among its names, as a size remade under a name a
-/// cleanup was queued for does. The file is locked until the caller's transaction ends, so
-/// a size can't be stored under `key` between this answer and a delete it leads to.
+/// cleanup was queued for does. The file is locked `FOR SHARE` until the caller's
+/// transaction ends, so a size can't be written in (`lock_for_size_in`) between this
+/// answer and a delete it leads to; a size job whose object such a delete took finds it
+/// missing once committed and stores it again.
 pub async fn key_in_use_in(
     tx: &mut PgConnection,
     storage: &str,

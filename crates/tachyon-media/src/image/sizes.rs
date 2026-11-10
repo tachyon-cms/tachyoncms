@@ -7,8 +7,8 @@ use serde_json::{Map, Value};
 use tachyon_core::uploads::{EncodeOptions, Fit, ImageFormat, ImageSize, size_filename};
 
 use super::{
-    ImageError, InputFormat, Meta, check_cap, decode, encode_animation, encode_to, internal, made,
-    mime_of, probe_unguarded, resize_around, unpanicked, write_new,
+    ImageError, InputFormat, Meta, Shown, check_cap, decode, encode_animation, encode_to, internal,
+    made, mime_of, probe_unguarded, resize_around, unpanicked, upright_exif, write_new,
 };
 
 /// A size made: its `sizes.<name>` entry (`width`, `height`, `mimeType`, `filesize`,
@@ -58,140 +58,182 @@ fn extension(f: InputFormat) -> &'static str {
     }
 }
 
-/// `size` made from `original`, the stored file named `filename`, into new files in
-/// `out_dir`, decoding at most `cap` pixels. `None` when it's skipped: unless
-/// `withoutEnlargement` is false, a size larger than the original in both dimensions.
-///
-/// One side only keeps the aspect ratio; both are fitted as `fit` says, a cover crop
-/// centred on `focal` (percent across and down; given when `focalPoint` is on) unless the
-/// size sets a `position` or `crop`. It's made in its `formatOptions`, else
-/// `default_format`, with AVIF and WebP copies besides unless it's already one of those.
-/// Every frame of an animation is resized; a GIF or WebP keeps them all, an AVIF the
-/// first. The colour profile is kept, other metadata never.
-pub fn make_size(
-    original: &Path,
-    filename: &str,
-    size: &ImageSize,
-    focal: Option<(f32, f32)>,
-    default_format: ImageFormat,
-    cap: u64,
-    out_dir: &Path,
-) -> Result<Option<SizeOut>, ImageError> {
-    unpanicked(|| {
-        make_unguarded(
-            original,
-            filename,
-            size,
-            focal,
-            default_format,
-            cap,
-            out_dir,
-        )
-    })
+/// A stored original decoded once, upright, every frame of an animation kept, for making
+/// each of its sizes from.
+pub struct Original {
+    frames: Vec<Shown>,
+    loops: Option<u16>,
+    meta: Meta,
 }
 
-fn make_unguarded(
-    original: &Path,
-    filename: &str,
-    size: &ImageSize,
-    focal: Option<(f32, f32)>,
-    default_format: ImageFormat,
-    cap: u64,
-    out_dir: &Path,
-) -> Result<Option<SizeOut>, ImageError> {
-    let bytes = std::fs::read(original).map_err(internal)?;
-    let probe = probe_unguarded(original, &bytes[..bytes.len().min(8192)])?;
-    check_cap(&probe, cap)?;
-    let decoded = decode(&bytes, &probe, cap, probe.frames > 1, false)?;
-    let mut frames = decoded.frames;
-    let (iw, ih) = (frames[0].image.width(), frames[0].image.height());
-    let aspect = |a: u32, b: u32, c: u32| (f64::from(a) * f64::from(b) / f64::from(c)).round();
-    let (tw, th) = match (size.width, size.height) {
-        (Some(w), Some(h)) => (f64::from(w), f64::from(h)),
-        (Some(w), None) => (f64::from(w), aspect(ih, w, iw)),
-        (None, Some(h)) => (aspect(iw, h, ih), f64::from(h)),
-        (None, None) => (f64::from(iw), f64::from(ih)),
-    };
-    if size.without_enlargement.unwrap_or(true) && tw > f64::from(iw) && th > f64::from(ih) {
-        return Ok(None);
+/// What making one size came to.
+#[derive(Debug)]
+pub enum Made {
+    Size(SizeOut),
+    /// Larger than the original in both dimensions, and `withoutEnlargement` isn't false.
+    Skipped,
+    /// It can't be made from this original: over the pixel cap, or the resize or encode
+    /// failed. Making it again would fail the same way.
+    Failed(ImageError),
+}
+
+impl Original {
+    /// The image at `path` decoded with at most `cap` pixels, all frames counted. The
+    /// colour profile is kept, and with `keep_metadata` (`withMetadata`) its EXIF, its
+    /// orientation reset since the frames are turned upright, and XMP. A file that can't be
+    /// read is `Internal`; one that can't be decoded is any other error.
+    pub fn open(path: &Path, cap: u64, keep_metadata: bool) -> Result<Original, ImageError> {
+        let bytes = std::fs::read(path).map_err(internal)?;
+        unpanicked(|| {
+            let probe = probe_unguarded(path, &bytes[..bytes.len().min(8192)])?;
+            check_cap(&probe, cap)?;
+            let d = decode(&bytes, &probe, cap, probe.frames > 1, keep_metadata)?;
+            Ok(Original {
+                frames: d.frames,
+                loops: d.loops,
+                meta: Meta {
+                    icc: d.meta.icc,
+                    exif: d.meta.exif.map(|e| upright_exif(&e)),
+                    xmp: d.meta.xmp,
+                },
+            })
+        })
     }
-    let position = size.position.or(size.crop);
-    let both = size.width.is_some() && size.height.is_some();
-    let focal = focal
-        .filter(|_| both && size.fit == Fit::Cover && position.is_none())
-        .map(|(x, y)| {
-            let at = |v: f32| (f64::from(v) / 100.0).clamp(0.0, 1.0);
-            (at(x), at(y))
-        });
-    let count = frames.len() as u64;
-    for (i, f) in frames.iter_mut().enumerate() {
-        f.image = resize_around(
-            &f.image,
-            size.width,
-            size.height,
-            size.fit,
-            position.unwrap_or_default(),
-            focal,
-            // Unset, a size the check above let through may grow, as sharp's default does.
-            size.without_enlargement == Some(true),
-            cap,
-        )?;
-        if i == 0 {
-            let total = u64::from(f.image.width()) * u64::from(f.image.height());
-            if total.saturating_mul(count) > cap {
-                return Err(ImageError::Corrupt(format!(
-                    "the size would be {total} pixels a frame, {count} frames; the limit is {cap}"
-                )));
+
+    /// `size` made from this original, the stored file named `filename`, into new files in
+    /// `out_dir`, holding the result to `cap` pixels, all frames counted. The error is only
+    /// for files that couldn't be written (`Internal`): anything else is `Made::Failed`.
+    ///
+    /// One side only keeps the aspect ratio; both are fitted as `fit` says, a cover crop
+    /// centred on `focal` (percent across and down; given when `focalPoint` is on) unless
+    /// the size sets a `position` or `crop`. It's made in its `formatOptions`, else
+    /// `default_format`, with AVIF and WebP copies besides unless it's already one of
+    /// those. Every frame of an animation is resized; a GIF or WebP keeps them all, an
+    /// AVIF the first.
+    pub fn make(
+        &self,
+        filename: &str,
+        size: &ImageSize,
+        focal: Option<(f32, f32)>,
+        default_format: ImageFormat,
+        cap: u64,
+        out_dir: &Path,
+    ) -> Result<Made, ImageError> {
+        let encoded = match unpanicked(|| self.encode(size, focal, default_format, cap)) {
+            Ok(Some(e)) => e,
+            Ok(None) => return Ok(Made::Skipped),
+            Err(e) => return Ok(Made::Failed(e)),
+        };
+        let mut out = SizeOut {
+            entry: Map::new(),
+            formats: Vec::new(),
+            files: Vec::new(),
+        };
+        for (key, format, w, h, bytes) in encoded {
+            // Should this fail, `out` drops and takes the files written so far with it.
+            let (path, filesize) = write_new(out_dir, &bytes)?;
+            let name = size_filename(filename, w, h, extension(format));
+            out.files.push((name.clone(), path));
+            let mut entry = Map::new();
+            entry.insert("width".into(), w.into());
+            entry.insert("height".into(), h.into());
+            entry.insert("mimeType".into(), mime_of(format).into());
+            entry.insert("filesize".into(), filesize.into());
+            entry.insert("filename".into(), name.into());
+            match key {
+                None => out.entry = entry,
+                Some(k) => out.formats.push((k, entry)),
             }
         }
+        Ok(Made::Size(out))
     }
-    let (main, options) = match &size.format_options {
-        Some(f) => (made(f.format), f.options.clone()),
-        None => (made(default_format), EncodeOptions::default()),
-    };
-    let meta = Meta {
-        icc: decoded.meta.icc,
-        ..Meta::default()
-    };
-    let (w, h) = (frames[0].image.width(), frames[0].image.height());
-    let encode = |format: InputFormat, o: &EncodeOptions| match format {
-        InputFormat::Gif | InputFormat::Webp if frames.len() > 1 => {
-            encode_animation(frames.clone(), decoded.loops, format, o, &meta)
+
+    /// Each output of `size` (the size itself, then its copies by `formats` key) as its
+    /// format, width, height and bytes; `None` when it's skipped.
+    #[allow(clippy::type_complexity)]
+    fn encode(
+        &self,
+        size: &ImageSize,
+        focal: Option<(f32, f32)>,
+        default_format: ImageFormat,
+        cap: u64,
+    ) -> Result<Option<Vec<(Option<&'static str>, InputFormat, u32, u32, Vec<u8>)>>, ImageError>
+    {
+        let (iw, ih) = (self.frames[0].image.width(), self.frames[0].image.height());
+        let aspect = |a: u32, b: u32, c: u32| (f64::from(a) * f64::from(b) / f64::from(c)).round();
+        let (tw, th) = match (size.width, size.height) {
+            (Some(w), Some(h)) => (f64::from(w), f64::from(h)),
+            (Some(w), None) => (f64::from(w), aspect(ih, w, iw)),
+            (None, Some(h)) => (aspect(iw, h, ih), f64::from(h)),
+            (None, None) => (f64::from(iw), f64::from(ih)),
+        };
+        if size.without_enlargement.unwrap_or(true) && tw > f64::from(iw) && th > f64::from(ih) {
+            return Ok(None);
         }
-        _ => encode_to(&frames[0].image, format, o, &meta),
-    };
-    let plain = EncodeOptions::default();
-    let outputs: Vec<(Option<&'static str>, InputFormat, &EncodeOptions)> = [
-        (None, main, &options),
-        (Some("avif"), InputFormat::Avif, &plain),
-        (Some("webp"), InputFormat::Webp, &plain),
-    ]
-    .into_iter()
-    .filter(|(key, f, _)| key.is_none() || *f != main)
-    .collect();
-    let mut out = SizeOut {
-        entry: Map::new(),
-        formats: Vec::new(),
-        files: Vec::new(),
-    };
-    for (key, format, o) in outputs {
-        let encoded = encode(format, o)?;
-        // Should this fail, `out` drops and takes the files written so far with it.
-        let (path, filesize) = write_new(out_dir, &encoded)?;
-        let name = size_filename(filename, w, h, extension(format));
-        out.files.push((name.clone(), path));
-        let mut entry = Map::new();
-        entry.insert("width".into(), w.into());
-        entry.insert("height".into(), h.into());
-        entry.insert("mimeType".into(), mime_of(format).into());
-        entry.insert("filesize".into(), filesize.into());
-        entry.insert("filename".into(), name.into());
-        match key {
-            None => out.entry = entry,
-            Some(k) => out.formats.push((k, entry)),
+        let position = size.position.or(size.crop);
+        let both = size.width.is_some() && size.height.is_some();
+        let focal = focal
+            .filter(|_| both && size.fit == Fit::Cover && position.is_none())
+            .map(|(x, y)| {
+                let at = |v: f32| (f64::from(v) / 100.0).clamp(0.0, 1.0);
+                (at(x), at(y))
+            });
+        let count = self.frames.len() as u64;
+        let mut frames = Vec::with_capacity(self.frames.len());
+        for (i, f) in self.frames.iter().enumerate() {
+            let image = resize_around(
+                &f.image,
+                size.width,
+                size.height,
+                size.fit,
+                position.unwrap_or_default(),
+                focal,
+                // Unset, a size the check above let through may grow, as sharp's default
+                // does.
+                size.without_enlargement == Some(true),
+                cap,
+            )
+            // Resizing fails the same way however often it's tried.
+            .map_err(|e| ImageError::Corrupt(e.to_string()))?;
+            if i == 0 {
+                let total = u64::from(image.width()) * u64::from(image.height());
+                if total.saturating_mul(count) > cap {
+                    return Err(ImageError::Corrupt(format!(
+                        "the size would be {total} pixels a frame, {count} frames; the limit is {cap}"
+                    )));
+                }
+            }
+            frames.push(Shown {
+                image,
+                delay_ms: f.delay_ms,
+            });
         }
+        let (main, options) = match &size.format_options {
+            Some(f) => (made(f.format), f.options.clone()),
+            None => (made(default_format), EncodeOptions::default()),
+        };
+        let (w, h) = (frames[0].image.width(), frames[0].image.height());
+        let plain = EncodeOptions::default();
+        let outputs = [
+            (None, main, &options),
+            (Some("avif"), InputFormat::Avif, &plain),
+            (Some("webp"), InputFormat::Webp, &plain),
+        ];
+        let mut out = Vec::new();
+        for (key, format, o) in outputs {
+            if key.is_some() && format == main {
+                continue;
+            }
+            let bytes = match format {
+                InputFormat::Gif | InputFormat::Webp if frames.len() > 1 => {
+                    encode_animation(frames.clone(), self.loops, format, o, &self.meta)?
+                }
+                _ => encode_to(&frames[0].image, format, o, &self.meta)?,
+            };
+            out.push((key, format, w, h, bytes));
+        }
+        Ok(Some(out))
     }
-    Ok(Some(out))
 }
 
 #[cfg(test)]
@@ -221,7 +263,15 @@ mod tests {
         let d = dir();
         let input = d.join("in");
         std::fs::write(&input, bytes).unwrap();
-        make_size(&input, "a.png", &size(s), focal, format, 50_000_000, &d).unwrap()
+        let original = Original::open(&input, 50_000_000, false).unwrap();
+        match original
+            .make("a.png", &size(s), focal, format, 50_000_000, &d)
+            .unwrap()
+        {
+            Made::Size(out) => Some(out),
+            Made::Skipped => None,
+            Made::Failed(e) => panic!("{e}"),
+        }
     }
 
     fn halves() -> Vec<u8> {
@@ -371,5 +421,58 @@ mod tests {
         assert_eq!(size_format("image/gif"), Some(ImageFormat::Gif));
         assert_eq!(size_format("image/tiff"), Some(ImageFormat::Png));
         assert_eq!(size_format("image/svg+xml"), None);
+    }
+
+    #[test]
+    fn one_decode_makes_every_size_and_a_bad_one_fails_alone() {
+        let d = dir();
+        let input = d.join("in");
+        std::fs::write(&input, encoded(&gradient(100, 5000), Codec::Png)).unwrap();
+        let original = Original::open(&input, 50_000_000, false).unwrap();
+        let wide = size(json!({"name": "wide", "width": 1920, "withoutEnlargement": false}));
+        let made = original
+            .make("a.png", &wide, None, ImageFormat::Png, 50_000_000, &d)
+            .unwrap();
+        assert!(
+            matches!(made, Made::Failed(ImageError::Corrupt(_))),
+            "{made:?}"
+        );
+        let thumb = size(json!({"name": "thumb", "width": 10}));
+        let made = original
+            .make("a.png", &thumb, None, ImageFormat::Png, 50_000_000, &d)
+            .unwrap();
+        let Made::Size(out) = made else {
+            panic!("{made:?}")
+        };
+        assert_eq!(out.entry["height"], 500);
+    }
+
+    #[test]
+    fn with_metadata_sizes_keep_exif_and_xmp() {
+        use crate::fixtures::{exif, with_exif};
+        use img_parts::ImageEXIF;
+        let jpeg = with_exif(
+            encoded(&gradient(200, 100), Codec::Jpeg),
+            exif(Some(1), true),
+        );
+        let d = dir();
+        let input = d.join("in");
+        std::fs::write(&input, &jpeg).unwrap();
+        let s = size(json!({"name": "thumb", "width": 50}));
+        let exif_of = |keep: bool| {
+            let original = Original::open(&input, 50_000_000, keep).unwrap();
+            let Made::Size(out) = original
+                .make("a.jpg", &s, None, ImageFormat::Jpeg, 50_000_000, &d)
+                .unwrap()
+            else {
+                panic!("not made")
+            };
+            let bytes = std::fs::read(&out.files[0].1).unwrap();
+            img_parts::jpeg::Jpeg::from_bytes(bytes.into())
+                .unwrap()
+                .exif()
+        };
+        assert!(exif_of(true).is_some(), "kept with withMetadata");
+        assert!(exif_of(false).is_none(), "stripped without it");
     }
 }

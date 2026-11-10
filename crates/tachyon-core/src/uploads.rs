@@ -752,6 +752,11 @@ pub(crate) fn check(u: &Upload, fields: &[Field]) -> Result<(), String> {
         if s.width.is_none() && s.height.is_none() {
             return Err(format!("{at}: needs a width, a height or both"));
         }
+        for (side, v) in [("width", s.width), ("height", s.height)] {
+            if v == Some(0) {
+                return Err(format!("{at}.{side}: must be at least 1"));
+            }
+        }
     }
     if let Some(t) = &u.admin_thumbnail
         && !names.contains(&t.as_str())
