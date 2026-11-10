@@ -61,6 +61,9 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
     };
     let (mut frames, mut pixels, mut ends) = (0u32, 0u64, false);
     let (mut icc, mut xmp) = (None, None);
+    // The graphic control block for the next image: only the last one counts, and it's
+    // written just before that image, so repeating them carries nothing.
+    let mut control: Option<[u8; 8]> = None;
     loop {
         let start = i;
         let Some(kind) = at(i) else { break };
@@ -74,13 +77,17 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
                     .filter(|_| label == 0xFF && at(i + 2) == Some(11));
                 let data = || sub_block_data(bytes, i + 14, end);
                 // What's kept is rebuilt, so no payload rides along unchecked: graphic
-                // control blocks of their fixed shape, the loop count, and a profile that
-                // looks like one. Comments, plain text and anything else go.
+                // control blocks of their fixed shape (reserved bits cleared), the loop
+                // count, and a profile that looks like one. Comments, plain text and
+                // anything else go.
                 let rebuilt: Option<Vec<u8>> = match (label, id) {
-                    (0xF9, _) => bytes
-                        .get(start..end)
-                        .filter(|b| b.len() == 8 && b[2] == 4 && b[7] == 0)
-                        .map(<[u8]>::to_vec),
+                    (0xF9, _) => {
+                        if let Some(b) = bytes.get(start..end).filter(|b| b.len() == 8 && b[2] == 4)
+                        {
+                            control = Some([0x21, 0xF9, 4, b[3] & 0x1F, b[4], b[5], b[6], 0]);
+                        }
+                        None
+                    }
                     (0xFF, Some(id)) if id == b"NETSCAPE2.0" || id == b"ANIMEXTS1.0" => {
                         let d = data();
                         (d.len() == 3 && d[0] == 1).then(|| {
@@ -134,6 +141,9 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
                 i = end;
                 frames += 1;
                 pixels = pixels.saturating_add(screen.max(w * h));
+                if let (true, Some(c)) = (strip, control.take()) {
+                    out.extend_from_slice(&c);
+                }
                 keep(&mut out, start, i);
             }
             0x3B => {

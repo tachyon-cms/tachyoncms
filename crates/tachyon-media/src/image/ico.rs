@@ -224,8 +224,12 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
         Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
     };
     let header = u32_at(0)? as usize;
-    let w = (u32_at(4)? as i32).unsigned_abs();
-    let h = (u32_at(8)? as i32).unsigned_abs() / 2;
+    let (w, h) = (u32_at(4)? as i32, u32_at(8)? as i32);
+    // An icon's bitmap is bottom-up: a top-down (negative) height isn't one.
+    if w <= 0 || h <= 0 || header < 40 {
+        return Err(ImageError::Corrupt("an icon's bitmap has no size".into()));
+    }
+    let (w, h) = (w.unsigned_abs(), h.unsigned_abs() / 2);
     let bits = u16::from_le_bytes(
         data.get(14..16)
             .ok_or_else(cut)?
@@ -233,7 +237,7 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
             .map_err(|_| cut())?,
     );
     let compression = u32_at(16)?;
-    if w == 0 || h == 0 || header < 40 {
+    if h == 0 {
         return Err(ImageError::Corrupt("an icon's bitmap has no size".into()));
     }
     if u64::from(w) * u64::from(h) > cap {
@@ -242,11 +246,20 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
             cap,
         });
     }
-    if !(compression == 0 || (compression == 3 && bits == 32)) {
+    // Bit fields: the three channel masks sit at 40 (after a 40-byte header, inside a
+    // longer one). Only the one layout a plain 32-bit bitmap has is taken.
+    let bit_fields = compression == 3 && bits == 32;
+    if bit_fields && [u32_at(40)?, u32_at(44)?, u32_at(48)?] != [0x00FF_0000, 0x0000_FF00, 0xFF] {
+        return Err(ImageError::Unsupported(
+            "this icon bitmap's channel layout isn't supported",
+        ));
+    }
+    if !(compression == 0 || bit_fields) {
         return Err(ImageError::Unsupported(
             "compressed icon bitmaps aren't supported",
         ));
     }
+    let header = if bit_fields { header.max(52) } else { header };
     let colours = match bits {
         1 | 4 | 8 => {
             let used = u32_at(32)? as usize;
@@ -269,16 +282,21 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
     let mask_stride = (w as usize).div_ceil(32) * 4;
     let mask_at = pixels_at + stride * h as usize;
     let mut out = ::image::RgbaImage::new(w, h);
+    // Rows run bottom to top. The AND mask clears a pixel; a 32-bit bitmap carries its own
+    // alpha instead, unless that's zero throughout (older icons), when the mask is used.
+    let masked = |x: usize, y: usize| {
+        data.get(mask_at + mask_stride * y..mask_at + mask_stride * (y + 1))
+            .is_some_and(|m| (m[x / 8] >> (7 - x % 8)) & 1 == 1)
+    };
     for y in 0..h as usize {
-        // Rows run bottom to top.
         let row = data
             .get(pixels_at + stride * y..pixels_at + stride * (y + 1))
             .ok_or_else(cut)?;
-        let mask = data.get(mask_at + mask_stride * y..mask_at + mask_stride * (y + 1));
         for x in 0..w as usize {
             let index = |b: u16| -> usize {
                 let bit = x * usize::from(b);
-                usize::from((row[bit / 8] >> (8 - usize::from(b) - bit % 8)) & ((1 << b) - 1))
+                let shift = 8 - usize::from(b) - bit % 8;
+                usize::from((u16::from(row[bit / 8]) >> shift) & ((1u16 << b) - 1))
             };
             let [r, g, b, a] = match bits {
                 24 => [row[3 * x + 2], row[3 * x + 1], row[3 * x], 255],
@@ -289,14 +307,7 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
                     [p[2], p[1], p[0], 255]
                 }
             };
-            let masked = mask.is_some_and(|m| (m[x / 8] >> (7 - x % 8)) & 1 == 1);
-            let a = if bits == 32 {
-                a
-            } else if masked {
-                0
-            } else {
-                a
-            };
+            let a = if bits == 32 || !masked(x, y) { a } else { 0 };
             out.put_pixel(
                 x as u32,
                 (h as usize - 1 - y) as u32,
@@ -304,5 +315,190 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
             );
         }
     }
+    if bits == 32 && out.pixels().all(|p| p[3] == 0) {
+        for (x, y, p) in out.enumerate_pixels_mut() {
+            p[3] = if masked(x as usize, h as usize - 1 - y as usize) {
+                0
+            } else {
+                255
+            };
+        }
+    }
     Ok(out)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::io::Cursor;
+
+    use ::image::DynamicImage;
+    use ::image::codecs::bmp::BmpDecoder;
+
+    use super::*;
+
+    /// A 4×2 DIB of `bits` a pixel: an info header of `header` bytes with `compression`,
+    /// `palette` entries, `rows` (top first, each already packed and padded), and for an
+    /// icon (`mask` given) a doubled height, an AND mask after the pixels and anything in
+    /// `after_header` between the header and the palette.
+    #[allow(clippy::too_many_arguments)]
+    fn dib(
+        bits: u16,
+        header: u32,
+        compression: u32,
+        after_header: &[u8],
+        palette: &[[u8; 4]],
+        rows: &[&[u8]],
+        mask: Option<&[u8]>,
+    ) -> Vec<u8> {
+        let h = rows.len() as u32;
+        let mut out = Vec::new();
+        for v in [header, 4, if mask.is_some() { 2 * h } else { h }] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        out.extend_from_slice(&1u16.to_le_bytes());
+        out.extend_from_slice(&bits.to_le_bytes());
+        out.extend_from_slice(&compression.to_le_bytes());
+        out.extend_from_slice(&[0; 20]);
+        out.extend_from_slice(after_header);
+        out.extend(palette.iter().flatten());
+        for row in rows.iter().rev() {
+            out.extend_from_slice(row);
+        }
+        if let Some(m) = mask {
+            out.extend_from_slice(m);
+        }
+        out
+    }
+
+    fn icon(dib: &[u8]) -> Vec<u8> {
+        let mut out = vec![0, 0, 1, 0, 1, 0, 4, 2, 0, 0, 1, 0, 0, 0];
+        out.extend_from_slice(&(dib.len() as u32).to_le_bytes());
+        out.extend_from_slice(&22u32.to_le_bytes());
+        out.extend_from_slice(dib);
+        out
+    }
+
+    /// `dib` (no mask) as a BMP file, decoded by image's own decoder.
+    fn oracle(dib: &[u8], colours: usize) -> ::image::RgbImage {
+        let mut bmp = b"BM".to_vec();
+        bmp.extend_from_slice(&((14 + dib.len()) as u32).to_le_bytes());
+        bmp.extend_from_slice(&[0; 4]);
+        bmp.extend_from_slice(&((54 + 4 * colours) as u32).to_le_bytes());
+        bmp.extend_from_slice(dib);
+        let d = BmpDecoder::new(Cursor::new(bmp)).unwrap();
+        DynamicImage::from_decoder(d).unwrap().to_rgb8()
+    }
+
+    fn palette(n: usize) -> Vec<[u8; 4]> {
+        (0..n)
+            .map(|i| [i as u8, (i * 3) as u8, (i * 7) as u8, 0])
+            .collect()
+    }
+
+    /// `indices`, `bits` each, packed most significant first and padded to 4 bytes.
+    fn packed(bits: u16, indices: &[u8]) -> Vec<u8> {
+        let mut row = vec![0u8; 4];
+        for (x, &i) in indices.iter().enumerate() {
+            let bit = x * usize::from(bits);
+            row[bit / 8] |= i << (8 - usize::from(bits) - bit % 8);
+        }
+        row
+    }
+
+    #[test]
+    fn palette_bitmaps_match_images_decoder() {
+        for (bits, top, bottom) in [
+            (1, [0u8, 1, 1, 0], [1u8, 0, 0, 1]),
+            (4, [0, 1, 15, 8], [7, 2, 9, 14]),
+            (8, [0, 1, 128, 255], [200, 17, 64, 3]),
+        ] {
+            let colours = 1 << bits;
+            let (top, bottom) = (packed(bits, &top), packed(bits, &bottom));
+            let plain = dib(bits, 40, 0, &[], &palette(colours), &[&top, &bottom], None);
+            let ico = icon(&dib(
+                bits,
+                40,
+                0,
+                &[],
+                &palette(colours),
+                &[&top, &bottom],
+                Some(&[0; 8]),
+            ));
+            let ours = DynamicImage::ImageRgba8(decode_bitmap(&ico[22..], 100).unwrap());
+            assert_eq!(ours.to_rgb8(), oracle(&plain, colours), "{bits}-bit");
+            assert!(ours.to_rgba8().pixels().all(|p| p[3] == 255), "{bits}-bit");
+        }
+    }
+
+    #[test]
+    fn true_colour_bitmaps_match_images_decoder() {
+        let top24: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let bottom24: &[u8] = &[13, 14, 15, 16, 17, 18, 19, 20, 21, 22, 23, 24];
+        let top32: &[u8] = &[1, 2, 3, 200, 4, 5, 6, 0, 7, 8, 9, 100, 10, 11, 12, 255];
+        let bottom32: &[u8] = &[13, 14, 15, 1, 16, 17, 18, 2, 19, 20, 21, 3, 22, 23, 24, 4];
+        for (bits, rows) in [(24u16, [top24, bottom24]), (32, [top32, bottom32])] {
+            let plain = dib(bits, 40, 0, &[], &[], &rows, None);
+            let ico = icon(&dib(bits, 40, 0, &[], &[], &rows, Some(&[0; 8])));
+            let ours = DynamicImage::ImageRgba8(decode_bitmap(&ico[22..], 100).unwrap());
+            assert_eq!(ours.to_rgb8(), oracle(&plain, 0), "{bits}-bit");
+        }
+        // 32-bit alpha is kept when any pixel has some.
+        let ico = icon(&dib(32, 40, 0, &[], &[], &[top32, bottom32], Some(&[0; 8])));
+        let img = decode_bitmap(&ico[22..], 100).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 200]);
+        assert_eq!(img.get_pixel(1, 0).0, [6, 5, 4, 0]);
+        assert_eq!(img.get_pixel(3, 1).0, [24, 23, 22, 4]);
+    }
+
+    #[test]
+    fn all_zero_alpha_falls_back_to_the_and_mask() {
+        let top: &[u8] = &[1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0];
+        let bottom: &[u8] = &[13, 14, 15, 0, 16, 17, 18, 0, 19, 20, 21, 0, 22, 23, 24, 0];
+        // Mask rows bottom to top: the bottom row's first pixel and the top row's last.
+        let mask: &[u8] = &[0x80, 0, 0, 0, 0x10, 0, 0, 0];
+        let ico = icon(&dib(32, 40, 0, &[], &[], &[top, bottom], Some(mask)));
+        let img = decode_bitmap(&ico[22..], 100).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 255]);
+        assert_eq!(img.get_pixel(3, 0).0, [12, 11, 10, 0]);
+        assert_eq!(img.get_pixel(0, 1).0, [15, 14, 13, 0]);
+        assert_eq!(img.get_pixel(1, 1).0, [18, 17, 16, 255]);
+    }
+
+    #[test]
+    fn a_top_down_bitmap_is_refused() {
+        let row: &[u8] = &[1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12];
+        let mut ico = icon(&dib(24, 40, 0, &[], &[], &[row, row], Some(&[0; 8])));
+        ico[22 + 8..22 + 12].copy_from_slice(&(-4i32).to_le_bytes());
+        assert!(matches!(
+            decode_bitmap(&ico[22..], 100),
+            Err(ImageError::Corrupt(_))
+        ));
+    }
+
+    #[test]
+    fn bit_fields_after_a_40_byte_header_start_the_pixels_at_52() {
+        let top: &[u8] = &[1, 2, 3, 200, 4, 5, 6, 0, 7, 8, 9, 100, 10, 11, 12, 255];
+        let bottom: &[u8] = &[13, 14, 15, 1, 16, 17, 18, 2, 19, 20, 21, 3, 22, 23, 24, 4];
+        let masks = |m: [u32; 3]| m.iter().flat_map(|v| v.to_le_bytes()).collect::<Vec<u8>>();
+        let bgr = masks([0x00FF_0000, 0x0000_FF00, 0x0000_00FF]);
+        let ico = icon(&dib(32, 40, 3, &bgr, &[], &[top, bottom], Some(&[0; 8])));
+        let img = decode_bitmap(&ico[22..], 100).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 200]);
+        assert_eq!(img.get_pixel(3, 1).0, [24, 23, 22, 4]);
+        // Masks in a 108-byte header sit inside it; the pixels follow the header.
+        let mut v4 = bgr.clone();
+        v4.extend_from_slice(&[0; 56]);
+        let ico = icon(&dib(32, 108, 3, &v4, &[], &[top, bottom], Some(&[0; 8])));
+        assert_eq!(
+            decode_bitmap(&ico[22..], 100).unwrap().get_pixel(0, 0).0,
+            [3, 2, 1, 200]
+        );
+        // Any other layout isn't taken.
+        let rgb = masks([0x0000_00FF, 0x0000_FF00, 0x00FF_0000]);
+        let ico = icon(&dib(32, 40, 3, &rgb, &[], &[top, bottom], Some(&[0; 8])));
+        assert!(matches!(
+            decode_bitmap(&ico[22..], 100),
+            Err(ImageError::Unsupported(_))
+        ));
+    }
 }

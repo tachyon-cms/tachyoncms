@@ -219,6 +219,11 @@ pub fn probe(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     unpanicked(|| probe_unguarded(path, head))
 }
 
+// The guard below catches panics only while they unwind: a profile, `.cargo/config.toml`
+// or `RUSTFLAGS` setting `panic = "abort"` would turn a crafted file into a crash.
+#[cfg(not(panic = "unwind"))]
+compile_error!("tachyon-media needs panic = \"unwind\": its decoders run under catch_unwind");
+
 /// `work`, a panic in it (a parser or decoder bug some file reaches) taken as a file that
 /// can't be read rather than a failed request. Nothing here starts a thread, so every
 /// panic unwinds through this.
@@ -2084,21 +2089,6 @@ mod tests {
         assert!(matches!(got, Err(ImageError::Corrupt(_))), "{got:?}");
     }
 
-    /// The guard above catches panics only while they unwind.
-    #[test]
-    fn no_profile_aborts_on_panic() {
-        for manifest in [
-            include_str!("../../../../Cargo.toml"),
-            include_str!("../../Cargo.toml"),
-        ] {
-            let squashed: String = manifest.chars().filter(|c| !c.is_whitespace()).collect();
-            assert!(
-                !squashed.contains("panic=\"abort\""),
-                "a profile sets panic = abort"
-            );
-        }
-    }
-
     #[test]
     fn ravifs_layout_takes_a_profile() {
         let avif = encoded(&gradient(8, 8), Codec::Avif);
@@ -2131,6 +2121,38 @@ mod tests {
             assert!(!has(out, gone), "{:?} kept", String::from_utf8_lossy(gone));
         }
         assert_eq!(walked.icc, None);
+        assert_eq!(gif::walk(out, false).unwrap().frames, 2);
+    }
+
+    #[test]
+    fn gif_strip_keeps_one_graphic_control_block_per_image() {
+        let mut g = moving_gif(2, 2, 2);
+        // Three control blocks before the first image, reserved bits set, each with 4
+        // bytes that would otherwise ride along.
+        let mut extra = Vec::new();
+        for payload in [b"AAAA", b"BBBB", b"CCCC"] {
+            extra.extend_from_slice(&[0x21, 0xF9, 4]);
+            extra.extend_from_slice(payload);
+            extra.push(0);
+        }
+        let table = if g[10] & 0x80 != 0 {
+            3 << ((g[10] & 7) + 1)
+        } else {
+            0
+        };
+        g.splice(13 + table..13 + table, extra);
+        let walked = gif::walk(&g, true).unwrap();
+        let out = &walked.stripped;
+        let controls: Vec<&[u8]> = out
+            .windows(8)
+            .filter(|w| w[..3] == [0x21, 0xF9, 4])
+            .collect();
+        assert_eq!(controls.len(), 2, "one per image");
+        assert!(
+            controls.iter().all(|c| c[3] & 0xE0 == 0),
+            "reserved bits cleared"
+        );
+        assert!(!has(out, b"AAAA") && !has(out, b"BBBB"));
         assert_eq!(gif::walk(out, false).unwrap().frames, 2);
     }
 

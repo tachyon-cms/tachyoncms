@@ -434,7 +434,9 @@ pub(super) fn meta(data: &[u8]) -> Result<Meta, ImageError> {
         orientation: 1,
         ..Meta::default()
     };
-    let top = boxes(data, 0, data.len());
+    // A `meta` past where the walk stopped, or a second one, would go unseen: fail closed.
+    let (top, whole) = walk_boxes(data, 0, data.len());
+    m.unresolved = !whole || top.iter().filter(|b| &b.kind == b"meta").count() > 1;
     let Some(meta) = find(&top, b"meta") else {
         return Ok(m);
     };
@@ -890,8 +892,27 @@ mod tests {
         meta.extend(bx(b"iinf", &iinf));
         meta.extend(bx(b"iloc", &iloc));
         let mut out = bx(b"meta", &meta);
-        out.extend_from_slice(&[0x55; 64]);
+        out.extend(bx(b"mdat", &[0x55; 64]));
         out
+    }
+
+    #[test]
+    fn a_top_level_walk_that_stops_early_is_unresolved() {
+        let good = synthetic(0, &[(10, 4)]);
+        assert!(!meta(&good).unwrap().unresolved);
+        // A box claiming more bytes than the file has, before `meta`.
+        let mut early = bx(b"free", &[]);
+        early[3] = 99;
+        early.extend_from_slice(&good);
+        assert!(meta(&early).unwrap().unresolved);
+        // Trailing bytes that don't walk as a box.
+        let mut tail = good.clone();
+        tail.extend_from_slice(&[0, 0, 0, 99, b'f', b'r', b'e', b'e']);
+        assert!(meta(&tail).unwrap().unresolved);
+        // A second `meta`.
+        let mut twice = good.clone();
+        twice.extend(bx(b"meta", &[0; 4]));
+        assert!(meta(&twice).unwrap().unresolved);
     }
 
     #[test]
