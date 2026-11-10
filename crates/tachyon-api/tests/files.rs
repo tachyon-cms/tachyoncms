@@ -1275,3 +1275,66 @@ async fn urls_reach_trash_virtuals_and_old_versions(pool: PgPool) {
         "http://localhost:3000/api/public/file/new.png"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_published_file_wins_over_an_older_draft_of_the_same_name(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"versions": {"drafts": true, "maxVersions": 10}}),
+    )
+    .await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let doc = put(&app, "images", &png(1, 1), "a.png", None).await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    ok(&app, "POST", &format!("{one}/publish"), None).await;
+    let a = held(&pool, &doc["id"], "published_file").await.unwrap();
+    let a_version = ok(&app, "GET", &format!("{one}/versions"), None).await["docs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let res = upload(&app, "PATCH", &one, Some(&png(2, 2)), "a.png", None).await;
+    assert_eq!(res.json["filename"], "a.png", "{}", res.json);
+    ok(&app, "POST", &format!("{one}/publish"), None).await;
+    let b = held(&pool, &doc["id"], "published_file").await.unwrap();
+    ok(
+        &app,
+        "POST",
+        &format!("{one}/versions/{a_version}/restore"),
+        None,
+    )
+    .await;
+    assert_eq!(
+        held(&pool, &doc["id"], "draft_file").await,
+        Some(a),
+        "the draft holds A"
+    );
+    assert!(a < b, "A is the older file, found first by name");
+    // What's published comes first, whichever file is older.
+    let res = fetch(&editor, "/api/images/file/a.png").await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("etag"), format!("\"{b}-a.png\""));
+    assert_eq!(res.header("cache-control"), "public, no-cache");
+    assert_eq!(
+        res.body,
+        stored(&d.root, &files::get(&pool, b).await.unwrap().key)
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_authors_draft_is_theirs_alone(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({"versions": {"drafts": true}})).await;
+    let amy = as_role(&pool, &d, "amy@example.com", "author").await;
+    let bob = as_role(&pool, &d, "bob@example.com", "author").await;
+    put(&amy, "images", &png(1, 1), "amy.png", None).await;
+    let res = fetch(&amy, "/api/images/file/amy.png").await;
+    assert_eq!(res.status, 200, "{}", res.json());
+    assert_eq!(res.header("cache-control"), "private, no-store");
+    let res = fetch(&bob, "/api/images/file/amy.png").await;
+    assert_eq!(res.status, 404);
+    assert!(res.json().get("detail").is_none(), "{}", res.json());
+}

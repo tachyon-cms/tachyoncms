@@ -205,6 +205,10 @@ async fn find(
     // An original's name wins over a size of another file that happens to share it.
     let originals = candidates.iter().any(|f| f.filename == name);
     let anonymous = access.anonymous();
+    // Every published holder of every file with the name before any draft holder: a
+    // replace keeps the name, so an older file a draft holds can share it with the
+    // published one.
+    let mut held = Vec::new();
     for file in candidates {
         let Some((field, mime)) = served_as(&file, name, originals) else {
             continue;
@@ -212,28 +216,33 @@ async fn find(
         if !access.reads(c, &field) {
             continue;
         }
-        let mut holders = files::holders(&state.pool, file.id).await?;
-        holders.retain(|(doc, _)| id.is_none_or(|id| id == *doc));
-        // A published holder first, so what anyone may read is served as public.
-        holders.sort_by_key(|(_, copy)| *copy != DocCopy::Published);
+        let holders = files::holders(&state.pool, file.id).await?;
+        let file = Arc::new(file);
         for (doc, copy) in holders {
-            if access.read_copy(&state.pool, c, doc, copy).await?.is_none() {
-                continue;
+            if id.is_none_or(|id| id == doc) {
+                held.push((file.clone(), field.clone(), mime.clone(), doc, copy));
             }
-            let public = copy == DocCopy::Published
-                && anonymous.reads_every_document(c)
-                && anonymous.reads(c, &field);
-            let key = match name == file.filename {
-                true => file.key.clone(),
-                false => beside(&file.key, name),
-            };
-            return Ok(Some(Found {
-                file,
-                key,
-                mime,
-                public,
-            }));
         }
+    }
+    // Stable, so within each copy files keep their order by ID.
+    held.sort_by_key(|(_, _, _, _, copy)| *copy != DocCopy::Published);
+    for (file, field, mime, doc, copy) in held {
+        if access.read_copy(&state.pool, c, doc, copy).await?.is_none() {
+            continue;
+        }
+        let public = copy == DocCopy::Published
+            && anonymous.reads_every_document(c)
+            && anonymous.reads(c, &field);
+        let key = match name == file.filename {
+            true => file.key.clone(),
+            false => beside(&file.key, name),
+        };
+        return Ok(Some(Found {
+            file: (*file).clone(),
+            key,
+            mime,
+            public,
+        }));
     }
     Ok(None)
 }
