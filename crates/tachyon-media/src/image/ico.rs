@@ -247,9 +247,19 @@ pub(super) fn decode_bitmap(data: &[u8], cap: u64) -> Result<::image::RgbaImage,
         });
     }
     // Bit fields: the three channel masks sit at 40 (after a 40-byte header, inside a
-    // longer one). Only the one layout a plain 32-bit bitmap has is taken.
+    // longer one), and a header of 56 or more has an alpha mask at 52. Only the layout a
+    // plain 32-bit bitmap has is taken, with alpha either in the fourth byte or absent
+    // (then the fourth byte is read as a plain 32-bit bitmap's would be).
     let bit_fields = compression == 3 && bits == 32;
-    if bit_fields && [u32_at(40)?, u32_at(44)?, u32_at(48)?] != [0x00FF_0000, 0x0000_FF00, 0xFF] {
+    let alpha_mask = if bit_fields && header >= 56 {
+        u32_at(52)?
+    } else {
+        0
+    };
+    if bit_fields
+        && ([u32_at(40)?, u32_at(44)?, u32_at(48)?] != [0x00FF_0000, 0x0000_FF00, 0xFF]
+            || !matches!(alpha_mask, 0 | 0xFF00_0000))
+    {
         return Err(ImageError::Unsupported(
             "this icon bitmap's channel layout isn't supported",
         ));
@@ -462,6 +472,62 @@ mod tests {
         assert_eq!(img.get_pixel(3, 0).0, [12, 11, 10, 0]);
         assert_eq!(img.get_pixel(0, 1).0, [15, 14, 13, 0]);
         assert_eq!(img.get_pixel(1, 1).0, [18, 17, 16, 255]);
+    }
+
+    #[test]
+    fn bit_field_alpha_follows_the_alpha_mask() {
+        let top: &[u8] = &[1, 2, 3, 200, 4, 5, 6, 0, 7, 8, 9, 100, 10, 11, 12, 255];
+        let zero: &[u8] = &[1, 2, 3, 0, 4, 5, 6, 0, 7, 8, 9, 0, 10, 11, 12, 0];
+        let mask: &[u8] = &[0, 0, 0, 0, 0x80, 0, 0, 0];
+        let v4 = |alpha: u32| {
+            let mut m = [0x00FF_0000u32, 0x0000_FF00, 0xFF, alpha]
+                .iter()
+                .flat_map(|v| v.to_le_bytes())
+                .collect::<Vec<u8>>();
+            m.resize(68, 0);
+            m
+        };
+        // No alpha mask (a 40-byte header, or a longer one saying 0): as a plain 32-bit
+        // bitmap, the fourth byte is alpha and all-zero alpha falls back to the AND mask.
+        let bgr = v4(0)[..12].to_vec();
+        for after in [bgr, v4(0)] {
+            let header = (40 + after.len()) as u32;
+            let ico = icon(&dib(32, header, 3, &after, &[], &[top, top], Some(mask)));
+            let img = decode_bitmap(&ico[22..], 100).unwrap();
+            assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 200], "{header}");
+            assert_eq!(img.get_pixel(1, 0).0, [6, 5, 4, 0], "{header}");
+            let ico = icon(&dib(32, header, 3, &after, &[], &[zero, zero], Some(mask)));
+            let img = decode_bitmap(&ico[22..], 100).unwrap();
+            assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 0], "{header} masked");
+            assert_eq!(img.get_pixel(1, 0).0, [6, 5, 4, 255], "{header}");
+        }
+        // The alpha mask names the fourth byte: alpha comes from it.
+        let ico = icon(&dib(
+            32,
+            108,
+            3,
+            &v4(0xFF00_0000),
+            &[],
+            &[top, top],
+            Some(mask),
+        ));
+        let img = decode_bitmap(&ico[22..], 100).unwrap();
+        assert_eq!(img.get_pixel(0, 0).0, [3, 2, 1, 200]);
+        assert_eq!(img.get_pixel(1, 0).0, [6, 5, 4, 0]);
+        // Any other alpha mask isn't taken.
+        let ico = icon(&dib(
+            32,
+            108,
+            3,
+            &v4(0x0F00_0000),
+            &[],
+            &[top, top],
+            Some(mask),
+        ));
+        assert!(matches!(
+            decode_bitmap(&ico[22..], 100),
+            Err(ImageError::Unsupported(_))
+        ));
     }
 
     #[test]
