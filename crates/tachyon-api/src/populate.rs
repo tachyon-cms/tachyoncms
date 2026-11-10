@@ -86,11 +86,24 @@ pub(crate) fn prepare(
     })
 }
 
-/// The IDs `data` of `c` links to.
-pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
+/// The links a stored document holds, as `(field, ID)`: the field is the link's schema
+/// path, list indexes dropped (`attachments`, `links.author`), so a list keeps its links
+/// whatever their order.
+pub(crate) type Held = HashSet<(String, Uuid)>;
+
+/// The field of a link at `path`, as `Held` names it.
+fn field_of(path: &str) -> String {
+    path.split('.')
+        .filter(|s| !s.bytes().all(|b| b.is_ascii_digit()))
+        .collect::<Vec<_>>()
+        .join(".")
+}
+
+/// The links `data` of `c` holds (see `Held`).
+pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Held {
     relations(c.schema.data(), data)
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| (field_of(&r.path), r.id))
         .collect()
 }
 
@@ -238,22 +251,23 @@ async fn by_slug(
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
 pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
 
-/// Refuses the links in `next` that `before` didn't hold and that the caller can't read,
-/// exactly as a link to no document is refused, so a write can't tell a hidden document
-/// from a missing one. Links already on the document stay as they are. A draft (a request
+/// Refuses the links in `next` that `before` didn't hold in the same field and that the
+/// caller can't read, exactly as a link to no document is refused, so a write can't tell a
+/// hidden document from a missing one. Links already in their field stay as they are; one
+/// the caller can't read can't move to another field, as it can't be added. A draft (a request
 /// working on drafts) may link to a draft the caller may read as well as to what's
 /// published; anything else links only to what's published.
 pub(crate) async fn check_links(
     state: &AppState,
     access: &Access,
     next: &Prepared,
-    before: &[Uuid],
+    before: &Held,
 ) -> Result<Vouched, ApiError> {
     let mut ids: Vec<Uuid> = next
         .relations
         .iter()
+        .filter(|r| !before.contains(&(field_of(&r.path), r.id)))
         .map(|r| r.id)
-        .filter(|id| !before.contains(id))
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -302,9 +316,9 @@ impl Sent<'_> {
 /// Refuses each link that `data`, as written in `conn`'s transaction, holds in a field
 /// the write sends whose upload `filterOptions` the linked document doesn't match, in the
 /// copy `read` reads it in. Every link in a sent field is checked, the stored ones too,
-/// except those the caller can't read: they stay as they are, since checking them would
-/// say something about a document the caller can't see. A new link the caller can't read
-/// was refused already (`vouched_links`). The error is a missing link's, so nothing leaks.
+/// except those the caller can't read: checking them would say something about a document
+/// the caller can't see. `vouched_links` has already refused every such link that the
+/// locked document didn't hold in the same field, so those left stay where they were. The error is a missing link's, so nothing leaks.
 ///
 /// The linked documents are locked `FOR SHARE` first, in ID order, so a replace that
 /// would change what's matched (a new file's `mimeType`) waits for this write to finish,
@@ -434,21 +448,25 @@ pub(crate) async fn published_links(
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))
         .collect();
-    vouched_links(next, &[], &vouched)?;
+    vouched_links(next, &Held::new(), &vouched)?;
     filtered_links(conn, state, access, c, &next.data, Sent::All, &linkable).await
 }
 
 /// `check_links`' answer applied to the document as locked for the write: a link added
-/// since the check (relative to `before`) that it didn't vouch for is refused the same way.
+/// since the check (relative to `before`, the locked document's `link_ids`) that it didn't
+/// vouch for is refused the same way.
 pub(crate) fn vouched_links(
     next: &Prepared,
-    before: &[Uuid],
+    before: &Held,
     vouched: &Vouched,
 ) -> Result<(), ApiError> {
     let missing: Vec<FieldError> = next
         .relations
         .iter()
-        .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
+        .filter(|r| {
+            !before.contains(&(field_of(&r.path), r.id))
+                && !vouched.contains(&(r.id, r.collection_id))
+        })
         .map(|r| FieldError {
             path: r.at.clone(),
             message: MISSING_LINK.into(),

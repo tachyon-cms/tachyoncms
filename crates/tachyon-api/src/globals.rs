@@ -20,7 +20,7 @@ use crate::access::Access;
 use crate::documents::{json_body, mode_for, record, shaped, unique_error};
 use crate::params::{Format, autosave_param, read_params};
 use crate::populate::{
-    Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
+    Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
@@ -148,7 +148,7 @@ pub async fn update(
             .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, current))))
     };
     let before = |current: Option<&Map<String, Value>>| {
-        current.map_or_else(Vec::new, |data| link_ids(&c, data))
+        current.map_or_else(Held::new, |data| link_ids(&c, data))
     };
     // Links the patch adds are checked against the stored document (or none), then again
     // against the one the write locks.
@@ -200,7 +200,7 @@ pub async fn update(
         }
         drop(tx);
         let next = apply(None)?;
-        vouched_links(&next, &[], &vouched)?;
+        vouched_links(&next, &Held::new(), &vouched)?;
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         match documents::insert_in(&mut tx, c.id, c.schema_version, Some(c.id), copy, &next, by)
             .await

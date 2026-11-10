@@ -623,3 +623,48 @@ async fn filter_options_wait_for_a_change_to_the_linked_document(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(paths(&res), vec![("cover".into(), MISSING_LINK.into())]);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_links_stay_in_their_field(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "media", "upload": true, "access": {"read": {"role": ["admin"]}},
+               "fields": []}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "posts", "access": {"read": true}, "fields": [
+            {"name": "cover", "type": "upload", "relationTo": "media",
+             "filterOptions": {"mimeType": {"like": "image"}}},
+            {"name": "extra", "type": "upload", "relationTo": "media"},
+            {"name": "attachments", "type": "upload", "relationTo": "media", "hasMany": true}
+        ]}),
+    )
+    .await;
+    let x = put(&app, "media", &pdf(), "terms.pdf").await["id"].clone();
+    let y = put(&app, "media", &png(4, 4), "cat.png").await["id"].clone();
+    let post = ok(&app, "POST", "/api/posts", json!({"attachments": [x, y]})).await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    add_user(&pool, "editor@example.com", "editor").await;
+    let editor = signed_in(router(&pool, &d).await, "editor@example.com").await;
+    let patch = |body: Value| {
+        let (editor, url) = (editor.clone(), url.clone());
+        async move { send(&editor, "PATCH", &url, Some(&body.to_string())).await }
+    };
+
+    // A link the editor can't read can't move to another field, filtered or not.
+    for field in ["cover", "extra"] {
+        let res = patch(json!({field: x})).await;
+        assert_problem(&res, 422);
+        assert_eq!(paths(&res), vec![(field.into(), MISSING_LINK.into())]);
+    }
+    // It may stay where it is, in any order.
+    let flat = ok(&editor, "GET", &format!("{url}?depth=0"), json!(null)).await;
+    let res = patch(json!({"attachments": flat["attachments"]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = patch(json!({"attachments": [y, x]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}

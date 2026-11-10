@@ -30,7 +30,7 @@ use crate::params::{
     Format, Joins, create_params, list_params, no_params, read_params, update_params,
 };
 use crate::populate::{
-    Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
+    Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
@@ -290,7 +290,7 @@ pub async fn create(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &c, data))
         .map_err(|e| hide(e, &input))?;
-    check_links(&state, &access, &prepared, &[]).await?;
+    check_links(&state, &access, &prepared, &Held::new()).await?;
     let stored = match &checked {
         Some((u, f)) => {
             let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
