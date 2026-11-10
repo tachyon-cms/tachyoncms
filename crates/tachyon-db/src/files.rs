@@ -416,14 +416,15 @@ pub async fn by_name(
     .await?)
 }
 
-/// The storage key of the file each of `docs` holds in its published copy, by document.
+/// The storage key of the file each of `docs` holds in its published copy, by document;
+/// trashed documents left out.
 pub async fn published_keys(
     pool: &PgPool,
     docs: &[Uuid],
 ) -> Result<std::collections::HashMap<Uuid, String>, DbError> {
     let rows = sqlx::query!(
         r#"SELECT d.id, f.key FROM documents d JOIN files f ON f.id = d.published_file
-           WHERE d.tenant_id = $1 AND d.id = ANY($2)"#,
+           WHERE d.tenant_id = $1 AND d.id = ANY($2) AND d.deleted_at IS NULL"#,
         DEFAULT_TENANT,
         docs,
     )

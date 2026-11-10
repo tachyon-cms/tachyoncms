@@ -209,9 +209,14 @@ async fn version(
     let mut v = stored_version(state, d, vid, drafts).await?;
     if let Some(data) = v.data.take() {
         let mut data = stripped(access, &d.c, data);
-        // The version's own file, which it links to as the document did then.
+        // A bucket link only while the document still holds the version's file; an old one
+        // links to the route, which serves a version-only file to nobody.
         let key = match (v.file_id, direct_urls(access, &d.c)) {
-            (Some(file), true) => Some(files::get(&state.pool, file).await?.key),
+            (Some(file), true) => {
+                let key = files::get(&state.pool, file).await?.key;
+                let now = files::published_keys(&state.pool, &[d.id]).await?;
+                now.get(&d.id).is_some_and(|k| *k == key).then_some(key)
+            }
             _ => None,
         };
         fill_upload_urls(state, access, &d.c, d.id, &mut data, key.as_deref());

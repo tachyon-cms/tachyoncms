@@ -60,15 +60,21 @@ pub async fn list(
         owner: read.owner,
     };
     let found = query::list_trash(&state.pool, c.id, &q, p.oldest_first).await?;
-    let docs = found
+    let mut docs = found
         .docs
         .iter()
         .map(|d| {
             let mut v = to_value(d)?;
             access.strip(&c, &mut v);
-            Ok(shaped(v, p.select.as_ref()))
+            Ok((v, c.clone()))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
+    // So the trash can show what each file was; the route serves a trashed one to nobody.
+    crate::files::fill_urls(&state, &access, &mut docs).await?;
+    let docs: Vec<Value> = docs
+        .into_iter()
+        .map(|(v, _)| shaped(v, p.select.as_ref()))
+        .collect();
     let mut body = json!({
         "docs": docs,
         "limit": p.limit,

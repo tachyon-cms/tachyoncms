@@ -676,7 +676,8 @@ pub fn restricted(mime: &str, filename: &str) -> bool {
         .any(|(e, m)| *m == mime || e.eq_ignore_ascii_case(ext))
 }
 
-/// Header names `modifyResponseHeaders` can't set: the server's own safety headers.
+/// Header names `modifyResponseHeaders` can't set: the server's own safety headers, and
+/// those that frame the body or let a client revalidate or resume it.
 pub const PROTECTED_HEADERS: &[&str] = &[
     "content-type",
     "content-security-policy",
@@ -684,6 +685,14 @@ pub const PROTECTED_HEADERS: &[&str] = &[
     "content-disposition",
     "cache-control",
     "set-cookie",
+    "etag",
+    "last-modified",
+    "accept-ranges",
+    "content-length",
+    "content-range",
+    "content-encoding",
+    "transfer-encoding",
+    "connection",
 ];
 
 /// Checks `u` on its own; `fields` are the collection's data fields with the built-ins in.

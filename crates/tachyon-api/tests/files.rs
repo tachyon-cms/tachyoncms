@@ -250,10 +250,8 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert_eq!(res.header("x-content-type-options"), "nosniff");
     assert_eq!(res.header("content-length"), bytes.len().to_string());
     assert_eq!(res.header("etag"), format!("\"{file}-cat.png\""));
-    assert_eq!(
-        res.header("cache-control"),
-        "public, max-age=31536000, immutable"
-    );
+    // Revalidated each time: a deleted document's name can come back as other bytes.
+    assert_eq!(res.header("cache-control"), "public, no-cache");
     assert_eq!(
         res.header("content-disposition"),
         "inline; filename=\"cat.png\"; filename*=UTF-8''cat.png"
@@ -468,10 +466,11 @@ async fn private_files_stay_private(pool: PgPool) {
     // A draft's file: nobody gets it without asking for drafts, and only who may read them.
     put(&app, "drafted", &png(1, 1), "d.png", None).await;
     not_found(&fetch(&anon, "/api/drafted/file/d.png").await, "anonymous");
-    not_found(
-        &fetch(&editor, "/api/drafted/file/d.png").await,
-        "editor, published",
-    );
+    // Who may read drafts gets it without asking (it's private, and never cached).
+    let res = fetch(&editor, "/api/drafted/file/d.png").await;
+    assert_eq!(res.status, 200, "{}", res.json());
+    assert_eq!(res.header("cache-control"), "private, no-store");
+    not_found(&fetch(&viewer, "/api/drafted/file/d.png").await, "viewer");
     assert_problem_raw(
         &fetch(&anon, "/api/drafted/file/d.png?draft=true").await,
         401,
@@ -871,5 +870,408 @@ async fn urls_are_filled_on_every_read(pool: PgPool) {
         .await
         .status,
         404
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn drafts_fall_back_only_where_drafts_are_readable(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "drafted", json!({"versions": {"drafts": true}})).await;
+    collection(
+        &app,
+        "secret_drafts",
+        json!({"versions": {"drafts": true},
+               "fields": [{"name": "filename", "type": "text",
+                           "access": {"read": {"role": ["admin"]}}}]}),
+    )
+    .await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let doc = put(&app, "drafted", &png(1, 1), "d.png", None).await;
+    put(&app, "secret_drafts", &png(1, 1), "s.png", None).await;
+    assert_eq!(fetch(&editor, "/api/drafted/file/d.png").await.status, 200);
+    // A field rule still hides it in the draft.
+    assert_eq!(
+        fetch(&editor, "/api/secret_drafts/file/s.png").await.status,
+        404
+    );
+    assert_eq!(
+        fetch(&app, "/api/secret_drafts/file/s.png").await.status,
+        200
+    );
+    // A trashed draft is served to nobody.
+    ok(
+        &app,
+        "DELETE",
+        &format!("/api/drafted/{}", doc["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(fetch(&editor, "/api/drafted/file/d.png").await.status, 404);
+    assert_eq!(
+        fetch(&app, "/api/drafted/file/d.png?draft=true")
+            .await
+            .status,
+        404
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_missing_object_is_not_found(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let doc = put(&app, "images", &png(1, 1), "a.png", None).await;
+    let file = held(&pool, &doc["id"], "published_file").await.unwrap();
+    std::fs::remove_file(d.root.join(files::get(&pool, file).await.unwrap().key)).unwrap();
+    for method in ["GET", "HEAD"] {
+        let res = fetch_with(&app, method, "/api/images/file/a.png", &[]).await;
+        assert_eq!(res.status, 404, "{method}");
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn refusals_are_never_cached(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "drafted", json!({"versions": {"drafts": true}})).await;
+    collection(
+        &app,
+        "members",
+        json!({"access": {"read": {"signedIn": true}}}),
+    )
+    .await;
+    put(&app, "drafted", &png(1, 1), "d.png", None).await;
+    put(&app, "members", &png(1, 1), "m.png", None).await;
+    let anon = router(&pool, &d).await;
+    for (uri, status) in [
+        ("/api/drafted/file/d.png", 404),
+        ("/api/drafted/file/nope.png", 404),
+        ("/api/members/file/m.png", 401),
+        ("/api/drafted/file/d.png?draft=nonsense", 400),
+    ] {
+        let res = fetch(&anon, uri).await;
+        assert_eq!(res.status.as_u16(), status, "{uri}");
+        assert_eq!(res.header("cache-control"), "no-store", "{uri}");
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn version_diffs_ignore_urls(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"versions": {"drafts": true},
+               "upload": {"imageSizes": [{"name": "thumbnail", "width": 10}]}}),
+    )
+    .await;
+    let doc = put(&app, "images", &png(4, 4), "cat.png", None).await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    ok(&app, "POST", &format!("{one}/publish"), None).await;
+    let versions = ok(&app, "GET", &format!("{one}/versions"), None).await;
+    let vid = versions["docs"][0]["id"].as_str().unwrap();
+    let diff = ok(
+        &app,
+        "GET",
+        &format!("{one}/diff?from={vid}&to=published"),
+        None,
+    )
+    .await;
+    let paths: Vec<&str> = diff["changes"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|c| c["path"].as_str().unwrap())
+        .collect();
+    assert!(paths.is_empty(), "nothing changed: {paths:?}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn author_headers_never_replace_the_servers(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    for name in [
+        "ETag",
+        "Last-Modified",
+        "Content-Length",
+        "Content-Encoding",
+        "Accept-Ranges",
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(
+                &json!({"slug": "loose", "upload": {"modifyResponseHeaders": {name: "x"}},
+                        "fields": []})
+                .to_string(),
+            ),
+        )
+        .await;
+        assert_problem(&res, 422);
+    }
+    collection(&app, "images", json!({})).await;
+    put(&app, "images", &png(1, 1), "a.png", None).await;
+    // One that got in before the check: the server's own still wins.
+    sqlx::query(
+        "UPDATE collections SET schema = jsonb_set(schema, '{upload}',
+             '{\"modifyResponseHeaders\": {\"ETag\": \"\\\"v1\\\"\", \"X-Robots-Tag\": \"noindex\"}}') WHERE slug = 'images'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let anon = router(&pool, &d).await;
+    let res = fetch(&anon, "/api/images/file/a.png").await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("x-robots-tag"), "noindex", "the change was read");
+    assert_ne!(res.header("etag"), "\"v1\"");
+    let again = fetch_with(
+        &anon,
+        "GET",
+        "/api/images/file/a.png",
+        &[("if-none-match", res.header("etag"))],
+    )
+    .await;
+    assert_eq!(again.status, 304);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn awkward_names_round_trip(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    collection(&app, "others", json!({})).await;
+    let anon = router(&pool, &d).await;
+    let doc = put(&app, "images", &png(1, 1), "a b#ü,final.png", None).await;
+    let name = doc["filename"].as_str().unwrap().to_owned();
+    assert_eq!(name, "a b#ü,final.png");
+    let res = fetch(&anon, &path_of(&doc["url"])).await;
+    assert_eq!(res.status, 200, "{}", doc["url"]);
+    assert_eq!(
+        res.header("content-disposition"),
+        "inline; filename=\"a b#_,final.png\"; filename*=UTF-8''a%20b#%C3%BC%2Cfinal.png"
+    );
+    let etag = res.header("etag").to_owned();
+    assert!(!etag.trim_matches('"').contains(','), "{etag}");
+    let again = fetch_with(
+        &anon,
+        "GET",
+        &path_of(&doc["url"]),
+        &[("if-none-match", &etag)],
+    )
+    .await;
+    assert_eq!(again.status, 304, "{etag}");
+    // Names are per collection.
+    assert_eq!(
+        fetch(&anon, "/api/others/file/a%20b%23%C3%BC%2Cfinal.png")
+            .await
+            .status,
+        404
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_empty_file_is_served(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "notes", json!({"upload": {"mimeTypes": ["*/*"]}})).await;
+    let anon = router(&pool, &d).await;
+    let doc = put(&app, "notes", b"", "empty.txt", None).await;
+    let uri = path_of(&doc["url"]);
+    let res = fetch(&anon, &uri).await;
+    assert_eq!(res.status, 200);
+    assert!(res.body.is_empty());
+    assert_eq!(res.header("content-length"), "0");
+    let head = fetch_with(&anon, "HEAD", &uri, &[]).await;
+    assert_eq!(
+        (head.status.as_u16(), head.header("content-length")),
+        (200, "0")
+    );
+    let past = fetch_with(&anon, "GET", &uri, &[("range", "bytes=0-")]).await;
+    assert_eq!(past.status, 416);
+    assert_eq!(past.header("content-range"), "bytes */0");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_older_file_under_a_name_isnt_taken_as_fresh(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({"versions": {"maxVersions": 10}})).await;
+    let anon = router(&pool, &d).await;
+    let doc = put(&app, "images", &png(1, 1), "a.png", None).await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    let a = held(&pool, &doc["id"], "published_file").await.unwrap();
+    sqlx::query("UPDATE files SET created_at = created_at - interval '1 day' WHERE id = $1")
+        .bind(a)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let first = ok(&app, "GET", &format!("{one}/versions"), None).await["docs"][0]["id"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let res = upload(&app, "PATCH", &one, Some(&png(2, 2)), "a.png", None).await;
+    assert_eq!(res.json["filename"], "a.png");
+    let newer = fetch(&anon, "/api/images/file/a.png")
+        .await
+        .header("last-modified")
+        .to_owned();
+    ok(
+        &app,
+        "POST",
+        &format!("{one}/versions/{first}/restore"),
+        None,
+    )
+    .await;
+    let res = fetch_with(
+        &anon,
+        "GET",
+        "/api/images/file/a.png",
+        &[("if-modified-since", &newer)],
+    )
+    .await;
+    assert_eq!(
+        res.status, 200,
+        "A is back, older than what the client holds"
+    );
+    let own = res.header("last-modified").to_owned();
+    let res = fetch_with(
+        &anon,
+        "GET",
+        "/api/images/file/a.png",
+        &[("if-modified-since", &own)],
+    )
+    .await;
+    assert_eq!(res.status, 304);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_fields_hide_their_urls(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    let editors = json!({"read": {"role": ["admin", "editor"]}});
+    collection(
+        &app,
+        "images",
+        json!({"upload": {"imageSizes": [{"name": "thumbnail", "width": 10}]},
+               "fields": [{"name": "url", "type": "text", "access": editors},
+                          {"name": "sizes", "type": "group", "fields": [], "access": editors}]}),
+    )
+    .await;
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let doc = put(&app, "images", &png(4, 4), "cat.png", None).await;
+    let file = held(&pool, &doc["id"], "published_file").await.unwrap();
+    seed_size(&pool, &d.root, file, "thumbnail").await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    let seen = ok(&viewer, "GET", &one, None).await;
+    assert!(seen.get("url").is_none(), "{seen}");
+    assert_eq!(
+        seen["thumbnailURL"],
+        Value::Null,
+        "not the hidden url: {seen}"
+    );
+    // A hidden `sizes` hides each size's file, but not the original.
+    assert_eq!(fetch(&viewer, "/api/images/file/cat.png").await.status, 200);
+    assert_eq!(
+        fetch(&viewer, "/api/images/file/cat-10x5.png").await.status,
+        404
+    );
+    let res = fetch(&editor, "/api/images/file/cat-10x5.png").await;
+    assert_eq!(res.status, 200);
+    assert_eq!(
+        res.header("cache-control"),
+        "private, no-store",
+        "not everyone's"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn urls_reach_trash_virtuals_and_old_versions(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    collection(
+        &app,
+        "public",
+        json!({"versions": {"maxVersions": 10},
+        "upload": {"storage": "r2"}}),
+    )
+    .await;
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "posts", "fields": [
+            {"name": "image", "type": "relationship", "relationTo": "images"},
+            {"name": "imageUrl", "type": "text", "virtual": "image.url"}]})),
+    )
+    .await;
+    let doc = put(&app, "images", &png(1, 1), "a.png", None).await;
+    let url = "http://localhost:3000/api/images/file/a.png";
+    let post = ok(
+        &app,
+        "POST",
+        "/api/posts",
+        Some(json!({"image": doc["id"]})),
+    )
+    .await;
+    assert_eq!(post["imageUrl"], url, "{post}");
+    let at = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    ok(&app, "DELETE", &at, None).await;
+    ok(
+        &app,
+        "DELETE",
+        &format!("/api/images/{}", doc["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    let trash = ok(&app, "GET", "/api/images/trash", None).await;
+    assert_eq!(trash["docs"][0]["url"], url, "{trash}");
+    assert_eq!(trash["docs"][0]["thumbnailURL"], url);
+
+    // A bucket link only for the file a document holds now, never an old or trashed one.
+    let doc = put(&app, "public", &png(1, 1), "old.png", None).await;
+    let one = format!("/api/public/{}", doc["id"].as_str().unwrap());
+    let res = upload(&app, "PATCH", &one, Some(&png(2, 2)), "new.png", None).await;
+    assert!(
+        res.json["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://media.tachyoncms.com/")
+    );
+    let versions = ok(&app, "GET", &format!("{one}/versions"), None).await;
+    let (newest, oldest) = (&versions["docs"][0]["id"], &versions["docs"][1]["id"]);
+    let v = ok(
+        &app,
+        "GET",
+        &format!("{one}/versions/{}", oldest.as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert_eq!(
+        v["data"]["url"],
+        "http://localhost:3000/api/public/file/old.png"
+    );
+    let v = ok(
+        &app,
+        "GET",
+        &format!("{one}/versions/{}", newest.as_str().unwrap()),
+        None,
+    )
+    .await;
+    assert!(
+        v["data"]["url"]
+            .as_str()
+            .unwrap()
+            .starts_with("https://media.tachyoncms.com/")
+    );
+    ok(&app, "DELETE", &one, None).await;
+    let trash = ok(&app, "GET", "/api/public/trash", None).await;
+    assert_eq!(
+        trash["docs"][0]["url"],
+        "http://localhost:3000/api/public/file/new.png"
     );
 }

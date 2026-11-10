@@ -19,13 +19,14 @@ use axum::http::header::{
     LAST_MODIFIED, RANGE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
-use axum::response::Response;
+use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
 use tachyon_core::auth::Action;
 use tachyon_core::query::DocCopy;
 use tachyon_core::uploads::PROTECTED_HEADERS;
 use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, FileRow};
+use tachyon_media::storage::StorageError;
 use url::Url;
 use uuid::Uuid;
 
@@ -34,15 +35,36 @@ use crate::documents::collection;
 use crate::params::file_params;
 use crate::{ApiError, AppState};
 
-/// A cached copy of a public file: its name never comes back as other bytes while the file
-/// is live, so it never needs asking again.
-const PUBLIC: &str = "public, max-age=31536000, immutable";
+/// A public file may be cached anywhere, but asked about again each time (a cheap 304): a
+/// deleted document's name can come back later as other bytes.
+const PUBLIC: &str = "public, no-cache";
 const PRIVATE: &str = "private, no-store";
 
 /// `GET`/`HEAD /api/{collection}/file/{filename}`: the original, a size or a size's other
-/// format named `filename`. `?draft=true` also serves what drafts hold; `?id` picks the
-/// document, where `filenameCompoundIndex` lets several share a name.
+/// format named `filename`, from a document's published copy or else, for who may read it,
+/// its draft. `?id` picks the document, where `filenameCompoundIndex` lets several share a
+/// name. A refusal is never cached: the same URL may answer someone else, or later, with
+/// the file.
 pub async fn serve(
+    state: State<AppState>,
+    access: Access,
+    method: Method,
+    path: Result<Path<(String, String)>, PathRejection>,
+    raw: RawQuery,
+    headers: HeaderMap,
+) -> Response {
+    match serve_file(state, access, method, path, raw, headers).await {
+        Ok(res) => res,
+        Err(e) => {
+            let mut res = e.into_response();
+            res.headers_mut()
+                .insert(CACHE_CONTROL, HeaderValue::from_static("no-store"));
+            res
+        }
+    }
+}
+
+async fn serve_file(
     State(state): State<AppState>,
     access: Access,
     method: Method,
@@ -59,8 +81,8 @@ pub async fn serve(
     if !access.permits_any(Action::Read, &c) {
         return Err(access.hidden());
     }
-    let (draft, id) = file_params(raw.as_deref(), &c, &access)?;
-    let found = find(&state, &access, &c, &name, draft, id)
+    let id = file_params(raw.as_deref(), &c, &access)?;
+    let found = find(&state, &access, &c, &name, id)
         .await?
         .ok_or(ApiError::NotFound)?;
     let storage = state
@@ -73,7 +95,15 @@ pub async fn serve(
                 found.file.storage
             ))
         })?;
-    let failed = |e| ApiError::Internal(format!("can't read a stored file: {e}"));
+    let failed = |e: StorageError| match e.is_not_found() {
+        // The row says it's there and the store doesn't: worth knowing, but the caller
+        // gets what a missing file gets.
+        true => {
+            tracing::error!(file = %found.file.id, key = %found.key, "a live file's object is missing from storage");
+            ApiError::NotFound
+        }
+        false => ApiError::Internal(format!("can't read a stored file: {e}")),
+    };
 
     let mut out = HeaderMap::new();
     let etag = format!("\"{}-{}\"", found.file.id, encoded(&name, etag_char));
@@ -99,7 +129,7 @@ pub async fn serve(
     if sandboxed(&found.mime) {
         set(CONTENT_SECURITY_POLICY, "sandbox");
     }
-    // Last, and never over the server's own safety headers (refused at save already).
+    // Last, and never over a header the server sets (those are refused at save already).
     for (k, v) in &u.modify_response_headers {
         if PROTECTED_HEADERS.iter().any(|p| p.eq_ignore_ascii_case(k)) {
             continue;
@@ -107,7 +137,8 @@ pub async fn serve(
         if let (Ok(k), Ok(v)) = (
             HeaderName::from_bytes(k.as_bytes()),
             HeaderValue::from_str(v),
-        ) {
+        ) && !out.contains_key(&k)
+        {
             out.insert(k, v);
         }
     }
@@ -160,14 +191,14 @@ struct Found {
 }
 
 /// The file named `name` the caller may read: held by the published copy of a document
-/// they may read (or with `draft` its draft too), document `id` when given, through the
-/// field that names it.
+/// they may read, or else by the draft of one whose draft they may read (`read_copy`
+/// judges each copy), document `id` when given, through the field that names it. Trashed
+/// documents hold nothing here (`holders`).
 async fn find(
     state: &AppState,
     access: &Access,
     c: &Collection,
     name: &str,
-    draft: bool,
     id: Option<Uuid>,
 ) -> Result<Option<Found>, ApiError> {
     let candidates = files::by_name(&state.pool, c.id, name).await?;
@@ -182,9 +213,7 @@ async fn find(
             continue;
         }
         let mut holders = files::holders(&state.pool, file.id).await?;
-        holders.retain(|(doc, copy)| {
-            id.is_none_or(|id| id == *doc) && (draft || *copy == DocCopy::Published)
-        });
+        holders.retain(|(doc, _)| id.is_none_or(|id| id == *doc));
         // A published holder first, so what anyone may read is served as public.
         holders.sort_by_key(|(_, copy)| *copy != DocCopy::Published);
         for (doc, copy) in holders {
@@ -247,7 +276,8 @@ fn beside(key: &str, name: &str) -> String {
 }
 
 /// Whether the client's copy is still good: `If-None-Match` names this `etag` (or `*`),
-/// or, when it isn't sent, `If-Modified-Since` is no earlier than `modified`.
+/// or, when it isn't sent, `If-Modified-Since` is exactly this file's `modified`. Not
+/// "no earlier": a restored version puts an older file back under the same name.
 fn fresh(req: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
     if let Some(tags) = req.get(IF_NONE_MATCH) {
         return tags.to_str().is_ok_and(|tags| {
@@ -260,7 +290,7 @@ fn fresh(req: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
         .get(IF_MODIFIED_SINCE)
         .and_then(|v| v.to_str().ok())
         .and_then(|v| httpdate::parse_http_date(v).ok());
-    matches!((since, modified), (Some(since), Some(m)) if m <= since)
+    matches!((since, modified), (Some(since), Some(m)) if m == since)
 }
 
 /// Whether `if_range`, when sent, names this copy: its entity tag, compared strongly, or
@@ -354,9 +384,10 @@ fn attr_char(b: u8) -> bool {
     b.is_ascii_alphanumeric() || b"!#$&+-.^_`|~".contains(&b)
 }
 
-/// What an entity tag may hold, less `%`, which marks what's encoded.
+/// What an entity tag may hold, less `%`, which marks what's encoded, and `,`, which
+/// `If-None-Match` splits tags on.
 fn etag_char(b: u8) -> bool {
-    b.is_ascii_graphic() && b != b'"' && b != b'%'
+    b.is_ascii_graphic() && !matches!(b, b'"' | b'%' | b',')
 }
 
 /// `s` with each byte `keep` refuses percent-encoded.
@@ -437,7 +468,11 @@ pub(crate) fn fill_upload_urls(
             }
         }
     }
-    let url = url_of(doc);
+    // Hidden from the caller, the url can't come back as the thumbnail either.
+    let url = match access.reads(c, "url") {
+        true => url_of(doc),
+        false => Value::Null,
+    };
     if access.reads(c, "thumbnailURL") {
         let image = doc
             .get("mimeType")
@@ -449,7 +484,7 @@ pub(crate) fn fill_upload_urls(
             .and_then(|t| doc.get("sizes")?.get(t)?.get("url"))
             .filter(|v| v.is_string())
             .cloned()
-            .or_else(|| image.then(|| url.clone()))
+            .or_else(|| (image && url.is_string()).then(|| url.clone()))
             .unwrap_or(Value::Null);
         doc.insert("thumbnailURL".into(), thumbnail);
     }
@@ -563,6 +598,8 @@ mod tests {
         assert_eq!(ascii_name("café \"x\".png"), "caf_ _x_.png");
         assert_eq!(encoded("café 1.png", attr_char), "caf%C3%A9%201.png");
         assert_eq!(encoded("a\"b%.png", etag_char), "a%22b%25.png");
+        // A comma separates tags in `If-None-Match`.
+        assert_eq!(encoded("a,b.png", etag_char), "a%2Cb.png");
     }
 
     #[test]

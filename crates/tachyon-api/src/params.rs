@@ -157,13 +157,14 @@ pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
         .is_some_and(|p| flag(&p, "wait").unwrap_or(false))
 }
 
-/// A file read's `?draft` (worked out as a document read's is) and `?id`, the document
-/// holding it, taken only where `filenameCompoundIndex` lets documents share a name.
+/// A file read's `?id`, the document holding it, taken only where `filenameCompoundIndex`
+/// lets documents share a name. `?draft` is checked as a document read's is; the route
+/// serves a draft's file to who may read it either way.
 pub(crate) fn file_params(
     raw: Option<&str>,
     c: &Collection,
     access: &Access,
-) -> Result<(bool, Option<uuid::Uuid>), ApiError> {
+) -> Result<Option<uuid::Uuid>, ApiError> {
     let shared = c
         .schema
         .upload
@@ -172,10 +173,9 @@ pub(crate) fn file_params(
     let allowed: &[&str] = if shared { &["draft", "id"] } else { &["draft"] };
     let params = params(raw, allowed)?;
     draft(&params, c, access)?;
-    let id = single(&params, "id")?
+    single(&params, "id")?
         .map(|id| uuid::Uuid::try_parse(id).map_err(|_| bad("`id` must be a document ID")))
-        .transpose()?;
-    Ok((flag(&params, "draft")?, id))
+        .transpose()
 }
 
 /// Refuses any query parameter, for a write that takes none.

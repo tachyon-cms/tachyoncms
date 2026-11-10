@@ -54,7 +54,8 @@ fn diff_fields(
     row_id: Option<&str>,
     out: &mut Vec<FieldChange>,
 ) {
-    for f in fields {
+    // A computed value (a `url`) is worked out on read, so it never changed in what's stored.
+    for f in fields.iter().filter(|f| !f.computed) {
         let path = format!("{prefix}{}", f.name);
         let (b, a) = (present(before, &f.name), present(after, &f.name));
         match (&f.kind, b, a) {

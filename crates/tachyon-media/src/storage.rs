@@ -90,6 +90,13 @@ pub enum StorageError {
     Io(#[from] std::io::Error),
 }
 
+impl StorageError {
+    /// Whether the store has no object under the key.
+    pub fn is_not_found(&self) -> bool {
+        matches!(self, Self::Store(object_store::Error::NotFound { .. }))
+    }
+}
+
 /// An open `[storage.<name>]`.
 #[derive(Debug)]
 pub struct Storage {

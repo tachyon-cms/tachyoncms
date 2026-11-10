@@ -380,14 +380,19 @@ pub(crate) async fn fill_virtuals_each(
         return Ok(());
     }
     // Each linked document as the caller may read it, so a hidden field gives no value.
-    let linked: HashMap<Uuid, Value> = readable_docs(state, access, &ids)
-        .await?
+    let mut found = Vec::new();
+    for (collection_id, doc) in readable_docs(state, access, &ids).await? {
+        if let Some(c) = state.schemas.get_by_id(collection_id) {
+            let mut value = to_value(&doc)?;
+            access.strip(&c, &mut value);
+            found.push((value, c));
+        }
+    }
+    // A virtual may read a linked file's `url`, worked out like any read's.
+    crate::files::fill_urls(state, access, &mut found).await?;
+    let linked: HashMap<Uuid, Value> = found
         .into_iter()
-        .filter_map(|(collection_id, doc)| {
-            let mut value = Value::Object(doc.data.0);
-            access.strip(&*state.schemas.get_by_id(collection_id)?, &mut value);
-            Some((doc.id, value))
-        })
+        .filter_map(|(value, _)| Some((value.get("id")?.as_str()?.parse().ok()?, value)))
         .collect();
     for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
         if let Some(doc) = value.as_object_mut() {

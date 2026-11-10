@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT d.id, f.key FROM documents d JOIN files f ON f.id = d.published_file\n           WHERE d.tenant_id = $1 AND d.id = ANY($2)",
+  "query": "SELECT d.id, f.key FROM documents d JOIN files f ON f.id = d.published_file\n           WHERE d.tenant_id = $1 AND d.id = ANY($2) AND d.deleted_at IS NULL",
   "describe": {
     "columns": [
       {
@@ -37,5 +37,5 @@
       false
     ]
   },
-  "hash": "802a093416f04c955641bbafca16eb7f63ca08e67c6e9792a04af46eb391eb5a"
+  "hash": "75b3ab381ab9bf6f7e36e2ab31259f7042bbe28c2755dc1bf3f19f6e6932c07d"
 }
