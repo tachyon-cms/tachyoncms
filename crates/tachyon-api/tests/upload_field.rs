@@ -327,3 +327,299 @@ async fn filters_through_upload(pool: PgPool) {
     assert_eq!(hidden.status, 200, "{}", hidden.json);
     assert_eq!(hidden.json["docs"], json!([]));
 }
+
+/// `posts` with a filtered `cover`, a filtered list `images`, a filtered polymorphic
+/// `either` and an unfiltered `attachments`.
+async fn filtered(app: &Router) {
+    let images = json!({"mimeType": {"like": "image"}});
+    schema(app, json!({"slug": "media", "upload": true, "fields": []})).await;
+    schema(
+        app,
+        json!({"slug": "downloads", "upload": true, "fields": []}),
+    )
+    .await;
+    schema(
+        app,
+        json!({"slug": "posts", "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "cover", "type": "upload", "relationTo": "media", "filterOptions": images},
+            {"name": "images", "type": "upload", "relationTo": "media", "hasMany": true,
+             "filterOptions": images},
+            {"name": "either", "type": "upload", "relationTo": ["media", "downloads"],
+             "hasMany": true, "filterOptions": images},
+            {"name": "attachments", "type": "upload", "relationTo": "media", "hasMany": true}
+        ]}),
+    )
+    .await;
+}
+
+fn paths(res: &common::Res) -> Vec<(String, String)> {
+    res.json["errors"]
+        .as_array()
+        .unwrap_or(&Vec::new())
+        .iter()
+        .map(|e| {
+            let text = |k: &str| e[k].as_str().unwrap_or_default().to_owned();
+            (text("path"), text("message"))
+        })
+        .collect()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn filter_options_check_every_link_a_write_sends(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    filtered(&app).await;
+    let pdf_m = put(&app, "media", &pdf(), "terms.pdf").await["id"].clone();
+    let png_m = put(&app, "media", &png(4, 4), "cat.png").await["id"].clone();
+    let pdf_d = put(&app, "downloads", &pdf(), "guide.pdf").await["id"].clone();
+    let post = ok(&app, "POST", "/api/posts", json!({"attachments": [pdf_m]})).await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    let patch = |body: Value| {
+        let (app, url) = (app.clone(), url.clone());
+        async move { send(&app, "PATCH", &url, Some(&body.to_string())).await }
+    };
+    let missing = |path: &str| vec![(path.to_owned(), MISSING_LINK.to_owned())];
+
+    // Already linked elsewhere in the document, it's still checked where it's sent.
+    let res = patch(json!({"cover": pdf_m})).await;
+    assert_problem(&res, 422);
+    assert_eq!(paths(&res), missing("cover"));
+    // Each row of a list.
+    let res = patch(json!({"images": [png_m, pdf_m]})).await;
+    assert_problem(&res, 422);
+    assert_eq!(paths(&res), missing("images.1"));
+    // Each target of a polymorphic field.
+    let res = patch(json!({"either": [
+        {"relationTo": "media", "value": png_m},
+        {"relationTo": "downloads", "value": pdf_d}
+    ]}))
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(paths(&res), missing("either.1"));
+    // A write that doesn't send a field doesn't check it.
+    let res = patch(json!({"title": "Hi", "cover": png_m, "images": [png_m]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = patch(json!({"title": "Again"})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn publishing_checks_filter_options(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(&app, json!({"slug": "media", "upload": true, "fields": []})).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "versions": {"drafts": true}, "fields": [
+            {"name": "cover", "type": "upload", "relationTo": "media",
+             "filterOptions": {"mimeType": {"like": "image"}}}
+        ]}),
+    )
+    .await;
+    let m = put(&app, "media", &png(4, 4), "cat.png").await;
+    let id = m["id"].as_str().unwrap();
+    let post = ok(&app, "POST", "/api/posts", json!({"cover": id})).await;
+    assert_eq!(post["status"], "draft");
+    // The image becomes a PDF after the draft linked it.
+    let res = upload(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        Some(&pdf()),
+        "terms.pdf",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let publish = format!("/api/posts/{}/publish", post["id"].as_str().unwrap());
+    let res = send(&app, "POST", &publish, None).await;
+    assert_problem(&res, 422);
+    assert_eq!(paths(&res), vec![("cover".into(), MISSING_LINK.into())]);
+}
+
+/// `blog`, plus `photos`, which anyone reads but whose `filename` only admins read, and an
+/// editor, who can't read `media`.
+async fn guarded(pool: &PgPool, d: &tempfile::TempDir) -> (Router, Router, Value, Value) {
+    let app = admin(pool, d).await;
+    schema(
+        &app,
+        json!({"slug": "media", "upload": true, "access": {"read": {"role": ["admin"]}},
+               "fields": []}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "photos", "upload": true, "access": {"read": true}, "fields": [
+            {"name": "filename", "type": "text", "access": {"read": {"role": ["admin"]}}}
+        ]}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "posts", "access": {"read": true}, "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "cover", "type": "upload", "relationTo": "media",
+             "filterOptions": {"mimeType": {"like": "image"}}},
+            {"name": "photo", "type": "upload", "relationTo": "photos"}
+        ]}),
+    )
+    .await;
+    let m = put(&app, "media", &png(4, 4), "cat.png").await;
+    let p = put(&app, "photos", &png(4, 4), "dog.png").await;
+    let post = ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "Hi", "cover": m["id"], "photo": p["id"]}),
+    )
+    .await;
+    add_user(pool, "editor@example.com", "editor").await;
+    let editor = signed_in(router(pool, d).await, "editor@example.com").await;
+    (app, editor, post, m)
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn hidden_media_populate_as_ids_and_round_trip(pool: PgPool) {
+    let d = dir();
+    let (_, editor, post, m) = guarded(&pool, &d).await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    let read = ok(&editor, "GET", &format!("{url}?depth=1"), json!(null)).await;
+    assert_eq!(read["cover"], m["id"], "{read}");
+    assert_eq!(read["photo"]["id"], post["photo"]["id"]);
+    assert!(read["photo"].get("filename").is_none(), "{read}");
+    assert!(read["photo"]["url"].is_null(), "{read}");
+
+    // What the editor read goes back unchanged, the link they can't read included.
+    let flat = ok(&editor, "GET", &format!("{url}?depth=0"), json!(null)).await;
+    let body = json!({"title": "Edited", "cover": flat["cover"], "photo": flat["photo"]});
+    let res = send(&editor, "PATCH", &url, Some(&body.to_string())).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn select_and_populate_shape_upload_fields(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    blog(&app).await;
+    let m = put(&app, "media", &png(4, 4), "cat.png").await;
+    let post = ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "Hi", "cover": m["id"]}),
+    )
+    .await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    let got = ok(
+        &app,
+        "GET",
+        &format!("{url}?depth=1&populate[media][filename]=true"),
+        json!(null),
+    )
+    .await;
+    assert_eq!(got["cover"]["filename"], "cat.png", "{got}");
+    assert!(got["cover"].get("mimeType").is_none(), "{got}");
+    let got = ok(
+        &app,
+        "GET",
+        &format!("{url}?depth=0&select[cover]=true"),
+        json!(null),
+    )
+    .await;
+    assert_eq!(got["cover"], m["id"]);
+    assert!(got.get("title").is_none(), "{got}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_relationship_becomes_an_upload_keeping_its_links(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(&app, json!({"slug": "media", "upload": true, "fields": []})).await;
+    schema(
+        &app,
+        json!({"slug": "downloads", "upload": true, "fields": []}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "posts", "fields": [
+            {"name": "cover", "type": "relationship", "relationTo": "media"}
+        ]}),
+    )
+    .await;
+    let m = put(&app, "media", &png(4, 4), "cat.png").await;
+    let id = m["id"].as_str().unwrap();
+    let post = ok(&app, "POST", "/api/posts", json!({"cover": id})).await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+    let change = |field: Value| json!({"schema": {"slug": "posts", "fields": [field]}});
+
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(
+            &change(json!({"name": "cover", "type": "upload", "relationTo": "media"})).to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        ok(&app, "GET", &format!("{url}?depth=0"), json!(null)).await["cover"],
+        id
+    );
+    assert_problem(
+        &send(&app, "DELETE", &format!("/api/media/{id}"), None).await,
+        409,
+    );
+
+    // Back, gaining a target: the link is wrapped, not dropped.
+    let res = send(
+        &app,
+        "PUT",
+        "/api/admin/collections/posts",
+        Some(
+            &change(json!({"name": "cover", "type": "relationship",
+                           "relationTo": ["media", "downloads"]}))
+            .to_string(),
+        ),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        ok(&app, "GET", &format!("{url}?depth=0"), json!(null)).await["cover"],
+        json!({"relationTo": "media", "value": id})
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn filter_options_wait_for_a_change_to_the_linked_document(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    filtered(&app).await;
+    let m = put(&app, "media", &png(4, 4), "cat.png").await["id"].clone();
+    let post = ok(&app, "POST", "/api/posts", json!({"title": "Hi"})).await;
+    let url = format!("/api/posts/{}", post["id"].as_str().unwrap());
+
+    // Another transaction is turning the image into a PDF, and hasn't committed yet.
+    let mut other = pool.begin().await.unwrap();
+    sqlx::query(
+        "UPDATE documents SET published = jsonb_set(published, '{mimeType}', '\"application/pdf\"') \
+         WHERE id = $1::uuid",
+    )
+    .bind(m.as_str().unwrap())
+    .execute(&mut *other)
+    .await
+    .unwrap();
+    let body = json!({"cover": m}).to_string();
+    let write = tokio::spawn({
+        let app = app.clone();
+        async move { send(&app, "PATCH", &url, Some(&body)).await }
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+    assert!(!write.is_finished(), "the check waits for the change");
+    other.commit().await.unwrap();
+    let res = write.await.unwrap();
+    assert_problem(&res, 422);
+    assert_eq!(paths(&res), vec![("cover".into(), MISSING_LINK.into())]);
+}

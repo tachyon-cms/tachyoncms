@@ -622,3 +622,25 @@ async fn a_schema_reached_by_two_saved_blocks_is_listed_under_both(pool: PgPool)
         assert_eq!(landing.diff.changes.len(), 3, "{:?}", landing.diff);
     }
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn upload_stays_on_while_upload_fields_point_here(pool: PgPool) {
+    let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+    collections::create(&pool, &media).await.unwrap();
+    collections::create(
+        &pool,
+        &posts(json!([{"name": "cover", "type": "upload", "relationTo": "media"}])),
+    )
+    .await
+    .unwrap();
+    let off = schema(json!({"slug": "media", "fields": []}));
+    // Confirmed or not, it's the referrer that's named.
+    for confirm in [false, true] {
+        match apply(&pool, "media", &off, &Renames::new(), confirm).await {
+            Err(ChangeError::Invalid(tachyon_core::SchemaError::Referenced(m))) => {
+                assert!(m.contains("posts.cover"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}

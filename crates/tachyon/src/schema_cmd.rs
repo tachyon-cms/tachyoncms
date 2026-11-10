@@ -219,6 +219,9 @@ pub async fn run(
             .and_then(|()| s.check_upload_targets(lookup))
             .and_then(|()| check_rules(s, &users, &roles, &lookup))
     };
+    for s in &wanted {
+        tachyon_core::check_upload_referrers(s, &world)?;
+    }
     for s in &world {
         // `check_users_schema` here too for a `users` the file creates, which skips the
         // change's own check.
@@ -861,6 +864,36 @@ mod tests {
         let cta_now = collections::get_by_slug(&pool, "cta").await.unwrap();
         assert_eq!(cta_now.schema.fields.len(), 1);
         assert!(collections::get_by_slug(&pool, "posts").await.is_err());
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn upload_stays_on_while_upload_fields_point_here(pool: PgPool) {
+        let apply = |file: Value| {
+            let pool = pool.clone();
+            async move {
+                run(
+                    &pool,
+                    &limits(),
+                    &file.to_string(),
+                    &BTreeMap::new(),
+                    Some(true),
+                )
+                .await
+            }
+        };
+        apply(json!({"collections": [
+            {"slug": "media", "upload": true, "fields": []},
+            {"slug": "posts", "fields": [{"name": "cover", "type": "upload", "relationTo": "media"}]}
+        ]}))
+        .await
+        .unwrap();
+        let err = apply(json!({"collections": [{"slug": "media", "fields": []}]}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "media can't stop holding files while these upload fields point at it: posts.cover; change them first"
+        );
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

@@ -20,8 +20,8 @@ use crate::access::Access;
 use crate::documents::{json_body, mode_for, record, shaped, unique_error};
 use crate::params::{Format, autosave_param, read_params};
 use crate::populate::{
-    Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
-    to_value, vouched_links,
+    Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
+    link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -155,7 +155,6 @@ pub async fn update(
     let vouched = check_links(
         &state,
         &access,
-        &c,
         &apply(stored.as_ref())?,
         &before(stored.as_ref()),
     )
@@ -180,6 +179,17 @@ pub async fn update(
         .await;
         match updated {
             Ok(doc) => {
+                let sent = Sent::Keys(&patch);
+                filtered_links(
+                    &mut tx,
+                    &state,
+                    &access,
+                    &c,
+                    &doc.data.0,
+                    sent,
+                    access.linked(),
+                )
+                .await?;
                 record(&mut tx, &c, &doc, copy, by, autosave).await?;
                 tx.commit().await.map_err(DbError::from)?;
                 return respond(&state, &access, c.clone(), &doc, copy, 1).await;
@@ -196,6 +206,17 @@ pub async fn update(
             .await
         {
             Ok(doc) => {
+                let sent = Sent::Keys(&patch);
+                filtered_links(
+                    &mut tx,
+                    &state,
+                    &access,
+                    &c,
+                    &doc.data.0,
+                    sent,
+                    access.linked(),
+                )
+                .await?;
                 record(&mut tx, &c, &doc, copy, by, autosave).await?;
                 tx.commit().await.map_err(DbError::from)?;
                 return respond(&state, &access, c.clone(), &doc, copy, 1).await;

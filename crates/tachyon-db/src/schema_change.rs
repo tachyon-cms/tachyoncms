@@ -542,6 +542,12 @@ async fn run_in(
     let users = lookup(crate::auth::USERS)
         .map(|u| u.fields)
         .unwrap_or_default();
+    // Before every other check, and before any confirmation: `confirm` can't make links
+    // point at something that holds no files, so it's a conflict naming the referrers.
+    for (schema, _) in world.iter().filter(|(s, _)| saved(&s.slug).is_some()) {
+        tachyon_core::check_upload_referrers(schema, world.iter().map(|(s, _)| s))
+            .map_err(ChangeError::Invalid)?;
+    }
     for (schema, placed) in &world {
         let slug = schema.slug.as_str();
         let fail = |e: SchemaError| match saved(slug) {

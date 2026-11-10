@@ -15,7 +15,8 @@ use tachyon_core::access;
 use tachyon_core::auth::Action;
 use tachyon_core::diff::Renames;
 use tachyon_core::{
-    CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
+    CollectionKind, CollectionSchema, FieldError, SchemaError, check_upload_referrers,
+    explain_parse_error,
 };
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
@@ -47,6 +48,9 @@ fn to_json(c: &Collection) -> Value {
 }
 
 fn schema_error(e: SchemaError) -> ApiError {
+    if let SchemaError::Referenced(m) = e {
+        return ApiError::Conflict(m);
+    }
     ApiError::Validation(vec![match e {
         SchemaError::At { path, message } => FieldError { path, message },
         e => FieldError {
@@ -247,38 +251,6 @@ fn check_virtuals(world: &[CollectionSchema]) -> Result<(), ApiError> {
         .map_err(schema_error)
 }
 
-/// Turning `upload` off on a collection other collections' upload fields point at is
-/// refused, naming them, as deleting a shared block in use is: `confirm` can't make
-/// their links point at something that holds no files.
-fn check_upload_referrers(world: &[CollectionSchema]) -> Result<(), ApiError> {
-    let changed = &world[0];
-    if changed.upload.is_some() {
-        return Ok(());
-    }
-    let referrers: Vec<String> = world[1..]
-        .iter()
-        .flat_map(|other| {
-            other
-                .upload_links()
-                .into_iter()
-                .filter(|(_, f)| {
-                    f.kind
-                        .link()
-                        .is_some_and(|l| l.relation_to.allows(&changed.slug))
-                })
-                .map(|(path, _)| format!("{}.{path}", other.slug))
-        })
-        .collect();
-    if referrers.is_empty() {
-        return Ok(());
-    }
-    Err(ApiError::Conflict(format!(
-        "{} can't stop holding files while these upload fields point at it: {}; change them first",
-        changed.slug,
-        referrers.join(", ")
-    )))
-}
-
 /// A change must not break the virtual or join fields other collections read from it, such
 /// as a join on a relationship this change removes, or on a field of a shared block.
 fn check_dependents(world: &[CollectionSchema]) -> Result<(), ApiError> {
@@ -367,7 +339,7 @@ pub async fn preview(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
-    check_upload_referrers(&world)?;
+    check_upload_referrers(&world[0], &world[1..]).map_err(schema_error)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_PREVIEW, &slug, &req).await? {
@@ -389,7 +361,7 @@ pub async fn update(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
-    check_upload_referrers(&world)?;
+    check_upload_referrers(&world[0], &world[1..]).map_err(schema_error)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_CHANGE, &slug, &req).await? {

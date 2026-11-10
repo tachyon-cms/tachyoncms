@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use sqlx::types::Json;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 pub use tachyon_core::query::Readable;
 use tachyon_core::query::{
     Cond, Cursor, DocCopy, Filter, Op, Operand, Scalar, Sort, Target, ValueKind,
@@ -936,9 +936,24 @@ pub async fn get_many_readable(
     get_many_matching(pool, ids, read, None).await
 }
 
-/// `get_many_readable`, keeping only documents whose copy read matches `filter` as well.
+/// Locks the live documents with these IDs `FOR SHARE`, in ID order, until the
+/// transaction ends: what a write checks them against can't change under it.
+pub async fn lock_shared(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(), DbError> {
+    sqlx::query_scalar!(
+        "SELECT id FROM documents WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL
+         ORDER BY id FOR SHARE",
+        DEFAULT_TENANT,
+        ids
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(())
+}
+
+/// `get_many_readable`, keeping only documents whose copy read matches `filter` as well,
+/// read through `db`: the pool, or a transaction's connection.
 pub async fn get_many_matching(
-    pool: &PgPool,
+    db: impl sqlx::PgExecutor<'_>,
     ids: &[Uuid],
     read: &HashMap<Uuid, Readable>,
     filter: Option<&Filter>,
@@ -979,7 +994,7 @@ pub async fn get_many_matching(
         }
         qb.push(")");
     }
-    let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(pool).await?;
+    let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(db).await?;
     Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
 }
 

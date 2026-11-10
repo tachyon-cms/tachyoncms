@@ -25,7 +25,8 @@ use crate::files::{direct_urls, fill_upload_urls};
 use crate::globals::global;
 use crate::params::{diff_params, no_params, page_params};
 use crate::populate::{
-    check_links, link_ids, link_targets, prepare, published_links, vouched_links,
+    Sent, check_links, filtered_links, link_ids, link_targets, prepare, published_links,
+    vouched_links,
 };
 use crate::uploads::keep_server_set;
 use crate::{ApiError, AppState};
@@ -117,7 +118,7 @@ async fn publish_doc(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
-    published_links(state, access, c, &prepared)
+    published_links(&mut tx, state, access, c, &prepared)
         .await
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
     let doc = documents::publish_in(&mut tx, c, d.id, Some(&prepared), access.user_id())
@@ -319,7 +320,7 @@ async fn restore_version(
         })
         .map_err(|e| access.hide(c, e, Some(&next)))
     };
-    let vouched = check_links(state, access, c, &apply(&stored)?, &link_ids(c, &stored)).await?;
+    let vouched = check_links(state, access, &apply(&stored)?, &link_ids(c, &stored)).await?;
     let actor = access.actor(action, c);
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     let doc = documents::update_in(
@@ -338,6 +339,16 @@ async fn restore_version(
     )
     .await
     .map_err(|e| access.hide(c, unique_error(c, e), None))?;
+    filtered_links(
+        &mut tx,
+        state,
+        access,
+        c,
+        &doc.data.0,
+        Sent::All,
+        access.linked(),
+    )
+    .await?;
     record(&mut tx, c, &doc, copy, actor.map(|a| a.id), false).await?;
     tx.commit().await.map_err(DbError::from)?;
     answer(state, access, &d, &doc, copy).await

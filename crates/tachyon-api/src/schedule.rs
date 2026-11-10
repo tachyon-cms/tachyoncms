@@ -329,11 +329,10 @@ fn refused(e: ApiError) -> JobError {
     }
 }
 
-/// The snapshot a publish job ships, checked as a publish checks the draft: full
-/// validation, and links only to published documents the scheduler may read.
+/// The snapshot a publish job ships, fully validated. Its links are checked as a publish
+/// checks the draft's, in the job's transaction (`published_links`).
 async fn snapshot(
     state: &AppState,
-    access: &Access,
     c: &Collection,
     id: Uuid,
     job: &Job,
@@ -359,9 +358,6 @@ async fn snapshot(
         .map_err(why)?;
     // What's published is the snapshot, its stored file included.
     prepared.file = v.file_id.map_or(FileChange::Clear, FileChange::Set);
-    published_links(state, access, c, &prepared)
-        .await
-        .map_err(why)?;
     Ok(prepared)
 }
 
@@ -408,7 +404,7 @@ pub(crate) async fn run(state: &AppState, job: &Job) -> Result<(), JobError> {
         .await
         .map_err(refused)?;
     let publish = match job.kind == PUBLISH {
-        true => Some(snapshot(state, &access, &c, id, job).await?),
+        true => Some(snapshot(state, &c, id, job).await?),
         false => None,
     };
     let mut tx = state
@@ -438,6 +434,14 @@ pub(crate) async fn run(state: &AppState, job: &Job) -> Result<(), JobError> {
     // here no other worker can take the job over.
     if !jobs::complete_in(&mut tx, job).await.map_err(db)? {
         return Ok(());
+    }
+    if let Some(p) = &publish {
+        published_links(&mut tx, state, &access, &c, p)
+            .await
+            .map_err(|e| match e {
+                ApiError::Conflict(d) if d == crate::error::TRY_AGAIN => JobError::Retry(d),
+                e => why(e),
+            })?;
     }
     match &publish {
         Some(p) => documents::publish_in(&mut tx, &c, id, Some(p), Some(user))

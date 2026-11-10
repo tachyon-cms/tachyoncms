@@ -338,11 +338,11 @@ fn compare(
                     });
                 }
             }
+            // Relationship and upload store links alike, so a change between them keeps them.
             (a, b)
-                if a.name() == b.name()
-                    && a.link().zip(b.link()).is_some_and(|(x, y)| {
-                        x.relation_to != y.relation_to || x.has_many != y.has_many
-                    }) =>
+                if a.link().zip(b.link()).is_some_and(|(x, y)| {
+                    x.relation_to != y.relation_to || x.has_many != y.has_many
+                }) =>
             {
                 let (x, y) = (a.link().expect("a link"), b.link().expect("a link"));
                 let (from, to, h1, h2) = (x.relation_to, y.relation_to, &x.has_many, &y.has_many);
@@ -518,6 +518,10 @@ pub(crate) fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
         ) => true,
         (FieldKind::Select { multiple: x, .. }, FieldKind::Select { multiple: y, .. }) => x == y,
         (FieldKind::Date { date_only: x }, FieldKind::Date { date_only: y }) => x == y,
+        // The same stored links; `hasMany` changes the shape.
+        _ if a.link().is_some() && b.link().is_some() => {
+            a.link().map(|l| l.has_many) == b.link().map(|l| l.has_many)
+        }
         _ => a.name() == b.name(),
     }
 }
@@ -1210,6 +1214,38 @@ mod tests {
             d.changes
         );
     }
+    #[test]
+    fn switching_between_relationship_and_upload_keeps_links() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let field = |kind: &str, to: Value| {
+            schema(json!({"slug": "m", "fields": [{"name": "l", "type": kind, "relationTo": to}]}))
+        };
+        let rel = field("relationship", json!("media"));
+        let up = field("upload", json!("media"));
+        for (a, b) in [(&rel, &up), (&up, &rel)] {
+            let d = diff(a, b, &Renames::new()).unwrap();
+            assert_eq!(d.changes, vec![Change::OptionsChanged { path: "l".into() }]);
+            assert!(!d.is_destructive());
+        }
+        // A kind change that also changes targets reshapes links as a same-kind change does.
+        let both = field("upload", json!(["media", "files"]));
+        let d = diff(&rel, &both, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Relinked {
+                    path: "l".into(),
+                    from: "media".into(),
+                    to: "media, files".into()
+                },
+                Change::OptionsChanged { path: "l".into() }
+            ]
+        );
+        let mut doc = json!({"l": id}).as_object().unwrap().clone();
+        assert!(!relink(&[], &mut doc, &d.links));
+        assert_eq!(doc["l"], json!({"relationTo": "media", "value": id}));
+    }
+
     #[test]
     fn relationship_target_changes_carry_links_across() {
         let id = "0199d5c4-0000-7000-8000-00000000000a";

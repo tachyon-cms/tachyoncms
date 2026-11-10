@@ -30,8 +30,8 @@ use crate::params::{
     Format, Joins, create_params, list_params, no_params, read_params, update_params,
 };
 use crate::populate::{
-    Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
-    to_value, vouched_links,
+    Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
+    link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
     Incoming, UploadBody, check_and_process, file_limit, focal_of, persist, require_file, scope_of,
@@ -290,7 +290,7 @@ pub async fn create(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &c, data))
         .map_err(|e| hide(e, &input))?;
-    check_links(&state, &access, &c, &prepared, &[]).await?;
+    check_links(&state, &access, &prepared, &[]).await?;
     let stored = match &checked {
         Some((u, f)) => {
             let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
@@ -308,6 +308,16 @@ pub async fn create(
         let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
             .await
             .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+        filtered_links(
+            &mut tx,
+            &state,
+            &access,
+            &c,
+            &doc.data.0,
+            Sent::All,
+            access.linked(),
+        )
+        .await?;
         record(&mut tx, &c, &doc, copy, by, false).await?;
         let sizes = match &stored {
             Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
@@ -499,7 +509,7 @@ pub async fn update(
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
     let dry = apply(&stored, would.as_ref())?;
-    let vouched = check_links(&state, &access, &c, &dry, &link_ids(&c, &stored)).await?;
+    let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
     let saved = match &checked {
         Some((u, f)) => {
             let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));
@@ -528,6 +538,17 @@ pub async fn update(
         )
         .await
         .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
+        let data = &doc.data.0;
+        filtered_links(
+            &mut tx,
+            &state,
+            &access,
+            &c,
+            data,
+            Sent::Keys(&sent),
+            access.linked(),
+        )
+        .await?;
         record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
         let sizes = match &saved {
             Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,

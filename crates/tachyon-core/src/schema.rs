@@ -257,6 +257,19 @@ fn object_or_none<'de, D: serde::Deserializer<'de>>(
     }
 }
 
+/// An upload field's `filterOptions`: an object of conditions, or nothing.
+fn filter_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Map<String, Value>>, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        Value::Object(o) => Ok(Some(o)),
+        _ => Err(serde::de::Error::custom(
+            "filterOptions must be an object like {\"mimeType\": {\"like\": \"image\"}}",
+        )),
+    }
+}
+
 /// `null` reads as the default, like a missing key.
 fn null_as_default<'de, D: serde::Deserializer<'de>, T: Default + Deserialize<'de>>(
     d: D,
@@ -398,7 +411,7 @@ pub enum FieldKind {
         #[serde(default)]
         max_rows: Option<usize>,
         /// A `where` each linked document must match, checked at write.
-        #[serde(default, deserialize_with = "object_or_none")]
+        #[serde(default, deserialize_with = "filter_or_none")]
         filter_options: Option<Map<String, Value>>,
         /// For the admin only: whether to show a preview of the file.
         #[serde(default)]
@@ -500,6 +513,36 @@ impl SelectOption {
             Self::Value(v) | Self::Labeled { value: v, .. } => v,
         }
     }
+}
+
+/// Refuses `changed` holding no files while upload fields in `others` point at it,
+/// naming them. Its own fields are left to `check_upload_targets`.
+pub fn check_upload_referrers<'a>(
+    changed: &CollectionSchema,
+    others: impl IntoIterator<Item = &'a CollectionSchema>,
+) -> Result<(), SchemaError> {
+    if changed.upload.is_some() {
+        return Ok(());
+    }
+    let mut referrers = Vec::new();
+    for other in others.into_iter().filter(|o| o.slug != changed.slug) {
+        for (path, f) in other.upload_links() {
+            if f.kind
+                .link()
+                .is_some_and(|l| l.relation_to.allows(&changed.slug))
+            {
+                referrers.push(format!("{}.{path}", other.slug));
+            }
+        }
+    }
+    if referrers.is_empty() {
+        return Ok(());
+    }
+    Err(SchemaError::Referenced(format!(
+        "{} can't stop holding files while these upload fields point at it: {}; change them first",
+        changed.slug,
+        referrers.join(", ")
+    )))
 }
 
 /// A `relationship` or `upload` field's link options; see `FieldKind::link`.
@@ -1179,6 +1222,10 @@ pub enum SchemaError {
     UnknownOption { field: String, option: String },
     #[error("{0}")]
     InvalidOption(String),
+    /// The change would leave other collections pointing at it wrongly, such as upload
+    /// fields at a collection that no longer holds files. A conflict, not a bad request.
+    #[error("{0}")]
+    Referenced(String),
     /// A problem at a path in the schema, such as `fields.cover.relationTo`.
     #[error("{path}: {message}")]
     At { path: String, message: String },
@@ -4248,6 +4295,36 @@ mod tests {
             refused(json!({"name": "c", "type": "upload", "relationTo": ["media", "media"]})),
             "field `c`: relationTo lists `media` twice"
         );
+        let raw = json!({"slug": "posts", "fields": [
+            {"name": "c", "type": "upload", "relationTo": "media", "filterOptions": "image"}
+        ]});
+        let e = serde_json::from_value::<CollectionSchema>(raw.clone()).unwrap_err();
+        assert_eq!(
+            explain_parse_error(&raw, &e),
+            "field `c`: filterOptions must be an object like {\"mimeType\": {\"like\": \"image\"}}"
+        );
+    }
+
+    #[test]
+    fn turning_upload_off_is_refused_while_upload_fields_point_here() {
+        let off = schema(json!({"slug": "media", "fields": []}));
+        let posts = schema(json!({"slug": "posts", "fields": [
+            {"name": "g", "type": "group", "fields": [
+                {"name": "cover", "type": "upload", "relationTo": ["media", "files"]}
+            ]}
+        ]}));
+        let tags = schema(json!({"slug": "tags", "fields": [
+            {"name": "m", "type": "relationship", "relationTo": "media"}
+        ]}));
+        assert_eq!(
+            check_upload_referrers(&off, [&posts, &tags, &off]),
+            Err(SchemaError::Referenced(
+                "media can't stop holding files while these upload fields point at it: posts.g.cover; change them first".into()
+            ))
+        );
+        assert_eq!(check_upload_referrers(&off, [&tags]), Ok(()));
+        let on = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        assert_eq!(check_upload_referrers(&on, [&posts]), Ok(()));
     }
 
     #[test]

@@ -25,7 +25,9 @@ use uuid::Uuid;
 use crate::access::{Access, both};
 use crate::documents::{collection, mode_for, parse_id, respond, shaped, unique_error};
 use crate::params::{no_params, trash_params};
-use crate::populate::{Vouched, check_links, link_targets, prepare, to_value, vouched_links};
+use crate::populate::{
+    Sent, Vouched, check_links, filtered_links, link_targets, prepare, to_value, vouched_links,
+};
 use crate::{ApiError, AppState};
 
 /// A page of the trashed documents of a collection the caller may delete, most recently
@@ -116,7 +118,7 @@ pub async fn restore(
     let mut vouched = Vouched::new();
     let mut errors = Errors::default();
     for (copy, p, _) in &stored {
-        match check_links(&state, &access, &c, p, &[]).await {
+        match check_links(&state, &access, p, &[]).await {
             Ok(v) => vouched.extend(v),
             Err(e) => errors.add(&c, *copy, e)?,
         }
@@ -134,6 +136,18 @@ pub async fn restore(
         let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
         for (copy, p, _) in &locked {
             if let Err(e) = vouched_links(p, &[], &vouched) {
+                errors.add(&c, *copy, e)?;
+            } else if let Err(e) = filtered_links(
+                &mut tx,
+                &state,
+                &access,
+                &c,
+                &p.data,
+                Sent::All,
+                access.linked(),
+            )
+            .await
+            {
                 errors.add(&c, *copy, e)?;
             }
         }
