@@ -388,6 +388,25 @@ pub enum FieldKind {
         #[serde(default)]
         max_depth: Option<u8>,
     },
+    /// A relationship whose targets are upload collections.
+    Upload {
+        relation_to: RelationTo,
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
+        /// A `where` each linked document must match, checked at write.
+        #[serde(default, deserialize_with = "object_or_none")]
+        filter_options: Option<Map<String, Value>>,
+        /// For the admin only: whether to show a preview of the file.
+        #[serde(default)]
+        display_preview: Option<bool>,
+        /// Populate through this field at most this deep, whatever `depth` asks for.
+        #[serde(default)]
+        max_depth: Option<u8>,
+    },
     Json,
     /// The documents of `collection` whose `on` relationship links here. Read, not stored.
     Join {
@@ -481,6 +500,14 @@ impl SelectOption {
             Self::Value(v) | Self::Labeled { value: v, .. } => v,
         }
     }
+}
+
+/// A `relationship` or `upload` field's link options; see `FieldKind::link`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Link<'a> {
+    pub relation_to: &'a RelationTo,
+    pub has_many: bool,
+    pub max_depth: Option<u8>,
 }
 
 /// Which collections a relationship may link to.
@@ -831,6 +858,7 @@ fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result
             | FieldKind::Blocks { .. }
             | FieldKind::RichText { .. }
             | FieldKind::Relationship { .. }
+            | FieldKind::Upload { .. }
             | FieldKind::Join { .. }
     ) || f.kind.is_layout()
     {
@@ -859,7 +887,7 @@ fn split_virtual<'a>(root: &'a [Field], path: &str) -> Option<(&'a Field, String
         let f = current.iter().find(|f| f.name == *segment)?;
         match &f.kind {
             FieldKind::Group { fields } => current = fields,
-            FieldKind::Relationship { .. } if i + 1 < segments.len() => {
+            kind if kind.link().is_some() && i + 1 < segments.len() => {
                 return Some((f, segments[..=i].join("."), segments[i + 1..].join(".")));
             }
             _ => return None,
@@ -1151,6 +1179,9 @@ pub enum SchemaError {
     UnknownOption { field: String, option: String },
     #[error("{0}")]
     InvalidOption(String),
+    /// A problem at a path in the schema, such as `fields.cover.relationTo`.
+    #[error("{path}: {message}")]
+    At { path: String, message: String },
 }
 
 impl FieldKind {
@@ -1169,6 +1200,7 @@ impl FieldKind {
             Self::Point => "point",
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
+            Self::Upload { .. } => "upload",
             Self::Json => "json",
             Self::Join { .. } => "join",
             Self::Group { .. } => "group",
@@ -1178,6 +1210,28 @@ impl FieldKind {
             Self::Row { .. } => "row",
             Self::Collapsible { .. } => "collapsible",
             Self::Tabs { .. } => "tabs",
+        }
+    }
+
+    /// Where a `relationship` or `upload` field links, read the same way for both.
+    pub fn link(&self) -> Option<Link<'_>> {
+        match self {
+            Self::Relationship {
+                relation_to,
+                has_many,
+                max_depth,
+            }
+            | Self::Upload {
+                relation_to,
+                has_many,
+                max_depth,
+                ..
+            } => Some(Link {
+                relation_to,
+                has_many: *has_many,
+                max_depth: *max_depth,
+            }),
+            _ => None,
         }
     }
 
@@ -1209,11 +1263,10 @@ impl FieldKind {
     pub fn is_indexable(&self) -> bool {
         match self {
             Self::Select { multiple, .. } => !multiple,
-            Self::Relationship {
-                relation_to,
-                has_many,
-                ..
-            } => !has_many && !relation_to.is_polymorphic(),
+            Self::Relationship { .. } | Self::Upload { .. } => {
+                let l = self.link().expect("a link field");
+                !l.has_many && !l.relation_to.is_polymorphic()
+            }
             Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
             | Self::Join { .. }
@@ -1355,7 +1408,11 @@ impl CollectionSchema {
             let slug = &j.collection;
             // Inside blocks, several block types may have the path: any one linking here will do.
             let found = fields_at(target.data(), &j.on);
-            let links_here = |f: &&Field| matches!(&f.kind, FieldKind::Relationship { relation_to, .. } if relation_to.allows(&self.slug));
+            let links_here = |f: &&Field| {
+                f.kind
+                    .link()
+                    .is_some_and(|l| l.relation_to.allows(&self.slug))
+            };
             let Some(on) = found
                 .iter()
                 .copied()
@@ -1364,7 +1421,7 @@ impl CollectionSchema {
             else {
                 return Err(invalid(format!("{slug} has no field `{}`", j.on)));
             };
-            let FieldKind::Relationship { relation_to, .. } = &on.kind else {
+            let Some(Link { relation_to, .. }) = on.kind.link() else {
                 return Err(invalid(format!(
                     "{slug}.{} isn't a relationship field",
                     j.on
@@ -1417,7 +1474,7 @@ impl CollectionSchema {
                         path,
                         link: link_path,
                         read,
-                        many: matches!(link.kind, FieldKind::Relationship { has_many: true, .. }),
+                        many: link.kind.link().is_some_and(|l| l.has_many),
                     });
                 } else if let FieldKind::Group { fields } = &f.kind {
                     walk(fields, root, &path, out);
@@ -1441,8 +1498,8 @@ impl CollectionSchema {
                 field: field.name.clone(),
                 message,
             };
-            let Some(FieldKind::Relationship { relation_to, .. }) =
-                find_field(self.data(), &v.link).map(|f| &f.kind)
+            let Some(Link { relation_to, .. }) =
+                find_field(self.data(), &v.link).and_then(|f| f.kind.link())
             else {
                 continue;
             };
@@ -1516,9 +1573,8 @@ impl CollectionSchema {
         fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
             for f in fields {
                 match &f.kind {
-                    FieldKind::Relationship { relation_to, .. } => {
-                        out.extend(relation_to.targets())
-                    }
+                    FieldKind::Relationship { relation_to, .. }
+                    | FieldKind::Upload { relation_to, .. } => out.extend(relation_to.targets()),
                     FieldKind::Group { fields }
                     | FieldKind::Array { fields, .. }
                     | FieldKind::Row { fields }
@@ -1552,6 +1608,85 @@ impl CollectionSchema {
         out.sort_unstable();
         out.dedup();
         out
+    }
+
+    /// Every upload field, with its data path (through groups, lists and block types).
+    pub fn upload_links(&self) -> Vec<(String, &Field)> {
+        fn walk<'a>(fields: &'a [Field], prefix: &str, out: &mut Vec<(String, &'a Field)>) {
+            for f in fields {
+                let path = join(prefix, &f.name);
+                match &f.kind {
+                    FieldKind::Upload { .. } => out.push((path, f)),
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        walk(fields, &path, out)
+                    }
+                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+                        for b in blocks.iter().filter_map(BlockSource::def) {
+                            walk(&b.fields, &join(&path, &b.slug), out);
+                        }
+                    }
+                    _ => {}
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.data(), "", &mut out);
+        out
+    }
+
+    /// Checks every upload field's targets hold files, and its `filterOptions` fit each
+    /// one. `lookup` finds other collections; a target it can't find is left to the check
+    /// that every target exists.
+    pub fn check_upload_targets<S: Borrow<CollectionSchema>>(
+        &self,
+        lookup: impl Fn(&str) -> Option<S>,
+    ) -> Result<(), SchemaError> {
+        for (path, f) in self.upload_links() {
+            let FieldKind::Upload {
+                relation_to,
+                filter_options,
+                ..
+            } = &f.kind
+            else {
+                continue;
+            };
+            for slug in relation_to.targets() {
+                let found = if slug == self.slug {
+                    None
+                } else {
+                    lookup(slug)
+                };
+                let target: &CollectionSchema = match &found {
+                    Some(s) => s.borrow(),
+                    None if slug == self.slug => self,
+                    None => continue,
+                };
+                if target.upload.is_none() {
+                    return Err(SchemaError::At {
+                        path: format!("fields.{path}.relationTo"),
+                        message: format!(
+                            "`{slug}` doesn't hold files; an upload field links only to collections with upload on"
+                        ),
+                    });
+                }
+                let Some(w) = filter_options else { continue };
+                let reach = |slug: &str| {
+                    if slug == self.slug {
+                        Some(self.clone())
+                    } else {
+                        lookup(slug)
+                            .map(|s| s.borrow().clone())
+                            .filter(|s| s.kind == CollectionKind::Collection)
+                    }
+                };
+                crate::query::parse_filter_with(target.data(), &Value::Object(w.clone()), &reach)
+                    .map_err(|e| SchemaError::At {
+                    path: format!("fields.{path}.filterOptions"),
+                    message: format!("in {slug}: {e}"),
+                })?;
+            }
+        }
+        Ok(())
     }
 
     /// Checks the schema is usable before it's stored.
@@ -2253,11 +2388,12 @@ fn check_fields(
         }
         if (f.unique || f.filterable) && !f.kind.is_indexable() {
             let what = match &f.kind {
-                FieldKind::Relationship { relation_to, .. } if relation_to.is_polymorphic() => {
-                    "relationship fields with several targets".to_owned()
+                kind if kind.link().is_some_and(|l| l.relation_to.is_polymorphic()) => {
+                    format!("{} fields with several targets", f.kind.name())
                 }
                 FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
                 FieldKind::Relationship { .. }
+                | FieldKind::Upload { .. }
                 | FieldKind::Text { .. }
                 | FieldKind::Number { .. } => {
                     format!("{} fields with multiple values", f.kind.name())
@@ -2355,12 +2491,24 @@ fn check_fields(
                     "from must name a top-level text field, not `{source}`"
                 )));
             }
-            FieldKind::Relationship {
-                max_depth: Some(d), ..
-            } if *d > 5 => {
+            FieldKind::Upload {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            } if (min_rows.is_some() || max_rows.is_some())
+                && (!has_many || min_rows > max_rows && max_rows.is_some()) =>
+            {
+                return Err(invalid(if *has_many {
+                    "minRows is greater than maxRows".into()
+                } else {
+                    "minRows and maxRows only apply with hasMany".into()
+                }));
+            }
+            kind if kind.link().and_then(|l| l.max_depth).is_some_and(|d| d > 5) => {
                 return Err(invalid("maxDepth can be at most 5".into()));
             }
-            FieldKind::Relationship { relation_to, .. } => {
+            FieldKind::Relationship { relation_to, .. } | FieldKind::Upload { relation_to, .. } => {
                 let targets = relation_to.targets();
                 if targets.is_empty() {
                     return Err(invalid("relationTo needs at least one collection".into()));
@@ -4053,6 +4201,86 @@ mod tests {
             deep.check().unwrap_err().to_string(),
             "field `author`: maxDepth can be at most 5"
         );
+    }
+
+    #[test]
+    fn upload_fields_link_like_relationships() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"name": "cover", "type": "upload", "relationTo": "media", "maxDepth": 1,
+             "filterOptions": {"mimeType": {"like": "image"}}, "displayPreview": true},
+            {"name": "files", "type": "upload", "relationTo": ["media", "downloads"],
+             "hasMany": true, "minRows": 1, "maxRows": 2}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let cover = s.fields[0].kind.link().unwrap();
+        assert_eq!(cover.relation_to, &RelationTo::One("media".into()));
+        assert_eq!((cover.has_many, cover.max_depth), (false, Some(1)));
+        assert!(s.fields[1].kind.link().unwrap().has_many);
+        assert_eq!(s.fields[0].kind.name(), "upload");
+        assert_eq!(s.relation_targets(), ["downloads", "media"]);
+        assert!(FieldKind::Json.link().is_none());
+        // Round trips through stored JSON, admin-only options included.
+        let back: CollectionSchema = serde_json::from_value(s.to_compact_json()).unwrap();
+        assert_eq!(back.fields, s.fields);
+
+        let refused = |field: Value| {
+            schema(json!({"slug": "posts", "fields": [field]}))
+                .check()
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": "media", "maxRows": 2})),
+            "field `c`: minRows and maxRows only apply with hasMany"
+        );
+        assert_eq!(
+            refused(
+                json!({"name": "c", "type": "upload", "relationTo": "media", "hasMany": true,
+                           "minRows": 3, "maxRows": 2})
+            ),
+            "field `c`: minRows is greater than maxRows"
+        );
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": "media", "maxDepth": 6})),
+            "field `c`: maxDepth can be at most 5"
+        );
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": ["media", "media"]})),
+            "field `c`: relationTo lists `media` twice"
+        );
+    }
+
+    #[test]
+    fn upload_targets_must_hold_files_and_fit_the_filter() {
+        let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        let tags = schema(json!({"slug": "tags", "fields": []}));
+        let lookup = |slug: &str| [&media, &tags].into_iter().find(|s| s.slug == slug);
+        let with = |field: Value| schema(json!({"slug": "posts", "fields": [field]}));
+        let at = |s: CollectionSchema| match s.check_upload_targets(lookup) {
+            Err(SchemaError::At { path, message }) => (path, message),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            with(json!({"name": "c", "type": "upload", "relationTo": "media",
+                        "filterOptions": {"mimeType": {"like": "image"}}}))
+            .check_upload_targets(lookup),
+            Ok(())
+        );
+        let (path, message) = at(with(
+            json!({"name": "c", "type": "upload", "relationTo": ["media", "tags"]}),
+        ));
+        assert_eq!(path, "fields.c.relationTo");
+        assert!(message.contains("`tags`"), "{message}");
+        let (path, message) = at(with(json!({"name": "g", "type": "group", "fields": [
+            {"name": "c", "type": "upload", "relationTo": "media", "filterOptions": {"nope": {"equals": "x"}}}
+        ]})));
+        assert_eq!(path, "fields.g.c.filterOptions");
+        assert!(message.starts_with("in media: "), "{message}");
+        // An upload collection may link to itself.
+        let own = schema(json!({"slug": "media", "upload": true, "fields": [
+            {"name": "poster", "type": "upload", "relationTo": "media"}
+        ]}));
+        assert_eq!(own.check_upload_targets(lookup), Ok(()));
     }
 
     #[test]

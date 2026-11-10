@@ -564,6 +564,7 @@ async fn run_in(
         schema
             .check_virtual_targets(lookup)
             .and_then(|()| schema.check_join_targets(lookup))
+            .and_then(|()| schema.check_upload_targets(lookup))
             .and_then(|()| check_rules(schema, &users, &roles, &lookup))
             .map_err(fail)?;
     }

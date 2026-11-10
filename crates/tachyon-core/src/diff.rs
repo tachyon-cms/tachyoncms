@@ -338,18 +338,14 @@ fn compare(
                     });
                 }
             }
-            (
-                FieldKind::Relationship {
-                    relation_to: from,
-                    has_many: h1,
-                    ..
-                },
-                FieldKind::Relationship {
-                    relation_to: to,
-                    has_many: h2,
-                    ..
-                },
-            ) if from != to || h1 != h2 => {
+            (a, b)
+                if a.name() == b.name()
+                    && a.link().zip(b.link()).is_some_and(|(x, y)| {
+                        x.relation_to != y.relation_to || x.has_many != y.has_many
+                    }) =>
+            {
+                let (x, y) = (a.link().expect("a link"), b.link().expect("a link"));
+                let (from, to, h1, h2) = (x.relation_to, y.relation_to, &x.has_many, &y.has_many);
                 let keeps_every_target = from.targets().iter().all(|t| to.allows(t));
                 let shrinks_to_one = *h1 && !*h2;
                 // Several → more, with the same single/list shape: every stored link already fits.
@@ -475,6 +471,11 @@ fn rows_of<'a>(
 fn options_ignoring_targets(f: &Field) -> Field {
     let mut f = options(f);
     if let FieldKind::Relationship {
+        relation_to,
+        has_many,
+        ..
+    }
+    | FieldKind::Upload {
         relation_to,
         has_many,
         ..

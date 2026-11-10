@@ -6,7 +6,7 @@ use std::fmt;
 use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
-use crate::schema::{BlockSource, Field, FieldKind, SelectOption, data_fields};
+use crate::schema::{BlockSource, Field, FieldKind, Link, SelectOption, data_fields};
 use crate::validate::{is_date, normalize_date_time};
 
 const MAX_PARAMS: usize = 100;
@@ -245,16 +245,17 @@ pub enum ValueKind {
 
 /// How a field's values compare, or `None` when they can't be filtered or sorted.
 pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
+    if let Some(l) = kind.link() {
+        return Some(match (l.has_many, l.relation_to.is_polymorphic()) {
+            (true, true) => ValueKind::LinkList,
+            (true, false) => ValueKind::List,
+            (false, _) => ValueKind::Text,
+        });
+    }
     Some(match kind {
-        FieldKind::Relationship {
-            relation_to,
-            has_many: true,
-            ..
-        } if relation_to.is_polymorphic() => ValueKind::LinkList,
         FieldKind::Select { multiple: true, .. }
         | FieldKind::Text { has_many: true, .. }
-        | FieldKind::Number { has_many: true, .. }
-        | FieldKind::Relationship { has_many: true, .. } => ValueKind::List,
+        | FieldKind::Number { has_many: true, .. } => ValueKind::List,
         FieldKind::Number { .. } => ValueKind::Number,
         FieldKind::Boolean => ValueKind::Boolean,
         FieldKind::Date { .. } => ValueKind::Date,
@@ -268,7 +269,8 @@ pub fn value_kind(kind: &FieldKind) -> Option<ValueKind> {
         | FieldKind::Radio { .. }
         | FieldKind::Code { .. }
         | FieldKind::Slug { .. }
-        | FieldKind::Relationship { .. } => ValueKind::Text,
+        | FieldKind::Relationship { .. }
+        | FieldKind::Upload { .. } => ValueKind::Text,
         FieldKind::Json
         | FieldKind::Join { .. }
         | FieldKind::Group { .. }
@@ -753,11 +755,9 @@ fn resolve(
                 ));
             }
             // A polymorphic link is an object: its `relationTo`, or its `value` (the default).
-            FieldKind::Relationship {
-                relation_to,
-                has_many: false,
-                ..
-            } if relation_to.is_polymorphic()
+            kind if kind
+                .link()
+                .is_some_and(|l| !l.has_many && l.relation_to.is_polymorphic())
                 && (last || rest == "relationTo" || rest == "value") =>
             {
                 path.push(
@@ -776,12 +776,13 @@ fn resolve(
                     Some(f.clone()),
                 ));
             }
-            FieldKind::Relationship {
-                relation_to,
-                has_many,
-                ..
-            } if !last => {
-                if *has_many && (rest == "relationTo" || rest == "value") {
+            kind if kind.link().is_some() && !last => {
+                let Link {
+                    relation_to,
+                    has_many,
+                    ..
+                } = kind.link().expect("a link");
+                if has_many && (rest == "relationTo" || rest == "value") {
                     let at = path.join(".");
                     return Err(format!(
                         "`{at}` holds several links; use where[{at}][contains] to match one"
@@ -842,7 +843,7 @@ fn resolve(
                 return Ok((
                     Target::Via {
                         link: path,
-                        many: *has_many,
+                        many: has_many,
                         polymorphic: relation_to.is_polymorphic(),
                         collections: relation_to
                             .targets()
@@ -1024,26 +1025,22 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
         // The `relationTo` part of a polymorphic link: the path is the field's own name
         // followed by `relationTo` (a field merely named `relationTo` doesn't count).
-        (_, Some(f_kind @ FieldKind::Relationship { relation_to, .. }))
-            if relation_to.is_polymorphic()
-                && matches!(
-                    f_kind,
-                    FieldKind::Relationship {
-                        has_many: false,
-                        ..
-                    }
-                )
+        (_, Some(f_kind))
+            if f_kind
+                .link()
+                .is_some_and(|l| !l.has_many && l.relation_to.is_polymorphic())
                 && matches!((target, field), (Target::Field { path, .. }, Some(f))
                     if path.len() >= 2
                         && path[path.len() - 1] == "relationTo"
                         && path[path.len() - 2] == f.name) =>
         {
+            let relation_to = f_kind.link().expect("a link").relation_to;
             v.as_str()
                 .filter(|s| relation_to.allows(s))
                 .map(|s| Scalar::Text(s.to_owned()))
                 .ok_or_else(|| format!("expected one of: {relation_to}"))
         }
-        (_, None) | (_, Some(FieldKind::Relationship { .. })) => {
+        (_, None) | (_, Some(FieldKind::Relationship { .. } | FieldKind::Upload { .. })) => {
             let id = v
                 .as_str()
                 .and_then(|s| Uuid::try_parse(s).ok())

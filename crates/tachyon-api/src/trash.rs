@@ -116,7 +116,7 @@ pub async fn restore(
     let mut vouched = Vouched::new();
     let mut errors = Errors::default();
     for (copy, p, _) in &stored {
-        match check_links(&state, &access, p, &[]).await {
+        match check_links(&state, &access, &c, p, &[]).await {
             Ok(v) => vouched.extend(v),
             Err(e) => errors.add(&c, *copy, e)?,
         }

@@ -290,7 +290,7 @@ pub async fn create(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, &c, data))
         .map_err(|e| hide(e, &input))?;
-    check_links(&state, &access, &prepared, &[]).await?;
+    check_links(&state, &access, &c, &prepared, &[]).await?;
     let stored = match &checked {
         Some((u, f)) => {
             let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
@@ -499,7 +499,7 @@ pub async fn update(
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
     let dry = apply(&stored, would.as_ref())?;
-    let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
+    let vouched = check_links(&state, &access, &c, &dry, &link_ids(&c, &stored)).await?;
     let saved = match &checked {
         Some((u, f)) => {
             let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));

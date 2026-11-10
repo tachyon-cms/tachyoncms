@@ -7,7 +7,7 @@ use time::macros::format_description;
 use uuid::Uuid;
 
 use crate::schema::{
-    BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, RelationTo, SelectOption, data_fields,
+    BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, Link, RelationTo, SelectOption, data_fields,
 };
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
@@ -379,15 +379,10 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                     *s = utc;
                 }
             }
-            (
-                FieldKind::Relationship {
-                    has_many: false, ..
-                },
-                link,
-            ) => canonical_link(link),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+            (kind, Value::Array(links)) if kind.link().is_some_and(|l| l.has_many) => {
                 links.iter_mut().for_each(canonical_link);
             }
+            (kind, link) if kind.link().is_some_and(|l| !l.has_many) => canonical_link(link),
             (FieldKind::Group { fields }, Value::Object(inner)) => normalize(fields, inner),
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                 for row in rows {
@@ -515,6 +510,7 @@ fn is_list(kind: &FieldKind) -> bool {
         FieldKind::Text { has_many: true, .. }
             | FieldKind::Number { has_many: true, .. }
             | FieldKind::Relationship { has_many: true, .. }
+            | FieldKind::Upload { has_many: true, .. }
             | FieldKind::Select { multiple: true, .. }
             | FieldKind::Array { .. }
             | FieldKind::Blocks { .. }
@@ -556,6 +552,20 @@ pub(crate) fn check_value(
                 if let Some(message) = scalar_error(&f.kind, item) {
                     errors.push(error(format!("{path}.{i}"), &message));
                 }
+            }
+        }
+        (
+            FieldKind::Upload {
+                has_many: true,
+                min_rows,
+                max_rows,
+                ..
+            },
+            Value::Array(items),
+        ) => {
+            check_row_count(items.len(), *min_rows, *max_rows, path, errors);
+            if let Some(message) = scalar_error(&f.kind, v) {
+                errors.push(error(path.into(), &message));
             }
         }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
@@ -675,6 +685,35 @@ pub(crate) fn check_value(
     }
 }
 
+fn link_error(relation_to: &RelationTo, has_many: bool, v: &Value) -> Option<String> {
+    match (relation_to, has_many) {
+        (RelationTo::One(_), false) => {
+            (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into())
+        }
+        (RelationTo::One(_), true) => {
+            let ok = v
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
+            (!ok).then(|| "expected a list of document IDs".into())
+        }
+        (_, false) => (!is_link(v, relation_to)).then(|| {
+            format!(
+                "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
+            )
+        }),
+        (_, true) => {
+            let ok = v
+                .as_array()
+                .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
+            (!ok).then(|| {
+                format!(
+                    "expected a list of links like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to: {relation_to}"
+                )
+            })
+        }
+    }
+}
+
 fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
     match kind {
         FieldKind::Text {
@@ -753,35 +792,13 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         FieldKind::Slug { .. } => (!v.as_str().is_some_and(is_slug)).then(|| {
             "expected lowercase letters, digits and single hyphens, like my-first-post".into()
         }),
-        FieldKind::Relationship {
-            relation_to: RelationTo::One(_),
-            has_many: false, .. } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
-        FieldKind::Relationship {
-            relation_to: RelationTo::One(_),
-            has_many: true, .. } => {
-            let ok = v
-                .as_array()
-                .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
-            (!ok).then(|| "expected a list of document IDs".into())
-        }
-        FieldKind::Relationship {
-            relation_to,
-            has_many: false, .. } => (!is_link(v, relation_to)).then(|| {
-            format!(
-                "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
-            )
-        }),
-        FieldKind::Relationship {
-            relation_to,
-            has_many: true, .. } => {
-            let ok = v
-                .as_array()
-                .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
-            (!ok).then(|| {
-                format!(
-                    "expected a list of links like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to: {relation_to}"
-                )
-            })
+        FieldKind::Relationship { .. } | FieldKind::Upload { .. } => {
+            let Link {
+                relation_to,
+                has_many,
+                ..
+            } = kind.link().expect("a link");
+            link_error(relation_to, has_many, v)
         }
         FieldKind::Json => None,
         // Never reached: `check_value` hands rich text to `richtext::validate`.
@@ -947,6 +964,8 @@ pub struct RelationRef {
     pub id: Uuid,
     /// The field's `maxDepth`, if it caps population.
     pub max_depth: Option<u8>,
+    /// The upload field's `filterOptions`: a `where` the linked document must match.
+    pub filter_options: Option<Map<String, Value>>,
 }
 
 /// Reads a `{relationTo, value}` link to any collection; rich text checked the collection.
@@ -969,8 +988,9 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
             };
             let path = join(prefix, &f.name);
             let named = join(at, &f.name);
-            let max_depth = match f.kind {
-                FieldKind::Relationship { max_depth, .. } => max_depth,
+            let max_depth = f.kind.link().and_then(|l| l.max_depth);
+            let filter_options = match &f.kind {
+                FieldKind::Upload { filter_options, .. } => filter_options.as_ref(),
                 _ => None,
             };
             // A link at `path` as stored for `relation_to`, if it is one.
@@ -989,25 +1009,16 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     relation_to: slug.to_owned(),
                     id: Uuid::try_parse(id).ok()?,
                     max_depth,
+                    filter_options: filter_options.cloned(),
                 })
             };
+            let link = f.kind.link();
             match (&f.kind, value) {
-                (
-                    FieldKind::Relationship {
-                        relation_to,
-                        has_many: false,
-                        ..
-                    },
-                    id,
-                ) => out.extend(found(path, named, relation_to, id)),
-                (
-                    FieldKind::Relationship {
-                        relation_to,
-                        has_many: true,
-                        ..
-                    },
-                    Value::Array(ids),
-                ) => {
+                (_, id) if link.is_some_and(|l| !l.has_many) => {
+                    out.extend(found(path, named, link.expect("a link").relation_to, id))
+                }
+                (_, Value::Array(ids)) if link.is_some_and(|l| l.has_many) => {
+                    let relation_to = link.expect("a link").relation_to;
                     for (i, id) in ids.iter().enumerate() {
                         out.extend(found(
                             format!("{path}.{i}"),
@@ -1083,14 +1094,12 @@ fn map_inner(
             continue;
         };
         let path = join(prefix, &field.name);
+        let link = field.kind.link();
         match (&field.kind, value) {
-            (
-                FieldKind::Relationship {
-                    has_many: false, ..
-                },
-                slot,
-            ) => replace_link(slot, &mut |id| f(&path, id)),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+            (_, slot) if link.is_some_and(|l| !l.has_many) => {
+                replace_link(slot, &mut |id| f(&path, id))
+            }
+            (_, Value::Array(links)) if link.is_some_and(|l| l.has_many) => {
                 for (i, slot) in links.iter_mut().enumerate() {
                     let here = format!("{path}.{i}");
                     replace_link(slot, &mut |id| f(&here, id));
@@ -1569,6 +1578,52 @@ mod tests {
         assert_eq!(
             errs(&f, json!({"related": id})),
             vec![e("related", "expected a list of document IDs")]
+        );
+    }
+
+    #[test]
+    fn upload_fields_validate_and_link_like_relationships() {
+        let f = fields(json!([
+            {"name": "cover", "type": "upload", "relationTo": "media", "maxDepth": 2,
+             "filterOptions": {"mimeType": {"like": "image"}}},
+            {"name": "files", "type": "upload", "relationTo": ["media", "downloads"],
+             "hasMany": true, "maxRows": 2}
+        ]));
+        let a = "0199D5C4-0000-7000-8000-00000000000A";
+        let b = "0199d5c4-0000-7000-8000-00000000000b";
+        let doc = ok(
+            &f,
+            json!({"cover": a, "files": [{"relationTo": "downloads", "value": b}]}),
+        );
+        assert_eq!(doc["cover"], a.to_lowercase());
+        let found = relations(&f, &doc);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].max_depth, Some(2));
+        assert_eq!(
+            found[0].filter_options,
+            Some(
+                json!({"mimeType": {"like": "image"}})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            )
+        );
+        assert_eq!(
+            (
+                found[1].path.as_str(),
+                found[1].relation_to.as_str(),
+                found[1].filter_options.as_ref()
+            ),
+            ("files.0", "downloads", None)
+        );
+        let link = |id: &str| json!({"relationTo": "media", "value": id});
+        assert_eq!(
+            errs(&f, json!({"files": [link(a), link(b), link(a)]})),
+            vec![e("files", "must have at most 2 rows")]
+        );
+        assert_eq!(
+            errs(&f, json!({"cover": "nope"})),
+            vec![e("cover", "expected a document ID")]
         );
     }
 

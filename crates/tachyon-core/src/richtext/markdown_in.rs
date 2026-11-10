@@ -1005,7 +1005,7 @@ fn attributes(s: &str) -> Option<Vec<(String, String)>> {
 /// other is read as the JSON `to_markdown` wrote (`30`, `true`, `{…}`).
 fn takes_text(kind: &FieldKind) -> bool {
     matches!(value_kind(kind), Some(ValueKind::Text | ValueKind::Date))
-        && !matches!(kind, FieldKind::Relationship { relation_to, .. } if relation_to.is_polymorphic())
+        && !kind.link().is_some_and(|l| l.relation_to.is_polymorphic())
 }
 
 #[cfg(test)]

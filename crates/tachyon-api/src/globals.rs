@@ -155,6 +155,7 @@ pub async fn update(
     let vouched = check_links(
         &state,
         &access,
+        &c,
         &apply(stored.as_ref())?,
         &before(stored.as_ref()),
     )

@@ -117,7 +117,7 @@ async fn publish_doc(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
-    published_links(state, access, &prepared)
+    published_links(state, access, c, &prepared)
         .await
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
     let doc = documents::publish_in(&mut tx, c, d.id, Some(&prepared), access.user_id())
@@ -319,7 +319,7 @@ async fn restore_version(
         })
         .map_err(|e| access.hide(c, e, Some(&next)))
     };
-    let vouched = check_links(state, access, &apply(&stored)?, &link_ids(c, &stored)).await?;
+    let vouched = check_links(state, access, c, &apply(&stored)?, &link_ids(c, &stored)).await?;
     let actor = access.actor(action, c);
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     let doc = documents::update_in(

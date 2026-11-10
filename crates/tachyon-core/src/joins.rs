@@ -20,7 +20,7 @@ fn pattern(fields: &[Field], path: &str) -> Option<String> {
     let f = fields.iter().find(|f| f.name == head)?;
     // Field names are identifiers, so they need no escaping.
     match (&f.kind, rest) {
-        (FieldKind::Relationship { has_many, .. }, None) => Some(if *has_many {
+        (kind, None) if kind.link().is_some() => Some(if kind.link().is_some_and(|l| l.has_many) {
             format!(r"{head}(\.\d+)?")
         } else {
             head.to_owned()

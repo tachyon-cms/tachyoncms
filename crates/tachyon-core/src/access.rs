@@ -490,8 +490,10 @@ impl Checker<'_> {
                     FieldKind::Text { has_many: true, .. }
                         | FieldKind::Number { has_many: true, .. }
                         | FieldKind::Select { multiple: true, .. }
-                ) || matches!(&f.kind, FieldKind::Relationship { has_many: true, relation_to, .. }
-                    if !relation_to.is_polymorphic());
+                ) || f
+                    .kind
+                    .link()
+                    .is_some_and(|l| l.has_many && !l.relation_to.is_polymorphic());
                 if list && !matches!(op, "in" | "not_in") {
                     return Err(format!(
                         "`$user.{}` holds a list, so it works only with in or not_in",

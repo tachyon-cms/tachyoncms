@@ -359,7 +359,7 @@ async fn snapshot(
         .map_err(why)?;
     // What's published is the snapshot, its stored file included.
     prepared.file = v.file_id.map_or(FileChange::Clear, FileChange::Set);
-    published_links(state, access, &prepared)
+    published_links(state, access, c, &prepared)
         .await
         .map_err(why)?;
     Ok(prepared)

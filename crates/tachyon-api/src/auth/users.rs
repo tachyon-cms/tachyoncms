@@ -361,7 +361,7 @@ pub(crate) async fn update(
         // them, for an Admin editing someone else's).
         let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
         let next = apply(&stored)?;
-        let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
+        let vouched = check_links(&state, &access, users, &next, &link_ids(users, &stored)).await?;
         Some((apply, vouched))
     } else {
         None

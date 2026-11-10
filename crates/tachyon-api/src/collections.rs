@@ -47,9 +47,12 @@ fn to_json(c: &Collection) -> Value {
 }
 
 fn schema_error(e: SchemaError) -> ApiError {
-    ApiError::Validation(vec![FieldError {
-        path: String::new(),
-        message: e.to_string(),
+    ApiError::Validation(vec![match e {
+        SchemaError::At { path, message } => FieldError { path, message },
+        e => FieldError {
+            path: String::new(),
+            message: e.to_string(),
+        },
     }])
 }
 
@@ -234,13 +237,46 @@ fn find<'w>(world: &'w [CollectionSchema]) -> impl Fn(&str) -> Option<&'w Collec
 }
 
 /// Every virtual field of the saved schema, `world[0]`, must read a field its targets have,
-/// and every join a field that links here.
+/// every join a field that links here, and every upload field a collection that holds files.
 fn check_virtuals(world: &[CollectionSchema]) -> Result<(), ApiError> {
     let lookup = find(world);
     world[0]
         .check_virtual_targets(&lookup)
         .and_then(|()| world[0].check_join_targets(&lookup))
+        .and_then(|()| world[0].check_upload_targets(&lookup))
         .map_err(schema_error)
+}
+
+/// Turning `upload` off on a collection other collections' upload fields point at is
+/// refused, naming them, as deleting a shared block in use is: `confirm` can't make
+/// their links point at something that holds no files.
+fn check_upload_referrers(world: &[CollectionSchema]) -> Result<(), ApiError> {
+    let changed = &world[0];
+    if changed.upload.is_some() {
+        return Ok(());
+    }
+    let referrers: Vec<String> = world[1..]
+        .iter()
+        .flat_map(|other| {
+            other
+                .upload_links()
+                .into_iter()
+                .filter(|(_, f)| {
+                    f.kind
+                        .link()
+                        .is_some_and(|l| l.relation_to.allows(&changed.slug))
+                })
+                .map(|(path, _)| format!("{}.{path}", other.slug))
+        })
+        .collect();
+    if referrers.is_empty() {
+        return Ok(());
+    }
+    Err(ApiError::Conflict(format!(
+        "{} can't stop holding files while these upload fields point at it: {}; change them first",
+        changed.slug,
+        referrers.join(", ")
+    )))
 }
 
 /// A change must not break the virtual or join fields other collections read from it, such
@@ -251,6 +287,7 @@ fn check_dependents(world: &[CollectionSchema]) -> Result<(), ApiError> {
         other
             .check_virtual_targets(&lookup)
             .and_then(|()| other.check_join_targets(&lookup))
+            .and_then(|()| other.check_upload_targets(&lookup))
             .map_err(|e| {
                 schema_error(SchemaError::InvalidChange(format!(
                     "this change would break {}: {e}",
@@ -330,6 +367,7 @@ pub async fn preview(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
+    check_upload_referrers(&world)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_PREVIEW, &slug, &req).await? {
@@ -351,6 +389,7 @@ pub async fn update(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
+    check_upload_referrers(&world)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_CHANGE, &slug, &req).await? {

@@ -6,6 +6,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use tachyon_core::query::parse_filter_with;
 use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::validate::markdown_inputs;
@@ -244,6 +245,7 @@ pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
 pub(crate) async fn check_links(
     state: &AppState,
     access: &Access,
+    c: &Collection,
     next: &Prepared,
     before: &[Uuid],
 ) -> Result<Vouched, ApiError> {
@@ -273,7 +275,76 @@ pub(crate) async fn check_links(
         .map(|(collection_id, doc)| (doc.id, collection_id))
         .collect();
     vouched_links(next, before, &vouched)?;
+    filtered_links(state, access, c, next, before, &linkable).await?;
     Ok(vouched)
+}
+
+/// Refuses each link in `next` that `before` didn't hold, made through an upload field
+/// whose `filterOptions` the linked document doesn't match in the copy `read` reads it
+/// in. The error is a missing link's, so a write learns nothing about the document.
+async fn filtered_links(
+    state: &AppState,
+    access: &Access,
+    c: &Collection,
+    next: &Prepared,
+    before: &[Uuid],
+    read: &HashMap<Uuid, Readable>,
+) -> Result<(), ApiError> {
+    // One query per filter and target collection: (filter, collection, [(at, id)]).
+    type Group<'a> = (Map<String, Value>, Uuid, Vec<(&'a str, Uuid)>);
+    let mut groups: Vec<Group> = Vec::new();
+    for r in relations(c.schema.data(), &next.data) {
+        let Some(w) = r.filter_options else { continue };
+        let Some(link) = next.relations.iter().find(|l| l.at == r.at) else {
+            continue;
+        };
+        if before.contains(&link.id) {
+            continue;
+        }
+        let entry = (link.at.as_str(), link.id);
+        match groups
+            .iter_mut()
+            .find(|(gw, gc, _)| *gw == w && *gc == link.collection_id)
+        {
+            Some((_, _, links)) => links.push(entry),
+            None => groups.push((w, link.collection_id, vec![entry])),
+        }
+    }
+    let mut missing = Vec::new();
+    for (w, collection_id, links) in groups {
+        // Checked at save against the target's fields; one that no longer parses matches nothing.
+        let filter = state.schemas.get_by_id(collection_id).and_then(|t| {
+            let lookup = |slug: &str| state.schemas.lookup(slug);
+            parse_filter_with(t.schema.data(), &Value::Object(w), &lookup).ok()
+        });
+        let matched: HashSet<Uuid> = match (filter, read.get(&collection_id)) {
+            (Some(f), Some(r)) => {
+                let ids: Vec<Uuid> = links.iter().map(|(_, id)| *id).collect();
+                let one = HashMap::from([(collection_id, r.clone())]);
+                let f = access.guard(f);
+                query::get_many_matching(&state.pool, &ids, &one, Some(&f))
+                    .await?
+                    .into_iter()
+                    .map(|(_, doc)| doc.id)
+                    .collect()
+            }
+            _ => HashSet::new(),
+        };
+        missing.extend(
+            links
+                .iter()
+                .filter(|(_, id)| !matched.contains(id))
+                .map(|(at, _)| FieldError {
+                    path: (*at).to_owned(),
+                    message: MISSING_LINK.into(),
+                }),
+        );
+    }
+    if missing.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(missing))
+    }
 }
 
 /// Refuses every link in `next`, about to be published, to a document with no published
@@ -289,6 +360,7 @@ pub(crate) async fn check_links(
 pub(crate) async fn published_links(
     state: &AppState,
     access: &Access,
+    c: &Collection,
     next: &Prepared,
 ) -> Result<(), ApiError> {
     let mut ids: Vec<Uuid> = next.relations.iter().map(|r| r.id).collect();
@@ -307,7 +379,8 @@ pub(crate) async fn published_links(
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))
         .collect();
-    vouched_links(next, &[], &vouched)
+    vouched_links(next, &[], &vouched)?;
+    filtered_links(state, access, c, next, &[], &linkable).await
 }
 
 /// `check_links`' answer applied to the document as locked for the write: a link added

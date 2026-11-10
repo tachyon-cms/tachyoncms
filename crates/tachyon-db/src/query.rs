@@ -933,6 +933,16 @@ pub async fn get_many_readable(
     ids: &[Uuid],
     read: &HashMap<Uuid, Readable>,
 ) -> Result<Vec<(Uuid, Document)>, DbError> {
+    get_many_matching(pool, ids, read, None).await
+}
+
+/// `get_many_readable`, keeping only documents whose copy read matches `filter` as well.
+pub async fn get_many_matching(
+    pool: &PgPool,
+    ids: &[Uuid],
+    read: &HashMap<Uuid, Readable>,
+    filter: Option<&Filter>,
+) -> Result<Vec<(Uuid, Document)>, DbError> {
     // Sorted, so the same map always builds the same SQL text (and reuses its statement).
     let mut read: Vec<_> = read.iter().collect();
     read.sort_unstable_by_key(|(id, _)| **id);
@@ -960,6 +970,10 @@ pub async fn get_many_readable(
                     push_unreadable(&mut qb, "", 0, first);
                 }
                 push_readable(&mut qb, "", 0, way);
+                if let Some(f) = filter {
+                    qb.push(" AND ");
+                    push_filter_in(&mut qb, f, &copy_base("", 0, copy));
+                }
                 qb.push(")");
             }
         }

@@ -216,6 +216,7 @@ pub async fn run(
     let works = |s: &CollectionSchema| {
         s.check_virtual_targets(lookup)
             .and_then(|()| s.check_join_targets(lookup))
+            .and_then(|()| s.check_upload_targets(lookup))
             .and_then(|()| check_rules(s, &users, &roles, &lookup))
     };
     for s in &world {
