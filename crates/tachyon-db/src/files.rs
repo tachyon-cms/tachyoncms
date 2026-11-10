@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
-use tachyon_core::uploads::{numbered, numbered_bounds};
+use tachyon_core::uploads::{numbered, numbered_bounds, rename_sizes};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -257,12 +257,26 @@ pub async fn go_live_in(
     Ok(())
 }
 
+/// A file `renumber_in` renamed: its sizes' objects, in the directory of `key` on
+/// `storage`, must move from each old name to its new one.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Renamed {
+    pub file: Uuid,
+    pub storage: String,
+    pub key: String,
+    /// (old, new) for each size and copy, the original's own name not among them: its
+    /// object keeps the key it was stored under.
+    pub sizes: Vec<(String, String)>,
+}
+
 /// Gives the files document `doc` holds (either copy), just taken out of the trash, a free
 /// name again: another live document may have taken theirs meanwhile. A renamed file's
-/// `filename` changes in both copies that hold it, and never to a name another of the
-/// document's files ends with. Numbering locks are taken in scope order (`reserve` takes
-/// one), so two restores can't deadlock on them. True when one was renamed.
-pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool, DbError> {
+/// `filename` changes in both copies that hold it and in every version holding it, and
+/// never to a name another of the document's files ends with; its sizes are renamed after
+/// it everywhere they're described, and the caller moves their objects (`Renamed`).
+/// Numbering locks are taken in scope order (`reserve` takes one), so two restores can't
+/// deadlock on them. Returns those renamed.
+pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<Vec<Renamed>, DbError> {
     let held = sqlx::query!(
         r#"SELECT f.id, f.collection_id, f.scope, f.filename FROM files f
            JOIN documents d ON f.id IN (d.published_file, d.draft_file)
@@ -291,6 +305,7 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool
         }
     }
     let mut names: Vec<String> = held.iter().map(|f| f.filename.clone()).collect();
+    let mut renamed = Vec::new();
     for &i in &clashing {
         let f = &held[i];
         // Every other file of the document in this scope keeps, or already got, its name.
@@ -309,34 +324,82 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<bool
             &also,
         )
         .await?;
+        // Locked before its sizes are read, so a size being written waits or is seen.
+        let row = sqlx::query!(
+            r#"SELECT storage, key, names, sizes AS "sizes: Json<Map<String, Value>>"
+               FROM files WHERE tenant_id = $1 AND id = $2 FOR UPDATE"#,
+            DEFAULT_TENANT,
+            f.id,
+        )
+        .fetch_one(&mut *tx)
+        .await?;
+        let mut sizes = row.sizes.0;
+        let moved = rename_sizes(&mut sizes, &name);
+        let served: Vec<String> = row
+            .names
+            .iter()
+            .map(|n| match moved.iter().find(|(old, _)| old == n) {
+                _ if *n == f.filename => name.clone(),
+                Some((_, new)) => new.clone(),
+                None => n.clone(),
+            })
+            .collect();
+        let sizes = Value::Object(sizes);
         sqlx::query!(
-            "UPDATE files SET filename = $3, names = array_replace(names, filename, $3)
-             WHERE tenant_id = $1 AND id = $2",
+            "UPDATE files SET filename = $3, names = $4, sizes = $5 WHERE tenant_id = $1 AND id = $2",
             DEFAULT_TENANT,
             f.id,
             name,
+            &served,
+            &sizes,
         )
         .execute(&mut *tx)
         .await?;
+        // Sizes no job has filled yet stay as each copy has them.
         sqlx::query!(
             r#"UPDATE documents SET
-                   published = CASE WHEN published_file = $3 AND published ? 'filename'
-                                    THEN jsonb_set(published, '{filename}', to_jsonb($4::text))
+                   published = CASE WHEN published_file = $2 AND published ? 'filename'
+                                    THEN jsonb_set(published, '{filename}', to_jsonb($3::text))
+                                         || CASE WHEN jsonb_typeof(published->'sizes') = 'object'
+                                                 THEN jsonb_build_object('sizes', published->'sizes' || $4::jsonb)
+                                                 ELSE '{}' END
                                     ELSE published END,
-                   draft = CASE WHEN draft_file = $3 AND draft ? 'filename'
-                                THEN jsonb_set(draft, '{filename}', to_jsonb($4::text))
+                   draft = CASE WHEN draft_file = $2 AND draft ? 'filename'
+                                THEN jsonb_set(draft, '{filename}', to_jsonb($3::text))
+                                     || CASE WHEN jsonb_typeof(draft->'sizes') = 'object'
+                                             THEN jsonb_build_object('sizes', draft->'sizes' || $4::jsonb)
+                                             ELSE '{}' END
                                 ELSE draft END
-               WHERE tenant_id = $1 AND id = $2"#,
+               WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2)"#,
             DEFAULT_TENANT,
-            doc,
             f.id,
             name,
+            &sizes,
         )
         .execute(&mut *tx)
         .await?;
+        sqlx::query!(
+            r#"UPDATE versions SET data = jsonb_set(data, '{filename}', to_jsonb($3::text))
+                   || CASE WHEN jsonb_typeof(data->'sizes') = 'object'
+                           THEN jsonb_build_object('sizes', data->'sizes' || $4::jsonb)
+                           ELSE '{}' END
+               WHERE tenant_id = $1 AND file_id = $2 AND data ? 'filename'"#,
+            DEFAULT_TENANT,
+            f.id,
+            name,
+            &sizes,
+        )
+        .execute(&mut *tx)
+        .await?;
+        renamed.push(Renamed {
+            file: f.id,
+            storage: row.storage,
+            key: row.key,
+            sizes: moved,
+        });
         names[i] = name;
     }
-    Ok(!clashing.is_empty())
+    Ok(renamed)
 }
 
 /// Turns each of `candidates` that nothing points at any more `gone`, queuing its cleanup
@@ -375,7 +438,7 @@ pub async fn release_in(tx: &mut PgConnection, candidates: &[Uuid]) -> Result<Ve
 }
 
 /// File `id`, whatever its state.
-pub async fn get(pool: &PgPool, id: Uuid) -> Result<FileRow, DbError> {
+pub async fn get<'e>(conn: impl sqlx::PgExecutor<'e>, id: Uuid) -> Result<FileRow, DbError> {
     sqlx::query_as!(
         FileRow,
         r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
@@ -386,9 +449,127 @@ pub async fn get(pool: &PgPool, id: Uuid) -> Result<FileRow, DbError> {
         DEFAULT_TENANT,
         id,
     )
-    .fetch_optional(pool)
+    .fetch_optional(conn)
     .await?
     .ok_or(DbError::NotFound)
+}
+
+/// Locks file `id` to write one of its sizes, in the caller's transaction, and returns it
+/// while it's live; `None` once it's pending, gone or deleted. The documents holding it are
+/// locked first, as a document write takes them before its files. Store a size's objects
+/// only while this holds the row: a `{"keys"}` cleanup waits on it before it decides.
+pub async fn lock_live_in(tx: &mut PgConnection, id: Uuid) -> Result<Option<FileRow>, DbError> {
+    sqlx::query!(
+        "SELECT id FROM documents
+         WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2)
+         ORDER BY id FOR NO KEY UPDATE",
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(sqlx::query_as!(
+        FileRow,
+        r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
+                  height, focal_x, focal_y, blurhash,
+                  sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
+                  issued_to, issued_key
+           FROM files WHERE tenant_id = $1 AND id = $2 FOR UPDATE"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .filter(|f| f.state == "live"))
+}
+
+/// Writes size `name` of file `id` as `entry` everywhere the file's described: its row,
+/// where `new_names` join the names it's served under, each document copy holding it,
+/// trashed ones too, and each version holding it (call 1). Matched by file ID, so a size
+/// made for a file a document has since replaced lands only where that file still is. A
+/// version another write has locked, which only a prune deleting it does, is left out
+/// rather than waited on. Call it under `lock_live_in`. Returns how many documents and
+/// versions hold it.
+pub async fn fill_size_in(
+    tx: &mut PgConnection,
+    id: Uuid,
+    name: &str,
+    entry: &Value,
+    new_names: &[String],
+) -> Result<u64, DbError> {
+    sqlx::query!(
+        r#"UPDATE files SET sizes = sizes || jsonb_build_object($3::text, $4::jsonb),
+               names = names || ARRAY(SELECT n FROM unnest($5::text[]) n WHERE n <> ALL(names))
+           WHERE tenant_id = $1 AND id = $2"#,
+        DEFAULT_TENANT,
+        id,
+        name,
+        entry,
+        new_names,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let docs = sqlx::query!(
+        r#"UPDATE documents SET
+               published = CASE WHEN published_file = $2 AND published ? 'sizes'
+                                THEN jsonb_set(published, '{sizes}',
+                                     CASE WHEN jsonb_typeof(published->'sizes') = 'object'
+                                          THEN published->'sizes' ELSE '{}' END
+                                     || jsonb_build_object($3::text, $4::jsonb))
+                                ELSE published END,
+               draft = CASE WHEN draft_file = $2 AND draft ? 'sizes'
+                            THEN jsonb_set(draft, '{sizes}',
+                                 CASE WHEN jsonb_typeof(draft->'sizes') = 'object'
+                                      THEN draft->'sizes' ELSE '{}' END
+                                 || jsonb_build_object($3::text, $4::jsonb))
+                            ELSE draft END
+           WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2)"#,
+        DEFAULT_TENANT,
+        id,
+        name,
+        entry,
+    )
+    .execute(&mut *tx)
+    .await?;
+    let versions = sqlx::query!(
+        r#"UPDATE versions SET data = jsonb_set(data, '{sizes}',
+               CASE WHEN jsonb_typeof(data->'sizes') = 'object' THEN data->'sizes' ELSE '{}' END
+               || jsonb_build_object($3::text, $4::jsonb))
+           WHERE id IN (SELECT id FROM versions
+                        WHERE tenant_id = $1 AND file_id = $2 AND data ? 'sizes'
+                        ORDER BY id FOR UPDATE SKIP LOCKED)"#,
+        DEFAULT_TENANT,
+        id,
+        name,
+        entry,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(docs.rows_affected() + versions.rows_affected())
+}
+
+/// Queues the deletion of `keys` on `storage`, objects no row may record; each is kept if
+/// a file serves it by the time the cleanup runs (`key_in_use_in`).
+pub async fn queue_key_cleanup(
+    conn: &mut PgConnection,
+    storage: &str,
+    keys: &[String],
+) -> Result<Uuid, DbError> {
+    jobs::enqueue(
+        conn,
+        &NewJob {
+            kind: CLEANUP,
+            document_id: None,
+            collection_id: None,
+            payload: json!({ "keys": keys, "storage": storage }),
+            run_at: OffsetDateTime::now_utc(),
+            dedupe_key: None,
+            created_by: None,
+            key_id: None,
+            max_attempts: Some(CLEANUP_ATTEMPTS),
+        },
+    )
+    .await
 }
 
 /// Live files of `collection_id` served under `name`, the original's or a size's. More than
@@ -601,22 +782,26 @@ pub async fn on_unknown_storage(pool: &PgPool, storages: &[String]) -> Result<i6
 
 /// Whether `key` on `storage` is still served: a file that isn't gone sits in the key's
 /// directory and lists its last part among its names, as a size remade under a name a
-/// cleanup was queued for does.
-pub async fn key_in_use(pool: &PgPool, storage: &str, key: &str) -> Result<bool, DbError> {
+/// cleanup was queued for does. The file is locked until the caller's transaction ends, so
+/// a size can't be stored under `key` between this answer and a delete it leads to.
+pub async fn key_in_use_in(
+    tx: &mut PgConnection,
+    storage: &str,
+    key: &str,
+) -> Result<bool, DbError> {
     let Some((dir, name)) = key.rsplit_once('/') else {
         return Ok(false);
     };
-    Ok(sqlx::query_scalar!(
-        r#"SELECT EXISTS (
-               SELECT 1 FROM files
-               WHERE tenant_id = $1 AND storage = $2 AND state <> 'gone'
-                 AND starts_with(key, $3 || '/') AND strpos(substr(key, length($3) + 2), '/') = 0
-                 AND $4 = ANY(names)) AS "used!""#,
+    let names = sqlx::query_scalar!(
+        r#"SELECT names FROM files
+           WHERE tenant_id = $1 AND storage = $2 AND state <> 'gone'
+             AND starts_with(key, $3 || '/') AND strpos(substr(key, length($3) + 2), '/') = 0
+           ORDER BY id FOR SHARE"#,
         DEFAULT_TENANT,
         storage,
         dir,
-        name,
     )
-    .fetch_one(pool)
-    .await?)
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(names.iter().any(|n| n.iter().any(|n| n == name)))
 }

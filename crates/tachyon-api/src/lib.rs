@@ -345,24 +345,45 @@ async fn add_security_headers(mut response: Response) -> Response {
     response
 }
 
-async fn time_limit(State(limits): State<TimeLimits>, req: Request, next: Next) -> Response {
+/// When the request's time is up: the handler's own waits stop short of it.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Deadline(pub(crate) tokio::time::Instant);
+
+async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Next) -> Response {
     let limit = match upload_time(&req) {
         Some(_) => limits.uploads,
         None => limits.normal,
     };
+    req.extensions_mut()
+        .insert(Deadline(tokio::time::Instant::now() + limit));
     tokio::time::timeout(limit, next.run(req))
         .await
         .unwrap_or_else(|_| ApiError::Timeout.into_response())
 }
 
 /// Inside `principal::resolve`: a signed-out caller's `?wait=true` keeps the normal limit,
-/// so a parameter alone can't hold a connection open for the upload limit.
-async fn anonymous_wait(State(limits): State<TimeLimits>, req: Request, next: Next) -> Response {
+/// so a parameter alone can't hold a connection open for the upload limit. With a file, the
+/// upload itself still gets the upload limit, but the wait for its sizes doesn't.
+async fn anonymous_wait(
+    State(limits): State<TimeLimits>,
+    mut req: Request,
+    next: Next,
+) -> Response {
     let signed_in = req
         .extensions()
         .get::<auth::principal::Principal>()
         .is_some_and(|p| p.identity().is_some());
-    if upload_time(&req) != Some(UploadTime::Wait) || signed_in {
+    let upload = upload_time(&req);
+    if signed_in || upload.is_none() || !params::wants_wait(req.uri().query()) {
+        return next.run(req).await;
+    }
+    let normal = tokio::time::Instant::now() + limits.normal;
+    let until = req
+        .extensions()
+        .get::<Deadline>()
+        .map_or(normal, |d| d.0.min(normal));
+    req.extensions_mut().insert(Deadline(until));
+    if upload != Some(UploadTime::Wait) {
         return next.run(req).await;
     }
     tokio::time::timeout(limits.normal, next.run(req))
@@ -533,6 +554,35 @@ mod tests {
                 .uri(uri)
                 .header("content-type", "application/json");
             assert_eq!(call_with(app.clone(), req).await.0, status, "{uri}");
+        }
+    }
+
+    #[tokio::test]
+    async fn a_signed_out_wait_ends_with_the_normal_limit() {
+        // Answers how long the handler has left, in ms.
+        let left = |req: Request<Body>| async move {
+            let d = req.extensions().get::<Deadline>().unwrap().0;
+            (d - tokio::time::Instant::now()).as_millis().to_string()
+        };
+        let limits = TimeLimits {
+            normal: Duration::from_millis(50),
+            uploads: Duration::from_secs(5),
+        };
+        let routes = Router::new()
+            .route("/api/{collection}", post(left))
+            .layer(axum::middleware::from_fn_with_state(limits, anonymous_wait));
+        let app = layers(routes, limits);
+        for (uri, most) in [("/api/images?wait=true", 50), ("/api/images", 5_000)] {
+            let req = Request::builder()
+                .method("POST")
+                .uri(uri)
+                .header("content-type", "multipart/form-data; boundary=x")
+                .body(Body::empty())
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            let body = res.into_body().collect().await.unwrap().to_bytes();
+            let ms: u128 = std::str::from_utf8(&body).unwrap().parse().unwrap();
+            assert!(ms <= most && ms + 1_000 > most, "{uri}: {ms} ms");
         }
     }
 

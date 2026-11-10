@@ -132,7 +132,7 @@ pub async fn restore(
     errors.check()?;
     let by = access.user_id();
     let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
-    let doc = documents::restore_in(&mut tx, &c, id, &copies, by)
+    let (doc, renamed) = documents::restore_in(&mut tx, &c, id, &copies, by)
         .await
         .map_err(|e| {
             let e = match e {
@@ -154,7 +154,12 @@ pub async fn restore(
             }
         }
     }
-    tx.commit().await.map_err(DbError::from)?;
+    // A renamed file's sizes move to their new names before the names are seen.
+    crate::media_jobs::move_sizes_in(&state, &mut tx, &renamed).await?;
+    if let Err(e) = tx.commit().await {
+        crate::media_jobs::forget_moved(&state, &renamed).await;
+        return Err(DbError::from(e).into());
+    }
     respond(&state, &access, c, &doc, read.copy, 1).await
 }
 

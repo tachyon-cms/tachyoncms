@@ -664,7 +664,7 @@ async fn a_restored_file_is_renumbered_on_a_clash(pool: PgPool) {
         (DocCopy::Draft, named(FileChange::Keep)),
         (DocCopy::Published, named(FileChange::Keep)),
     ];
-    let restored = documents::restore_in(&mut tx, &c, doc, &copies, None)
+    let (restored, _) = documents::restore_in(&mut tx, &c, doc, &copies, None)
         .await
         .unwrap();
     tx.commit().await.unwrap();
@@ -901,4 +901,55 @@ async fn failed_cleanups_outlive_the_job_purge(pool: PgPool) {
         "kept while their objects may be in storage"
     );
     assert!(!left.contains(&for_live) && !left.contains(&other) && !left.contains(&refused));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_being_written_holds_off_a_keys_cleanup(pool: PgPool) {
+    let c = seed(&pool).await;
+    let f = reserve(&pool, &c, "a.png", "", None).await;
+    let doc = draft_with(&pool, &c, f.id).await;
+    let key = format!("images/{}/a-4x3.png", f.id);
+    let mut writing = pool.begin().await.unwrap();
+    let locked = files::lock_live_in(&mut writing, f.id).await.unwrap();
+    assert_eq!(locked.map(|l| l.id), Some(f.id));
+    let checking = {
+        let (pool, key) = (pool.clone(), key.clone());
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.unwrap();
+            files::key_in_use_in(&mut tx, "default", &key)
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!checking.is_finished(), "the check waits on the size");
+    let entry = json!({"width": 4, "height": 3, "mimeType": "image/png", "filesize": 1,
+                       "filename": "a-4x3.png"});
+    let written = files::fill_size_in(&mut writing, f.id, "thumb", &entry, &["a-4x3.png".into()])
+        .await
+        .unwrap();
+    writing.commit().await.unwrap();
+    assert!(checking.await.unwrap(), "it sees the size written");
+    assert_eq!(written, 1, "the one document holding it");
+    let row = files::get(&pool, f.id).await.unwrap();
+    assert_eq!(row.names, ["a.png", "a-4x3.png"]);
+    assert_eq!(row.sizes["thumb"], entry);
+    // The same name again isn't listed twice.
+    let mut tx = pool.begin().await.unwrap();
+    files::lock_live_in(&mut tx, f.id).await.unwrap().unwrap();
+    files::fill_size_in(&mut tx, f.id, "thumb", &entry, &["a-4x3.png".into()])
+        .await
+        .unwrap();
+    tx.commit().await.unwrap();
+    assert_eq!(files::get(&pool, f.id).await.unwrap().names.len(), 2);
+    // Released, the file can't take a size.
+    set_draft_file(
+        &pool,
+        &c,
+        doc,
+        reserve(&pool, &c, "b.png", "", Some(doc)).await.id,
+    )
+    .await;
+    let mut tx = pool.begin().await.unwrap();
+    assert!(files::lock_live_in(&mut tx, f.id).await.unwrap().is_none());
 }

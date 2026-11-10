@@ -10,6 +10,7 @@ mod avif;
 mod gif;
 mod ico;
 mod jpeg;
+mod sizes;
 #[cfg(test)]
 mod walker_fuzz;
 
@@ -29,6 +30,8 @@ use img_parts::{Bytes, ImageEXIF, ImageICC};
 use tachyon_core::uploads::{
     EncodeOptions, FailOn, Fit, ImageFormat, Position, TrimOptions, Upload,
 };
+
+pub use sizes::{SizeOut, make_size, size_format};
 
 /// The most a header read may allocate: ICC profiles and text chunks, never pixels.
 const HEADER_ALLOC: u64 = 16 * 1024 * 1024;
@@ -413,6 +416,7 @@ fn webp_info(bytes: &[u8]) -> WebpInfo {
 }
 
 /// A frame as it's shown, and for how long.
+#[derive(Clone)]
 struct Shown {
     image: DynamicImage,
     delay_ms: u32,
@@ -1186,6 +1190,31 @@ pub fn resize(
     without_enlargement: bool,
     limit: u64,
 ) -> Result<DynamicImage, ImageError> {
+    resize_around(
+        img,
+        width,
+        height,
+        fit,
+        position,
+        None,
+        without_enlargement,
+        limit,
+    )
+}
+
+/// `resize`, a cover crop centred as near `focal` (0 to 1 across and down) as the picture
+/// allows when given, instead of kept at `position`.
+#[allow(clippy::too_many_arguments)]
+fn resize_around(
+    img: &DynamicImage,
+    width: Option<u32>,
+    height: Option<u32>,
+    fit: Fit,
+    position: Position,
+    focal: Option<(f64, f64)>,
+    without_enlargement: bool,
+    limit: u64,
+) -> Result<DynamicImage, ImageError> {
     let (iw, ih) = (f64::from(img.width()), f64::from(img.height()));
     let (w, h) = match (width, height) {
         (None, None) => return Ok(img.clone()),
@@ -1220,7 +1249,14 @@ pub fn resize(
     match fit {
         Fit::Cover => {
             let (cw, ch) = (iw.min(ih * w / h), ih.min(iw * h / w));
-            let crop = ((iw - cw) * ax, (ih - ch) * ay, cw, ch);
+            let (left, top) = match focal {
+                Some((fx, fy)) => (
+                    (fx * iw - cw / 2.0).clamp(0.0, iw - cw),
+                    (fy * ih - ch / 2.0).clamp(0.0, ih - ch),
+                ),
+                None => ((iw - cw) * ax, (ih - ch) * ay),
+            };
+            let crop = (left, top, cw, ch);
             let (ow, oh) = fits(round(w), round(h))?;
             scale(img, ow, oh, Some(crop))
         }

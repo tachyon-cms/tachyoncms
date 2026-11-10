@@ -687,14 +687,15 @@ pub fn copy_errors(c: &Collection, copy: DocCopy, errors: Vec<FieldError>) -> Ve
 /// `UniqueViolation`. A file whose name another live document took meanwhile is renumbered
 /// as `files::reserve` numbers, its `filename` changing with it. The caller has locked it
 /// (`query::lock_trash_in`) and passes every copy it has. Returns the copy a write to `c`
-/// changes: the draft, with drafts.
+/// changes (the draft, with drafts), and the files renamed, whose sizes' objects the
+/// caller moves before it commits.
 pub async fn restore_in(
     tx: &mut PgConnection,
     c: &Collection,
     id: Uuid,
     prepared: &[(DocCopy, Prepared)],
     by: Option<Uuid>,
-) -> Result<Document, DbError> {
+) -> Result<(Document, Vec<crate::files::Renamed>), DbError> {
     // Lock order: the document (by the caller), then every link target in id order, and
     // only then are its link rows replaced. A purge locks its targets FOR UPDATE, then
     // deletes the rows linking them; taking the targets before touching those rows means a
@@ -753,7 +754,8 @@ pub async fn restore_in(
     if !errors.is_empty() {
         return Err(DbError::Validation(errors));
     }
-    if crate::files::renumber_in(tx, id).await? {
+    let renamed = crate::files::renumber_in(tx, id).await?;
+    if !renamed.is_empty() {
         let data = sqlx::query_scalar!(
             r#"SELECT CASE WHEN $2 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>"
                FROM documents WHERE id = $1"#,
@@ -762,9 +764,9 @@ pub async fn restore_in(
         )
         .fetch_one(&mut *tx)
         .await?;
-        return Ok(Document { data, ..doc });
+        return Ok((Document { data, ..doc }, renamed));
     }
-    Ok(doc)
+    Ok((doc, renamed))
 }
 
 /// Deletes the trashed documents of `collection_id` among `ids` for good inside `tx`,

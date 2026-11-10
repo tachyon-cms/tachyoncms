@@ -4228,7 +4228,8 @@ mod tests {
         let u = s.uploads().unwrap();
         assert_eq!(u.storage, "s3");
         assert_eq!(u.image_sizes[0].fit, Fit::Inside);
-        assert_eq!(u.image_sizes[0].position, Crop::Centre);
+        assert_eq!(u.image_sizes[0].position, Some(Crop::Centre));
+        assert_eq!(u.image_sizes[1].position, None);
         assert_eq!(u.image_sizes[0].crop, Some(Crop::LeftTop));
         assert_eq!(u.image_sizes[1].fit, Fit::Cover);
         assert_eq!(u.format_options.as_ref().unwrap().format, ImageFormat::Jpeg);

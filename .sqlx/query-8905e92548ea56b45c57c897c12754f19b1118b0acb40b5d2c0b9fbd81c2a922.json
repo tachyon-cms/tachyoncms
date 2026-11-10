@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE files SET sizes = sizes || jsonb_build_object($3::text, $4::jsonb),\n               names = names || ARRAY(SELECT n FROM unnest($5::text[]) n WHERE n <> ALL(names))\n           WHERE tenant_id = $1 AND id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8905e92548ea56b45c57c897c12754f19b1118b0acb40b5d2c0b9fbd81c2a922"
+}

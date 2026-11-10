@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE versions SET data = jsonb_set(data, '{filename}', to_jsonb($3::text))\n                   || CASE WHEN jsonb_typeof(data->'sizes') = 'object'\n                           THEN jsonb_build_object('sizes', data->'sizes' || $4::jsonb)\n                           ELSE '{}' END\n               WHERE tenant_id = $1 AND file_id = $2 AND data ? 'filename'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "aebb6b91d042041c2f00c2069dd5c5d088452e32d26309ec7dd5408e8cb33025"
+}

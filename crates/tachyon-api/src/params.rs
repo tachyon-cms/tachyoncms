@@ -178,6 +178,13 @@ pub(crate) fn file_params(
         .transpose()
 }
 
+/// `?wait=true` on a create, the only parameter it takes: answer once the file's sizes
+/// are made, or the request's time is nearly up.
+pub(crate) fn create_params(raw: Option<&str>) -> Result<bool, ApiError> {
+    let params = params(raw, &["wait"])?;
+    flag(&params, "wait").map_err(|_| bad("`wait` must be true or false"))
+}
+
 /// Refuses any query parameter, for a write that takes none.
 pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())
@@ -212,10 +219,19 @@ pub(crate) fn diff_params(raw: Option<&str>) -> Result<(String, String), ApiErro
 
 /// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
 /// that turns autosave on.
+/// An update's `?autosave` and `?wait` (see `create_params`).
+pub(crate) fn update_params(raw: Option<&str>, c: &Collection) -> Result<(bool, bool), ApiError> {
+    let params = params(raw, &["autosave", "wait"])?;
+    let wait = flag(&params, "wait").map_err(|_| bad("`wait` must be true or false"))?;
+    Ok((autosave(&params, c)?, wait))
+}
+
 pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {
-    let params = params(raw, &["autosave"])?;
-    let autosave =
-        flag(&params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
+    autosave(&params(raw, &["autosave"])?, c)
+}
+
+fn autosave(params: &Map<String, Value>, c: &Collection) -> Result<bool, ApiError> {
+    let autosave = flag(params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
     let on = c
         .schema
         .versions

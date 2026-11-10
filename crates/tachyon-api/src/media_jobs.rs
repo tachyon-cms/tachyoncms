@@ -1,19 +1,360 @@
-//! Jobs that look after stored files: deleting the ones nothing holds, and an hourly sweep
-//! that tries the deletes storage refused for longer than their retries.
+//! Jobs that look after stored files: making an image's sizes, deleting the files nothing
+//! holds, and an hourly sweep that tries the deletes storage refused for longer than their
+//! retries.
 
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use serde_json::{Value, json};
-use sqlx::PgPool;
+use futures_util::StreamExt;
+use serde_json::{Map, Value, json};
+use sqlx::{PgConnection, PgPool, Postgres, Transaction};
+use tachyon_core::uploads::{ImageFormat, ImageSize, rename_sizes};
 use tachyon_db::DbError;
-use tachyon_db::files;
+use tachyon_db::collections::Collection;
+use tachyon_db::files::{self, Renamed};
 use tachyon_db::jobs::{self, Job, NewJob};
+use tachyon_media::image::{self as picture, ImageError, SizeOut};
 use tachyon_media::storage::Storage;
+use tempfile::NamedTempFile;
 use time::OffsetDateTime;
+use tokio::io::AsyncWriteExt;
 use uuid::Uuid;
 
-use crate::AppState;
-use crate::jobs::JobError;
+use crate::jobs::{JobError, LEASE, Leased, keep_leased};
+use crate::uploads::Decoding;
+use crate::{ApiError, AppState};
+
+/// Makes a file's `imageSizes`. Its payload is `{"file": id}`, its dedupe key
+/// `image_sizes:<file id>`.
+pub(crate) const IMAGE_SIZES: &str = "image_sizes";
+
+/// Queues the sizes of file `file`, which a document of `c` is taking in `tx`. The job's
+/// ID, or `None` when there's nothing to make: `c` has no `imageSizes`, or the file isn't
+/// an image they can be made from (an SVG, say).
+pub(crate) async fn queue_sizes(
+    tx: &mut PgConnection,
+    c: &Collection,
+    file: Uuid,
+) -> Result<Option<Uuid>, DbError> {
+    if c.schema
+        .upload
+        .as_ref()
+        .is_none_or(|u| u.image_sizes.is_empty())
+    {
+        return Ok(None);
+    }
+    let f = files::get(&mut *tx, file).await?;
+    if picture::size_format(&f.mime_type).is_none() {
+        return Ok(None);
+    }
+    let job = NewJob {
+        kind: IMAGE_SIZES,
+        document_id: None,
+        collection_id: Some(c.id),
+        payload: json!({ "file": file }),
+        run_at: OffsetDateTime::now_utc(),
+        dedupe_key: Some(format!("{IMAGE_SIZES}:{file}")),
+        created_by: None,
+        key_id: None,
+        max_attempts: None,
+    };
+    jobs::enqueue(tx, &job).await.map(Some)
+}
+
+fn released() -> JobError {
+    JobError::Permanent("file released".into())
+}
+
+/// The key of `name` in the directory of `key`, where a file's sizes sit.
+fn beside(key: &str, name: &str) -> String {
+    match key.rsplit_once('/') {
+        Some((dir, _)) => format!("{dir}/{name}"),
+        None => name.to_owned(),
+    }
+}
+
+/// Makes each of the file's sizes its row doesn't have yet, from its stored original, one
+/// at a time: each is stored and written everywhere the file is described (`fill_size_in`)
+/// in a transaction of its own, the last one completing the job. A run that lost its lease
+/// stops before its next size. A file deleted or released meanwhile fails it for good.
+pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobError> {
+    let id = file_of(job)?;
+    let file = match files::get(&state.pool, id).await {
+        Ok(f) if f.state == "live" => f,
+        Ok(_) | Err(DbError::NotFound) => return Err(released()),
+        Err(e) => return Err(retry(e)),
+    };
+    let leased = keep_leased(state, job, LEASE).await?;
+    // Already taken over: the run that took it is the one that counts.
+    if leased.lost() {
+        return Ok(());
+    }
+    let upload = state
+        .schemas
+        .get_by_id(file.collection_id)
+        .and_then(|c| c.schema.upload.clone());
+    let format = picture::size_format(&file.mime_type);
+    let (Some(u), Some(format)) = (upload, format) else {
+        drop(leased);
+        return complete(state, job, None).await;
+    };
+    // Those an earlier run made are kept.
+    let todo: Vec<&ImageSize> = u
+        .image_sizes
+        .iter()
+        .filter(|s| file.sizes.get(&s.name).is_none_or(Value::is_null))
+        .collect();
+    if todo.is_empty() {
+        drop(leased);
+        return complete(state, job, None).await;
+    }
+    let storage = storage(state, &file.storage)?;
+    let original = fetch(storage, &file.key, &state.media.temp_dir).await?;
+    let cap = picture::cap(&u, state.media.max_pixels);
+    let focal = u.focal_point.then_some((file.focal_x, file.focal_y));
+    let mut leased = Some(leased);
+    for (i, size) in todo.iter().enumerate() {
+        if leased.as_ref().is_some_and(Leased::lost) {
+            return Ok(());
+        }
+        let made = make(
+            state,
+            original.path(),
+            &file.filename,
+            size,
+            focal,
+            format,
+            cap,
+        )
+        .await?;
+        let last = i + 1 == todo.len();
+        let tx = state.pool.begin().await.map_err(retry)?;
+        let lease = if last { leased.take() } else { None };
+        if !store_size(
+            state,
+            storage,
+            tx,
+            job,
+            id,
+            &size.name,
+            made.as_ref(),
+            lease,
+            last,
+        )
+        .await?
+        {
+            return Ok(());
+        }
+    }
+    Ok(())
+}
+
+fn file_of(job: &Job) -> Result<Uuid, JobError> {
+    job.payload
+        .get("file")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse().ok())
+        .ok_or_else(|| JobError::Permanent("the payload names no file".into()))
+}
+
+/// The object at `key`, copied into a new file in `dir` that's deleted when it drops.
+async fn fetch(storage: &Storage, key: &str, dir: &Path) -> Result<NamedTempFile, JobError> {
+    let got = storage.get_range(key, None).await.map_err(retry)?;
+    let file = NamedTempFile::new_in(dir).map_err(retry)?;
+    let mut out = tokio::fs::File::from_std(file.reopen().map_err(retry)?);
+    let mut chunks = got.into_stream();
+    while let Some(chunk) = chunks.next().await {
+        out.write_all(&chunk.map_err(retry)?).await.map_err(retry)?;
+    }
+    out.flush().await.map_err(retry)?;
+    Ok(file)
+}
+
+/// `size` made from `original` on a blocking thread, holding a `DECODES` permit. What it
+/// makes is deleted when the result drops, there too should this be dropped meanwhile.
+async fn make(
+    state: &AppState,
+    original: &Path,
+    filename: &str,
+    size: &ImageSize,
+    focal: Option<(f32, f32)>,
+    format: ImageFormat,
+    cap: u64,
+) -> Result<Option<SizeOut>, JobError> {
+    let permit = Decoding::permit().await;
+    let (original, filename, size): (PathBuf, String, ImageSize) =
+        (original.to_owned(), filename.to_owned(), size.clone());
+    let out_dir = state.media.temp_dir.clone();
+    tokio::task::spawn_blocking(move || {
+        let _decoding = Decoding::running(permit);
+        picture::make_size(&original, &filename, &size, focal, format, cap, &out_dir)
+    })
+    .await
+    .map_err(|e| JobError::Retry(format!("making a size failed: {e}")))?
+    .map_err(|e| match e {
+        ImageError::Internal(e) => JobError::Retry(e),
+        e => JobError::Permanent(e.to_string()),
+    })
+}
+
+/// Stores size `name` of file `id` as `made` (`None`: skipped) and writes it in, in `tx`
+/// with the file locked, completing `job` when it's the `last` (`lease` is dropped first).
+/// False when the run lost the job, its work undone. Objects stored by a write that didn't
+/// commit are queued for cleanup, which keeps any a later run has stored since.
+#[allow(clippy::too_many_arguments)]
+async fn store_size(
+    state: &AppState,
+    storage: &Storage,
+    mut tx: Transaction<'static, Postgres>,
+    job: &Job,
+    id: Uuid,
+    name: &str,
+    made: Option<&SizeOut>,
+    lease: Option<Leased>,
+    last: bool,
+) -> Result<bool, JobError> {
+    let Some(file) = files::lock_live_in(&mut tx, id).await.map_err(retry)? else {
+        return Err(released());
+    };
+    let (entry, objects) = match made {
+        // The reference's shape for a size it skips.
+        None => (
+            json!({"width": null, "height": null, "mimeType": null, "filesize": null,
+                   "filename": null}),
+            Vec::new(),
+        ),
+        Some(m) => named(m, name, &file.filename),
+    };
+    let mut stored = Vec::new();
+    let wrote = async {
+        for (key, path, mime) in &objects {
+            let key = beside(&file.key, key);
+            stored.push(key.clone());
+            storage.put_file(&key, path, mime).await.map_err(retry)?;
+        }
+        let names: Vec<String> = objects.iter().map(|(n, _, _)| n.clone()).collect();
+        files::fill_size_in(&mut tx, id, name, &entry, &names)
+            .await
+            .map_err(retry)?;
+        if last {
+            drop(lease);
+            if !jobs::complete_in(&mut tx, job).await.map_err(retry)? {
+                return Ok(false);
+            }
+        }
+        tx.commit().await.map_err(retry)?;
+        Ok(true)
+    }
+    .await;
+    if !matches!(wrote, Ok(true)) && !stored.is_empty() {
+        let queued = async {
+            let mut conn = state.pool.acquire().await?;
+            files::queue_key_cleanup(&mut conn, storage.name(), &stored).await
+        };
+        if let Err(error) = queued.await {
+            tracing::error!(%error, file = %id, keys = ?stored, "couldn't queue the cleanup of a size that wasn't written; its objects are left");
+        }
+    }
+    wrote
+}
+
+/// `made`'s entry for size `name`, its copies under `formats`, named after `filename`, the
+/// name the file has now, and the objects to store: (name, path, type).
+fn named(made: &SizeOut, name: &str, filename: &str) -> (Value, Vec<(String, PathBuf, String)>) {
+    let mut entry = made.entry.clone();
+    if !made.formats.is_empty() {
+        let formats: Map<String, Value> = made
+            .formats
+            .iter()
+            .map(|(k, f)| ((*k).to_owned(), Value::Object(f.clone())))
+            .collect();
+        entry.insert("formats".into(), formats.into());
+    }
+    // A restore may have renamed the file since the size was made.
+    let mut one = Map::from_iter([(name.to_owned(), Value::Object(entry))]);
+    let moved = rename_sizes(&mut one, filename);
+    let entry = one.remove(name).unwrap_or_default();
+    let mime_of = |n: &str| {
+        let of = |e: &Value| {
+            (e.get("filename")?.as_str()? == n)
+                .then(|| e.get("mimeType")?.as_str().map(str::to_owned))
+                .flatten()
+        };
+        of(&entry)
+            .or_else(|| entry.get("formats")?.as_object()?.values().find_map(of))
+            .unwrap_or_else(|| "application/octet-stream".into())
+    };
+    let objects = made
+        .files
+        .iter()
+        .map(|(n, path)| {
+            let n = moved
+                .iter()
+                .find(|(old, _)| old == n)
+                .map_or_else(|| n.clone(), |(_, new)| new.clone());
+            let mime = mime_of(&n);
+            (n, path.clone(), mime)
+        })
+        .collect();
+    (entry, objects)
+}
+
+/// After the restore that moved `renamed`'s sizes failed to commit: their new copies are
+/// queued for cleanup (each is kept should a file serve it after all).
+pub(crate) async fn forget_moved(state: &AppState, renamed: &[Renamed]) {
+    for r in renamed.iter().filter(|r| !r.sizes.is_empty()) {
+        let keys: Vec<String> = r.sizes.iter().map(|(_, new)| beside(&r.key, new)).collect();
+        let queued = async {
+            let mut conn = state.pool.acquire().await?;
+            files::queue_key_cleanup(&mut conn, &r.storage, &keys).await
+        };
+        if let Err(error) = queued.await {
+            tracing::error!(%error, ?keys, "couldn't queue the cleanup of sizes copied for a restore that failed");
+        }
+    }
+}
+
+/// Moves the sizes of each file `renamed` lists to their new names, copying them in `tx`'s
+/// life, before it commits: the old objects are queued for cleanup in `tx`, and copies a
+/// failure leaves are queued for cleanup outside it.
+pub(crate) async fn move_sizes_in(
+    state: &AppState,
+    tx: &mut PgConnection,
+    renamed: &[Renamed],
+) -> Result<(), ApiError> {
+    for r in renamed.iter().filter(|r| !r.sizes.is_empty()) {
+        let storage = state.media.storages.get(&r.storage).ok_or_else(|| {
+            ApiError::Internal(format!("no storage named `{}` is configured", r.storage))
+        })?;
+        let mut copied = Vec::new();
+        let mut old = Vec::new();
+        for (from, to) in &r.sizes {
+            let (from, to) = (beside(&r.key, from), beside(&r.key, to));
+            if let Err(e) = storage.copy(&from, &to).await {
+                // A size whose object was never stored has nothing to move.
+                if e.is_not_found() {
+                    continue;
+                }
+                let queued = async {
+                    let mut conn = state.pool.acquire().await?;
+                    files::queue_key_cleanup(&mut conn, &r.storage, &copied).await
+                };
+                if !copied.is_empty()
+                    && let Err(error) = queued.await
+                {
+                    tracing::error!(%error, keys = ?copied, "couldn't queue the cleanup of sizes copied for a restore that failed");
+                }
+                return Err(ApiError::Internal(format!("can't move a size: {e}")));
+            }
+            copied.push(to);
+            old.push(from);
+        }
+        if !old.is_empty() {
+            files::queue_key_cleanup(tx, &r.storage, &old).await?;
+        }
+    }
+    Ok(())
+}
 
 /// Re-queues cleanups that ran out of attempts; runs hourly.
 pub(crate) const CLEANUP_SWEEP: &str = "file_cleanup_sweep";
@@ -78,24 +419,21 @@ pub(crate) async fn run_cleanup(state: &AppState, job: &Job) -> Result<(), JobEr
             .ok_or_else(|| JobError::Permanent("the payload names no storage".into()))?;
         let storage = storage(state, name)?;
         for key in &keys {
-            // shortcut: checked, then deleted, so a size remade under this name in between is
-            // lost; make the remake lock the file row before it writes if that ever matters.
-            if files::key_in_use(&state.pool, name, key)
+            // The file is locked from the check until the delete is done, and a size is
+            // only stored under that lock, so one can't be stored here in between.
+            let mut tx = state.pool.begin().await.map_err(retry)?;
+            if files::key_in_use_in(&mut tx, name, key)
                 .await
                 .map_err(retry)?
             {
                 continue;
             }
             storage.delete(key).await.map_err(retry)?;
+            tx.commit().await.map_err(retry)?;
         }
         return complete(state, job, None).await;
     }
-    let id: Uuid = job
-        .payload
-        .get("file")
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse().ok())
-        .ok_or_else(|| JobError::Permanent("the payload names no file".into()))?;
+    let id = file_of(job)?;
     let file = match files::get(&state.pool, id).await {
         Ok(file) => file,
         // Already cleaned up, by an earlier run whose completion was lost.

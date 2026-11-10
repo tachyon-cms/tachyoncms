@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT names FROM files\n           WHERE tenant_id = $1 AND storage = $2 AND state <> 'gone'\n             AND starts_with(key, $3 || '/') AND strpos(substr(key, length($3) + 2), '/') = 0\n           ORDER BY id FOR SHARE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "names"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bcf9ad6310b6a6d60e1b5e70107b9187caeb2bd32d1c4962bdf2ac3b1e87e921"
+}

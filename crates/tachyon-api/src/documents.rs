@@ -18,13 +18,17 @@ use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Document, FileChange};
 use tachyon_db::indexes::{IndexKind, index_name};
+use tachyon_db::jobs;
 use tachyon_db::query::{self, ListQuery, Readable, get_many_readable};
 use tachyon_db::versions::record_version;
 use uuid::Uuid;
 
 use crate::access::{Access, both};
 use crate::joins::fill_joins;
-use crate::params::{Format, Joins, autosave_param, list_params, no_params, read_params};
+use crate::media_jobs::queue_sizes;
+use crate::params::{
+    Format, Joins, create_params, list_params, no_params, read_params, update_params,
+};
 use crate::populate::{
     Shapes, check_links, fill_virtuals, from_markdown, link_ids, link_targets, populate, prepare,
     to_value, vouched_links,
@@ -255,7 +259,8 @@ pub async fn create(
     if !access.may_create(&c) {
         return Err(access.refuse());
     }
-    no_params(raw.as_deref())?;
+    let wait = create_params(raw.as_deref())?;
+    let deadline = deadline(&req);
     let copy = access.write_copy(&c)?;
     // Read only now, so a caller who may not create never gets a byte spooled.
     let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
@@ -298,21 +303,62 @@ pub async fn create(
         prepared.file = FileChange::Set(s.file.id);
     }
     let by = access.actor(Action::Create, &c).map(|a| a.id);
-    let doc = taken_or_abandoned(&state, stored.as_ref(), async {
+    let (doc, sizes) = taken_or_abandoned(&state, stored.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
             .await
             .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
         record(&mut tx, &c, &doc, copy, by, false).await?;
-        // Where the file's sizes will be queued: in the transaction that takes it.
+        let sizes = match &stored {
+            Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+            None => None,
+        };
         tx.commit().await.map_err(DbError::from)?;
-        Ok(doc)
+        Ok((doc, sizes))
     })
     .await?;
+    let doc = waited(&state, &c, doc, copy, sizes.filter(|_| wait), deadline).await;
     Ok((
         StatusCode::CREATED,
         respond(&state, &access, c, &doc, copy, 1).await?,
     ))
+}
+
+/// When the request's time is up, if a time limit is set on it.
+fn deadline(req: &Request) -> Option<tokio::time::Instant> {
+    req.extensions().get::<crate::Deadline>().map(|d| d.0)
+}
+
+/// `doc` read again once its file's sizes job `sizes` has finished, or once `deadline` is
+/// a second away, whichever comes first (call 5); `doc` itself with no job to wait for.
+/// Polled, so it works whichever server runs the job.
+async fn waited(
+    state: &AppState,
+    c: &Collection,
+    doc: Document,
+    copy: DocCopy,
+    sizes: Option<Uuid>,
+    deadline: Option<tokio::time::Instant>,
+) -> Document {
+    const EVERY: std::time::Duration = std::time::Duration::from_millis(200);
+    let Some(job) = sizes else { return doc };
+    let until = deadline.map(|d| d - std::time::Duration::from_secs(1));
+    loop {
+        match jobs::status(&state.pool, job).await {
+            Ok(Some(s)) if !matches!(s.state.as_str(), "queued" | "running") => break,
+            Ok(Some(_)) => {}
+            // Gone, or unreadable: there's nothing more to wait for.
+            Ok(None) | Err(_) => break,
+        }
+        let next = tokio::time::Instant::now() + EVERY;
+        if until.is_some_and(|u| next > u) {
+            break;
+        }
+        tokio::time::sleep(EVERY).await;
+    }
+    documents::get(&state.pool, c.id, doc.id, copy)
+        .await
+        .unwrap_or(doc)
 }
 
 pub async fn get(
@@ -372,7 +418,8 @@ pub async fn update(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     access.may_write(Action::Update, &c)?;
-    let autosave = autosave_param(raw.as_deref(), &c)?;
+    let (autosave, wait) = update_params(raw.as_deref(), &c)?;
+    let deadline = deadline(&req);
     let copy = access.write_copy(&c)?;
     let guard = access
         .write_guard(&state.pool, Action::Update, &c, id)
@@ -457,7 +504,7 @@ pub async fn update(
         }
         None => None,
     };
-    let doc = taken_or_abandoned(&state, saved.as_ref(), async {
+    let (doc, sizes) = taken_or_abandoned(&state, saved.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         let doc = documents::update_in(
             &mut tx,
@@ -479,11 +526,15 @@ pub async fn update(
         .await
         .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
         record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
-        // Where the file's sizes will be queued: in the transaction that takes it.
+        let sizes = match &saved {
+            Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+            None => None,
+        };
         tx.commit().await.map_err(DbError::from)?;
-        Ok(doc)
+        Ok((doc, sizes))
     })
     .await?;
+    let doc = waited(&state, &c, doc, copy, sizes.filter(|_| wait), deadline).await;
     respond(&state, &access, c, &doc, copy, 1).await
 }
 

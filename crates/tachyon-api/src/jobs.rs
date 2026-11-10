@@ -208,6 +208,7 @@ async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
         }
         tachyon_db::files::CLEANUP => crate::media_jobs::run_cleanup(state, job).await,
         crate::media_jobs::CLEANUP_SWEEP => crate::media_jobs::run_cleanup_sweep(state, job).await,
+        crate::media_jobs::IMAGE_SIZES => crate::media_jobs::run_sizes(state, job).await,
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]

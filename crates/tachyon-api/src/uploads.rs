@@ -344,15 +344,15 @@ pub fn decodes_peak() -> usize {
 
 /// A `DECODES` permit, counted while the blocking work holding it runs. It's moved into
 /// that work, so a request dropped meanwhile can't give it back early.
-struct Decoding(#[allow(dead_code)] SemaphorePermit<'static>);
+pub(crate) struct Decoding(#[allow(dead_code)] SemaphorePermit<'static>);
 
 impl Decoding {
-    async fn permit() -> SemaphorePermit<'static> {
+    pub(crate) async fn permit() -> SemaphorePermit<'static> {
         DECODES.acquire().await.expect("DECODES is never closed")
     }
 
     /// Called first thing in the blocking work.
-    fn running(permit: SemaphorePermit<'static>) -> Self {
+    pub(crate) fn running(permit: SemaphorePermit<'static>) -> Self {
         let now = BUSY.fetch_add(1, Ordering::Relaxed) + 1;
         PEAK.fetch_max(now, Ordering::Relaxed);
         Self(permit)

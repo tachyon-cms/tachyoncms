@@ -89,8 +89,9 @@ pub struct ImageSize {
     pub height: Option<u32>,
     #[serde(default)]
     pub fit: Fit,
-    #[serde(default)]
-    pub position: Position,
+    /// Unset, a cover crop keeps the focal point (with `focalPoint`), else the centre.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub position: Option<Position>,
     #[serde(default)]
     pub without_enlargement: Option<bool>,
     #[serde(default)]
@@ -645,6 +646,43 @@ pub fn size_filename(filename: &str, width: u32, height: u32, ext: &str) -> Stri
     compose(stem, &format!("-{width}x{height}"), ext)
 }
 
+/// `sizes` (a file's `sizes`, each entry with its `formats`) named after `filename`, as a
+/// file renamed to it has them, and each name changed as (old, new).
+pub fn rename_sizes(
+    sizes: &mut serde_json::Map<String, Value>,
+    filename: &str,
+) -> Vec<(String, String)> {
+    fn rename(entry: &mut Value, filename: &str, changed: &mut Vec<(String, String)>) {
+        let dimension = |k: &str| {
+            entry
+                .get(k)
+                .and_then(Value::as_u64)
+                .and_then(|v| u32::try_from(v).ok())
+        };
+        let (Some(w), Some(h)) = (dimension("width"), dimension("height")) else {
+            return;
+        };
+        let Some(old) = entry.get("filename").and_then(Value::as_str) else {
+            return;
+        };
+        let new = size_filename(filename, w, h, split(old).1);
+        if new != old {
+            changed.push((old.to_owned(), new.clone()));
+            entry["filename"] = new.into();
+        }
+    }
+    let mut changed = Vec::new();
+    for entry in sizes.values_mut() {
+        rename(entry, filename, &mut changed);
+        if let Some(Value::Object(formats)) = entry.get_mut("formats") {
+            for f in formats.values_mut() {
+                rename(f, filename, &mut changed);
+            }
+        }
+    }
+    changed
+}
+
 /// `mime` without parameters, lowercased.
 fn essence(mime: &str) -> String {
     mime.split(';')
@@ -1023,6 +1061,32 @@ pub(crate) fn check_raw(upload: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn renamed_files_rename_their_sizes() {
+        let mut sizes = json!({
+            "thumb": {"width": 40, "height": 30, "filename": "a-40x30.png",
+                      "formats": {"avif": {"width": 40, "height": 30, "filename": "a-40x30.avif"},
+                                  "webp": null}},
+            "big": {"width": null, "height": null, "filename": null},
+            "pending": null
+        });
+        let changed = rename_sizes(sizes.as_object_mut().unwrap(), "a-1.png");
+        assert_eq!(
+            changed,
+            [
+                ("a-40x30.png".to_owned(), "a-1-40x30.png".to_owned()),
+                ("a-40x30.avif".to_owned(), "a-1-40x30.avif".to_owned()),
+            ]
+        );
+        assert_eq!(sizes["thumb"]["filename"], "a-1-40x30.png");
+        assert_eq!(
+            sizes["thumb"]["formats"]["avif"]["filename"],
+            "a-1-40x30.avif"
+        );
+        assert_eq!(sizes["big"]["filename"], Value::Null);
+        assert_eq!(sizes["pending"], Value::Null);
+    }
 
     #[test]
     fn filenames_are_made_safe() {
