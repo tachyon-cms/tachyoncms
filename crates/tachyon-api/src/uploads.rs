@@ -121,7 +121,28 @@ impl UploadBody {
     /// `file_limit` (no `file` part at all when `None`), and at most one `_payload` part of
     /// JSON; any other part is a 400 naming it. A body cut off midway is a 400, and leaves no
     /// spool file behind.
+    /// A URL in the body lengthens the request's time limit to the upload one.
     pub(crate) async fn read(
+        req: Request,
+        file_limit: Option<u64>,
+        temp_dir: &Path,
+    ) -> Result<Self, ApiError> {
+        let limit = req.extensions().get::<crate::Limit>().cloned();
+        let body = Self::read_body(req, file_limit, temp_dir).await?;
+        if let (
+            Self::Upload {
+                file: Incoming::Url(_),
+                ..
+            },
+            Some(limit),
+        ) = (&body, limit)
+        {
+            limit.lengthen();
+        }
+        Ok(body)
+    }
+
+    async fn read_body(
         req: Request,
         file_limit: Option<u64>,
         temp_dir: &Path,

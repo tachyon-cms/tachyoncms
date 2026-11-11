@@ -354,15 +354,63 @@ async fn add_security_headers(mut response: Response) -> Response {
 pub(crate) struct Deadline(pub(crate) tokio::time::Instant);
 
 async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Next) -> Response {
+    let now = tokio::time::Instant::now();
     let limit = match upload_time(&req) {
         Some(_) => limits.uploads,
         None => limits.normal,
     };
-    req.extensions_mut()
-        .insert(Deadline(tokio::time::Instant::now() + limit));
-    tokio::time::timeout(limit, next.run(req))
-        .await
-        .unwrap_or_else(|_| ApiError::Timeout.into_response())
+    let until = Limit::new(now + limit, now + limits.uploads);
+    req.extensions_mut().insert(Deadline(now + limit));
+    req.extensions_mut().insert(until.clone());
+    let run = next.run(req);
+    tokio::pin!(run);
+    loop {
+        let at = until.at();
+        tokio::select! {
+            res = &mut run => return res,
+            () = tokio::time::sleep_until(at) => {
+                if until.at() <= at {
+                    return ApiError::Timeout.into_response();
+                }
+            }
+            () = until.0.moved.notified() => {}
+        }
+    }
+}
+
+/// When `time_limit` ends a request. A body found to carry a file only once it's read, a
+/// URL in JSON, lengthens it to the upload limit, as a file part has it from the start.
+#[derive(Clone)]
+pub(crate) struct Limit(Arc<LimitAt>);
+
+struct LimitAt {
+    at: std::sync::Mutex<tokio::time::Instant>,
+    uploads: tokio::time::Instant,
+    moved: tokio::sync::Notify,
+}
+
+impl Limit {
+    fn new(at: tokio::time::Instant, uploads: tokio::time::Instant) -> Self {
+        Self(Arc::new(LimitAt {
+            at: std::sync::Mutex::new(at),
+            uploads,
+            moved: tokio::sync::Notify::new(),
+        }))
+    }
+
+    fn at(&self) -> tokio::time::Instant {
+        *self.0.at.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    fn set(&self, at: tokio::time::Instant) {
+        *self.0.at.lock().unwrap_or_else(|e| e.into_inner()) = at;
+        self.0.moved.notify_one();
+    }
+
+    /// To the upload limit, counted from when the request came in.
+    pub(crate) fn lengthen(&self) {
+        self.set(self.0.uploads.max(self.at()));
+    }
 }
 
 /// Inside `principal::resolve`: a signed-out caller's `?wait=true` keeps the normal limit,
@@ -387,12 +435,14 @@ async fn anonymous_wait(
         .get::<Deadline>()
         .map_or(normal, |d| d.0.min(normal));
     req.extensions_mut().insert(Deadline(until));
-    if upload != Some(UploadTime::Wait) {
-        return next.run(req).await;
+    // A wait alone ends the request at the normal limit; a URL found in its body still
+    // lengthens it, as a file part would have.
+    if upload == Some(UploadTime::Wait)
+        && let Some(limit) = req.extensions().get::<Limit>()
+    {
+        limit.set(normal.min(limit.at()));
     }
-    tokio::time::timeout(limits.normal, next.run(req))
-        .await
-        .unwrap_or_else(|_| ApiError::Timeout.into_response())
+    next.run(req).await
 }
 
 #[cfg(test)]
@@ -587,6 +637,83 @@ mod tests {
             let body = res.into_body().collect().await.unwrap().to_bytes();
             let ms: u128 = std::str::from_utf8(&body).unwrap().parse().unwrap();
             assert!(ms <= most && ms + 1_000 > most, "{uri}: {ms} ms");
+        }
+    }
+
+    /// A body with `file.url` in it, JSON or a multipart `_payload`, gets the upload limit
+    /// once it's read, as a file part does from the start; signed out with `?wait=true`
+    /// too, as a file part does.
+    #[tokio::test]
+    async fn a_pasted_url_gets_the_upload_time_limit() {
+        let temp = tempfile::Builder::new()
+            .prefix("tachyon-limit-")
+            .tempdir()
+            .unwrap();
+        let dir = temp.path().to_path_buf();
+        let read = move |req: Request<Body>| {
+            let dir = dir.clone();
+            async move {
+                let body = uploads::UploadBody::read(req, Some(1_000), &dir).await;
+                tokio::time::sleep(Duration::from_millis(300)).await;
+                match body {
+                    Ok(uploads::UploadBody::Upload { .. }) => "pasted",
+                    _ => "not pasted",
+                }
+            }
+        };
+        let limits = TimeLimits {
+            normal: Duration::from_millis(50),
+            uploads: Duration::from_secs(5),
+        };
+        let routes = Router::new()
+            .route("/api/{collection}", post(read.clone()))
+            .route("/api/{collection}/{id}", axum::routing::patch(read))
+            .layer(axum::middleware::from_fn_with_state(limits, anonymous_wait));
+        let app = layers(routes, limits);
+        let json = r#"{"file": {"url": "https://example.com/a.png"}}"#;
+        let part = format!(
+            "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{json}\r\n--x--\r\n"
+        );
+        let multipart = "multipart/form-data; boundary=x";
+        for (method, uri, kind, body, status) in [
+            (
+                "POST",
+                "/api/images",
+                "application/json",
+                json.to_owned(),
+                StatusCode::OK,
+            ),
+            (
+                "PATCH",
+                "/api/images/1",
+                "application/json",
+                json.to_owned(),
+                StatusCode::OK,
+            ),
+            (
+                "POST",
+                "/api/images?wait=true",
+                "application/json",
+                json.to_owned(),
+                StatusCode::OK,
+            ),
+            ("POST", "/api/images", multipart, part, StatusCode::OK),
+            (
+                "POST",
+                "/api/images",
+                "application/json",
+                r#"{"alt": "x"}"#.to_owned(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+        ] {
+            let req = Request::builder()
+                .method(method)
+                .uri(uri)
+                .header("content-type", kind)
+                .body(Body::from(body))
+                .unwrap();
+            let res = app.clone().oneshot(req).await.unwrap();
+            assert_eq!(res.status(), status, "{method} {uri} {kind}");
         }
     }
 
