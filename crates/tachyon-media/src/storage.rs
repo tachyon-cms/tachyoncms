@@ -13,7 +13,7 @@ use object_store::aws::AmazonS3Builder;
 use object_store::buffered::BufWriter;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as Key;
-use object_store::signer::Signer;
+use object_store::signer::{HeaderValue, Method, SignedUrlOptions, Signer};
 use object_store::{
     Attribute, Attributes, GetOptions, GetRange, GetResult, ObjectMeta, ObjectStore, ObjectStoreExt,
 };
@@ -88,6 +88,9 @@ pub enum StorageError {
     Store(#[from] object_store::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
+    /// This storage can't make signed URLs: it's local.
+    #[error("storage `{0}` can't sign URLs")]
+    Unsigned(String),
 }
 
 impl StorageError {
@@ -181,7 +184,16 @@ impl Storage {
                 ));
             }
         };
+        check_signing(name, c)?;
         Ok(Self::with_store(name, store, signer, c.clone()))
+    }
+
+    /// `self` signing URLs with `s`: how a test stands a local store in for a bucket. No
+    /// setting reaches it.
+    #[doc(hidden)]
+    pub fn with_signer(mut self, s: Arc<dyn Signer>) -> Storage {
+        self.signer = Some(s);
+        self
     }
 
     /// Storage over a store opened elsewhere, such as one a test wraps.
@@ -214,6 +226,38 @@ impl Storage {
 
     pub fn is_local(&self) -> bool {
         matches!(self.config.adapter, Adapter::Local { .. })
+    }
+
+    /// Whether a client may put files here itself (`client_uploads`, and a store that
+    /// signs).
+    pub fn takes_client_uploads(&self) -> bool {
+        self.config.client_uploads && self.signer.is_some()
+    }
+
+    fn signer_or_refuse(&self) -> Result<&Arc<dyn Signer>, StorageError> {
+        self.signer
+            .as_ref()
+            .ok_or_else(|| StorageError::Unsigned(self.name.clone()))
+    }
+
+    /// A URL a client `PUT`s a file of type `mime` to at `key`, for `expires`. The type is
+    /// signed: a `PUT` with another `content-type` is refused by the bucket.
+    pub async fn presign_put(
+        &self,
+        key: &str,
+        mime: &str,
+        expires: Duration,
+    ) -> Result<Url, StorageError> {
+        let signer = self.signer_or_refuse()?;
+        let mime = HeaderValue::from_str(mime)
+            .map_err(|_| StorageError::BadKey(format!("`{mime}` isn't a content type")))?;
+        let options = SignedUrlOptions::default().with_signed_header(
+            object_store::signer::HeaderName::from_static("content-type"),
+            mime,
+        );
+        Ok(signer
+            .signed_url_opts(Method::PUT, &self.key(key)?, expires, &options)
+            .await?)
     }
 
     /// `key` under this storage's prefix, refused if it could leave it.
@@ -285,6 +329,18 @@ impl Storage {
             .extend(key.as_ref().split('/'));
         Some(url.into())
     }
+}
+
+/// Signing needs a bucket: a local storage that's told to sign is a mistake to catch at
+/// startup.
+fn check_signing(name: &str, c: &StorageConfig) -> Result<(), String> {
+    let local = matches!(c.adapter, Adapter::Local { .. });
+    if local && c.client_uploads {
+        return Err(format!(
+            "storage.{name}.client_uploads: local storage can't take uploads straight from clients; use a bucket"
+        ));
+    }
+    Ok(())
 }
 
 /// Whether every `/`-separated segment of `path` is a plain name: none empty, `.` or

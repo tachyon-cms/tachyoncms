@@ -1,5 +1,7 @@
 use std::path::{Path, PathBuf};
 
+use std::time::Duration;
+
 use tachyon_media::storage::{Adapter, Storage, StorageConfig, object_key};
 use uuid::Uuid;
 
@@ -125,6 +127,24 @@ fn a_bad_prefix_stops_startup() {
     }
 }
 
+#[tokio::test]
+async fn local_storage_takes_no_client_uploads() {
+    let root = temp_root();
+    let mut c = StorageConfig::local(&*root);
+    c.client_uploads = true;
+    let err = Storage::open("disk", &c).unwrap_err();
+    assert!(err.starts_with("storage.disk.client_uploads: "), "{err}");
+    // Opened as it may be, it signs no uploads.
+    let disk = Storage::open("disk", &StorageConfig::local(&*root)).unwrap();
+    assert!(!disk.takes_client_uploads());
+    let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
+    assert!(
+        disk.presign_put(&key, "image/png", Duration::from_secs(60))
+            .await
+            .is_err()
+    );
+}
+
 #[test]
 fn public_urls_encode_each_segment() {
     let root = temp_root();
@@ -179,4 +199,28 @@ async fn s3_round_trip() {
     let storage = Storage::open("s3test", &c).unwrap();
     assert!(!storage.is_local());
     round_trip(&storage).await;
+
+    // A client's put through a signed URL, which holds it to the type signed.
+    let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
+    let ten = Duration::from_secs(600);
+    let put = storage.presign_put(&key, "image/png", ten).await.unwrap();
+    let client = reqwest::Client::new();
+    let wrong = client
+        .put(put.clone())
+        .header("content-type", "text/html")
+        .body("<p>")
+        .send()
+        .await
+        .unwrap();
+    assert!(!wrong.status().is_success(), "another type is refused");
+    let done = client
+        .put(put)
+        .header("content-type", "image/png")
+        .body("0123456789")
+        .send()
+        .await
+        .unwrap();
+    assert!(done.status().is_success(), "{}", done.status());
+    assert_eq!(storage.head(&key).await.unwrap().size, 10);
+    storage.delete(&key).await.unwrap();
 }

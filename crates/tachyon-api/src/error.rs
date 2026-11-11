@@ -24,6 +24,12 @@ pub enum ApiError {
     UnsupportedMediaType(String),
     /// The request ran past its time limit.
     Timeout,
+    /// Too much is waiting on this caller already; worth asking again after `retry_after`
+    /// seconds.
+    TooManyRequests {
+        detail: String,
+        retry_after: u64,
+    },
     /// A `Range` that starts past the end of a file of this many bytes.
     RangeNotSatisfiable(u64),
     Conflict(String),
@@ -125,6 +131,12 @@ impl ApiError {
                 None,
             ),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
+            Self::TooManyRequests { detail, .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests",
+                Some(detail),
+                None,
+            ),
             Self::Unique(_) => (
                 StatusCode::CONFLICT,
                 "Conflict",
@@ -172,6 +184,10 @@ impl IntoResponse for ApiError {
             Self::RangeNotSatisfiable(size) => Some(format!("bytes */{size}")),
             _ => None,
         };
+        let retry = match self {
+            Self::TooManyRequests { retry_after, .. } => Some(retry_after),
+            _ => None,
+        };
         let (status, body) = self.problem();
         let mut res = (
             status,
@@ -181,6 +197,10 @@ impl IntoResponse for ApiError {
             .into_response();
         if let Some(range) = range.and_then(|r| r.parse().ok()) {
             res.headers_mut().insert(header::CONTENT_RANGE, range);
+        }
+        if let Some(secs) = retry {
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
         }
         res
     }

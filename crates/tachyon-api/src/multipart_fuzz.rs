@@ -216,9 +216,9 @@ async fn multipart_fuzz() {
                 }
             }
             Ok(UploadBody::Upload {
-                file: Incoming::Url(..),
+                file: Incoming::Url(..) | Incoming::Client(..),
                 ..
-            }) => panic!("case {case}: a URL nobody sent"),
+            }) => panic!("case {case}: a URL or stored file nobody sent"),
             Ok(UploadBody::Upload {
                 payload: got,
                 file: Incoming::Spooled(s),

@@ -35,9 +35,9 @@ use crate::populate::{
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
-    UploadBody, check_and_process, edit_of, edited, file_limit, file_writes, focal_moved, focal_of,
-    persist, require_file, scope_of, server_fields, settle_server_set, take_edits,
-    taken_or_abandoned, with_fields,
+    UploadBody, edit_of, edited, file_limit, file_writes, focal_moved, focal_of, persist,
+    require_file, scope_of, server_fields, settle_server_set, take_edits, taken_or_abandoned,
+    with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -279,10 +279,7 @@ pub async fn create(
     access.writes(&c, &body, Action::Create, None)?;
     // Decoded only once the write is allowed.
     let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(file)) => {
-            let spool = file.spool(&state, u).await?;
-            Some((u, check_and_process(&state, u, spool).await?))
-        }
+        (Some(u), Some(file)) => Some((u, file.checked(&state, &access, &c, u).await?)),
         _ => None,
     };
     let targets = link_targets(&state, &c).await?;
@@ -531,10 +528,7 @@ pub async fn update(
     // Decoded only once the write is allowed. An edit makes its new file as a replacement
     // would arrive, and goes the same way from here.
     let checked = match (&c.schema.upload, file, &edit) {
-        (Some(u), Some(file), _) => {
-            let spool = file.spool(&state, u).await?;
-            Some((u, check_and_process(&state, u, spool).await?))
-        }
+        (Some(u), Some(file), _) => Some((u, file.checked(&state, &access, &c, u).await?)),
         (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e, deadline.limit.as_ref())
             .await?
             .map(|f| (u, f)),

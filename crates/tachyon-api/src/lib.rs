@@ -210,6 +210,14 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
             get(documents::list).post(documents::create),
         )
         .route(
+            "/api/upload-instructions",
+            post(uploads::upload_instructions),
+        )
+        .route(
+            "/api/{collection}/upload-instructions",
+            post(uploads::instructions_for),
+        )
+        .route(
             "/api/{collection}/trash",
             get(trash::list).delete(trash::empty),
         )

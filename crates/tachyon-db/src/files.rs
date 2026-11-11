@@ -95,8 +95,8 @@ fn cleanup(id: Uuid, run_at: OffsetDateTime) -> NewJob<'static> {
 /// transaction: `a.png`, then `a-1.png`, `a-2.png`… A name is taken by the current file of
 /// another live document (either copy) or by a pending file not uploaded for `document`. A
 /// version's file and `document`'s own don't count, so an edit or a replacement keeps its
-/// name. Names in `also` count as taken too. Holds the numbering lock of the collection and
-/// scope until the transaction ends.
+/// name. Names in `also` count as taken too, and file `except`'s doesn't. Holds the
+/// numbering lock of the collection and scope until the transaction ends.
 pub(crate) async fn free_name(
     conn: &mut PgConnection,
     collection_id: Uuid,
@@ -104,6 +104,7 @@ pub(crate) async fn free_name(
     filename: &str,
     document: Option<Uuid>,
     also: &HashSet<String>,
+    except: Option<Uuid>,
 ) -> Result<String, DbError> {
     // One numbering at a time per collection and scope, so two uploads can't pick one name.
     sqlx::query!(
@@ -117,6 +118,7 @@ pub(crate) async fn free_name(
     let mut taken: HashSet<String> = sqlx::query_scalar!(
         r#"SELECT fl.filename FROM files fl
            WHERE fl.tenant_id = $1 AND fl.collection_id = $2 AND fl.scope = $3
+             AND fl.id IS DISTINCT FROM $8
              AND (fl.filename = $5
                   OR (starts_with(fl.filename, $6) AND right(fl.filename, length($7)) = $7))
              AND ((fl.state = 'pending' AND (fl.document_id IS DISTINCT FROM $4 OR $4 IS NULL))
@@ -132,6 +134,7 @@ pub(crate) async fn free_name(
         filename,
         head,
         tail,
+        except,
     )
     .fetch_all(&mut *conn)
     .await?
@@ -157,13 +160,25 @@ pub async fn reserve(
     key_of: impl Fn(Uuid, &str) -> Result<String, String>,
 ) -> Result<FileRow, DbError> {
     let mut tx = pool.begin().await?;
+    let row = reserve_in(&mut tx, f, key_of).await?;
+    tx.commit().await?;
+    Ok(row)
+}
+
+/// `reserve` inside `tx`.
+async fn reserve_in(
+    tx: &mut PgConnection,
+    f: &NewFile<'_>,
+    key_of: impl Fn(Uuid, &str) -> Result<String, String>,
+) -> Result<FileRow, DbError> {
     let filename = free_name(
-        &mut tx,
+        &mut *tx,
         f.collection_id,
         f.scope,
         f.filename,
         f.document,
         &HashSet::new(),
+        None,
     )
     .await?;
     let id = Uuid::now_v7();
@@ -200,8 +215,129 @@ pub async fn reserve(
     .fetch_one(&mut *tx)
     .await?;
     let grace = time::Duration::try_from(PENDING_GRACE).expect("an hour fits");
-    jobs::enqueue(&mut tx, &cleanup(id, OffsetDateTime::now_utc() + grace)).await?;
+    jobs::enqueue(&mut *tx, &cleanup(id, OffsetDateTime::now_utc() + grace)).await?;
+    Ok(row)
+}
+
+/// The most files issued to one user and key in one collection that may wait, unclaimed
+/// and within their grace, at once.
+pub const ISSUED_CAP: i64 = 100;
+
+/// What `issue` did.
+pub enum Issued {
+    Reserved(Box<FileRow>),
+    /// `ISSUED_CAP` files already wait; the oldest's grace ends in `retry_after`.
+    Full {
+        retry_after: Duration,
+    },
+}
+
+/// `reserve`s `f` for the client it's issued to (`f.issued_to`, which it needs), unless
+/// `ISSUED_CAP` files issued to them in its collection already wait to be claimed.
+pub async fn issue(
+    pool: &PgPool,
+    f: &NewFile<'_>,
+    key_of: impl Fn(Uuid, &str) -> Result<String, String>,
+) -> Result<Issued, DbError> {
+    let Some((user, key)) = f.issued_to else {
+        return Err(DbError::Refused(
+            "an issued file needs whom it's issued to".into(),
+        ));
+    };
+    let mut tx = pool.begin().await?;
+    // One count at a time per client, so two requests can't both take the last place.
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        format!("files:issued:{}:{user}:{key:?}", f.collection_id),
+    )
+    .execute(&mut *tx)
+    .await?;
+    let waiting = sqlx::query!(
+        r#"SELECT count(*) AS "n!",
+                  ceil(extract(epoch FROM min(created_at) + make_interval(secs => $5) - now()))::bigint AS wait
+           FROM files
+           WHERE tenant_id = $1 AND collection_id = $2 AND state = 'pending'
+             AND issued_to = $3 AND issued_key IS NOT DISTINCT FROM $4
+             AND created_at + make_interval(secs => $5) > now()"#,
+        DEFAULT_TENANT,
+        f.collection_id,
+        user,
+        key,
+        PENDING_GRACE.as_secs_f64(),
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if waiting.n >= ISSUED_CAP {
+        let secs = waiting.wait.unwrap_or(1).max(1);
+        return Ok(Issued::Full {
+            retry_after: Duration::from_secs(secs.unsigned_abs()),
+        });
+    }
+    let row = reserve_in(&mut tx, f, key_of).await?;
     tx.commit().await?;
+    Ok(Issued::Reserved(Box::new(row)))
+}
+
+/// Records what pending file `id`, put by a client and claimed, turned out to be once it
+/// was checked: `f`'s type, size, dimensions, placeholder and focal point, and its name
+/// numbered again in `f.scope`, where `f.document`'s own files don't count, as `reserve`
+/// numbers. A new name moves its key (`key_of`), and whatever is stored under the old one
+/// is queued for deletion. Only a pending file: `Refused` otherwise.
+pub async fn settle_in(
+    tx: &mut PgConnection,
+    id: Uuid,
+    f: &NewFile<'_>,
+    key_of: impl Fn(Uuid, &str) -> Result<String, String>,
+) -> Result<FileRow, DbError> {
+    let was = sqlx::query!(
+        "SELECT key, storage FROM files
+         WHERE tenant_id = $1 AND id = $2 AND state = 'pending' FOR UPDATE",
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?
+    .ok_or_else(|| DbError::Refused(format!("the file `{id}` was deleted meanwhile")))?;
+    let filename = free_name(
+        &mut *tx,
+        f.collection_id,
+        f.scope,
+        f.filename,
+        f.document,
+        &HashSet::new(),
+        Some(id),
+    )
+    .await?;
+    let key = key_of(id, &filename).map_err(DbError::Refused)?;
+    let row = sqlx::query_as!(
+        FileRow,
+        r#"UPDATE files SET filename = $3, key = $4, names = ARRAY[$3], scope = $5,
+                  mime_type = $6, filesize = $7, width = $8, height = $9, focal_x = $10,
+                  focal_y = $11, blurhash = $12, document_id = $13
+           WHERE tenant_id = $1 AND id = $2
+           RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,
+                     height, focal_x, focal_y, blurhash,
+                     sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
+                     issued_to, issued_key"#,
+        DEFAULT_TENANT,
+        id,
+        filename,
+        key,
+        f.scope,
+        f.mime_type,
+        f.filesize,
+        f.width,
+        f.height,
+        f.focal.0,
+        f.focal.1,
+        f.blurhash,
+        f.document,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    if key != was.key {
+        queue_key_cleanup(tx, &was.storage, &[was.key], OffsetDateTime::now_utc()).await?;
+    }
     Ok(row)
 }
 
@@ -300,6 +436,7 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<Vec<
             &f.filename,
             Some(doc),
             &none,
+            None,
         )
         .await?;
         if name != f.filename {
@@ -324,6 +461,7 @@ pub(crate) async fn renumber_in(tx: &mut PgConnection, doc: Uuid) -> Result<Vec<
             &f.filename,
             Some(doc),
             &also,
+            None,
         )
         .await?;
         // Locked before its sizes are read, so a size being written waits or is seen.
@@ -717,8 +855,11 @@ pub async fn holders(pool: &PgPool, file: Uuid) -> Result<Vec<(Uuid, DocCopy)>, 
         .collect())
 }
 
-/// The pending file of `collection_id` named `filename` that was issued to `user` with
-/// `key` (none for a session), locked for the document write that takes it.
+/// Takes the pending file of `collection_id` named `filename` that was issued to `user` with
+/// `key` (none for a session), within its grace. Once taken it's issued to nobody, so no
+/// other request can take it: of two at once, the second waits for the first's row lock
+/// and then finds nothing. It stays pending, for the write that takes it to make live or
+/// give up, or for its cleanup.
 pub async fn claim_pending(
     tx: &mut PgConnection,
     collection_id: Uuid,
@@ -728,21 +869,25 @@ pub async fn claim_pending(
 ) -> Result<Option<FileRow>, DbError> {
     Ok(sqlx::query_as!(
         FileRow,
-        r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
-                  height, focal_x, focal_y, blurhash,
-                  sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
-                  issued_to, issued_key
-           FROM files
+        r#"UPDATE files SET issued_to = NULL, issued_key = NULL
            WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3 AND state = 'pending'
              AND issued_to = $4 AND issued_key IS NOT DISTINCT FROM $5
-           ORDER BY id
-           LIMIT 1
-           FOR UPDATE"#,
+             AND created_at + make_interval(secs => $6) > now()
+             AND id = (SELECT id FROM files
+                       WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3
+                         AND state = 'pending' AND issued_to = $4
+                         AND issued_key IS NOT DISTINCT FROM $5
+                       ORDER BY id LIMIT 1 FOR UPDATE)
+           RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,
+                     height, focal_x, focal_y, blurhash,
+                     sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
+                     issued_to, issued_key"#,
         DEFAULT_TENANT,
         collection_id,
         filename,
         user,
         key,
+        PENDING_GRACE.as_secs_f64(),
     )
     .fetch_optional(&mut *tx)
     .await?)

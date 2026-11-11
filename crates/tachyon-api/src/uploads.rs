@@ -7,7 +7,6 @@
 //! validation). Only then is a `pending` row reserved and the object stored, and a document
 //! write that fails after that gives the row up, so its cleanup deletes the object at once.
 
-use std::io::Read as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,9 +15,9 @@ use std::task::{Context, Poll};
 
 use axum::Json;
 use axum::body::Bytes;
-use axum::extract::{FromRequest, Request};
+use axum::extract::{FromRequest, Request, State};
 use axum::http::header::CONTENT_TYPE;
-use futures_util::Stream;
+use futures_util::{Stream, StreamExt as _};
 use multer::{Constraints, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
 use tachyon_core::uploads::{
@@ -26,15 +25,15 @@ use tachyon_core::uploads::{
     sanitize_filename,
 };
 use tachyon_core::{Field, FieldError, FieldKind};
-use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents;
 use tachyon_db::files::{self, FileRow, NewFile};
+use tachyon_db::{DbError, DocCopy};
 pub(crate) use tachyon_media::fetch::Spool;
 use tachyon_media::fetch::{FetchError, HEAD, MAX_URL};
 use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
-use tachyon_media::storage::{Storage, object_key};
+use tachyon_media::storage::{Storage, StorageError, object_key};
 use tachyon_media::svg::{self, SvgError};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
@@ -61,13 +60,25 @@ pub(crate) enum UploadBody {
     Upload { payload: Value, file: Incoming },
 }
 
-/// Where an upload's bytes come from: a file part already spooled, or a URL to fetch
-/// (`{"file": {"url": "…"}}` in the payload).
+/// Where an upload's bytes come from: a file part already spooled, a URL to fetch
+/// (`{"file": {"url": "…"}}` in the payload), or a file the client put in storage itself
+/// (`{"file": {"filename": "…"}}`, as its upload instructions named it).
 pub(crate) enum Incoming {
     Spooled(Spool),
     /// With the request's time limit, lengthened as the fetch starts.
     Url(String, Option<crate::Limit>),
+    /// With the request's time limit, lengthened as its download starts.
+    Client(ClientFile, Option<crate::Limit>),
 }
+
+/// A file put straight into storage, as a create or update names it: by the name its
+/// instructions gave. That's all that's read: what it is comes from its bytes.
+pub(crate) struct ClientFile {
+    pub filename: String,
+}
+
+/// How long a client has to `PUT` a file to the URL its instructions give.
+const PUT_EXPIRES: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
 impl Incoming {
     /// The file spooled in `[uploads] temp_dir`, fetched first if it's a URL: a 400 when `u`
@@ -77,6 +88,11 @@ impl Incoming {
         let (raw, limit) = match self {
             Self::Spooled(spool) => return Ok(spool),
             Self::Url(raw, limit) => (raw, limit),
+            Self::Client(..) => {
+                return Err(ApiError::Internal(
+                    "a file in storage isn't spooled; it's claimed".into(),
+                ));
+            }
         };
         if u.paste_url == PasteUrl::Off {
             return Err(ApiError::BadRequest(
@@ -111,6 +127,152 @@ impl Incoming {
     }
 }
 
+impl Incoming {
+    /// The file checked and made what's stored (`check_and_process`), from wherever it
+    /// comes: one put in storage by the client is claimed for the caller first.
+    pub(crate) async fn checked(
+        self,
+        state: &AppState,
+        access: &crate::access::Access,
+        c: &Collection,
+        u: &Upload,
+    ) -> Result<Checked, ApiError> {
+        match self {
+            Self::Client(f, limit) => claimed(state, access, c, u, &f, limit.as_ref()).await,
+            other => {
+                let spool = other.spool(state, u).await?;
+                check_and_process(state, u, spool).await
+            }
+        }
+    }
+}
+
+/// The 422 for a file in storage that isn't waiting for this caller: the same whether it
+/// never existed, is someone else's, another collection's, past its grace or taken.
+fn unclaimed() -> ApiError {
+    at_file("no upload by this name is waiting for you; ask for upload instructions first".into())
+}
+
+/// Gives up a claimed file when dropped: the request that claimed it failed, or ended,
+/// and its object goes now. Once a document took it, it's live, and giving up a live
+/// file does nothing.
+pub(crate) struct Claim {
+    pool: sqlx::PgPool,
+    id: Uuid,
+}
+
+impl Drop for Claim {
+    fn drop(&mut self) {
+        let (pool, file) = (self.pool.clone(), self.id);
+        // Dropped with the request, which may be cancelled: the work can't wait inside it.
+        // Without a runtime (shutting down), the cleanup `reserve` queued still runs.
+        if let Ok(rt) = tokio::runtime::Handle::try_current() {
+            rt.spawn(async move { abandon_on(&pool, file).await });
+        }
+    }
+}
+
+/// File `f`, put in storage by the client, claimed for the caller and checked as an upload
+/// is: past the limit by its stored size (413), then downloaded and sniffed, with the time
+/// an upload gets. Any refusal from here on gives it up (`Claim`).
+async fn claimed(
+    state: &AppState,
+    access: &crate::access::Access,
+    c: &Collection,
+    u: &Upload,
+    f: &ClientFile,
+    limit: Option<&crate::Limit>,
+) -> Result<Checked, ApiError> {
+    let Some(user) = access.user_id() else {
+        return Err(unclaimed());
+    };
+    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, access.key_id()).await?;
+    tx.commit().await.map_err(DbError::from)?;
+    let row = row.ok_or_else(unclaimed)?;
+    let claim = Claim {
+        pool: state.pool.clone(),
+        id: row.id,
+    };
+    let storage = state.media.storages.get(&row.storage).ok_or_else(|| {
+        ApiError::Internal(format!("no storage named `{}` is configured", row.storage))
+    })?;
+    let cap = u.filesize_limit.unwrap_or(state.media.max_file_size);
+    let too_big = || {
+        ApiError::BodyTooLarge(format!(
+            "the file is over this collection's limit of {cap} bytes"
+        ))
+    };
+    let unread = |e: StorageError| ApiError::Internal(format!("can't read a stored file: {e}"));
+    let size = match storage.head(&row.key).await {
+        Ok(meta) => meta.size,
+        Err(e) if e.is_not_found() => {
+            return Err(at_file(
+                "the file isn't in storage; put it there first".into(),
+            ));
+        }
+        Err(e) => return Err(unread(e)),
+    };
+    if size > cap {
+        return Err(too_big());
+    }
+    // Every check that needs no bytes is behind it: the download gets an upload's time.
+    if let Some(limit) = limit {
+        limit.lengthen();
+    }
+    let spool = download(storage, &row.key, &state.media.temp_dir, &row.filename, cap)
+        .await
+        .map_err(unread)?
+        .ok_or_else(too_big)?;
+    // What `check_and_process` remakes is stored again; anything else stays as put.
+    let sniffed = sniff(&spool.head);
+    let rewritten = sniffed == "image/svg+xml" || picture::decodes(sniffed);
+    let mut checked = check_and_process(state, u, spool).await?;
+    checked.source = match checked.source {
+        Source::Spool(spool) => Source::Claimed {
+            spool,
+            file: Box::new(row),
+            rewritten,
+            _claim: claim,
+        },
+        other => other,
+    };
+    Ok(checked)
+}
+
+/// The object at `key`, streamed into a new spool file in `dir` named `name`; `None`, and
+/// the spool deleted, once it's past `cap` bytes.
+async fn download(
+    storage: &Storage,
+    key: &str,
+    dir: &Path,
+    name: &str,
+    cap: u64,
+) -> Result<Option<Spool>, StorageError> {
+    let got = storage.get_range(key, None).await?;
+    let file = NamedTempFile::new_in(dir)?;
+    let mut out = tokio::fs::File::from_std(file.reopen()?);
+    let (mut head, mut len) = (Vec::with_capacity(HEAD), 0u64);
+    let mut chunks = got.into_stream();
+    while let Some(chunk) = chunks.next().await {
+        let chunk = chunk?;
+        len += chunk.len() as u64;
+        if len > cap {
+            return Ok(None);
+        }
+        let room = HEAD - head.len();
+        head.extend_from_slice(&chunk[..room.min(chunk.len())]);
+        out.write_all(&chunk).await?;
+    }
+    out.flush().await?;
+    Ok(Some(Spool {
+        file,
+        len,
+        head,
+        name: name.to_owned(),
+    }))
+}
+
 fn at_url(message: String) -> ApiError {
     ApiError::Validation(vec![FieldError {
         path: "file.url".into(),
@@ -139,6 +301,15 @@ pub(crate) enum Source {
     Spool(Spool),
     /// Already stored, under `key` in `storage`, to be copied there: a focal point moved.
     Copy { storage: String, key: String },
+    /// Put in storage by the client as pending `file`, claimed by this request, and
+    /// downloaded into `spool` to be checked. Stored again only when the check remade it
+    /// (`rewritten`) or its name changed.
+    Claimed {
+        spool: Spool,
+        file: Box<FileRow>,
+        rewritten: bool,
+        _claim: Claim,
+    },
 }
 
 /// A reserved and stored file, with the server-set fields the document takes from it.
@@ -162,7 +333,7 @@ impl UploadBody {
         let limit = req.extensions().get::<crate::Limit>().cloned();
         let mut body = Self::read_body(req, file_limit, temp_dir).await?;
         if let Self::Upload {
-            file: Incoming::Url(_, at),
+            file: Incoming::Url(_, at) | Incoming::Client(_, at),
             ..
         } = &mut body
         {
@@ -252,17 +423,25 @@ impl UploadBody {
         }
     }
 
-    /// `payload`, as an upload of the URL in its `file` when it's `{"url": "…"}` and the
-    /// collection takes files (`file_limit`); any other key beside `url` is a 422.
+    /// `payload`, as an upload of the URL in its `file` when it's `{"url": "…"}`, or of a
+    /// file put in storage when it's `{"filename": "…"}`, and the collection takes files
+    /// (`file_limit`). Any other key beside them is a 422.
     fn pasted(mut payload: Value, file_limit: Option<u64>) -> Result<Self, ApiError> {
-        let pasting =
-            file_limit.is_some() && payload.get("file").is_some_and(|f| f.get("url").is_some());
-        let Some(Value::Object(file)) = pasting
+        let has = |k: &str| payload.get("file").is_some_and(|f| f.get(k).is_some());
+        let pasting = file_limit.is_some() && has("url");
+        let putting = file_limit.is_some() && !pasting && has("filename");
+        let Some(Value::Object(file)) = (pasting || putting)
             .then(|| payload.as_object_mut()?.remove("file"))
             .flatten()
         else {
             return Ok(Self::Json(payload));
         };
+        if putting {
+            return Ok(Self::Upload {
+                payload,
+                file: Incoming::Client(client_file(&file)?, None),
+            });
+        }
         let unknown: Vec<FieldError> = file
             .keys()
             .filter(|k| *k != "url")
@@ -282,6 +461,35 @@ impl UploadBody {
             _ => Err(at_url("expected a URL".into())),
         }
     }
+}
+
+/// `file` of a payload naming a file put in storage: its `filename`, with the `mimeType`
+/// and `filesize` its instructions gave allowed beside it. A 422 at what's wrong.
+fn client_file(file: &Map<String, Value>) -> Result<ClientFile, ApiError> {
+    let at = |k: &str, message: &str| FieldError {
+        path: format!("file.{k}"),
+        message: message.into(),
+    };
+    let mut errors: Vec<FieldError> = file
+        .keys()
+        .filter(|k| !["filename", "mimeType", "filesize"].contains(&k.as_str()))
+        .map(|k| {
+            at(
+                k,
+                "unknown field; a file put in storage takes `filename`, `mimeType` and `filesize`",
+            )
+        })
+        .collect();
+    let filename = file["filename"].as_str();
+    if filename.is_none() {
+        errors.push(at("filename", "expected text"));
+    }
+    if !errors.is_empty() {
+        return Err(ApiError::Validation(errors));
+    }
+    Ok(ClientFile {
+        filename: filename.unwrap_or_default().to_owned(),
+    })
 }
 
 type BoxError = Box<dyn std::error::Error + Send + Sync>;
@@ -499,6 +707,22 @@ fn image_refused(e: ImageError) -> ApiError {
     }
 }
 
+/// A 415 unless `u` takes a file of type `mime` named `name`, saying what it looked like.
+fn type_allowed(u: &Upload, mime: &str, name: &str) -> Result<(), ApiError> {
+    if !mime_allowed(&u.mime_types, mime) {
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "this file is {mime}; this collection takes {}",
+            u.mime_types.join(", ")
+        )));
+    }
+    if !u.allow_restricted_file_types && restricted(mime, name) {
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "this file is {mime}, named `{name}`; this collection doesn't take executables or scripts"
+        )));
+    }
+    Ok(())
+}
+
 /// Checks what `spool` is, by its bytes alone, against what `u` takes: a 415 saying what
 /// it looked like. Then makes it what's stored: an image's size is read from its headers
 /// and refused past the pixel cap before anything is decoded, then it's decoded behind
@@ -510,18 +734,7 @@ pub(crate) async fn check_and_process(
     mut spool: Spool,
 ) -> Result<Checked, ApiError> {
     let mime = sniff(&spool.head);
-    if !mime_allowed(&u.mime_types, mime) {
-        return Err(ApiError::UnsupportedMediaType(format!(
-            "this file is {mime}; this collection takes {}",
-            u.mime_types.join(", ")
-        )));
-    }
-    if !u.allow_restricted_file_types && restricted(mime, &spool.name) {
-        return Err(ApiError::UnsupportedMediaType(format!(
-            "this file is {mime}, named `{}`; this collection doesn't take executables or scripts",
-            spool.name
-        )));
-    }
+    type_allowed(u, mime, &spool.name)?;
     let (mut mime, mut width, mut height, mut blurhash) = (mime, None, None, None);
     if mime == "image/svg+xml" {
         let path = spool.file.path().to_path_buf();
@@ -1034,24 +1247,13 @@ async fn fetch_spool(
     dir: &Path,
     name: &str,
 ) -> Result<Spool, ApiError> {
-    let file = crate::media_jobs::fetch(storage, key, dir)
+    download(storage, key, dir, name, u64::MAX)
         .await
         .map_err(|e| match e.is_not_found() {
             true => gone_meanwhile(),
             false => ApiError::Internal(format!("can't read a stored file: {e}")),
-        })?;
-    let read = |e: std::io::Error| ApiError::Internal(format!("can't read a stored file: {e}"));
-    let len = file.as_file().metadata().map_err(read)?.len();
-    let mut head = Vec::with_capacity(HEAD);
-    std::io::Read::take(file.reopen().map_err(read)?, HEAD as u64)
-        .read_to_end(&mut head)
-        .map_err(read)?;
-    Ok(Spool {
-        file,
-        len,
-        head,
-        name: name.to_owned(),
-    })
+        })?
+        .ok_or_else(|| ApiError::Internal("a stored file is bigger than any file".into()))
 }
 
 /// Reserves `f` for `document` (the one being updated, if any) under its sanitised name,
@@ -1066,9 +1268,10 @@ pub(crate) async fn persist(
     focal: (f32, f32),
     document: Option<Uuid>,
 ) -> Result<Stored, ApiError> {
-    // A copy stays in the storage it's copied within.
+    // A copy stays in the storage it's copied within, and a claimed file where it was put.
     let name = match &f.source {
         Source::Copy { storage, .. } => storage,
+        Source::Claimed { file, .. } => &file.storage,
         Source::Spool(_) => &u.storage,
     };
     let storage =
@@ -1092,16 +1295,36 @@ pub(crate) async fn persist(
         document,
     };
     let static_dir = u.static_dir.as_deref();
-    let file = files::reserve(&state.pool, &new, |id, name| {
+    let key_of = |id, name: &str| {
         object_key(static_dir, &c.schema.slug, id, name).map_err(|e| e.to_string())
-    })
-    .await?;
+    };
+    let file = match &f.source {
+        // Reserved when its instructions were given; now it's known what it is.
+        Source::Claimed { file, .. } => {
+            let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+            let settled = files::settle_in(&mut tx, file.id, &new, key_of).await?;
+            tx.commit().await.map_err(DbError::from)?;
+            settled
+        }
+        _ => files::reserve(&state.pool, &new, key_of).await?,
+    };
     let stored = match &f.source {
-        Source::Spool(spool) => storage
+        Source::Spool(spool) => Some(spool),
+        Source::Claimed {
+            spool,
+            file: was,
+            rewritten,
+            ..
+        } if *rewritten || was.key != file.key => Some(spool),
+        _ => None,
+    };
+    let stored = match (stored, &f.source) {
+        (Some(spool), _) => storage
             .put_file(&file.key, spool.file.path(), &f.mime)
             .await
             .map(|_| ()),
-        Source::Copy { key, .. } => storage.copy(key, &file.key).await,
+        (None, Source::Copy { key, .. }) => storage.copy(key, &file.key).await,
+        (None, _) => Ok(()),
     };
     if let Err(e) = stored {
         abandon(state, file.id).await;
@@ -1118,7 +1341,11 @@ pub(crate) async fn persist(
 /// failed, so its object is deleted now rather than after the grace. Should even that
 /// fail, the cleanup `reserve` queued still runs once the grace is over.
 async fn abandon(state: &AppState, file: Uuid) {
-    if let Err(error) = files::abandon(&state.pool, file).await {
+    abandon_on(&state.pool, file).await;
+}
+
+async fn abandon_on(pool: &sqlx::PgPool, file: Uuid) {
+    if let Err(error) = files::abandon(pool, file).await {
         tracing::warn!(%error, %file, "couldn't give up an upload; it's cleaned up within the hour");
     }
 }
@@ -1136,6 +1363,159 @@ pub(crate) async fn taken_or_abandoned<T>(
         abandon(state, s.file.id).await;
     }
     result
+}
+
+/// What a client asks upload instructions for.
+#[derive(serde::Deserialize)]
+#[serde(rename_all = "camelCase", deny_unknown_fields)]
+struct Ask {
+    filename: String,
+    mime_type: String,
+    filesize: u64,
+}
+
+/// `POST /api/{collection}/upload-instructions`: where and how the caller puts a file in
+/// storage itself, for a create or update to name after (see `upload_instructions_in`).
+pub async fn instructions_for(
+    State(state): State<AppState>,
+    access: crate::access::Access,
+    path: Result<axum::extract::Path<String>, axum::extract::rejection::PathRejection>,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let axum::extract::Path(slug) = path.map_err(|_| ApiError::NotFound)?;
+    upload_instructions_in(&state, &access, &slug, json_body(body)?).await
+}
+
+/// `POST /api/upload-instructions`, its collection named by `collectionSlug`.
+pub async fn upload_instructions(
+    State(state): State<AppState>,
+    access: crate::access::Access,
+    body: Result<Json<Value>, axum::extract::rejection::JsonRejection>,
+) -> Result<Json<Value>, ApiError> {
+    let mut body = json_body(body)?;
+    let slug = match body
+        .as_object_mut()
+        .and_then(|o| o.remove("collectionSlug"))
+    {
+        Some(Value::String(slug)) => slug,
+        _ => {
+            return Err(ApiError::BadRequest(
+                "name the collection in `collectionSlug`".into(),
+            ));
+        }
+    };
+    upload_instructions_in(&state, &access, &slug, body).await
+}
+
+/// Instructions for a file of collection `slug`, as `body` describes it. Only for a caller
+/// who may create there, signed in, and a storage that takes client uploads (else 400).
+/// The size and type claimed are checked as an upload's are (413, 415), though only the
+/// bytes put decide later. A `pending` file is reserved under the sanitised, numbered
+/// name, issued to the caller and their key (429 while 100 wait), with a `PUT` URL that
+/// lasts 15 minutes; the file waits an hour to be claimed.
+async fn upload_instructions_in(
+    state: &AppState,
+    access: &crate::access::Access,
+    slug: &str,
+    body: Value,
+) -> Result<Json<Value>, ApiError> {
+    let c = crate::documents::collection(state, slug)?;
+    access.scope(tachyon_core::auth::Action::Create, &c.schema.slug)?;
+    let user = access.user_id().filter(|_| access.may_create(&c));
+    let Some(user) = user else {
+        return Err(access.refuse());
+    };
+    let Some(u) = &c.schema.upload else {
+        return Err(ApiError::BadRequest(
+            "this collection doesn't take files".into(),
+        ));
+    };
+    let ask: Ask = serde_json::from_value(body)
+        .map_err(|e| ApiError::BadRequest(format!("bad upload instructions request: {e}")))?;
+    let storage = state.media.storages.get(&u.storage).ok_or_else(|| {
+        ApiError::Internal(format!("no storage named `{}` is configured", u.storage))
+    })?;
+    if !storage.takes_client_uploads() {
+        return Err(ApiError::BadRequest(format!(
+            "storage `{}` doesn't take files straight from clients; send the file to /api/{slug}",
+            u.storage
+        )));
+    }
+    let cap = u.filesize_limit.unwrap_or(state.media.max_file_size);
+    if ask.filesize > cap {
+        return Err(ApiError::BodyTooLarge(format!(
+            "the file is over this collection's limit of {cap} bytes"
+        )));
+    }
+    let mime = ask.mime_type.trim().to_ascii_lowercase();
+    if !media_type(&mime) {
+        return Err(ApiError::UnsupportedMediaType(format!(
+            "`{}` isn't a media type",
+            ask.mime_type.escape_debug()
+        )));
+    }
+    let name = sanitize_filename(&ask.filename);
+    type_allowed(u, &mime, &name)?;
+    let filesize = i64::try_from(ask.filesize)
+        .map_err(|_| ApiError::Internal("the file size doesn't fit a database integer".into()))?;
+    let new = NewFile {
+        collection_id: c.id,
+        storage: &u.storage,
+        filename: &name,
+        scope: "",
+        mime_type: &mime,
+        filesize,
+        width: None,
+        height: None,
+        focal: (50.0, 50.0),
+        blurhash: None,
+        issued_to: Some((user, access.key_id())),
+        document: None,
+    };
+    let static_dir = u.static_dir.as_deref();
+    let issued = files::issue(&state.pool, &new, |id, name| {
+        object_key(static_dir, &c.schema.slug, id, name).map_err(|e| e.to_string())
+    })
+    .await?;
+    let file = match issued {
+        files::Issued::Reserved(file) => *file,
+        files::Issued::Full { retry_after } => {
+            return Err(ApiError::TooManyRequests {
+                detail: format!(
+                    "{} uploads wait for you to use them here; use or let some expire first",
+                    files::ISSUED_CAP
+                ),
+                retry_after: retry_after.as_secs(),
+            });
+        }
+    };
+    let url = match storage.presign_put(&file.key, &mime, PUT_EXPIRES).await {
+        Ok(url) => url,
+        Err(e) => {
+            abandon(state, file.id).await;
+            return Err(ApiError::Internal(format!("can't sign an upload: {e}")));
+        }
+    };
+    Ok(Json(json!({
+        "type": "http",
+        "request": {
+            "url": url.as_str(),
+            "method": "PUT",
+            "headers": {"content-type": mime},
+        },
+        "file": {"filename": file.filename, "mimeType": mime, "filesize": ask.filesize},
+    })))
+}
+
+/// Whether `mime` is a bare `type/subtype` of token characters, fit for a signed header.
+fn media_type(mime: &str) -> bool {
+    let token = |s: &str| {
+        !s.is_empty()
+            && s.bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b"!#$&-^_.+".contains(&b))
+    };
+    mime.split_once('/')
+        .is_some_and(|(t, sub)| token(t) && token(sub))
 }
 
 #[cfg(test)]
