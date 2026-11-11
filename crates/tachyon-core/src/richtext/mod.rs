@@ -63,8 +63,8 @@ pub struct UploadView {
     pub alt: Option<String>,
     pub mime_type: String,
     pub filename: String,
-    /// Each size made of the image in its own type, and its WebP copy, by width: the
-    /// candidates of an `<img>`'s `srcset`.
+    /// Each size made of the image in its own type or as WebP, and each size's WebP copy,
+    /// by width: the candidates of an `<img>`'s `srcset`.
     pub srcset: Vec<(String, u32)>,
 }
 
@@ -89,7 +89,9 @@ pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
         .flat_map(Map::values)
         .filter_map(Value::as_object)
     {
-        if text(size, "mimeType").as_deref() == Some(&mime_type) {
+        // A size made as WebP from another type has no WebP copy of its own.
+        let own = text(size, "mimeType");
+        if own.as_deref() == Some(&mime_type) || own.as_deref() == Some("image/webp") {
             srcset.extend(candidate(size));
         }
         let webp = size.get("formats").and_then(|f| f.get("webp"));
@@ -2236,6 +2238,21 @@ mod tests {
                     (u("a-400x300.webp"), 400),
                 ],
             }
+        );
+        // A size made as WebP has no WebP copy, so it's offered itself; an AVIF size only
+        // by its copy.
+        let made =
+            |name: &str, w: u32, mime: &str| json!({"url": u(name), "width": w, "mimeType": mime});
+        let mut avif = made("a-200.avif", 200, "image/avif");
+        avif["formats"] = json!({"webp": made("a-200.webp", 200, "image/webp")});
+        let mut converted = cover();
+        converted.insert(
+            "sizes".into(),
+            json!({"w": made("a-400.webp", 400, "image/webp"), "j": avif}),
+        );
+        assert_eq!(
+            upload_view(&converted).unwrap().srcset,
+            vec![(u("a-200.webp"), 200), (u("a-400.webp"), 400)]
         );
         // No URL, as when it's hidden from the caller: nothing to show.
         let mut hidden = cover();
