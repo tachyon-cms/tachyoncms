@@ -126,7 +126,11 @@ async fn folders_nest_and_list(pool: PgPool) {
         .find(|f| f["name"] == "collections")
         .unwrap()
         .clone();
-    assert_eq!(collections["options"], json!(["media"]), "{folders}");
+    assert_eq!(
+        collections["options"],
+        json!(["media", "users"]),
+        "{folders}"
+    );
 
     let top = folder(&app, "Top", None, &["media"]).await;
     let inner = folder(&app, "Inner", Some(&top), &["media"]).await;
@@ -661,7 +665,7 @@ async fn folder_options_list_every_collection(pool: PgPool) {
             .unwrap()["options"]
             .clone()
     };
-    assert_eq!(options(app.clone()).await, json!([]));
+    assert_eq!(options(app.clone()).await, json!(["users"]));
     let posts =
         json!({"slug": "posts", "folders": true, "fields": [{"name": "title", "type": "text"}]});
     schema(&app, posts.clone()).await;
@@ -675,7 +679,7 @@ async fn folder_options_list_every_collection(pool: PgPool) {
     schema(&app, private.clone()).await;
     assert_eq!(
         options(app.clone()).await,
-        json!(["plain", "posts", "private_docs"])
+        json!(["plain", "posts", "private_docs", "users"])
     );
     let f = folder(&app, "F", None, &["posts", "plain"]).await;
     let only = folder(&app, "Only", None, &["private_docs"]).await;
@@ -718,7 +722,7 @@ async fn folder_options_list_every_collection(pool: PgPool) {
     .await;
     assert_eq!(
         options(app.clone()).await,
-        json!(["plain", "posts", "private_docs"])
+        json!(["plain", "posts", "private_docs", "users"])
     );
     // The folders' own lists are left as they were.
     let kept = ok(&app, "GET", &format!("/api/folders/{f}"), Value::Null).await;
@@ -759,7 +763,11 @@ async fn folder_options_list_every_collection(pool: PgPool) {
         .find(|f| f["name"] == "collections")
         .unwrap()["options"]
         .clone();
-    assert_eq!(listed, json!(["plain", "posts", "private_docs"]), "{saved}");
+    assert_eq!(
+        listed,
+        json!(["plain", "posts", "private_docs", "users"]),
+        "{saved}"
+    );
 }
 
 /// Signed out, folders take the same defaults as a collection with no rules, and the
@@ -1308,4 +1316,142 @@ async fn folders_hold_what_they_list(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(error_path(&res), "moveContentsTo", "{}", res.json);
     assert!(res.json.to_string().contains(&page), "{}", res.json);
+}
+
+/// Accounts are filed like any document: through the profile route too, into a folder
+/// that lists `users` or none.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn profiles_file_by_the_folders_list(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let mut users =
+        ok(&app, "GET", "/api/admin/collections/users", Value::Null).await["schema"].clone();
+    users["folders"] = json!(true);
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/users",
+        json!({"schema": users}),
+    )
+    .await;
+    let me: Uuid = sqlx::query_scalar("SELECT user_id FROM accounts WHERE email = $1")
+        .bind(ADMIN)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let posts_only = folder(&app, "Posts", None, &["posts"]).await;
+    let people = folder(&app, "People", None, &["users"]).await;
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/users/{me}"),
+        json!({"folder": posts_only}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/users/{me}"),
+        json!({"folder": people}),
+    )
+    .await;
+    // And when the account is made.
+    let res = call(
+        &app,
+        "POST",
+        "/api/users",
+        json!({"email": "new@example.com", "password": PASSWORD, "name": "N", "folder": posts_only}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+}
+
+/// A document restored from the trash goes back into its folder, which must still be
+/// there and still hold its collection.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn restoring_rechecks_the_folder(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "pages", "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let restore = |p: String| {
+        let app = app.clone();
+        async move {
+            call(
+                &app,
+                "POST",
+                &format!("/api/posts/trash/{p}/restore"),
+                Value::Null,
+            )
+            .await
+        }
+    };
+    // Its folder gone.
+    let gone = folder(&app, "Gone", None, &["posts"]).await;
+    let p = id(&ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "a", "folder": gone}),
+    )
+    .await);
+    ok(&app, "DELETE", &format!("/api/posts/{p}"), Value::Null).await;
+    ok(&app, "DELETE", &format!("/api/folders/{gone}"), Value::Null).await;
+    let res = restore(p.clone()).await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    assert_problem(
+        &call(&app, "GET", &format!("/api/posts/{p}"), Value::Null).await,
+        404,
+    );
+    // Its folder no longer holding posts.
+    let narrowed = folder(&app, "Narrowed", None, &["posts"]).await;
+    let q = id(&ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "b", "folder": narrowed}),
+    )
+    .await);
+    ok(&app, "DELETE", &format!("/api/posts/{q}"), Value::Null).await;
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/folders/{narrowed}"),
+        json!({"collections": ["pages"]}),
+    )
+    .await;
+    let res = restore(q.clone()).await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    assert_problem(
+        &call(&app, "GET", &format!("/api/posts/{q}"), Value::Null).await,
+        404,
+    );
+    // Back to holding them, it restores.
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/folders/{narrowed}"),
+        json!({"collections": ["posts"]}),
+    )
+    .await;
+    let res = restore(q.clone()).await;
+    assert_eq!(res.status, 200, "{}", res.json);
 }

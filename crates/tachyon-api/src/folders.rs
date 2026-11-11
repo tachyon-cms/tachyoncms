@@ -3,7 +3,7 @@
 
 use std::collections::HashMap;
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sqlx::PgConnection;
 use tachyon_core::access::Compiled;
 use tachyon_core::auth::Action;
@@ -50,34 +50,6 @@ fn bad_move(message: &str) -> ApiError {
         path: "moveContentsTo".into(),
         message: message.into(),
     }])
-}
-
-/// Refuses `data` of `c` filed in a folder whose `collections` lists others but not `c`.
-/// One that lists none holds any collection. Folders nest whatever they list.
-pub(crate) async fn check_filed(
-    tx: &mut PgConnection,
-    c: &Collection,
-    data: &Map<String, Value>,
-) -> Result<(), ApiError> {
-    if c.schema.slug == FOLDERS || !c.schema.folders {
-        return Ok(());
-    }
-    let Some(folder) = data
-        .get("folder")
-        .and_then(Value::as_str)
-        .and_then(|s| s.parse::<Uuid>().ok())
-    else {
-        return Ok(());
-    };
-    match folders::lists_in(tx, folder).await? {
-        Some(listed) if !listed.is_empty() && !listed.contains(&c.schema.slug) => {
-            Err(ApiError::Validation(vec![FieldError {
-                path: "folder".into(),
-                message: format!("this folder doesn't hold {}", c.schema.slug),
-            }]))
-        }
-        _ => Ok(()),
-    }
 }
 
 /// Deletes folder `id` of `c` (under `guard`, judging `copy`), first moving what files into
@@ -198,7 +170,7 @@ async fn move_one(
         }
     }
     let patch = json!({ "folder": to });
-    let doc = documents::update_any_in(
+    documents::update_any_in(
         tx,
         dc.id,
         dc.schema_version,
@@ -219,9 +191,9 @@ async fn move_one(
         },
     )
     .await?;
-    match dc.schema.slug == FOLDERS {
-        // A folder takes what's inside it along, which must still fit.
-        true => check_place(tx, item.id).await,
-        false => check_filed(tx, dc, &doc.data.0).await,
+    // A folder takes what's inside it along, which must still fit.
+    if dc.schema.slug == FOLDERS {
+        check_place(tx, item.id).await?;
     }
+    Ok(())
 }

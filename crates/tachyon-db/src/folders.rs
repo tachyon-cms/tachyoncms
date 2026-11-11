@@ -15,9 +15,9 @@ pub use tachyon_core::FOLDERS;
 /// How many folders may sit above one.
 pub const MAX_DEPTH: i32 = 64;
 
-/// The slugs a folder's `collections` may name: every collection, whether or not it has
-/// folders on, except the system's own. A slug never leaves the list when folders are
-/// turned off, so no folder's list is ever rewritten wider.
+/// The slugs a folder's `collections` may name: every collection, `users` too, whether or
+/// not it has folders on, except the folders themselves. A slug never leaves the list when
+/// folders are turned off, so no folder's list is ever rewritten wider.
 pub fn listable(
     schemas: impl IntoIterator<Item = impl std::borrow::Borrow<CollectionSchema>>,
 ) -> Vec<String> {
@@ -25,9 +25,7 @@ pub fn listable(
         .into_iter()
         .filter(|s| {
             let s = s.borrow();
-            s.kind == CollectionKind::Collection
-                && s.slug != FOLDERS
-                && s.slug != crate::auth::USERS
+            s.kind == CollectionKind::Collection && s.slug != FOLDERS
         })
         .map(|s| s.borrow().slug.clone())
         .collect();
@@ -360,4 +358,40 @@ pub async fn lists_in(conn: &mut PgConnection, id: Uuid) -> Result<Option<Vec<St
             .collect(),
         _ => Vec::new(),
     }))
+}
+
+/// Refuses `copy` of document `from_doc`, its links just stored, filed in a folder whose
+/// `collections` lists others but not its own collection; one that lists none holds any.
+/// Every write of a link goes through here, so every write of a `folder` is judged: a
+/// create, update, publish, restore, move, profile write or schema change alike. Folders
+/// nest whatever they list.
+pub(crate) async fn check_filed_in(
+    conn: &mut PgConnection,
+    from_doc: Uuid,
+    copy: DocCopy,
+) -> Result<(), DbError> {
+    let refused = sqlx::query_scalar!(
+        r#"SELECT fc.slug FROM relations r
+           JOIN documents f ON f.id = r.from_doc
+           JOIN collections fc ON fc.id = f.collection_id AND fc.slug <> $3
+           JOIN documents t ON t.id = r.to_doc
+           JOIN collections tc ON tc.id = t.collection_id AND tc.slug = $3
+           WHERE r.tenant_id = $4 AND r.from_doc = $1 AND r.copy = $2 AND r.field_path = 'folder'
+             AND jsonb_typeof(t.published -> 'collections') = 'array'
+             AND jsonb_array_length(t.published -> 'collections') > 0
+             AND NOT (t.published -> 'collections') ? fc.slug"#,
+        from_doc,
+        copy.as_str(),
+        FOLDERS,
+        DEFAULT_TENANT,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    match refused {
+        Some(slug) => Err(DbError::Validation(vec![tachyon_core::FieldError {
+            path: "folder".into(),
+            message: format!("this folder doesn't hold {slug}"),
+        }])),
+        None => Ok(()),
+    }
 }
