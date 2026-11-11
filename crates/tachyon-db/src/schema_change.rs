@@ -446,6 +446,14 @@ async fn run_in(
         // stays true until then: no other schema, shared block or role changes meanwhile.
         crate::auth::lock_rule_roles(&mut *tx).await?;
     }
+    // Folders are made when a server starts; a change using them may come first, as a
+    // schema file applied to a new database can. A preview rolls it back with the rest.
+    if saves
+        .iter()
+        .any(|s| s.schema.folders || s.slug == crate::folders::FOLDERS)
+    {
+        crate::folders::ensure_in(&mut *tx).await?;
+    }
     let stored = sqlx::query_as!(
         Collection,
         r#"SELECT id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at
@@ -772,14 +780,13 @@ async fn run_in(
         .fetch_one(&mut *tx)
         .await?;
     }
-    // The folders list which collections file into them.
-    let enabled = world
-        .iter()
-        .map(|(s, _)| s)
-        .filter(|s| s.folders && s.kind == CollectionKind::Collection)
-        .map(|s| s.slug.clone())
-        .collect();
-    crate::folders::refresh_in(&mut *tx, enabled).await?;
+    // The folders may name every collection; a save of them answers as refreshed.
+    let listable = crate::folders::listable(world.iter().map(|(s, _)| s));
+    if let Some(folders) = crate::folders::refresh_in(&mut *tx, listable).await?
+        && let Some(i) = saved(crate::folders::FOLDERS)
+    {
+        current[i] = folders;
+    }
     for s in saves {
         // Delivered to every listening server when the transaction commits.
         sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", s.slug)

@@ -320,6 +320,39 @@ async fn folders_slug_is_the_systems(pool: PgPool) {
     )
     .await;
     assert_problem(&res, 422);
+    // Nor files: every folder would need one.
+    let mut uploads = stored.clone();
+    uploads["upload"] = json!(true);
+    let res = call(
+        &app,
+        "PUT",
+        "/api/admin/collections/folders",
+        json!({"schema": uploads, "confirm": true}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "upload", "{}", res.json);
+    // Its own fields stay at the top, not in a row.
+    for inner in ["name", "folder", "collections"] {
+        let mut rowed = stored.clone();
+        let fields = rowed["fields"].as_array_mut().unwrap();
+        let at = fields.iter().position(|f| f["name"] == inner).unwrap();
+        let f = fields.remove(at);
+        fields.push(json!({"type": "row", "fields": [f]}));
+        let res = call(
+            &app,
+            "PUT",
+            "/api/admin/collections/folders",
+            json!({"schema": rowed, "confirm": true}),
+        )
+        .await;
+        assert_problem(&res, 422);
+        assert!(
+            res.json.to_string().contains(inner),
+            "{inner}: {}",
+            res.json
+        );
+    }
     // Globals have no documents to file.
     let res = call(
         &app,
@@ -522,15 +555,15 @@ async fn folders_follow_collection_reads(pool: PgPool) {
     let public = folder(&app, "Public", None, &["public_docs"]).await;
     let both = folder(&app, "Both", None, &["public_docs", "private_docs"]).await;
     let any = folder(&app, "Any", None, &[]).await;
+    // A child of a hidden folder is still readable by its own rules.
+    let below = folder(&app, "Below", Some(&private), &["public_docs"]).await;
     let doc = id(&ok(
         &app,
         "POST",
         "/api/public_docs",
-        json!({"title": "t", "folder": private}),
+        json!({"title": "t", "folder": below}),
     )
     .await);
-    // A child of a hidden folder is still readable by its own rules.
-    let below = folder(&app, "Below", Some(&private), &["public_docs"]).await;
 
     let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
     let res = call(
@@ -563,7 +596,7 @@ async fn folders_follow_collection_reads(pool: PgPool) {
     assert!(
         ids(
             &viewer,
-            "/api/public_docs?where[folder.name][equals]=Private"
+            "/api/public_docs?where[folder.folder.name][equals]=Private"
         )
         .await
         .is_empty()
@@ -576,10 +609,18 @@ async fn folders_follow_collection_reads(pool: PgPool) {
         .await
         .is_empty()
     );
+    assert_eq!(
+        ids(
+            &app,
+            "/api/public_docs?where[folder.folder.name][equals]=Private"
+        )
+        .await,
+        vec![doc]
+    );
     let got = ok(
         &viewer,
         "GET",
-        &format!("/api/public_docs/{doc}?depth=1"),
+        &format!("/api/folders/{below}?depth=1"),
         Value::Null,
     )
     .await;
@@ -587,7 +628,7 @@ async fn folders_follow_collection_reads(pool: PgPool) {
     let got = ok(
         &app,
         "GET",
-        &format!("/api/public_docs/{doc}?depth=1"),
+        &format!("/api/folders/{below}?depth=1"),
         Value::Null,
     )
     .await;
@@ -603,8 +644,11 @@ async fn folders_follow_collection_reads(pool: PgPool) {
     .await;
 }
 
+/// The folders' `collections` options are every collection there is, so turning a
+/// collection's folders off or on never rewrites a folder's list, and can't widen who
+/// reads it.
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn folder_enabled_collections_are_listed(pool: PgPool) {
+async fn folder_options_list_every_collection(pool: PgPool) {
     let d = dir();
     let app = admin(&pool, &d).await;
     let options = |app: Router| async move {
@@ -623,12 +667,18 @@ async fn folder_enabled_collections_are_listed(pool: PgPool) {
     schema(&app, posts.clone()).await;
     schema(
         &app,
-        json!({"slug": "pages", "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+        json!({"slug": "plain", "fields": [{"name": "title", "type": "text"}]}),
     )
     .await;
-    assert_eq!(options(app.clone()).await, json!(["pages", "posts"]));
-    let f = folder(&app, "F", None, &["posts", "pages"]).await;
-    let only = folder(&app, "Only", None, &["posts"]).await;
+    let private = json!({"slug": "private_docs", "folders": true,
+        "access": {"read": {"role": "editor"}}, "fields": [{"name": "title", "type": "text"}]});
+    schema(&app, private.clone()).await;
+    assert_eq!(
+        options(app.clone()).await,
+        json!(["plain", "posts", "private_docs"])
+    );
+    let f = folder(&app, "F", None, &["posts", "plain"]).await;
+    let only = folder(&app, "Only", None, &["private_docs"]).await;
     let p = id(&ok(
         &app,
         "POST",
@@ -655,15 +705,30 @@ async fn folder_enabled_collections_are_listed(pool: PgPool) {
         json!({"schema": off, "confirm": true}),
     )
     .await;
-    assert_eq!(options(app.clone()).await, json!(["pages"]));
     let doc = ok(&app, "GET", &format!("/api/posts/{p}"), Value::Null).await;
     assert!(doc.get("folder").is_none(), "{doc}");
-    // Stored values naming it are dropped, not left dangling; a folder left with none
-    // holds any collection.
+    let mut private_off = private.clone();
+    private_off["folders"] = json!(false);
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/private_docs",
+        json!({"schema": private_off, "confirm": true}),
+    )
+    .await;
+    assert_eq!(
+        options(app.clone()).await,
+        json!(["plain", "posts", "private_docs"])
+    );
+    // The folders' own lists are left as they were.
     let kept = ok(&app, "GET", &format!("/api/folders/{f}"), Value::Null).await;
-    assert_eq!(kept["collections"], json!(["pages"]));
-    let emptied = ok(&app, "GET", &format!("/api/folders/{only}"), Value::Null).await;
-    assert!(emptied.get("collections").is_none(), "{emptied}");
+    assert_eq!(kept["collections"], json!(["posts", "plain"]));
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    assert_problem(
+        &call(&viewer, "GET", &format!("/api/folders/{only}"), Value::Null).await,
+        404,
+    );
+    assert!(!ids(&viewer, "/api/folders").await.contains(&only));
     // A folder can be deleted now that nothing files into it.
     let res = call(&app, "DELETE", &format!("/api/folders/{f}"), Value::Null).await;
     assert_eq!(res.status, 204, "{}", res.json);
@@ -671,6 +736,30 @@ async fn folder_enabled_collections_are_listed(pool: PgPool) {
     let none = folder(&app, "None", None, &[]).await;
     let got = ok(&app, "GET", &format!("/api/folders/{none}"), Value::Null).await;
     assert!(got.get("collections").is_none(), "{got}");
+
+    // A save of the folders answers with what's stored once refreshed.
+    let mut s =
+        ok(&app, "GET", "/api/admin/collections/folders", Value::Null).await["schema"].clone();
+    for f in s["fields"].as_array_mut().unwrap() {
+        if f["name"] == "collections" {
+            f["options"] = json!(["posts"]);
+        }
+    }
+    let saved = ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/folders",
+        json!({"schema": s, "confirm": true}),
+    )
+    .await;
+    let listed = saved["collection"]["schema"]["fields"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|f| f["name"] == "collections")
+        .unwrap()["options"]
+        .clone();
+    assert_eq!(listed, json!(["plain", "posts", "private_docs"]), "{saved}");
 }
 
 /// Signed out, folders take the same defaults as a collection with no rules, and the
@@ -856,4 +945,367 @@ async fn a_move_names_the_document_that_fails(pool: PgPool) {
     );
     let doc = ok(&app, "GET", &format!("/api/notes/{n}?depth=0"), Value::Null).await;
     assert_eq!(doc["folder"], f.as_str(), "nothing moved");
+}
+
+/// A folder restored from the trash must still fit: the folders above it may have moved
+/// down while it was there.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn restoring_a_folder_keeps_its_depth(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    let mut chain = vec![folder(&app, "0", None, &[]).await];
+    for n in 1..=62 {
+        let above = chain[n - 1].clone();
+        chain.push(folder(&app, &n.to_string(), Some(&above), &[]).await);
+    }
+    // 63 above it.
+    let x = folder(&app, "X", Some(&chain[62]), &[]).await;
+    let res = call(&app, "DELETE", &format!("/api/folders/{x}"), Value::Null).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    let n1 = folder(&app, "N1", None, &[]).await;
+    let n2 = folder(&app, "N2", None, &[]).await;
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/folders/{}", chain[0]),
+        json!({"folder": n1}),
+    )
+    .await;
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/folders/{n1}"),
+        json!({"folder": n2}),
+    )
+    .await;
+    let res = call(
+        &app,
+        "POST",
+        &format!("/api/folders/trash/{x}/restore"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    assert_problem(
+        &call(&app, "GET", &format!("/api/folders/{x}"), Value::Null).await,
+        404,
+    );
+    // Moved back up, it fits again.
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/folders/{n1}"),
+        json!({"folder": null}),
+    )
+    .await;
+    ok(
+        &app,
+        "POST",
+        &format!("/api/folders/trash/{x}/restore"),
+        Value::Null,
+    )
+    .await;
+}
+
+/// Moving a live copy out of a folder changes what's published, so it takes the right to
+/// publish, by rule and by key scope, as a publish would.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn moving_live_copies_takes_publish(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "folders": true, "versions": {"drafts": true},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let author = as_role(&pool, &d, "author@example.com", "author").await;
+    let g = id(&ok(&author, "POST", "/api/folders", json!({"name": "G"})).await);
+    let p = id(&ok(
+        &author,
+        "POST",
+        "/api/posts",
+        json!({"title": "t", "folder": g}),
+    )
+    .await);
+    ok(
+        &app,
+        "POST",
+        &format!("/api/posts/{p}/publish"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(
+        &call(
+            &author,
+            "POST",
+            &format!("/api/posts/{p}/publish"),
+            Value::Null,
+        )
+        .await,
+        403,
+    );
+    let held = |app: Router| {
+        let p = p.clone();
+        async move {
+            let live = ok(&app, "GET", &format!("/api/posts/{p}?depth=0"), Value::Null).await;
+            let draft = ok(
+                &app,
+                "GET",
+                &format!("/api/posts/{p}?draft=true&depth=0"),
+                Value::Null,
+            )
+            .await;
+            (live["folder"].clone(), draft["folder"].clone())
+        }
+    };
+    let res = call(
+        &author,
+        "DELETE",
+        &format!("/api/folders/{g}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        held(app.clone()).await,
+        (json!(g), json!(g)),
+        "nothing moved"
+    );
+
+    // A key that may write but not publish.
+    let key = ok(
+        &app,
+        "POST",
+        "/api/auth/keys",
+        json!({"name": "w", "scopes": ["*:write"]}),
+    )
+    .await["key"]
+        .as_str()
+        .unwrap()
+        .to_owned();
+    let keyed = common::with_key(router(&pool, &d).await, &key);
+    let res = call(
+        &keyed,
+        "DELETE",
+        &format!("/api/folders/{g}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 403);
+    assert_eq!(
+        held(app.clone()).await,
+        (json!(g), json!(g)),
+        "nothing moved"
+    );
+
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let res = call(
+        &editor,
+        "DELETE",
+        &format!("/api/folders/{g}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    assert_eq!(held(app.clone()).await, (Value::Null, Value::Null));
+}
+
+/// Trashed documents move with the rest, so restoring one later works.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn trashed_contents_move_too(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "folders": true, "versions": {"drafts": true},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let f = folder(&app, "F", None, &[]).await;
+    let b = folder(&app, "B", None, &[]).await;
+    let p = id(&ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "t", "folder": f}),
+    )
+    .await);
+    ok(
+        &app,
+        "POST",
+        &format!("/api/posts/{p}/publish"),
+        Value::Null,
+    )
+    .await;
+    let res = call(&app, "DELETE", &format!("/api/posts/{p}"), Value::Null).await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{f}?moveContentsTo={b}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    ok(
+        &app,
+        "POST",
+        &format!("/api/posts/trash/{p}/restore"),
+        Value::Null,
+    )
+    .await;
+    let live = ok(&app, "GET", &format!("/api/posts/{p}?depth=0"), Value::Null).await;
+    let draft = ok(
+        &app,
+        "GET",
+        &format!("/api/posts/{p}?draft=true&depth=0"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!((&live["folder"], &draft["folder"]), (&json!(b), &json!(b)));
+}
+
+/// A folder the caller can't read is no different from none, as a place to move to.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_hidden_target_is_a_missing_one(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "private_docs", "folders": true, "access": {"read": {"role": "editor"}},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let hidden = folder(&app, "Hidden", None, &["private_docs"]).await;
+    let author = as_role(&pool, &d, "author@example.com", "author").await;
+    let x = id(&ok(&author, "POST", "/api/folders", json!({"name": "X"})).await);
+    let a = call(
+        &author,
+        "DELETE",
+        &format!("/api/folders/{x}?moveContentsTo={hidden}"),
+        Value::Null,
+    )
+    .await;
+    let b = call(
+        &author,
+        "DELETE",
+        &format!("/api/folders/{x}?moveContentsTo={}", Uuid::now_v7()),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&a, 422);
+    assert_eq!((a.status, &a.json["errors"]), (b.status, &b.json["errors"]));
+}
+
+/// Accounts filed in a folder move with it, by those who manage users only.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn users_move_with_their_folder(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    let mut users =
+        ok(&app, "GET", "/api/admin/collections/users", Value::Null).await["schema"].clone();
+    users["folders"] = json!(true);
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/users",
+        json!({"schema": users}),
+    )
+    .await;
+    let me: Uuid = sqlx::query_scalar("SELECT user_id FROM accounts WHERE email = $1")
+        .bind(ADMIN)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    let f = folder(&app, "Team", None, &[]).await;
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/users/{me}"),
+        json!({"folder": f}),
+    )
+    .await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    let res = call(
+        &editor,
+        "DELETE",
+        &format!("/api/folders/{f}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 403);
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{f}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 204, "{}", res.json);
+    let profile = ok(&app, "GET", &format!("/api/users/{me}"), Value::Null).await;
+    assert!(
+        profile.get("folder").is_none_or(Value::is_null),
+        "{profile}"
+    );
+}
+
+/// A folder that lists collections holds only those; one that lists none holds any.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn folders_hold_what_they_list(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    for slug in ["posts", "pages"] {
+        schema(
+            &app,
+            json!({"slug": slug, "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+        )
+        .await;
+    }
+    let posts_only = folder(&app, "Posts", None, &["posts"]).await;
+    let any = folder(&app, "Any", None, &[]).await;
+    let res = call(
+        &app,
+        "POST",
+        "/api/pages",
+        json!({"title": "t", "folder": posts_only}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    let page = id(&ok(
+        &app,
+        "POST",
+        "/api/pages",
+        json!({"title": "t", "folder": any}),
+    )
+    .await);
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/pages/{page}"),
+        json!({"folder": posts_only}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "t", "folder": posts_only}),
+    )
+    .await;
+    // Moved into one that doesn't list it, the move is refused, naming the page.
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{any}?moveContentsTo={posts_only}"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "moveContentsTo", "{}", res.json);
+    assert!(res.json.to_string().contains(&page), "{}", res.json);
 }

@@ -428,19 +428,49 @@ pub async fn update_in<E: From<DbError>>(
     guard: Option<&Filter>,
     apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
 ) -> Result<Document, E> {
+    update_any_in(
+        tx,
+        collection_id,
+        schema_version,
+        id,
+        copy,
+        false,
+        actor,
+        guard,
+        apply,
+    )
+    .await
+}
+
+/// `update_in` of a document in the trash when `trashed`, which stays there: how a
+/// folder's deletion moves what's trashed in it along with the rest.
+#[allow(clippy::too_many_arguments)] // `update_in`'s, plus where the document is
+pub async fn update_any_in<E: From<DbError>>(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    schema_version: i32,
+    id: Uuid,
+    copy: DocCopy,
+    trashed: bool,
+    actor: Option<Actor>,
+    guard: Option<&Filter>,
+    apply: impl FnOnce(&Map<String, Value>) -> Result<Prepared, E>,
+) -> Result<Document, E> {
     check_schema(&mut *tx, collection_id, schema_version).await?;
     let draft = copy == DocCopy::Draft;
     let current = sqlx::query!(
         r#"SELECT CASE WHEN $4 THEN draft ELSE published END AS "data!: Json<Map<String, Value>>",
                   created_by, CASE WHEN $4 THEN draft_file ELSE published_file END AS file
            FROM documents
-           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+           WHERE tenant_id = $1 AND collection_id = $2 AND id = $3
+             AND (deleted_at IS NOT NULL) = $5
              AND CASE WHEN $4 THEN draft ELSE published END IS NOT NULL
            FOR NO KEY UPDATE"#,
         DEFAULT_TENANT,
         collection_id,
         id,
         draft,
+        trashed,
     )
     .fetch_optional(&mut *tx)
     .await

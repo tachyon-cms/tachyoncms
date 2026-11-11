@@ -1,7 +1,7 @@
 //! The folders system collection: documents of any collection with `folders` on link to
 //! one through their `folder` field, and folders nest through theirs.
 
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::{CollectionKind, CollectionSchema, FieldKind, SchemaError, SelectOption};
@@ -15,36 +15,72 @@ pub use tachyon_core::FOLDERS;
 /// How many folders may sit above one.
 pub const MAX_DEPTH: i32 = 64;
 
-/// The `folders` collection, created the first time it's needed, listing the collections
-/// that file into folders now.
+/// The slugs a folder's `collections` may name: every collection, whether or not it has
+/// folders on, except the system's own. A slug never leaves the list when folders are
+/// turned off, so no folder's list is ever rewritten wider.
+pub fn listable(
+    schemas: impl IntoIterator<Item = impl std::borrow::Borrow<CollectionSchema>>,
+) -> Vec<String> {
+    let mut out: Vec<String> = schemas
+        .into_iter()
+        .filter(|s| {
+            let s = s.borrow();
+            s.kind == CollectionKind::Collection
+                && s.slug != FOLDERS
+                && s.slug != crate::auth::USERS
+        })
+        .map(|s| s.borrow().slug.clone())
+        .collect();
+    out.sort();
+    out.dedup();
+    out
+}
+
+/// The folders collection as the system makes it, its `collections` listing `options`.
+pub fn system_schema(options: Vec<String>) -> CollectionSchema {
+    serde_json::from_value(json!({
+        "slug": FOLDERS,
+        "fields": [
+            {"name": "name", "type": "text", "required": true},
+            {"name": "folder", "type": "relationship", "relationTo": FOLDERS},
+            {"name": "collections", "type": "select", "multiple": true, "options": options},
+        ]
+    }))
+    .expect("the folders schema is valid")
+}
+
+/// The `folders` collection, created the first time it's needed.
 pub async fn ensure_folders_collection(pool: &PgPool) -> Result<Collection, DbError> {
     match collections::get_by_slug(pool, FOLDERS).await {
         Ok(c) => return Ok(c),
         Err(DbError::NotFound) => {}
         Err(e) => return Err(e),
     }
-    let enabled: Vec<String> = collections::list(pool)
-        .await?
-        .iter()
-        .map(|c| &c.schema.0)
-        .filter(|s| s.folders && s.kind == CollectionKind::Collection)
-        .map(|s| s.slug.clone())
-        .collect();
-    let schema: CollectionSchema = serde_json::from_value(json!({
-        "slug": FOLDERS,
-        "fields": [
-            {"name": "name", "type": "text", "required": true},
-            {"name": "folder", "type": "relationship", "relationTo": FOLDERS},
-            {"name": "collections", "type": "select", "multiple": true, "options": enabled},
-        ]
-    }))
-    .expect("the folders schema is valid");
+    let all = collections::list(pool).await?;
+    let schema = system_schema(listable(all.iter().map(|c| &c.schema.0)));
     match collections::create(pool, &schema).await {
         Ok(c) => Ok(c),
         // Another server got there first.
         Err(DbError::Conflict(_)) => collections::get_by_slug(pool, FOLDERS).await,
         Err(e) => Err(e),
     }
+}
+
+/// `ensure_folders_collection` inside a schema change, which holds the schema lock (or, for
+/// a preview, rolls back): so a change that turns folders on before any server has made
+/// them works, and a preview of it creates nothing.
+pub(crate) async fn ensure_in(conn: &mut PgConnection) -> Result<(), DbError> {
+    let found = sqlx::query_scalar!(
+        "SELECT id FROM collections WHERE tenant_id = $1 AND slug = $2",
+        DEFAULT_TENANT,
+        FOLDERS,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    if found.is_none() {
+        collections::insert(conn, Uuid::now_v7(), &system_schema(Vec::new())).await?;
+    }
+    Ok(())
 }
 
 /// The folders collection is the system's: a schema can't create one (`new`), and a change
@@ -67,16 +103,23 @@ pub fn check_folders_schema(schema: &CollectionSchema, new: bool) -> Result<(), 
             "versions: folders can't have versions or drafts, since restoring one could put a folder inside itself".into(),
         ));
     }
+    if schema.upload.is_some() {
+        return Err(SchemaError::At {
+            path: "upload".into(),
+            message: "folders can't hold files, since every folder would then need one".into(),
+        });
+    }
+    // At the top, not in a row or tab, where the refresh and the read filter find them.
     let top = |name: &str| {
         schema
-            .data()
+            .fields
             .iter()
             .find(|f| f.name == name && f.virtual_path.is_none())
     };
     let kept = [
         (
             "name",
-            "folders need their text field called name",
+            "folders need their text field called name, at the top level",
             top("name").is_some_and(|f| {
                 matches!(
                     f.kind,
@@ -89,7 +132,7 @@ pub fn check_folders_schema(schema: &CollectionSchema, new: bool) -> Result<(), 
         ),
         (
             "folder",
-            "folders need their folder field, a relationship to one folder",
+            "folders need their folder field, a relationship to one folder, at the top level",
             top("folder").is_some_and(|f| {
                 f.kind
                     .link()
@@ -99,7 +142,7 @@ pub fn check_folders_schema(schema: &CollectionSchema, new: bool) -> Result<(), 
         ),
         (
             "collections",
-            "folders need their collections field, a select of several",
+            "folders need their collections field, a select of several, at the top level",
             top("collections")
                 .is_some_and(|f| matches!(f.kind, FieldKind::Select { multiple: true, .. })),
         ),
@@ -113,13 +156,15 @@ pub fn check_folders_schema(schema: &CollectionSchema, new: bool) -> Result<(), 
     }
 }
 
-/// Lists `enabled`, the collections that file into folders, as the options of the folders'
-/// `collections`, and drops stored values naming any other. Inside a schema change, which
-/// holds the schema lock; the folders' writes retry against the new options.
+/// Lists `listable`, the collections a folder may name, as the options of the folders'
+/// `collections`, and returns the folders collection when that changed it. Inside a schema
+/// change, which holds the schema lock; the folders' writes retry against the new options.
+/// Stored lists are never rewritten: no slug leaves the options while collections can't
+/// be deleted.
 pub(crate) async fn refresh_in(
     conn: &mut PgConnection,
-    mut enabled: Vec<String>,
-) -> Result<(), DbError> {
+    listable: Vec<String>,
+) -> Result<Option<Collection>, DbError> {
     let Some(row) = sqlx::query!(
         r#"SELECT id, schema AS "schema: Json<CollectionSchema>" FROM collections
            WHERE tenant_id = $1 AND slug = $2 FOR UPDATE"#,
@@ -129,9 +174,8 @@ pub(crate) async fn refresh_in(
     .fetch_optional(&mut *conn)
     .await?
     else {
-        return Ok(());
+        return Ok(None);
     };
-    enabled.sort();
     let mut schema = row.schema.0;
     let Some(FieldKind::Select { options, .. }) = schema
         .fields
@@ -139,67 +183,42 @@ pub(crate) async fn refresh_in(
         .find(|f| f.name == "collections")
         .map(|f| &mut f.kind)
     else {
-        return Ok(());
+        return Ok(None);
     };
     if options
         .iter()
         .map(SelectOption::value)
-        .eq(enabled.iter().map(String::as_str))
+        .eq(listable.iter().map(String::as_str))
     {
-        return Ok(());
+        return Ok(None);
     }
-    *options = enabled.iter().cloned().map(SelectOption::Value).collect();
-    sqlx::query!(
-        "UPDATE collections SET schema = $2, schema_version = schema_version + 1, updated_at = now() WHERE id = $1",
+    *options = listable.into_iter().map(SelectOption::Value).collect();
+    let saved = sqlx::query_as!(
+        Collection,
+        r#"UPDATE collections
+           SET schema = $2, schema_version = schema_version + 1, updated_at = now()
+           WHERE id = $1
+           RETURNING id, schema AS "schema: Json<CollectionSchema>", schema_version, created_at, updated_at"#,
         row.id,
         Json(&schema) as _,
     )
-    .execute(&mut *conn)
+    .fetch_one(&mut *conn)
     .await?;
-    let docs = sqlx::query!(
-        r#"SELECT id, published AS "published: Json<Map<String, Value>>",
-                  draft AS "draft: Json<Map<String, Value>>"
-           FROM documents WHERE tenant_id = $1 AND collection_id = $2
-             AND (published ? 'collections' OR draft ? 'collections')"#,
-        DEFAULT_TENANT,
-        row.id,
-    )
-    .fetch_all(&mut *conn)
-    .await?;
-    let keep = |copy: Option<Json<Map<String, Value>>>| {
-        copy.map(|Json(mut doc)| {
-            if let Some(Value::Array(listed)) = doc.get_mut("collections") {
-                listed.retain(|v| v.as_str().is_some_and(|s| enabled.iter().any(|e| e == s)));
-                // None left is no restriction, as a folder made without any.
-                if listed.is_empty() {
-                    doc.remove("collections");
-                }
-            }
-            Json(doc)
-        })
-    };
-    for d in docs {
-        sqlx::query!(
-            "UPDATE documents SET published = $2, draft = $3 WHERE id = $1",
-            d.id,
-            keep(d.published) as _,
-            keep(d.draft) as _,
-        )
-        .execute(&mut *conn)
-        .await?;
-    }
     sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", FOLDERS)
         .execute(&mut *conn)
         .await?;
-    Ok(())
+    Ok(Some(saved))
 }
 
 /// Holds every change to where folders sit until `conn`'s transaction ends, so two moves
 /// at once can't each pass `check_place_in` and make a loop between them.
 pub async fn lock_tree_in(conn: &mut PgConnection) -> Result<(), DbError> {
-    sqlx::query!("SELECT pg_advisory_xact_lock(hashtext('tachyon_folders'))")
-        .execute(&mut *conn)
-        .await?;
+    sqlx::query!(
+        "SELECT pg_advisory_xact_lock(hashtextextended($1, 0))",
+        format!("folders:{DEFAULT_TENANT}"),
+    )
+    .execute(&mut *conn)
+    .await?;
     Ok(())
 }
 
@@ -274,12 +293,18 @@ pub async fn check_place_in(conn: &mut PgConnection, id: Uuid) -> Result<(), DbE
     }]))
 }
 
-/// Locks live folder `id` for deleting, and returns what files into it: each document
-/// (collection and ID) and copy whose `folder` names it.
-pub async fn contents_in(
-    conn: &mut PgConnection,
-    id: Uuid,
-) -> Result<Vec<(Uuid, Uuid, DocCopy)>, DbError> {
+/// What files into a folder: a document (collection and ID), the copy whose `folder`
+/// names it, and whether the document is in the trash.
+pub struct Content {
+    pub collection_id: Uuid,
+    pub id: Uuid,
+    pub copy: DocCopy,
+    pub trashed: bool,
+}
+
+/// Locks live folder `id` for deleting, and returns what files into it, trashed documents
+/// included: they'd otherwise be left linking to a folder in the trash.
+pub async fn contents_in(conn: &mut PgConnection, id: Uuid) -> Result<Vec<Content>, DbError> {
     sqlx::query_scalar!(
         "SELECT id FROM documents WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL FOR UPDATE",
         DEFAULT_TENANT,
@@ -289,10 +314,11 @@ pub async fn contents_in(
     .await?
     .ok_or(DbError::NotFound)?;
     let rows = sqlx::query!(
-        r#"SELECT d.collection_id, d.id, r.copy FROM relations r
+        r#"SELECT d.collection_id, d.id, r.copy, d.deleted_at IS NOT NULL AS "trashed!"
+           FROM relations r
            JOIN documents d ON d.id = r.from_doc
            WHERE r.tenant_id = $1 AND r.to_doc = $2 AND r.field_path = 'folder'
-             AND r.from_doc <> $2 AND d.deleted_at IS NULL
+             AND r.from_doc <> $2
            ORDER BY d.id, r.copy"#,
         DEFAULT_TENANT,
         id,
@@ -306,7 +332,32 @@ pub async fn contents_in(
                     format!("unknown document copy `{}`", r.copy).into(),
                 ))
             })?;
-            Ok((r.collection_id, r.id, copy))
+            Ok(Content {
+                collection_id: r.collection_id,
+                id: r.id,
+                copy,
+                trashed: r.trashed,
+            })
         })
         .collect()
+}
+
+/// The collections folder `id` lists, as `conn` sees it: empty when it lists none (any
+/// collection), `None` when there's no such live folder.
+pub async fn lists_in(conn: &mut PgConnection, id: Uuid) -> Result<Option<Vec<String>>, DbError> {
+    let listed = sqlx::query_scalar!(
+        r#"SELECT published -> 'collections' AS "listed: Json<Value>" FROM documents
+           WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_optional(&mut *conn)
+    .await?;
+    Ok(listed.map(|l| match l {
+        Some(Json(Value::Array(slugs))) => slugs
+            .iter()
+            .filter_map(|s| s.as_str().map(str::to_owned))
+            .collect(),
+        _ => Vec::new(),
+    }))
 }

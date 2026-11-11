@@ -1038,7 +1038,7 @@ pub async fn by_slug(
     Ok(out)
 }
 
-/// Whether live document `id`'s `copy` matches `filter`. Run after locking the row, this
+/// Whether document `id`'s `copy` matches `filter`. Run after locking the row, this
 /// judges the version the rest of the transaction writes over.
 pub(crate) async fn matches(
     conn: &mut sqlx::PgConnection,
@@ -1048,8 +1048,9 @@ pub(crate) async fn matches(
 ) -> Result<bool, DbError> {
     let mut qb =
         QueryBuilder::<Postgres>::new("SELECT EXISTS (SELECT 1 FROM documents WHERE tenant_id = ");
+    // The caller has locked the row, live or in the trash, so only the filter is judged.
     qb.push_bind(DEFAULT_TENANT)
-        .push(" AND deleted_at IS NULL AND id = ")
+        .push(" AND id = ")
         .push_bind(id);
     push_copy(&mut qb, "", copy, None);
     qb.push(" AND ");

@@ -551,18 +551,17 @@ impl Access {
     /// a collection they can read, and those for no collection in particular. Every read
     /// of a folder, linked or asked for, goes through it, so a hidden one is missing.
     fn folder_reads(&self, folders: &Collection, scoped: bool) -> Compiled {
-        let enabled: Vec<Arc<Collection>> = self
-            .schemas
-            .all()
-            .into_iter()
-            .filter(|c| c.schema.folders && c.schema.kind == CollectionKind::Collection)
-            .collect();
-        let readable: Vec<&str> = enabled
+        // Every collection a folder may list, folders on or not, so turning a collection's
+        // folders off never opens the folders made for it.
+        let all = self.schemas.all();
+        let listable = tachyon_db::folders::listable(all.iter().map(|c| &c.schema.0));
+        let readable: Vec<&str> = all
             .iter()
+            .filter(|c| listable.contains(&c.schema.slug))
             .filter(|c| self.allows_in(Action::Read, c, scoped) != Compiled::Deny)
             .map(|c| c.schema.slug.as_str())
             .collect();
-        if readable.len() == enabled.len() {
+        if readable.len() == listable.len() {
             return Compiled::Allow;
         }
         // Stored lists only name collections with folders, and never an empty one.
@@ -945,20 +944,7 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<Option<Filter>, ApiError> {
-        self.may_write(action, c)?;
-        let (read, write) = match self.write_rules(action, c) {
-            Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
-            // Refused for the whole collection, so a 403 before the readability check is
-            // intended: it says nothing about this document.
-            Err(WriteRefusal::Refused) => return Err(self.refuse()),
-            Ok(filters) => filters,
-        };
-        let read = match self.draft_readable(c, read.clone()) {
-            Some(r) => r,
-            // Refused for the whole collection, as above.
-            None if c.schema.drafts() => return Err(self.refuse()),
-            None => Readable::published(read),
-        };
+        let (read, write) = self.guard_rules(action, c)?;
         // Checked first so a hidden document is a 404; the guard checks it again under the
         // lock, so a change in between can only turn this into a 403. The owner never
         // changes, so it needn't be. A draft the caller can't read, of a document whose
@@ -973,6 +959,31 @@ impl Access {
             }
         }
         Ok(both(read.filter, write))
+    }
+
+    /// What `write_guard` judges, worked out without looking at any document: how the
+    /// caller reads the copy the write changes, and the action's own filter. A caller with
+    /// a transaction open uses this, and lets the locked row be judged by both.
+    pub(crate) fn guard_rules(
+        &self,
+        action: Action,
+        c: &Collection,
+    ) -> Result<(Readable, Option<Filter>), ApiError> {
+        self.may_write(action, c)?;
+        let (read, write) = match self.write_rules(action, c) {
+            Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
+            // Refused for the whole collection, so a 403 before the readability check is
+            // intended: it says nothing about this document.
+            Err(WriteRefusal::Refused) => return Err(self.refuse()),
+            Ok(filters) => filters,
+        };
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            // Refused for the whole collection, as above.
+            None if c.schema.drafts() => return Err(self.refuse()),
+            None => Readable::published(read),
+        };
+        Ok((read, write))
     }
 
     /// The refusals an update or delete (`action`) of `c` meets before any document is

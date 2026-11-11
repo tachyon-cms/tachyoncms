@@ -11,7 +11,7 @@ use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
-use tachyon_db::folders::{FOLDERS, check_folders_schema, ensure_folders_collection};
+use tachyon_db::folders::{FOLDERS, check_folders_schema, listable, system_schema};
 use tachyon_db::schema_change::{self, ChangeError, ConfirmationScope, Preview, Save};
 use tachyon_db::{collections, indexes};
 
@@ -157,13 +157,19 @@ pub async fn run(
     apply: Option<bool>,
 ) -> anyhow::Result<String> {
     let wanted = parse_bundle(text)?;
-    // The folders are the system's, made when the server starts; a file using them may
-    // come first.
-    if wanted.iter().any(|s| s.folders || s.slug == FOLDERS) {
-        ensure_folders_collection(pool).await?;
+    let mut existing: Vec<CollectionSchema> = collections::list(pool)
+        .await?
+        .into_iter()
+        .map(|c| c.schema.0)
+        .collect();
+    // The folders are the system's, made when a server starts. A file using them may come
+    // first: the change makes them, and until then they're checked as they'll be made.
+    let makes_folders = wanted.iter().any(|s| s.folders || s.slug == FOLDERS)
+        && !existing.iter().any(|c| c.slug == FOLDERS);
+    if makes_folders {
+        existing.push(system_schema(listable(existing.iter().chain(&wanted))));
     }
-    let existing = collections::list(pool).await?;
-    let is_new = |slug: &str| !existing.iter().any(|c| c.schema.0.slug == slug);
+    let is_new = |slug: &str| !existing.iter().any(|c| c.slug == slug);
 
     for slug in renames.keys() {
         if !wanted.iter().any(|s| &s.slug == slug) {
@@ -177,7 +183,7 @@ pub async fn run(
         // What the API checks at save against this server's storages and limits.
         check_upload(uploads, s).map_err(|e| anyhow!("{}: {}: {}", s.slug, e.path, e.message))?;
         for target in s.relation_targets() {
-            let mut known = wanted.iter().chain(existing.iter().map(|c| &c.schema.0));
+            let mut known = wanted.iter().chain(&existing);
             if !known.any(|o| o.slug == target && o.kind == CollectionKind::Collection) {
                 bail!(
                     "{}: relationTo `{target}` doesn't match a collection in the file or the database",
@@ -192,12 +198,10 @@ pub async fn run(
     // access rules filter through them or read `$user` fields from `users`. Each sees its
     // shared blocks as the file leaves them.
     let raw = |slug: &str| {
-        wanted.iter().find(|o| o.slug == slug).or_else(|| {
-            existing
-                .iter()
-                .map(|c| &c.schema.0)
-                .find(|o| o.slug == slug)
-        })
+        wanted
+            .iter()
+            .find(|o| o.slug == slug)
+            .or_else(|| existing.iter().find(|o| o.slug == slug))
     };
     let mut world = Vec::new();
     for s in &wanted {
@@ -205,8 +209,7 @@ pub async fn run(
         expanded.check().with_context(|| s.slug.clone())?;
         world.push(expanded);
     }
-    for c in &existing {
-        let other = &c.schema.0;
+    for other in &existing {
         if !wanted.iter().any(|s| s.slug == other.slug) {
             world.push(
                 other
@@ -282,12 +285,12 @@ pub async fn run(
             describe(slug, &o.preview)
         });
     }
+    if makes_folders {
+        report.push(format!("+ create {FOLDERS} (built in, for folders)"));
+    }
     for c in &existing {
-        if !wanted.iter().any(|s| s.slug == c.schema.0.slug) {
-            report.push(format!(
-                "  {} isn't in the file; left as it is",
-                c.schema.0.slug
-            ));
+        if !wanted.iter().any(|s| s.slug == c.slug) && !(makes_folders && c.slug == FOLDERS) {
+            report.push(format!("  {} isn't in the file; left as it is", c.slug));
         }
     }
     let report = report.join("\n");
@@ -372,6 +375,12 @@ mod tests {
         let file = json!({"collections": [{"slug": "posts", "folders": true, "fields": [
             {"name": "title", "type": "text"}]}]})
         .to_string();
+        // A diff only says what it would do.
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        assert!(plan.contains("+ create folders"), "{plan}");
+        assert!(collections::list(&pool).await.unwrap().is_empty(), "{plan}");
         run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap();

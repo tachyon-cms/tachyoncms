@@ -1,8 +1,11 @@
 //! Writes to the folders collection: where a folder sits, and deleting one with its
 //! contents moved (`?moveContentsTo`). Who may read a folder is `Access::folder_reads`.
 
-use serde_json::{Value, json};
+use std::collections::HashMap;
+
+use serde_json::{Map, Value, json};
 use sqlx::PgConnection;
+use tachyon_core::access::Compiled;
 use tachyon_core::auth::Action;
 use tachyon_core::query::Filter;
 use tachyon_core::{FOLDERS, FieldError, merged, validate_document_in};
@@ -11,10 +14,10 @@ use tachyon_db::DocCopy;
 use tachyon_db::auth::USERS;
 use tachyon_db::collections::Collection;
 use tachyon_db::documents::{self, Actor};
-use tachyon_db::folders;
+use tachyon_db::folders::{self, Content};
 use uuid::Uuid;
 
-use crate::access::Access;
+use crate::access::{Access, both};
 use crate::documents::{delete_error, mode_for};
 use crate::populate::{link_targets, prepare};
 use crate::{ApiError, AppState};
@@ -49,10 +52,42 @@ fn bad_move(message: &str) -> ApiError {
     }])
 }
 
+/// Refuses `data` of `c` filed in a folder whose `collections` lists others but not `c`.
+/// One that lists none holds any collection. Folders nest whatever they list.
+pub(crate) async fn check_filed(
+    tx: &mut PgConnection,
+    c: &Collection,
+    data: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    if c.schema.slug == FOLDERS || !c.schema.folders {
+        return Ok(());
+    }
+    let Some(folder) = data
+        .get("folder")
+        .and_then(Value::as_str)
+        .and_then(|s| s.parse::<Uuid>().ok())
+    else {
+        return Ok(());
+    };
+    match folders::lists_in(tx, folder).await? {
+        Some(listed) if !listed.is_empty() && !listed.contains(&c.schema.slug) => {
+            Err(ApiError::Validation(vec![FieldError {
+                path: "folder".into(),
+                message: format!("this folder doesn't hold {}", c.schema.slug),
+            }]))
+        }
+        _ => Ok(()),
+    }
+}
+
 /// Deletes folder `id` of `c` (under `guard`, judging `copy`), first moving what files into
-/// it, documents and folders, to `to` (`None`: the root). One transaction: any refusal or
-/// failure leaves everything as it was. Each moved copy is an update, judged by its
-/// collection's rules and the `folder` field's; versions aren't touched.
+/// it, documents and folders, in the trash or not, to `to` (`None`: the root). One
+/// transaction, on one connection: any refusal or failure leaves everything as it was.
+/// Each moved copy is an update, judged by its collection's rules and the `folder` field's,
+/// and a live copy with drafts beside it by the right to publish too; versions aren't
+/// touched.
+// shortcut: one guard check and update per document, all under the tree lock; move a
+// folder of many thousands on the jobs worker, in batches, when that's needed.
 #[allow(clippy::too_many_arguments)] // the delete's, plus where to
 pub(crate) async fn delete_moving(
     state: &AppState,
@@ -70,6 +105,13 @@ pub(crate) async fn delete_moving(
     {
         return Err(bad_move("doesn't match any folder"));
     }
+    // What each collection with a `folder` may link to, worked out before the lock.
+    let mut targets = HashMap::new();
+    for dc in state.schemas.all() {
+        if dc.schema.folders || dc.schema.slug == FOLDERS {
+            targets.insert(dc.id, link_targets(state, &dc).await?);
+        }
+    }
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     lock(&mut tx).await?;
     if let Some(t) = to
@@ -79,12 +121,15 @@ pub(crate) async fn delete_moving(
             "can't be the folder being deleted or one inside it",
         ));
     }
-    for (collection_id, doc, held) in folders::contents_in(&mut tx, id).await? {
-        let dc = state
-            .schemas
-            .get_by_id(collection_id)
-            .ok_or_else(|| ApiError::Conflict(crate::error::TRY_AGAIN.into()))?;
-        move_one(&mut tx, state, access, &dc, doc, held, to)
+    for item in folders::contents_in(&mut tx, id).await? {
+        let (dc, links) = match (
+            state.schemas.get_by_id(item.collection_id),
+            targets.get(&item.collection_id),
+        ) {
+            (Some(dc), Some(links)) => (dc, links),
+            _ => return Err(ApiError::Conflict(crate::error::TRY_AGAIN.into())),
+        };
+        move_one(&mut tx, access, &dc, links, &item, to)
             .await
             .map_err(|e| match e {
                 // Hidden from them is still a document they may not change.
@@ -96,8 +141,9 @@ pub(crate) async fn delete_moving(
                         .map(|f| FieldError {
                             path: "moveContentsTo".into(),
                             message: format!(
-                                "{} {doc} can't be moved: {}{}",
+                                "{} {} can't be moved: {}{}",
                                 dc.schema.slug,
+                                item.id,
                                 match f.path.is_empty() {
                                     true => String::new(),
                                     false => format!("{} ", f.path),
@@ -117,43 +163,55 @@ pub(crate) async fn delete_moving(
     Ok(())
 }
 
-/// Rewrites `copy` of document `doc` of `dc` to sit in `to`, as an update by the caller.
+/// Rewrites `item`'s copy, of a document of `dc`, to sit in `to`, as an update by the
+/// caller, on `tx` alone.
 async fn move_one(
     tx: &mut PgConnection,
-    state: &AppState,
     access: &Access,
     dc: &Collection,
-    doc: Uuid,
-    copy: DocCopy,
+    targets: &HashMap<String, Uuid>,
+    item: &Content,
     to: Option<Uuid>,
 ) -> Result<(), ApiError> {
     // Accounts change through their own routes, which only those who manage users pass.
-    let (actor, guard) = if dc.schema.slug == USERS {
+    let (actor, mut guard) = if dc.schema.slug == USERS {
         if !access.manages_users() {
             return Err(access.refuse());
         }
         (None, None)
     } else {
-        let guard = access
-            .write_guard(&state.pool, Action::Update, dc, doc)
-            .await?;
-        (access.actor(Action::Update, dc), guard)
+        // Judged on the locked row: the read and update rules, and the creator where
+        // either right is the caller's own documents only.
+        let (read, write) = access.guard_rules(Action::Update, dc)?;
+        let actor = access.actor(Action::Update, dc).map(|a| Actor {
+            own_only: a.own_only || read.owner.is_some(),
+            ..a
+        });
+        (actor, both(read.filter, write))
     };
-    let targets = link_targets(state, dc).await?;
+    // A live copy with a draft beside it changes only by publishing.
+    if item.copy == DocCopy::Published && dc.schema.drafts() {
+        match access.allows(Action::Publish, dc) {
+            Compiled::Deny => return Err(access.refuse()),
+            Compiled::Allow => {}
+            Compiled::Filter(f) => guard = both(guard, Some(f)),
+        }
+    }
     let patch = json!({ "folder": to });
-    documents::update_in(
+    let doc = documents::update_any_in(
         tx,
         dc.id,
         dc.schema_version,
-        doc,
-        copy,
+        item.id,
+        item.copy,
+        item.trashed,
         actor,
         guard.as_ref(),
         |current| {
             access.writes(dc, &patch, Action::Update, Some(current))?;
-            validate_document_in(mode_for(copy), dc.schema.data(), &patch, Some(current))
+            validate_document_in(mode_for(item.copy), dc.schema.data(), &patch, Some(current))
                 .map_err(ApiError::Validation)
-                .and_then(|data| prepare(&targets, dc, data))
+                .and_then(|data| prepare(targets, dc, data))
                 .map_err(|e| {
                     let doc = merged(dc.schema.data(), &patch, Some(current));
                     access.hide(dc, e, Some(&doc))
@@ -161,9 +219,9 @@ async fn move_one(
         },
     )
     .await?;
-    // A folder takes what's inside it along, which must still fit.
-    if dc.schema.slug == FOLDERS {
-        check_place(tx, doc).await?;
+    match dc.schema.slug == FOLDERS {
+        // A folder takes what's inside it along, which must still fit.
+        true => check_place(tx, item.id).await,
+        false => check_filed(tx, dc, &doc.data.0).await,
     }
-    Ok(())
 }

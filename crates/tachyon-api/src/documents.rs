@@ -319,6 +319,9 @@ pub async fn create(
         if moves {
             folders::check_place(&mut tx, doc.id).await?;
         }
+        if body.get("folder").is_some() {
+            folders::check_filed(&mut tx, &c, &doc.data.0).await?;
+        }
         filtered_links(
             &mut tx,
             &state,
@@ -611,6 +614,9 @@ pub async fn update(
         .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
         if moves {
             folders::check_place(&mut tx, id).await?;
+        }
+        if sent.get("folder").is_some() {
+            folders::check_filed(&mut tx, &c, &doc.data.0).await?;
         }
         let data = &doc.data.0;
         filtered_links(

@@ -134,6 +134,12 @@ pub async fn restore(
     let (mut tries, mut size_rounds, mut last_names) = (0, 0, None);
     while tries < crate::media_jobs::RESTORE_TRIES && size_rounds < crate::media_jobs::SIZE_ROUNDS {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        // A folder comes back where it was, which must still fit: those above may have
+        // moved down meanwhile. The tree lock comes before any row's.
+        let folder = c.schema.slug == tachyon_core::FOLDERS;
+        if folder {
+            crate::folders::lock(&mut tx).await?;
+        }
         let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
         for (copy, p, _) in &locked {
             if let Err(e) = vouched_links(p, &Held::new(), &vouched) {
@@ -170,6 +176,9 @@ pub async fn restore(
                 };
                 access.hide(&c, e, None)
             })?;
+        if folder {
+            crate::folders::check_place(&mut tx, id).await?;
+        }
         if !copied.covers(&renamed) {
             drop(tx);
             let names: Vec<(Uuid, String)> = renamed
