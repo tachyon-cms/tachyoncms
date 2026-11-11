@@ -43,3 +43,4 @@ timeout = "10m"                 # how long one upload request may take; under 1h
 # public_url = "https://files.example.com"    # where browsers reach the bucket
 # client_uploads = false                      # clients put files here themselves (buckets only)
 # signed_downloads = false                    # or true, or { mime_types = ["application/pdf"], expires_in = "2h" }
+#                                             # (buckets only; a link lasts 7 days at most)

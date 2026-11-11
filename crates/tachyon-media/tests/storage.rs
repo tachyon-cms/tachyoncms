@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use std::time::Duration;
 
-use tachyon_media::storage::{Adapter, Storage, StorageConfig, object_key};
+use tachyon_media::storage::{Adapter, SignedDownloads, Storage, StorageConfig, object_key};
 use uuid::Uuid;
 
 /// A path in a fresh directory under the system's temp dir, removed on drop.
@@ -128,21 +128,61 @@ fn a_bad_prefix_stops_startup() {
 }
 
 #[tokio::test]
-async fn local_storage_takes_no_client_uploads() {
+async fn local_storage_cant_sign() {
     let root = temp_root();
+    let mut c = StorageConfig::local(&*root);
+    c.signed_downloads = SignedDownloads::On {
+        mime_types: Vec::new(),
+        expires_in: Duration::from_secs(60),
+    };
+    let err = Storage::open("disk", &c).unwrap_err();
+    assert!(err.starts_with("storage.disk.signed_downloads: "), "{err}");
     let mut c = StorageConfig::local(&*root);
     c.client_uploads = true;
     let err = Storage::open("disk", &c).unwrap_err();
     assert!(err.starts_with("storage.disk.client_uploads: "), "{err}");
-    // Opened as it may be, it signs no uploads.
+    // Opened as it may be, it signs nothing and takes no client's files.
     let disk = Storage::open("disk", &StorageConfig::local(&*root)).unwrap();
     assert!(!disk.takes_client_uploads());
+    assert!(disk.signs("image/png").is_none());
     let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
+    assert!(
+        disk.presign_get(&key, Duration::from_secs(60))
+            .await
+            .is_err()
+    );
     assert!(
         disk.presign_put(&key, "image/png", Duration::from_secs(60))
             .await
             .is_err()
     );
+}
+
+#[test]
+fn signed_links_last_seven_days_at_most() {
+    let bucket = |expires_in| StorageConfig {
+        adapter: Adapter::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            region: Some("us-east-1".into()),
+        },
+        signed_downloads: SignedDownloads::On {
+            mime_types: vec!["application/pdf".into()],
+            expires_in,
+        },
+        ..StorageConfig::local("unused")
+    };
+    let week = Duration::from_secs(7 * 24 * 3600);
+    let s3 = Storage::open("s3", &bucket(week)).unwrap();
+    assert_eq!(s3.signs("application/pdf"), Some(week));
+    assert_eq!(s3.signs("image/png"), None);
+    for bad in [week + Duration::from_secs(1), Duration::ZERO] {
+        let err = Storage::open("s3", &bucket(bad)).unwrap_err();
+        assert!(
+            err.starts_with("storage.s3.signed_downloads.expires_in: "),
+            "{err}"
+        );
+    }
 }
 
 #[test]
@@ -200,7 +240,8 @@ async fn s3_round_trip() {
     assert!(!storage.is_local());
     round_trip(&storage).await;
 
-    // A client's put through a signed URL, which holds it to the type signed.
+    // A client's put through a signed URL, which holds it to the type signed, and a
+    // signed read of it.
     let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
     let ten = Duration::from_secs(600);
     let put = storage.presign_put(&key, "image/png", ten).await.unwrap();
@@ -222,5 +263,8 @@ async fn s3_round_trip() {
         .unwrap();
     assert!(done.status().is_success(), "{}", done.status());
     assert_eq!(storage.head(&key).await.unwrap().size, 10);
+    let get = storage.presign_get(&key, ten).await.unwrap();
+    let got = client.get(get).send().await.unwrap();
+    assert_eq!(&got.bytes().await.unwrap()[..], b"0123456789");
     storage.delete(&key).await.unwrap();
 }

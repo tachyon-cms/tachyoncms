@@ -234,6 +234,26 @@ impl Storage {
         self.config.client_uploads && self.signer.is_some()
     }
 
+    /// How long a signed link to a file of type `mime` lasts, when this storage serves
+    /// that type through signed links (`signed_downloads`).
+    pub fn signs(&self, mime: &str) -> Option<Duration> {
+        match &self.config.signed_downloads {
+            SignedDownloads::On {
+                mime_types,
+                expires_in,
+            } if self.signer.is_some() && tachyon_core::uploads::mime_allowed(mime_types, mime) => {
+                Some(*expires_in)
+            }
+            _ => None,
+        }
+    }
+
+    /// Whether any file here is served through signed links, so none may have a public
+    /// bucket URL.
+    pub fn signs_any(&self) -> bool {
+        matches!(self.config.signed_downloads, SignedDownloads::On { .. })
+    }
+
     fn signer_or_refuse(&self) -> Result<&Arc<dyn Signer>, StorageError> {
         self.signer
             .as_ref()
@@ -257,6 +277,14 @@ impl Storage {
         );
         Ok(signer
             .signed_url_opts(Method::PUT, &self.key(key)?, expires, &options)
+            .await?)
+    }
+
+    /// A URL that fetches `key` for `expires`.
+    pub async fn presign_get(&self, key: &str, expires: Duration) -> Result<Url, StorageError> {
+        let signer = self.signer_or_refuse()?;
+        Ok(signer
+            .signed_url(Method::GET, &self.key(key)?, expires)
             .await?)
     }
 
@@ -331,14 +359,29 @@ impl Storage {
     }
 }
 
+/// The longest a signed link may last: what S3 itself allows.
+pub const MAX_SIGNED: Duration = Duration::from_secs(7 * 24 * 3600);
+
 /// Signing needs a bucket: a local storage that's told to sign is a mistake to catch at
-/// startup.
+/// startup, as is a link meant to outlast what a bucket signs.
 fn check_signing(name: &str, c: &StorageConfig) -> Result<(), String> {
     let local = matches!(c.adapter, Adapter::Local { .. });
     if local && c.client_uploads {
         return Err(format!(
             "storage.{name}.client_uploads: local storage can't take uploads straight from clients; use a bucket"
         ));
+    }
+    if let SignedDownloads::On { expires_in, .. } = &c.signed_downloads {
+        if local {
+            return Err(format!(
+                "storage.{name}.signed_downloads: local storage can't sign links; use a bucket"
+            ));
+        }
+        if *expires_in > MAX_SIGNED || expires_in.is_zero() {
+            return Err(format!(
+                "storage.{name}.signed_downloads.expires_in: a link lasts between a second and 7 days"
+            ));
+        }
     }
     Ok(())
 }

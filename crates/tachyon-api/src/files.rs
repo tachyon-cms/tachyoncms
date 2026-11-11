@@ -16,7 +16,7 @@ use axum::extract::{Path, RawQuery, State};
 use axum::http::header::{
     ACCEPT_RANGES, CACHE_CONTROL, CONTENT_DISPOSITION, CONTENT_LENGTH, CONTENT_RANGE,
     CONTENT_SECURITY_POLICY, CONTENT_TYPE, ETAG, IF_MODIFIED_SINCE, IF_NONE_MATCH, IF_RANGE,
-    LAST_MODIFIED, RANGE,
+    LAST_MODIFIED, LOCATION, RANGE,
 };
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
@@ -95,6 +95,20 @@ async fn serve_file(
                 found.file.storage
             ))
         })?;
+    // Served from the bucket through a short-lived link, once the caller is known to be
+    // allowed it; never stored, as the link is theirs.
+    if let Some(expires) = storage.signs(&found.mime) {
+        let url = storage
+            .presign_get(&found.key, expires)
+            .await
+            .map_err(|e| ApiError::Internal(format!("can't sign a download: {e}")))?;
+        let mut out = HeaderMap::new();
+        out.insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE));
+        let location = HeaderValue::from_str(url.as_str())
+            .map_err(|e| ApiError::Internal(format!("a signed link isn't a header: {e}")))?;
+        out.insert(LOCATION, location);
+        return Ok(answer(StatusCode::FOUND, out, Body::empty()));
+    }
     let failed = |e: StorageError| match e.is_not_found() {
         // The row says it's there and the store doesn't: worth knowing, but the caller
         // gets what a missing file gets.
@@ -428,10 +442,18 @@ fn encoded(s: &str, keep: fn(u8) -> bool) -> String {
 
 /// Whether documents of `c` link straight to the bucket (call 6): only when a signed-out
 /// caller may read every document and its `filename` and `sizes`, and `c` has no drafts,
-/// so a draft's object never has a public URL.
-pub(crate) fn direct_urls(access: &Access, c: &Collection) -> bool {
+/// so a draft's object never has a public URL. A bucket that signs its downloads is never
+/// linked to: its files go through the route, which signs them for who may have them.
+pub(crate) fn direct_urls(state: &AppState, access: &Access, c: &Collection) -> bool {
     let anonymous = access.anonymous();
-    !c.schema.drafts()
+    let signed = c
+        .schema
+        .upload
+        .as_ref()
+        .and_then(|u| state.media.storages.get(&u.storage))
+        .is_some_and(|s| s.signs_any());
+    !signed
+        && !c.schema.drafts()
         && anonymous.reads_every_document(c)
         && anonymous.reads(c, "filename")
         && anonymous.reads(c, "sizes")
@@ -554,7 +576,9 @@ pub(crate) async fn fill_urls(
         if c.schema.upload.is_none() {
             continue;
         }
-        let d = *direct.entry(c.id).or_insert_with(|| direct_urls(access, c));
+        let d = *direct
+            .entry(c.id)
+            .or_insert_with(|| direct_urls(state, access, c));
         if d && let Some(id) = id_of(v) {
             wanted.push(id);
         }

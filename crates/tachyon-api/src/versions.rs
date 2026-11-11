@@ -212,7 +212,7 @@ async fn version(
         let mut data = stripped(access, &d.c, data);
         // A bucket link only while the document still holds the version's file; an old one
         // links to the route, which serves a version-only file to nobody.
-        let key = match (v.file_id, direct_urls(access, &d.c)) {
+        let key = match (v.file_id, direct_urls(state, access, &d.c)) {
             (Some(file), true) => {
                 let key = files::get(&state.pool, file).await?.key;
                 let now = files::published_keys(&state.pool, &[d.id]).await?;

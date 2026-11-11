@@ -1,5 +1,5 @@
 //! Files a client puts straight into a bucket (`/api/upload-instructions`, then a create or
-//! update naming the file).
+//! update naming the file), and files served from a bucket through short-lived links.
 //!
 //! The bucket is a local store with a fake signer: a "signed" URL names the method, the key
 //! and what it was signed with, and a client's `PUT` to it is a write into the store's root.
@@ -12,7 +12,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use axum::Router;
-use common::{ADMIN, PASSWORD, Res, add_user, assert_problem, png, send, signed_in};
+use axum::body::Body;
+use axum::http::Request;
+use common::{ADMIN, PASSWORD, Res, add_user, assert_problem, png, send, signed_in, upload};
+use http_body_util::BodyExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as Key;
 use object_store::signer::{Method, SignedUrlOptions, Signer};
@@ -20,7 +23,8 @@ use serde_json::{Value, json};
 use sqlx::PgPool;
 use tachyon_api::{JobsConfig, Options, UploadsConfig};
 use tachyon_db::files::{self, CLEANUP};
-use tachyon_media::storage::{Storage, StorageConfig, Storages};
+use tachyon_media::storage::{SignedDownloads, Storage, StorageConfig, Storages};
+use tower::ServiceExt;
 use url::Url;
 use uuid::Uuid;
 
@@ -68,6 +72,7 @@ struct Dirs {
     temp: PathBuf,
     root: PathBuf,
     bucket: PathBuf,
+    pdfs: PathBuf,
     _base: tempfile::TempDir,
 }
 
@@ -80,19 +85,25 @@ fn dirs() -> Dirs {
         temp: base.path().join("spool"),
         root: base.path().join("store"),
         bucket: base.path().join("bucket"),
+        pdfs: base.path().join("pdfs"),
         _base: base,
     };
-    for dir in [&d.temp, &d.root, &d.bucket] {
+    for dir in [&d.temp, &d.root, &d.bucket, &d.pdfs] {
         std::fs::create_dir_all(dir).unwrap();
     }
     d
 }
 
-/// A bucket over the local directory `root`, taking client uploads.
-fn bucket(name: &str, root: &Path) -> Arc<Storage> {
+/// A bucket over the local directory `root`, taking client uploads and signing downloads
+/// of `signed` types (all with an empty list).
+fn bucket(name: &str, root: &Path, signed: Vec<String>) -> Arc<Storage> {
     let mut c = StorageConfig::local(root);
     c.client_uploads = true;
     c.public_url = Some(Url::parse("https://media.tachyoncms.com").unwrap());
+    c.signed_downloads = SignedDownloads::On {
+        mime_types: signed,
+        expires_in: Duration::from_secs(600),
+    };
     let store = LocalFileSystem::new_with_prefix(root).unwrap();
     Arc::new(Storage::with_store(name, Arc::new(store), None, c).with_signer(Arc::new(FakeSigner)))
 }
@@ -101,7 +112,11 @@ fn options(d: &Dirs, workers: usize) -> Options {
     let local = Storage::open("default", &StorageConfig::local(&d.root)).unwrap();
     let storages = Storages(HashMap::from([
         ("default".into(), Arc::new(local)),
-        ("bucket".into(), bucket("bucket", &d.bucket)),
+        ("bucket".into(), bucket("bucket", &d.bucket, Vec::new())),
+        (
+            "pdfs".into(),
+            bucket("pdfs", &d.pdfs, vec!["application/pdf".into()]),
+        ),
     ]));
     Options {
         jobs: JobsConfig {
@@ -233,6 +248,32 @@ fn refusal(res: &Res) -> Value {
     let mut body = res.json.clone();
     body.as_object_mut().unwrap().remove("requestId");
     body
+}
+
+struct Raw {
+    status: u16,
+    headers: axum::http::HeaderMap,
+}
+
+impl Raw {
+    fn header(&self, name: &str) -> &str {
+        self.headers
+            .get(name)
+            .map_or("", |v| v.to_str().unwrap_or_default())
+    }
+}
+
+async fn fetch(app: &Router, method: &str, uri: &str) -> Raw {
+    let req = Request::builder().method(method).uri(uri);
+    let res = app
+        .clone()
+        .oneshot(req.body(Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let headers = res.headers().clone();
+    let _ = res.into_body().collect().await.unwrap();
+    Raw { status, headers }
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -664,4 +705,121 @@ async fn client_uploads_replace_and_save_drafts(pool: PgPool) {
     let rows = file_states(&pool, "media").await;
     assert_eq!(rows.len(), 2);
     assert!(rows.iter().all(|r| r.1 == "live"), "{rows:?}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn signed_downloads_redirect_after_access(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "mine",
+        json!({"access": {"read": {"owner": "$user.id"}, "create": true},
+               "upload": {"storage": "bucket",
+                          "imageSizes": [{"name": "thumb", "width": 2}]},
+               "fields": [{"name": "owner", "type": "relationship", "relationTo": "users"}]}),
+    )
+    .await;
+    collection(
+        &app,
+        "open",
+        json!({"access": {"read": true}, "upload": {"storage": "bucket"}}),
+    )
+    .await;
+    collection(
+        &app,
+        "papers",
+        json!({"access": {"read": true}, "upload": {"storage": "pdfs"}}),
+    )
+    .await;
+    collection(
+        &app,
+        "drafted",
+        json!({"versions": {"drafts": true}, "upload": {"storage": "bucket"}}),
+    )
+    .await;
+    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    let amy_id = add_user(&pool, "amy@example.com", "author").await;
+    let amy = signed_in(router(&pool, &d).await, "amy@example.com").await;
+    let bob = as_role(&pool, &d, "bob@example.com", "author").await;
+    let anon = router(&pool, &d).await;
+    let res = upload(
+        &amy,
+        "POST",
+        "/api/mine?wait=true",
+        Some(&png(4, 4)),
+        "m.png",
+        Some(&json!({"owner": amy_id})),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let thumb = res.json["sizes"]["thumb"]["filename"]
+        .as_str()
+        .expect("the size was made")
+        .to_owned();
+    let key: String = sqlx::query_scalar("SELECT key FROM files WHERE filename = 'm.png'")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+
+    for method in ["GET", "HEAD"] {
+        let res = fetch(&amy, method, "/api/mine/file/m.png").await;
+        assert_eq!(res.status, 302, "{method}");
+        assert_eq!(res.header("cache-control"), "private, no-store");
+        let location = res.header("location");
+        assert_eq!(signed_key(location), key);
+        assert_eq!(query(location, "method").as_deref(), Some("GET"));
+        assert_eq!(query(location, "expires").as_deref(), Some("600"));
+        // Another Author gets what a missing file gets, and no link.
+        let res = fetch(&bob, method, "/api/mine/file/m.png").await;
+        assert_eq!(res.status, 404, "{method}");
+        assert_eq!(res.header("location"), "");
+    }
+    // A size is signed beside its original.
+    let res = fetch(&amy, "GET", &format!("/api/mine/file/{thumb}")).await;
+    assert_eq!(res.status, 302);
+    let (dir, _) = key.rsplit_once('/').unwrap();
+    assert_eq!(signed_key(res.header("location")), format!("{dir}/{thumb}"));
+    assert_eq!(
+        fetch(&bob, "GET", &format!("/api/mine/file/{thumb}"))
+            .await
+            .status,
+        404
+    );
+
+    // Readable by anyone, a signed bucket's files still go through the route.
+    let res = upload(&app, "POST", "/api/open", Some(&png(1, 1)), "o.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["url"], "http://localhost:3000/api/open/file/o.png");
+    let res = fetch(&anon, "GET", "/api/open/file/o.png").await;
+    assert_eq!(res.status, 302);
+    assert_eq!(res.header("cache-control"), "private, no-store");
+
+    // Only the types listed are signed; the rest stream.
+    let res = upload(&app, "POST", "/api/papers", Some(&png(1, 1)), "p.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(
+        fetch(&anon, "GET", "/api/papers/file/p.png").await.status,
+        200
+    );
+
+    // A draft's file: only for who may read it, when they ask.
+    let res = upload(
+        &app,
+        "POST",
+        "/api/drafted",
+        Some(&png(1, 1)),
+        "d.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let res = fetch(&anon, "GET", "/api/drafted/file/d.png?draft=true").await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.header("location"), "");
+    let res = fetch(&app, "GET", "/api/drafted/file/d.png?draft=true").await;
+    assert_eq!(res.status, 302);
+    assert_eq!(res.header("cache-control"), "private, no-store");
 }
