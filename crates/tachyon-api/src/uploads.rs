@@ -1001,7 +1001,8 @@ pub(crate) async fn edited(
         ApiError::Internal(format!("no storage named `{}` is configured", row.storage))
     })?;
     // Every check is behind it: fetching and cutting the original gets the time an upload
-    // does, as a pasted URL's fetch does.
+    // does, as a pasted URL's fetch does. The field rules on what the cut file sets come
+    // after, as they must: they need its new size, which only the cut gives.
     if let Some(limit) = limit {
         limit.lengthen();
     }

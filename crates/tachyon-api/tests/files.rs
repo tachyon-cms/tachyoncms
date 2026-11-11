@@ -1350,3 +1350,172 @@ async fn an_authors_draft_is_theirs_alone(pool: PgPool) {
     assert_eq!(res.status, 404);
     assert!(res.json().get("detail").is_none(), "{}", res.json());
 }
+
+/// Whether `a` and `b` answer alike, as two requests can: the same status, headers and
+/// body, apart from each request's own ID and, for a `?draft=true` url against a plain
+/// one, the Cache-Control every `?draft=true` answer carries.
+fn alike(a: &Raw, b: &Raw) -> bool {
+    let strip = |r: &Raw| {
+        let mut h = r.headers.clone();
+        h.remove("x-request-id");
+        h.remove("cache-control");
+        let mut body = r.json();
+        if let Some(o) = body.as_object_mut() {
+            o.remove("requestId");
+        }
+        let body = if body.is_null() {
+            r.body.clone()
+        } else {
+            body.to_string().into_bytes()
+        };
+        (r.status, h, body)
+    };
+    strip(a) == strip(b)
+}
+
+/// Document `slug`/`id` published by `publisher`, then its draft cropped to 2×2 by `by`.
+async fn crop_draft(publisher: &Router, by: &Router, slug: &str, id: &Value) -> Value {
+    let one = format!("/api/{slug}/{}", id.as_str().unwrap());
+    ok(publisher, "POST", &format!("{one}/publish"), None).await;
+    let crop = json!({"uploadEdits": {"crop": {"x": 0, "y": 0, "width": 2, "height": 2}}});
+    ok(by, "PATCH", &one, Some(crop)).await
+}
+
+fn size_of(res: &Raw) -> (u32, u32) {
+    let image = image::load_from_memory(&res.body).unwrap();
+    (image.width(), image.height())
+}
+
+/// An Author reads drafts only of their own documents. At `?draft=true` they get their own
+/// draft's file, and for anyone else's exactly what a caller who reads no drafts gets:
+/// the published file, or a 404 for a name only a draft holds.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn own_only_draft_readers_get_only_their_own_drafts(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "drafted", json!({"versions": {"drafts": true}})).await;
+    let amy = as_role(&pool, &d, "amy@example.com", "author").await;
+    let bob = as_role(&pool, &d, "bob@example.com", "author").await;
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    // Amy's published document, its draft then cropped; Bob's draft-only one; and one of
+    // the Admin's, published, then cropped in its draft.
+    let mine = put(&amy, "drafted", &png(4, 4), "amy.png", None).await;
+    crop_draft(&app, &amy, "drafted", &mine["id"]).await;
+    put(&bob, "drafted", &png(4, 4), "bob.png", None).await;
+    let theirs = put(&app, "drafted", &png(4, 4), "pub.png", None).await;
+    crop_draft(&app, &app, "drafted", &theirs["id"]).await;
+    let at = |name: &str| format!("/api/drafted/file/{name}?draft=true");
+
+    // Her own draft: the crop, never cached.
+    let res = fetch(&amy, &at("amy.png")).await;
+    assert_eq!(res.status, 200, "{}", res.json());
+    assert_eq!(size_of(&res), (2, 2), "her draft's file");
+    assert_eq!(res.header("cache-control"), "private, no-store");
+    // Another's draft: what the Viewer gets, and what the plain url gives.
+    for name in ["pub.png", "bob.png"] {
+        let (hers, viewers) = (
+            fetch(&amy, &at(name)).await,
+            fetch(&viewer, &at(name)).await,
+        );
+        assert!(
+            alike(&hers, &viewers),
+            "{name}: {} vs {}",
+            hers.status,
+            viewers.status
+        );
+        assert_eq!(
+            hers.header("cache-control"),
+            viewers.header("cache-control")
+        );
+    }
+    let res = fetch(&amy, &at("pub.png")).await;
+    assert_eq!(res.status, 200);
+    assert_eq!(size_of(&res), (4, 4), "the published file");
+    assert!(alike(&res, &fetch(&amy, "/api/drafted/file/pub.png").await));
+    let res = fetch(&amy, &at("bob.png")).await;
+    assert_eq!(res.status, 404, "a draft-only name she can't read");
+    assert!(
+        alike(&res, &fetch(&amy, &at("nothing.png")).await),
+        "as a name nobody holds"
+    );
+    // Bob, the same from his side.
+    assert_eq!(size_of(&fetch(&bob, &at("amy.png")).await), (4, 4));
+}
+
+/// With `filenameCompoundIndex`, documents share a name and urls carry `?id=`; with drafts
+/// they also carry `?draft=true`, and each document answers for itself: the Admin gets the
+/// draft's file, a Viewer and a signed-out caller the published one, as at the plain url.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn shared_names_pick_the_document_and_its_draft(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "shared",
+        json!({"upload": {"filenameCompoundIndex": ["alt"]}, "versions": {"drafts": true},
+               "access": {"read": true}}),
+    )
+    .await;
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    let anon = router(&pool, &d).await;
+    let one = put(
+        &app,
+        "shared",
+        &png(4, 4),
+        "a.png",
+        Some(json!({"alt": "x"})),
+    )
+    .await;
+    let two = put(
+        &app,
+        "shared",
+        &png(6, 6),
+        "a.png",
+        Some(json!({"alt": "y"})),
+    )
+    .await;
+    assert_eq!(
+        (&one["filename"], &two["filename"]),
+        (&json!("a.png"), &json!("a.png"))
+    );
+    let cropped = crop_draft(&app, &app, "shared", &one["id"]).await;
+    ok(
+        &app,
+        "POST",
+        &format!("/api/shared/{}/publish", two["id"].as_str().unwrap()),
+        None,
+    )
+    .await;
+    let url = path_of(&cropped["url"]);
+    let id = |doc: &Value| doc["id"].as_str().unwrap().to_owned();
+    assert_eq!(
+        url,
+        format!("/api/shared/file/a.png?id={}&draft=true", id(&one))
+    );
+    let plain = |doc: &Value| format!("/api/shared/file/a.png?id={}", id(doc));
+    let drafted = |doc: &Value| format!("{}&draft=true", plain(doc));
+
+    let res = fetch(&app, &drafted(&one)).await;
+    assert_eq!(
+        (res.status.as_u16(), size_of(&res)),
+        (200, (2, 2)),
+        "the Admin: the draft's"
+    );
+    assert_eq!(res.header("cache-control"), "private, no-store");
+    for (who, caller) in [("viewer", &viewer), ("anonymous", &anon)] {
+        let res = fetch(caller, &drafted(&one)).await;
+        assert_eq!(
+            (res.status.as_u16(), size_of(&res)),
+            (200, (4, 4)),
+            "{who}: published"
+        );
+        assert_eq!(res.header("cache-control"), "private, no-store", "{who}");
+        assert!(alike(&res, &fetch(caller, &plain(&one)).await), "{who}");
+    }
+    // The other document, with no draft of its own, is itself for everyone.
+    for caller in [&app, &viewer, &anon] {
+        let res = fetch(caller, &drafted(&two)).await;
+        assert_eq!((res.status.as_u16(), size_of(&res)), (200, (6, 6)));
+        assert_eq!(res.header("cache-control"), "private, no-store");
+    }
+}

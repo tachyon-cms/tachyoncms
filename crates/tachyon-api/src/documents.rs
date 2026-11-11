@@ -512,7 +512,8 @@ pub async fn update(
     let mut patch = settle(&stored)?;
     // The focal point an edit ends at is written into the patch, for the field rules and
     // validation to judge like any other value.
-    let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some())?;
+    let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some())
+        .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &sent, Some(&stored)))))?;
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     // Decoded only once the write is allowed. An edit makes its new file as a replacement
@@ -533,7 +534,9 @@ pub async fn update(
     let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
         settle(current)?;
         access.writes(&c, &patch, Action::Update, Some(current))?;
-        // A new file writes what it sets: the field rules judge what changes.
+        // A new file writes what it sets: the field rules judge what changes. The dry run
+        // judges the name as sent, this run the one `reserve` numbered, which only it knows;
+        // a refusal here gives up what was stored.
         let file = file_writes(fields, Some(current));
         access.writes(&c, &file, Action::Update, Some(current))?;
         let input = with_fields(&patch, fields);

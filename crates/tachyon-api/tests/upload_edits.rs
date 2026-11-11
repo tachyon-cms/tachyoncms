@@ -890,3 +890,37 @@ async fn field_rules_cover_what_a_new_file_sets(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["filename"], "b.png");
 }
+
+/// A refusal of a focal value beside an edit is hidden like any other validation error at
+/// a field the caller can't read.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn bad_focal_values_hide_like_other_errors(pool: PgPool) {
+    let d = dirs();
+    let admin = admin(&pool, &d).await;
+    collection(
+        &admin,
+        "images",
+        json!(true),
+        json!({"fields": [
+            {"name": "alt", "type": "text"},
+            {"name": "focalX", "type": "number", "access": {"read": {"role": "admin"}}}
+        ]}),
+    )
+    .await;
+    let doc = post(&admin, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    add_user(&pool, "ed@example.com", "editor").await;
+    let editor = signed_in(app(&pool, &d).await, "ed@example.com").await;
+    let crop = json!({"x": 0, "y": 0, "width": 10, "height": 10});
+    let body = json!({"focalX": "x", "uploadEdits": {"crop": crop}});
+    let res = call(&admin, "PATCH", &one, body.clone()).await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["path"], "focalX",
+        "who reads it is told"
+    );
+    let res = call(&editor, "PATCH", &one, body).await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "", "{}", res.json);
+    assert!(!res.json.to_string().contains("focalX"), "{}", res.json);
+}
