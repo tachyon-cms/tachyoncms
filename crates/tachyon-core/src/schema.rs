@@ -1,5 +1,5 @@
 use std::borrow::{Borrow, Cow};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -464,6 +464,10 @@ pub enum FieldKind {
         /// Block types the text may hold as block nodes, inline or shared, like `blocks`.
         #[serde(default)]
         blocks: Vec<BlockSource>,
+        /// The upload collections whose files the text may hold as upload nodes, and the
+        /// fields each node carries: `{"collections": {"media": {"fields": [...]}}}`.
+        #[serde(default)]
+        upload: Option<RichUpload>,
     },
     /// Puts its fields side by side in the admin. No effect on data.
     Row {
@@ -527,10 +531,7 @@ pub fn check_upload_referrers<'a>(
     let mut referrers = Vec::new();
     for other in others.into_iter().filter(|o| o.slug != changed.slug) {
         for (path, f) in other.upload_links() {
-            if f.kind
-                .link()
-                .is_some_and(|l| l.relation_to.allows(&changed.slug))
-            {
+            if f.kind.upload_targets().contains(&changed.slug.as_str()) {
                 referrers.push(format!("{}.{path}", other.slug));
             }
         }
@@ -660,6 +661,29 @@ impl<'de> Deserialize<'de> for BlockSource {
     }
 }
 
+/// A rich text field's upload nodes, by the collection they hold a file from. Each named
+/// collection must be one of the field's `relationTo` and hold files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RichUpload {
+    pub collections: BTreeMap<String, UploadNodeFields>,
+}
+
+/// The fields an upload node of one collection carries beside its file, such as a caption.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadNodeFields {
+    #[serde(default)]
+    pub fields: Vec<Field>,
+}
+
+/// Where the fields of an upload node of `collection` sit in a schema position
+/// (`RelationRef::field`): `@` can't start a field name or a block slug, so this never
+/// names a block type's fields.
+pub(crate) fn upload_node_key(collection: &str) -> String {
+    format!("@{collection}")
+}
+
 /// Keys every block row carries besides its block's fields.
 pub const BLOCK_ROW_KEYS: &[&str] = &["id", "blockType"];
 
@@ -781,6 +805,13 @@ fn compact_fields(fields: &mut Value) {
         }
         if let Some(inner) = f.get_mut("fields") {
             compact_fields(inner);
+        }
+        if let Some(Value::Object(nodes)) =
+            f.get_mut("upload").and_then(|u| u.get_mut("collections"))
+        {
+            for inner in nodes.values_mut().filter_map(|n| n.get_mut("fields")) {
+                compact_fields(inner);
+            }
         }
         for key in ["tabs", "blocks"] {
             if let Some(Value::Array(parts)) = f.get_mut(key) {
@@ -1291,6 +1322,29 @@ impl FieldKind {
             .find(|b| b.slug == slug)
     }
 
+    /// What a rich text upload node from `collection` carries; `None` when this isn't a
+    /// rich text field that may hold that collection's files.
+    pub fn upload_node(&self, collection: &str) -> Option<&UploadNodeFields> {
+        match self {
+            Self::RichText {
+                upload: Some(u), ..
+            } => u.collections.get(collection),
+            _ => None,
+        }
+    }
+
+    /// The collections this field links to as upload links: an upload field's targets, or
+    /// the collections a rich text field's upload nodes hold files from.
+    pub fn upload_targets(&self) -> Vec<&str> {
+        match self {
+            Self::Upload { relation_to, .. } => relation_to.targets(),
+            Self::RichText {
+                upload: Some(u), ..
+            } => u.collections.keys().map(String::as_str).collect(),
+            _ => Vec::new(),
+        }
+    }
+
     /// The block types a `blocks` or `richText` field offers; none for other kinds.
     pub fn block_sources(&self) -> &[BlockSource] {
         match self {
@@ -1639,11 +1693,15 @@ impl CollectionSchema {
                     FieldKind::RichText {
                         relation_to,
                         blocks,
+                        upload,
                         ..
                     } => {
                         out.extend(relation_to.iter().map(String::as_str));
                         for block in blocks.iter().filter_map(BlockSource::def) {
                             walk(&block.fields, out);
+                        }
+                        for node in upload.iter().flat_map(|u| u.collections.values()) {
+                            walk(&node.fields, out);
                         }
                     }
                     _ => {}
@@ -1657,13 +1715,16 @@ impl CollectionSchema {
         out
     }
 
-    /// Every upload field, with its data path (through groups, lists and block types).
+    /// Every upload field, and every rich text field with upload nodes, with its data path
+    /// (through groups, lists, block types and upload nodes, as `body.@media`).
     pub fn upload_links(&self) -> Vec<(String, &Field)> {
         fn walk<'a>(fields: &'a [Field], prefix: &str, out: &mut Vec<(String, &'a Field)>) {
             for f in fields {
                 let path = join(prefix, &f.name);
+                if !f.kind.upload_targets().is_empty() {
+                    out.push((path.clone(), f));
+                }
                 match &f.kind {
-                    FieldKind::Upload { .. } => out.push((path, f)),
                     FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                         walk(fields, &path, out)
                     }
@@ -1673,6 +1734,14 @@ impl CollectionSchema {
                         }
                     }
                     _ => {}
+                }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (slug, node) in &u.collections {
+                        walk(&node.fields, &join(&path, &upload_node_key(slug)), out);
+                    }
                 }
             }
         }
@@ -1689,15 +1758,11 @@ impl CollectionSchema {
         lookup: impl Fn(&str) -> Option<S>,
     ) -> Result<(), SchemaError> {
         for (path, f) in self.upload_links() {
-            let FieldKind::Upload {
-                relation_to,
-                filter_options,
-                ..
-            } = &f.kind
-            else {
-                continue;
+            let (option, filter_options) = match &f.kind {
+                FieldKind::Upload { filter_options, .. } => ("relationTo", filter_options),
+                _ => ("upload.collections", &None),
             };
-            for slug in relation_to.targets() {
+            for slug in f.kind.upload_targets() {
                 let found = if slug == self.slug {
                     None
                 } else {
@@ -1709,10 +1774,14 @@ impl CollectionSchema {
                     None => continue,
                 };
                 if target.upload.is_none() {
+                    let what = match option {
+                        "relationTo" => "an upload field links",
+                        _ => "upload nodes link",
+                    };
                     return Err(SchemaError::At {
-                        path: format!("fields.{path}.relationTo"),
+                        path: format!("fields.{path}.{option}"),
                         message: format!(
-                            "`{slug}` doesn't hold files; an upload field links only to collections with upload on"
+                            "`{slug}` doesn't hold files; {what} only to collections with upload on"
                         ),
                     });
                 }
@@ -2159,6 +2228,18 @@ fn unknown_in_fields(
                         }
                     }
                 }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (slug, node) in &u.collections {
+                        unknown_in_fields(
+                            &node.fields,
+                            raw.pointer(&format!("/upload/collections/{slug}/fields")),
+                            &format!("{here}.upload.collections.{slug}.fields"),
+                        )?;
+                    }
+                }
             }
             FieldKind::Tabs { tabs } => {
                 if let (Some(Value::Array(raw_tabs)), Some(Value::Array(known_tabs))) =
@@ -2382,6 +2463,58 @@ fn field_steps<'a>(
     Some(steps)
 }
 
+/// Refuses, at any depth in an upload node's fields, what nothing reads there yet: field
+/// access rules and admin conditions, virtual and layout fields, and shared blocks. Field
+/// rules and schema changes walk block nodes, not upload nodes, so these would be ignored.
+fn plain_node_fields(fields: &[Field]) -> Result<(), String> {
+    for f in fields {
+        let what = if f.access.is_some() {
+            "access rules"
+        } else if f.admin.condition.is_some() {
+            "admin conditions"
+        } else if f.virtual_path.is_some() {
+            "virtual fields"
+        } else if f.kind.is_layout() {
+            "row, collapsible or tabs fields"
+        } else if f
+            .kind
+            .block_sources()
+            .iter()
+            .any(|b| matches!(b, BlockSource::Ref(_)))
+        {
+            "shared blocks"
+        } else {
+            ""
+        };
+        if !what.is_empty() {
+            let name = match f.name.as_str() {
+                "" => f.kind.name(),
+                name => name,
+            };
+            return Err(format!("`{name}`: upload nodes can't hold {what} yet"));
+        }
+        match &f.kind {
+            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                plain_node_fields(fields)?
+            }
+            kind => {
+                for b in kind.block_sources().iter().filter_map(BlockSource::def) {
+                    plain_node_fields(&b.fields)?;
+                }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = kind
+                {
+                    for node in u.collections.values() {
+                        plain_node_fields(&node.fields)?;
+                    }
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
 pub(crate) fn is_identifier(s: &str, allow_upper: bool) -> bool {
     let ok = |c: char| c.is_ascii_lowercase() || (allow_upper && c.is_ascii_uppercase());
     let mut chars = s.chars();
@@ -2595,6 +2728,7 @@ fn check_fields(
                 features,
                 relation_to,
                 blocks,
+                upload,
             } => {
                 if let Some(features) = features {
                     let mut seen = HashSet::new();
@@ -2612,13 +2746,18 @@ fn check_fields(
                             "blocks needs `block` in features, or no features list".into(),
                         ));
                     }
+                    if upload.is_some() && !features.contains(&F::Upload) {
+                        return Err(invalid(
+                            "upload needs `upload` in features, or no features list".into(),
+                        ));
+                    }
                     if !relation_to.is_empty()
                         && !features
                             .iter()
-                            .any(|f| matches!(f, F::Link | F::Relationship))
+                            .any(|f| matches!(f, F::Link | F::Relationship | F::Upload))
                     {
                         return Err(invalid(
-                            "relationTo needs `link` or `relationship` in features, or no features list"
+                            "relationTo needs `link`, `relationship` or `upload` in features, or no features list"
                                 .into(),
                         ));
                     }
@@ -2632,6 +2771,25 @@ fn check_fields(
                     }
                     if !seen.insert(t) {
                         return Err(invalid(format!("relationTo lists `{t}` twice")));
+                    }
+                }
+                if let Some(u) = upload {
+                    if u.collections.is_empty() {
+                        return Err(invalid(
+                            "upload.collections needs at least one collection".into(),
+                        ));
+                    }
+                    for (slug, node) in &u.collections {
+                        if !relation_to.contains(slug) {
+                            return Err(invalid(format!(
+                                "upload.collections names `{slug}`, which relationTo doesn't list"
+                            )));
+                        }
+                        plain_node_fields(&node.fields).map_err(|m| {
+                            invalid(format!("upload.collections.{slug}.fields: {m}"))
+                        })?;
+                        let path = join(&join(prefix, &f.name), &upload_node_key(slug));
+                        check_fields(&node.fields, Level::Nested, root, &path, true, within)?;
                     }
                 }
             }
@@ -2944,7 +3102,7 @@ mod tests {
             ),
             (
                 json!({"name": "b", "type": "richText", "features": ["bold"], "relationTo": ["posts"]}),
-                "field `b`: relationTo needs `link` or `relationship` in features, or no features list",
+                "field `b`: relationTo needs `link`, `relationship` or `upload` in features, or no features list",
             ),
             (
                 json!({"name": "b", "type": "richText", "relationTo": ["Posts"]}),
@@ -3022,6 +3180,151 @@ mod tests {
             )
             .starts_with("field `b`: unknown variant `blink`")
         );
+    }
+
+    #[test]
+    fn rich_text_upload_nodes_parse_and_check() {
+        let pages = schema(json!({"slug": "pages", "fields": [
+            {"name": "body", "type": "richText", "features": ["bold", "upload"],
+             "relationTo": ["media", "docs"],
+             "upload": {"collections": {
+                "media": {"fields": [
+                    {"name": "caption", "type": "text", "required": true},
+                    {"name": "credit", "type": "relationship", "relationTo": "authors"},
+                    {"name": "more", "type": "upload", "relationTo": "docs"}
+                ]},
+                "docs": {}
+             }}}
+        ]}));
+        assert_eq!(pages.check(), Ok(()));
+        let compact = pages.to_compact_json();
+        assert_eq!(schema(compact.clone()), pages);
+        assert_eq!(pages.reject_unknown_options(&compact), Ok(()));
+        assert_eq!(
+            compact["fields"][0]["upload"]["collections"]["media"]["fields"][0],
+            json!({"name": "caption", "type": "text", "required": true})
+        );
+        // Node fields' links are targets, and their upload fields upload links.
+        assert_eq!(pages.relation_targets(), ["authors", "docs", "media"]);
+        let links: Vec<String> = pages.upload_links().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(links, ["body", "body.@media.more"]);
+
+        // Every collection upload nodes name must hold files, and stay holding them.
+        let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        let docs = schema(json!({"slug": "docs", "upload": true, "fields": []}));
+        let plain = schema(json!({"slug": "docs", "fields": []}));
+        let world = [media.clone(), docs.clone()];
+        assert_eq!(
+            pages.check_upload_targets(|s: &str| world.iter().find(|c| c.slug == s)),
+            Ok(())
+        );
+        let world = [media.clone(), plain.clone()];
+        assert_eq!(
+            pages
+                .check_upload_targets(|s: &str| world.iter().find(|c| c.slug == s))
+                .unwrap_err()
+                .to_string(),
+            SchemaError::At {
+                path: "fields.body.upload.collections".into(),
+                message: "`docs` doesn't hold files; upload nodes link only to collections with upload on"
+                    .into(),
+            }
+            .to_string()
+        );
+        assert!(
+            check_upload_referrers(&plain, [&pages])
+                .unwrap_err()
+                .to_string()
+                .contains("pages.body, pages.body.@media.more")
+        );
+
+        let field = |upload: Value| json!({"name": "b", "type": "richText", "relationTo": ["media"], "upload": upload});
+        let node = |fields: Value| field(json!({"collections": {"media": {"fields": fields}}}));
+        for (f, message) in [
+            (
+                field(json!({"collections": {"posts": {}}})),
+                "field `b`: upload.collections names `posts`, which relationTo doesn't list",
+            ),
+            (
+                field(json!({"collections": {}})),
+                "field `b`: upload.collections needs at least one collection",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "features": ["bold", "link"],
+                    "relationTo": ["media"], "upload": {"collections": {"media": {}}}}),
+                "field `b`: upload needs `upload` in features, or no features list",
+            ),
+            (
+                node(json!([{"name": "Bad name", "type": "text"}])),
+                "field name `Bad name` must start with a letter and use only letters, digits and underscores (64 at most)",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "unique": true}])),
+                "field `t`: unique, filterable and slug fields must be at the top level",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "default": 3}])),
+                "field `t`: default: expected text",
+            ),
+            // What nothing reads inside upload nodes yet is refused, at any depth.
+            (
+                node(
+                    json!([{"name": "t", "type": "text", "access": {"read": {"role": "editor"}}}]),
+                ),
+                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold access rules yet",
+            ),
+            (
+                node(json!([{"name": "g", "type": "group", "fields": [
+                    {"name": "t", "type": "text", "admin": {"condition": {"field": "x", "exists": true}}}
+                ]}])),
+                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold admin conditions yet",
+            ),
+            (
+                node(json!([{"type": "row", "fields": [{"name": "t", "type": "text"}]}])),
+                "field `b`: upload.collections.media.fields: `row`: upload nodes can't hold row, collapsible or tabs fields yet",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "virtual": "x.y"}])),
+                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold virtual fields yet",
+            ),
+            (
+                node(json!([{"name": "l", "type": "blocks", "blocks": [{"blockRef": "cta"}]}])),
+                "field `b`: upload.collections.media.fields: `l`: upload nodes can't hold shared blocks yet",
+            ),
+        ] {
+            let s = schema(json!({"slug": "p", "fields": [f]}));
+            assert_eq!(s.check().unwrap_err().to_string(), message);
+        }
+        // Unknown options are named, inside the nodes' fields too.
+        for (raw, option) in [
+            (
+                field(json!({"collections": {"media": {}}, "extra": 1})),
+                None,
+            ),
+            (
+                field(json!({"collections": {"media": {"fieldz": []}}})),
+                None,
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "maxLenght": 3}])),
+                Some("maxLenght"),
+            ),
+        ] {
+            let raw = json!({"slug": "p", "fields": [raw]});
+            match option {
+                None => assert!(serde_json::from_value::<CollectionSchema>(raw).is_err()),
+                Some(option) => {
+                    let parsed = schema(raw.clone());
+                    assert_eq!(
+                        parsed.reject_unknown_options(&raw),
+                        Err(SchemaError::UnknownOption {
+                            field: "t".into(),
+                            option: option.into()
+                        })
+                    );
+                }
+            }
+        }
     }
 
     #[test]

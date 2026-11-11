@@ -4,13 +4,15 @@
 
 use serde_json::{Map, Value, json};
 
-use super::{MAX_START, RenderCtx, from_markdown, slug_refs_mut, to_markdown, to_text};
+use super::{MAX_START, RenderCtx, UploadView, from_markdown, slug_refs_mut, to_markdown, to_text};
 use crate::schema::{Field, FieldKind};
 
-/// A callout holding text (which may hold an aside holding text) and a video leaf.
+/// A callout holding text (which may hold an aside holding text) and a video leaf, and
+/// files from `media`.
 fn field() -> Field {
     serde_json::from_value(json!({"name": "body", "type": "richText",
-        "relationTo": ["posts", "authors"], "blocks": [
+        "relationTo": ["posts", "authors", "media"],
+        "upload": {"collections": {"media": {}}}, "blocks": [
         {"slug": "callout", "fields": [
             {"name": "kind", "type": "text"},
             {"name": "body", "type": "richText", "relationTo": ["posts"], "blocks": [
@@ -174,6 +176,25 @@ const DOCS: &[(&str, &str, &str)] = &[
     ("authors", "0199d5c4-0000-7000-8000-0000000000b2", "b-2"),
 ];
 
+/// Files upload nodes may hold: the first readable, its alt text hostile; the second not.
+const FILES: &[&str] = &[
+    "0199d5c4-0000-7000-8000-0000000000d1",
+    "0199d5c4-0000-7000-8000-0000000000d2",
+];
+
+/// The render context's file: `FILES[0]` reads, with alt text Markdown must escape.
+fn file(to: &str, v: &Value) -> Option<UploadView> {
+    (to == "media" && v.as_str() == Some(FILES[0])).then(|| UploadView {
+        url: "/api/media/file/a.png".into(),
+        width: Some(8),
+        height: None,
+        alt: Some("a *b* ](x) ![c] \\ \n|".into()),
+        mime_type: "image/png".into(),
+        filename: "a.png".into(),
+        srcset: Vec::new(),
+    })
+}
+
 fn text(r: &mut Rng) -> String {
     (0..1 + r.n(3)).map(|_| r.pick(FRAGS)).collect()
 }
@@ -331,6 +352,10 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
         },
         // A paragraph that is only hard breaks: an empty line in an editor.
         10 => para((0..1 + r.n(2)).map(|_| br()).collect()),
+        // A file the caller can't read is left out, so only a readable one comes back.
+        11 if matches!(at, In::Root) => {
+            json!({"type": "upload", "attrs": {"relationTo": "media", "value": FILES[0]}})
+        }
         _ => match at {
             In::Root if r.n(2) == 0 => {
                 let mut fields = Map::new();
@@ -428,7 +453,8 @@ const ORDER: [&str; 6] = ["bold", "italic", "underline", "strike", "link", "code
 /// same-marked neighbours merge (R34); marks in one order (R37); a table cell is one
 /// paragraph, code blocks end lines with `\n`, `start: 1` and empty `fields` go, a
 /// table's first row is its header, and empty paragraphs go wherever a sibling sits
-/// beside them, a quote or item keeping one if that's all it holds (R39, R41).
+/// beside them, a quote or item keeping one if that's all it holds (R39, R41). An upload
+/// node keeps nothing but its file, by ID.
 fn normal(v: &Value) -> Value {
     let Value::Object(o) = v else {
         return match v {
@@ -509,10 +535,25 @@ fn cell_inline(content: &Value) -> Vec<Value> {
             out.push(br());
         }
         match block["type"].as_str() {
-            Some("paragraph" | "heading") => {
-                out.extend(block.get("content").and_then(Value::as_array).into_iter().flatten().cloned())
+            Some("paragraph" | "heading") => out.extend(
+                block
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                    .cloned(),
+            ),
+            _ => {
+                let none = |_: &str, _: &Value| None;
+                let ctx = RenderCtx {
+                    link_url: &none,
+                    title: &none,
+                    slug: &none,
+                    upload: &file,
+                };
+                let text = to_text(&json!({"type": "doc", "content": [block]}), &ctx);
+                out.push(json!({"type": "text", "text": text}))
             }
-            _ => out.push(json!({"type": "text", "text": to_text(&json!({"type": "doc", "content": [block]}))})),
         }
     }
     out.retain(|n| n["type"] != "text" || n["text"] != "");
@@ -605,6 +646,7 @@ fn run(seed: u64, cases: usize, make: impl Fn(&mut Rng, usize) -> Value) {
         link_url: &none,
         title: &none,
         slug: &slug,
+        upload: &file,
     };
     let mut r = Rng(seed);
     let mut failures = Vec::new();
@@ -735,4 +777,62 @@ fn markdown_block_fuzz_round_trips() {
         2_500,
         |r, _| json!({"type": "doc", "content": blocks(r, In::Root, 0, 4)}),
     );
+}
+
+/// Untrusted Markdown built around images: refused or read, never a panic, and anything
+/// read holds upload nodes only where an image named `media:` alone in its paragraph.
+#[test]
+fn markdown_image_input_fuzz() {
+    const PARTS: &[&str] = &[
+        "![",
+        "![x](media:",
+        "](",
+        ")",
+        "media:",
+        "media:media/",
+        "media:posts/",
+        "0199d5c4-0000-7000-8000-0000000000d1",
+        "nope",
+        "/",
+        "./a.png",
+        "https://x.y/a.png",
+        "x",
+        " ",
+        "\n",
+        "\n\n",
+        "[",
+        "]",
+        "*",
+        "**",
+        "> ",
+        "- ",
+        "1. ",
+        "| a |\n| --- |\n| ",
+        " |",
+        "`",
+        "<u>",
+        "</u>",
+        " \"t\"",
+        "<",
+        ">",
+        "#",
+        "\\",
+        "::",
+        ":::callout\n",
+        "\n:::",
+    ];
+    let kind = field().kind;
+    let mut r = Rng(0x2545_f491_4f6c_dd1d);
+    for _ in 0..20_000 {
+        let src: String = (0..1 + r.n(12)).map(|_| r.pick(PARTS)).collect();
+        let Ok(doc) = from_markdown(&src, &kind) else {
+            continue;
+        };
+        let mut found = 0;
+        super::each_node(&doc, &mut |n| found += usize::from(n["type"] == "upload"));
+        assert!(
+            found <= src.matches("](media:").count(),
+            "{src:?} read as {doc}"
+        );
+    }
 }

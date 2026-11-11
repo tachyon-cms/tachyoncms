@@ -24,6 +24,9 @@ use crate::schema::FieldKind;
 /// one, and a cell keeps its own as R37 says (W1-R39, W1-R41).
 /// A table's first row is its header, as GFM has no table without one (W1-R39).
 /// An ordered list's `start: 1` and a block's empty `fields` aren't written (W1-R39).
+/// An upload node is `![alt](media:<collection>/<id>)`: its alt text is the file's, and its
+/// own `fields` aren't written, as Markdown has nowhere to put them. One the caller can't
+/// read is left out (W1-R24).
 /// A task item with no `checked` is written unchecked, and reads back so (W1-R42).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
@@ -152,7 +155,7 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> S
             for (i, row) in children(node).iter().enumerate() {
                 let cells: Vec<String> = children(row)
                     .iter()
-                    .map(|cell| line_start(inline(&cell_inline(cell), ctx, Where::Cell)))
+                    .map(|cell| line_start(inline(&cell_inline(cell, ctx), ctx, Where::Cell)))
                     .collect();
                 lines.push(format!("| {} |", cells.join(" | ")));
                 if i == 0 {
@@ -176,6 +179,22 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> S
             }
         }
         "block" => directive(node, k, ctx),
+        // By ID, as a URL can't be read back (W1-R23); the alt text is the file's, so it's
+        // written to be read but not read back. The node's own fields aren't written.
+        "upload" => match (super::upload_of(node, ctx), attr(node, "value")) {
+            (Some(file), Some(Value::String(id))) => {
+                let to = attr(node, "relationTo")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let alt = file.alt.unwrap_or_default();
+                format!(
+                    "![{}]({})",
+                    escape(&alt),
+                    destination(&format!("media:{to}/{id}"))
+                )
+            }
+            _ => String::new(),
+        },
         _ => String::new(),
     }
 }
@@ -451,7 +470,7 @@ fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
 
 /// A table cell's blocks as one line of inline nodes, hard breaks between them: a cell is
 /// one line of Markdown (W1-R37).
-fn cell_inline(cell: &Value) -> Vec<Value> {
+fn cell_inline(cell: &Value, ctx: &RenderCtx) -> Vec<Value> {
     let mut out = Vec::new();
     for (i, block) in children(cell).iter().enumerate() {
         if i > 0 {
@@ -461,7 +480,7 @@ fn cell_inline(cell: &Value) -> Vec<Value> {
             "paragraph" | "heading" => out.extend(children(block).iter().cloned()),
             _ => {
                 let doc = serde_json::json!({"type": "doc", "content": [block]});
-                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc)}));
+                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc, ctx)}));
             }
         }
     }
@@ -786,7 +805,7 @@ fn link_destination(mark: &Value, ctx: &RenderCtx) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{A1, P1, doc, full, para, text};
+    use super::super::tests::{A1, P1, doc, full, media_file, para, text};
     use super::*;
     use serde_json::json;
 
@@ -797,7 +816,8 @@ mod tests {
         f.kind
     }
 
-    /// Post `P1`'s slug is `hello` and author `A1`'s is `ann`; nothing else is readable.
+    /// Post `P1`'s slug is `hello` and author `A1`'s is `ann`; media `M1` and `M2` are
+    /// files (`media_file`); nothing else is readable.
     fn ctx_for(test: impl FnOnce(&RenderCtx)) {
         let none = |_: &str, _: &Value| None;
         let slug = |to: &str, v: &Value| match (to, v.as_str()?) {
@@ -809,6 +829,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &slug,
+            upload: &media_file,
         })
     }
 

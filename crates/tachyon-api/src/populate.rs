@@ -581,7 +581,8 @@ pub(crate) fn populate<'a>(
 
 /// Renders the rich text in `items` as `format` asks, in place. What it links to is read
 /// as the caller may read it, whatever the depth, in one query for all of `items`: a link
-/// to a document they can't read, or whose collection has no `url`, is its text alone.
+/// to a document they can't read, or whose collection has no `url`, is its text alone, and
+/// an upload node holding a file they can't read is left out.
 // ponytail: a second query per level beside populate's own, and it also reads the targets
 // of relationship fields inside block nodes, which render as IDs. Fold it into populate's
 // query if rendered reads show up in a profile.
@@ -595,7 +596,7 @@ async fn render(
         Format::Json => return Ok(()),
         Format::Html => |text, _, ctx| richtext::to_html(text, ctx),
         Format::Markdown => richtext::to_markdown,
-        Format::Text => |text, _, _| richtext::to_text(text),
+        Format::Text => |text, _, ctx| richtext::to_text(text, ctx),
     };
     // The links inside each rich text field, block nodes' fields included.
     let mut ids = Vec::new();
@@ -616,7 +617,7 @@ async fn render(
     }
     ids.sort_unstable();
     ids.dedup();
-    let mut targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = HashMap::new();
+    let (mut found, mut found_ids) = (Vec::new(), Vec::new());
     if !ids.is_empty() {
         for (collection_id, doc) in readable_docs(state, access, &ids).await? {
             let Some(c) = state.schemas.get_by_id(collection_id) else {
@@ -624,11 +625,20 @@ async fn render(
             };
             let mut value = to_value(&doc)?;
             access.strip(&c, &mut value);
-            if let Value::Object(fields) = value {
-                targets.insert(doc.id, (c, fields));
-            }
+            found.push((value, c));
+            found_ids.push(doc.id);
         }
     }
+    // An upload node shows its file's URLs, worked out as any read's are.
+    crate::files::fill_urls(state, access, &mut found).await?;
+    let targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = found_ids
+        .into_iter()
+        .zip(found)
+        .filter_map(|(id, (value, c))| match value {
+            Value::Object(fields) => Some((id, (c, fields))),
+            _ => None,
+        })
+        .collect();
     // A link's target, if the caller read it and it's in the collection the link names.
     let target = |to: &str, value: &Value| {
         let (c, doc) = targets.get(&Uuid::try_parse(value.as_str()?).ok()?)?;
@@ -637,10 +647,16 @@ async fn render(
     let link_url = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.link_url(d));
     let title = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.title_of(d));
     let slug = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.slug_of(d));
+    let upload = |to: &str, v: &Value| {
+        target(to, v)
+            .filter(|(c, _)| c.schema.upload.is_some())
+            .and_then(|(_, d)| richtext::upload_view(d))
+    };
     let ctx = RenderCtx {
         link_url: &link_url,
         title: &title,
         slug: &slug,
+        upload: &upload,
     };
     for (v, c, _) in items.iter_mut() {
         if let Some(doc) = v.as_object_mut() {

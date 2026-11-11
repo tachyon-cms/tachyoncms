@@ -8,6 +8,7 @@ use uuid::Uuid;
 
 use crate::schema::{
     BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, Link, RelationTo, SelectOption, data_fields,
+    upload_node_key,
 };
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
@@ -244,14 +245,11 @@ fn strip_nulls(f: &Field, value: &mut Value) {
                 }
             }
         }
-        (kind @ FieldKind::RichText { .. }, text) => {
-            crate::richtext::blocks_mut(text, &mut |attrs| {
-                let fields = node_fields(kind, attrs);
-                if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
-                    strip_object(fields, obj);
-                }
-            })
-        }
+        (kind @ FieldKind::RichText { .. }, text) => nodes_mut(kind, text, &mut |fields, attrs| {
+            if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                strip_object(fields, obj);
+            }
+        }),
         _ => {}
     }
 }
@@ -265,11 +263,36 @@ pub(crate) fn node_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -
         .map_or(&[], |b| &b.fields)
 }
 
-/// Fills defaults into the fields of every block node in rich text `text`.
+/// The fields an upload node's `attrs` carry, by the collection they name; none when the
+/// field holds no files from it.
+pub(crate) fn upload_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -> &'a [Field] {
+    attrs
+        .get("relationTo")
+        .and_then(Value::as_str)
+        .and_then(|c| kind.upload_node(c))
+        .map_or(&[], |n| &n.fields)
+}
+
+/// Calls `f` on the `attrs` of every block and upload node in rich text `text` of `kind`,
+/// with the fields its block type or collection gives its `fields`.
+pub(crate) fn nodes_mut<'k>(
+    kind: &'k FieldKind,
+    text: &mut Value,
+    f: &mut impl FnMut(&'k [Field], &mut Map<String, Value>),
+) {
+    crate::richtext::each_item_mut(text, &mut |_, item| match item {
+        crate::richtext::ItemMut::Block(attrs) => f(node_fields(kind, attrs), attrs),
+        crate::richtext::ItemMut::Upload(attrs) => f(upload_fields(kind, attrs), attrs),
+        crate::richtext::ItemMut::Link(_) => {}
+    })
+}
+
+/// Fills defaults into the fields of every block and upload node in rich text `text`.
 pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
-    crate::richtext::blocks_mut(text, &mut |attrs| {
-        let fields = node_fields(kind, attrs);
-        match attrs.get_mut("fields") {
+    nodes_mut(
+        kind,
+        text,
+        &mut |fields, attrs| match attrs.get_mut("fields") {
             Some(Value::Object(obj)) => apply_defaults(fields, obj),
             None => {
                 let filled = defaults(fields);
@@ -278,8 +301,8 @@ pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
                 }
             }
             Some(_) => {}
-        }
-    })
+        },
+    )
 }
 
 fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
@@ -412,6 +435,15 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                             normalize(fields, obj);
                         }
                         keep_or_give_id(attrs);
+                    }
+                    crate::richtext::ItemMut::Upload(attrs) => {
+                        let fields = upload_fields(kind, attrs);
+                        if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                            normalize(fields, obj);
+                        }
+                        if let Some(Value::String(id)) = attrs.get_mut("value") {
+                            canonical_id(id);
+                        }
                     }
                 })
             }
@@ -1079,6 +1111,26 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                                     );
                                 }
                             }
+                            // The node is a link of the text's, keyed as the field; its
+                            // fields' links sit under its collection (`body.@media.credit`).
+                            crate::richtext::Item::Upload(attrs) => {
+                                let link =
+                                    found(here.clone(), format!("{node}.value"), &ANY, attrs);
+                                out.extend(link);
+                                if let (Some(Value::Object(inner)), Some(obj)) =
+                                    (attrs.get("fields"), attrs.as_object())
+                                {
+                                    let to = obj.get("relationTo").and_then(Value::as_str);
+                                    walk(
+                                        upload_fields(&f.kind, obj),
+                                        inner,
+                                        &here,
+                                        &format!("{node}.fields"),
+                                        &join(&field, &upload_node_key(to.unwrap_or(""))),
+                                        out,
+                                    );
+                                }
+                            }
                         }
                     }
                 }
@@ -1147,6 +1199,15 @@ fn map_inner(
                         }
                         crate::richtext::ItemMut::Block(attrs) => {
                             let fields = node_fields(kind, attrs);
+                            if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
+                                map_inner(fields, inner, &here, f);
+                            }
+                        }
+                        crate::richtext::ItemMut::Upload(attrs) => {
+                            if let Some(inner) = attrs.get_mut("value") {
+                                replace_id(inner, &mut |id| f(&here, id));
+                            }
+                            let fields = upload_fields(kind, attrs);
                             if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
                                 map_inner(fields, inner, &here, f);
                             }
@@ -1702,14 +1763,17 @@ mod tests {
                 {"name": "parts", "type": "blocks", "blocks": [doc_block]}
             ]},
             {"name": "layout", "type": "blocks", "blocks": [doc_block]},
-            {"name": "body", "type": "richText", "relationTo": ["media"], "blocks": [doc_block]},
+            // A collection may share a block type's slug: `doc` is both here.
+            {"name": "body", "type": "richText", "relationTo": ["media", "doc"], "blocks": [doc_block],
+             "upload": {"collections": {"doc": {"fields": [up("file")]}}}},
             {"name": "attachments", "type": "upload", "relationTo": "media", "hasMany": true},
             {"type": "tabs", "tabs": [{"name": "seo", "label": "SEO", "fields": [up("image")]}]}
         ]));
         let id = "0199d5c4-0000-7000-8000-00000000000a";
         let body = json!({"type": "doc", "content": [
             {"type": "relationship", "attrs": {"relationTo": "media", "value": id}},
-            {"type": "block", "attrs": {"blockType": "doc", "fields": {"file": id}}}
+            {"type": "block", "attrs": {"blockType": "doc", "fields": {"file": id}}},
+            {"type": "upload", "attrs": {"relationTo": "doc", "value": id, "fields": {"file": id}}}
         ]});
         let doc = ok(
             &f,
@@ -1725,7 +1789,9 @@ mod tests {
             }),
         );
         let keys: Vec<String> = relations(&f, &doc).into_iter().map(|r| r.field).collect();
-        // A row's own `blockType` text field doesn't make it a block row.
+        // A row's own `blockType` text field doesn't make it a block row. An upload node is
+        // one of its text's links; its fields sit under `@` and its collection, which no
+        // block slug can name.
         assert_eq!(
             keys,
             [
@@ -1736,6 +1802,8 @@ mod tests {
                 "layout.doc.file",
                 "body",
                 "body.doc.file",
+                "body",
+                "body.@doc.file",
                 "attachments",
                 "attachments",
                 "seo.image",

@@ -23,6 +23,13 @@ pub use markdown_in::{from_markdown, slug_refs_mut};
 pub use markdown_out::to_markdown;
 pub use text::to_text;
 
+/// An upload node's file: `relationTo` and `value` from its attributes, as the context
+/// shows it, if it does.
+fn upload_of(node: &Value, ctx: &RenderCtx) -> Option<UploadView> {
+    let to = attr(node, "relationTo")?.as_str()?;
+    (ctx.upload)(to, attr(node, "value")?)
+}
+
 /// One step of a loop the scaling tests count, so a quadratic one fails them on any machine.
 #[cfg(test)]
 pub(crate) fn step() {
@@ -42,6 +49,62 @@ pub struct RenderCtx<'a> {
     pub title: &'a dyn Fn(&str, &Value) -> Option<String>,
     /// The slug Markdown names a linked document by (`doc:posts/<slug>`).
     pub slug: &'a dyn Fn(&str, &Value) -> Option<String>,
+    /// The file an upload node shows.
+    pub upload: &'a dyn Fn(&str, &Value) -> Option<UploadView>,
+}
+
+/// What an upload node shows of its file, read from the upload document (`upload_view`).
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadView {
+    pub url: String,
+    pub width: Option<u32>,
+    pub height: Option<u32>,
+    /// The document's `alt` field, when it has one.
+    pub alt: Option<String>,
+    pub mime_type: String,
+    pub filename: String,
+    /// Each size made of the image in its own type, and its WebP copy, by width: the
+    /// candidates of an `<img>`'s `srcset`.
+    pub srcset: Vec<(String, u32)>,
+}
+
+/// `doc`, an upload document as the caller reads it with its URLs filled, as an upload
+/// node shows it. `None` without a `url`, as when the caller can't read it.
+pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
+    let text =
+        |m: &Map<String, Value>, k: &str| m.get(k).and_then(Value::as_str).map(str::to_owned);
+    let number = |m: &Map<String, Value>, k: &str| {
+        m.get(k)
+            .and_then(Value::as_u64)
+            .and_then(|n| u32::try_from(n).ok())
+    };
+    let mime_type = text(doc, "mimeType").unwrap_or_default();
+    // A size not made yet has no URL; one of another type is left to its `formats`.
+    let candidate = |m: &Map<String, Value>| Some((text(m, "url")?, number(m, "width")?));
+    let mut srcset = Vec::new();
+    for size in doc
+        .get("sizes")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flat_map(Map::values)
+        .filter_map(Value::as_object)
+    {
+        if text(size, "mimeType").as_deref() == Some(&mime_type) {
+            srcset.extend(candidate(size));
+        }
+        let webp = size.get("formats").and_then(|f| f.get("webp"));
+        srcset.extend(webp.and_then(Value::as_object).and_then(candidate));
+    }
+    srcset.sort_by_key(|(_, w)| *w);
+    Some(UploadView {
+        url: text(doc, "url")?,
+        width: number(doc, "width"),
+        height: number(doc, "height"),
+        alt: text(doc, "alt"),
+        mime_type,
+        filename: text(doc, "filename").unwrap_or_default(),
+        srcset,
+    })
 }
 
 /// What a rich text field lets editors use. Paragraphs and plain text are always allowed.
@@ -67,6 +130,7 @@ pub enum Feature {
     CodeBlock,
     Relationship,
     Block,
+    Upload,
 }
 
 /// A reference rich text holds to another document.
@@ -117,6 +181,7 @@ const BLOCK_NODES: &[&str] = &[
     "table",
     "relationship",
     "block",
+    "upload",
 ];
 
 impl Holds {
@@ -153,6 +218,7 @@ fn node_spec(t: &str) -> Option<(Option<Feature>, Holds, &'static [&'static str]
         "tableCell" | "tableHeader" => (None, Blocks, &["colspan", "rowspan", "colwidth"]),
         "relationship" => (Some(F::Relationship), Nothing, &["relationTo", "value"]),
         "block" => (Some(F::Block), Nothing, &["blockType", "id", "fields"]),
+        "upload" => (Some(F::Upload), Nothing, &["relationTo", "value", "fields"]),
         _ => return None,
     })
 }
@@ -475,6 +541,7 @@ impl Check<'_, '_> {
             }
             "relationship" => self.link(attrs, &format!("{path}.attrs")),
             "block" => self.block(attrs, path, depth),
+            "upload" => self.upload(attrs, path, depth),
             _ => {}
         }
     }
@@ -493,28 +560,77 @@ impl Check<'_, '_> {
         {
             return self.fail(format!("{path}.{key}"), format!("unknown key `{key}`"));
         }
+        self.target(link, path);
+    }
+
+    /// The `relationTo` and `value` of a link, a relationship node or an upload node, at
+    /// `path`. Returns the collection when it's one the field may link to.
+    fn target<'v>(&mut self, link: &'v Map<String, Value>, path: &str) -> Option<&'v str> {
         let at = |k: &str| format!("{path}.{k}");
-        match link.get("relationTo").and_then(Value::as_str) {
-            None => return self.fail(at("relationTo"), "is required"),
-            Some(_) if self.relation_to.is_empty() => {
-                return self.fail(at("relationTo"), "this field can't link to documents");
-            }
+        let refused = match link.get("relationTo").and_then(Value::as_str) {
+            None => "is required".to_owned(),
+            Some(_) if self.relation_to.is_empty() => "this field can't link to documents".into(),
             Some(c) if !self.relation_to.iter().any(|r| r == c) => {
                 let allowed = self.relation_to.join(", ");
-                return self.fail(
-                    at("relationTo"),
-                    format!("can't link to `{c}`; expected one of: {allowed}"),
-                );
+                format!("can't link to `{c}`; expected one of: {allowed}")
             }
-            Some(_) => {}
-        }
-        match link.get("value") {
-            None | Some(Value::Null) => self.fail(at("value"), "is required"),
-            Some(v) if !v.as_str().is_some_and(|s| Uuid::try_parse(s).is_ok()) => {
-                self.fail(at("value"), "expected a document ID")
-            }
-            Some(_) => {}
-        }
+            Some(c) => match link.get("value") {
+                None | Some(Value::Null) => {
+                    self.fail(at("value"), "is required");
+                    return None;
+                }
+                Some(v) if !v.as_str().is_some_and(|s| Uuid::try_parse(s).is_ok()) => {
+                    self.fail(at("value"), "expected a document ID");
+                    return None;
+                }
+                Some(_) => return Some(c),
+            },
+        };
+        self.fail(at("relationTo"), refused);
+        None
+    }
+
+    /// An upload node: a link to a file in one of the field's upload collections, and the
+    /// fields that collection's nodes carry. Rich text in them nests below `depth`.
+    fn upload(&mut self, attrs: &Map<String, Value>, path: &str, depth: usize) {
+        let at = |k: &str| format!("{path}.attrs.{k}");
+        let kind = self.kind;
+        let Some(to) = self.target(attrs, &format!("{path}.attrs")) else {
+            return;
+        };
+        let Some(node) = kind.upload_node(to) else {
+            let held = kind.upload_targets();
+            return self.fail(
+                at("relationTo"),
+                match held.is_empty() {
+                    true => "this field can't hold files".to_owned(),
+                    false => format!(
+                        "can't hold files from `{to}`; expected one of: {}",
+                        held.join(", ")
+                    ),
+                },
+            );
+        };
+        let empty = Map::new();
+        let fields = match attrs.get("fields") {
+            None | Some(Value::Null) => &empty,
+            Some(Value::Object(f)) => f,
+            Some(_) => return self.fail(at("fields"), "expected an object"),
+        };
+        // As a block node's fields: one level below the node, whatever came before.
+        let outer = self.budget.depth;
+        self.budget.depth = depth;
+        let mode = self.budget.mode;
+        crate::validate::check_object(
+            &node.fields,
+            fields,
+            &[],
+            &at("fields"),
+            &mut self.errors,
+            Some(&mut *self.budget),
+            mode,
+        );
+        self.budget.depth = outer;
     }
 
     /// A block node's type, ID and fields. Rich text in its fields nests below `depth`.
@@ -768,17 +884,20 @@ fn each_node_mut(node: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) 
 }
 
 /// What rich text refers to, in document order. The k-th is reported at `<field>.<k>` by
-/// `relations`, and a block node's own links at `<field>.<k>.<path in its fields>`.
+/// `relations`, and a block or upload node's own links at `<field>.<k>.<path in its fields>`.
 pub(crate) enum Item<'v> {
     /// A link to a document or a relationship node: `{"relationTo", "value"}`.
     Link(&'v Value),
     /// A block node's `attrs`: `{"blockType", "id", "fields"}`.
     Block(&'v Map<String, Value>),
+    /// An upload node's `attrs`: a link, `{"relationTo", "value"}`, with `fields`.
+    Upload(&'v Value),
 }
 
 pub(crate) enum ItemMut<'v> {
     Link(&'v mut Value),
     Block(&'v mut Map<String, Value>),
+    Upload(&'v mut Map<String, Value>),
 }
 
 fn is_link_mark(mark: &Value) -> bool {
@@ -809,6 +928,9 @@ pub(crate) fn items(value: &Value) -> Vec<(String, Item<'_>)> {
             (Some("block"), Some(Value::Object(attrs))) => {
                 out.push((at("attrs".into()), Item::Block(attrs)))
             }
+            (Some("upload"), Some(attrs @ Value::Object(_))) => {
+                out.push((at("attrs".into()), Item::Upload(attrs)))
+            }
             _ => {}
         }
         let children = node.get("content").and_then(Value::as_array);
@@ -834,10 +956,15 @@ pub(crate) fn each_item_mut(value: &mut Value, f: &mut impl FnMut(usize, ItemMut
             }
         }
         let t = node.get("type").and_then(Value::as_str);
-        let (relationship, block) = (t == Some("relationship"), t == Some("block"));
+        let (relationship, block, upload) = (
+            t == Some("relationship"),
+            t == Some("block"),
+            t == Some("upload"),
+        );
         match node.get_mut("attrs") {
             Some(attrs) if relationship => f(k, ItemMut::Link(attrs)),
             Some(Value::Object(attrs)) if block => f(k, ItemMut::Block(attrs)),
+            Some(Value::Object(attrs)) if upload => f(k, ItemMut::Upload(attrs)),
             _ => return,
         }
         k += 1;
@@ -874,14 +1001,16 @@ pub(crate) fn blocks_mut(value: &mut Value, f: &mut impl FnMut(&mut Map<String, 
     });
 }
 
-/// The documents `value` links to and the relationship nodes it holds, in document order,
-/// each by where its `{relationTo, value}` sits in `value`
+/// The documents `value` links to and the relationship and upload nodes it holds, in
+/// document order, each by where its `{relationTo, value}` sits in `value`
 /// (`content.0.content.1.marks.0.attrs.doc`, `content.2.attrs`).
 pub fn links(value: &Value) -> Vec<(String, LinkRef)> {
     items(value)
         .into_iter()
         .filter_map(|(at, item)| {
-            let Item::Link(link) = item else { return None };
+            let (Item::Link(link) | Item::Upload(link)) = item else {
+                return None;
+            };
             let doc = LinkRef::Doc {
                 collection: link.get("relationTo")?.as_str()?.to_owned(),
                 id: Uuid::try_parse(link.get("value")?.as_str()?).ok()?,
@@ -974,6 +1103,8 @@ mod tests {
     pub(super) const A1: &str = "0199d5c4-0000-7000-8000-0000000000b1";
     pub(super) const A2: &str = "0199d5c4-0000-7000-8000-0000000000b2";
     pub(super) const B1: &str = "0199d5c4-0000-7000-8000-0000000000c1";
+    pub(super) const M1: &str = "0199d5c4-0000-7000-8000-0000000000d1";
+    pub(super) const M2: &str = "0199d5c4-0000-7000-8000-0000000000d2";
 
     /// A `body` rich text field with `options` on top of its type.
     fn fields(options: Value) -> Vec<Field> {
@@ -1013,6 +1144,47 @@ mod tests {
 
     pub(super) fn doc(content: Value) -> Value {
         json!({"type": "doc", "content": content})
+    }
+
+    /// A render context's `upload` where no file is readable.
+    pub(super) fn no_file(_: &str, _: &Value) -> Option<UploadView> {
+        None
+    }
+
+    /// Image `M1` of `media` and its sizes, as a read gives them with URLs filled: `alt`
+    /// "Cover", a `thumb` PNG with its WebP and AVIF copies, a `card` not made yet, and a
+    /// `tiny` JPEG of another type, which only its WebP copy offers.
+    pub(super) fn cover() -> Map<String, Value> {
+        let u = |name: &str| format!("https://cms.example/api/media/file/{name}");
+        let made = |name: &str, w: u32, h: u32, mime: &str| json!({"url": u(name), "width": w, "height": h, "mimeType": mime, "filename": name});
+        let mut thumb = made("a-400x300.png", 400, 300, "image/png");
+        thumb["formats"] = json!({
+            "webp": made("a-400x300.webp", 400, 300, "image/webp"),
+            "avif": made("a-400x300.avif", 400, 300, "image/avif"),
+        });
+        let mut tiny = made("a-40x30.jpg", 40, 30, "image/jpeg");
+        tiny["formats"] = json!({"webp": made("a-40x30.webp", 40, 30, "image/webp")});
+        let doc = json!({"id": M1, "url": u("a.png"), "filename": "a.png", "mimeType": "image/png",
+        "width": 800, "height": 600, "alt": "Cover", "sizes": {
+            "thumb": thumb,
+            "card": {"url": null, "width": null, "height": null, "mimeType": null, "filename": null},
+            "tiny": tiny
+        }});
+        doc.as_object().unwrap().clone()
+    }
+
+    /// `media` holds image `M1` (`cover`), a PDF `M2` and nothing else readable.
+    pub(super) fn media_file(to: &str, v: &Value) -> Option<UploadView> {
+        match (to, v.as_str()?) {
+            ("media", M1) => upload_view(&cover()),
+            ("media", M2) => upload_view(
+                json!({"url": "/api/media/file/terms.pdf", "filename": "terms.pdf",
+                    "mimeType": "application/pdf"})
+                .as_object()
+                .unwrap(),
+            ),
+            _ => None,
+        }
     }
 
     pub(super) fn text(s: &str) -> Value {
@@ -1299,7 +1471,7 @@ mod tests {
             ),
             // Unknown nodes, marks, keys and attributes.
             (all(), one(json!({"type": "video"})), "body.content.0", "unknown node type `video`".into()),
-            (all(), one(json!({"type": "upload", "attrs": {}})), "body.content.0", "unknown node type `upload`".into()),
+            (all(), one(json!({"type": "upload", "attrs": {}})), "body.content.0.attrs.relationTo", "is required".into()),
             (all(), one(json!({"content": []})), "body.content.0", "expected a node with a type".into()),
             (all(), one(json!("text")), "body.content.0", "expected a node with a type".into()),
             (
@@ -1794,6 +1966,287 @@ mod tests {
             body[3]["content"][0]["marks"][0]["attrs"]["doc"]["value"],
             P2
         );
+    }
+
+    /// A `body` field linking to posts and holding files from `media` and `docs`. A `media`
+    /// node carries a required caption, a credit linking to an author, a note of rich text
+    /// and a tone with a default; a `docs` node carries nothing.
+    fn uploads() -> Vec<Field> {
+        fields(
+            json!({"relationTo": ["posts", "media", "docs"], "upload": {"collections": {
+                "media": {"fields": [
+                    {"name": "caption", "type": "text", "required": true},
+                    {"name": "credit", "type": "relationship", "relationTo": "authors"},
+                    {"name": "note", "type": "richText"},
+                    {"name": "tone", "type": "text", "default": "plain"}
+                ]},
+                "docs": {}
+            }}}),
+        )
+    }
+
+    fn upload(to: &str, id: &str, fields: Value) -> Value {
+        json!({"type": "upload", "attrs": {"relationTo": to, "value": id, "fields": fields}})
+    }
+
+    #[test]
+    fn upload_node_validates() {
+        let one = |node: Value| doc(json!([node]));
+        let ok = check(
+            &uploads(),
+            doc(json!([
+                upload("media", &M1.to_uppercase(), json!({"caption": "Hi", "credit": A1, "note": null})),
+                {"type": "blockquote", "content": [
+                    {"type": "upload", "attrs": {"relationTo": "docs", "value": M2}}
+                ]}
+            ])),
+        )
+        .unwrap();
+        // Stored in canonical form, with its fields' defaults and without their nulls.
+        assert_eq!(
+            ok["body"]["content"][0]["attrs"],
+            json!({"relationTo": "media", "value": M1,
+                "fields": {"caption": "Hi", "credit": A1, "tone": "plain"}})
+        );
+        assert_eq!(
+            ok["body"]["content"][1]["content"][0]["attrs"],
+            json!({"relationTo": "docs", "value": M2})
+        );
+
+        let at = "body.content.0.attrs";
+        let cases: Vec<(Vec<Field>, Value, String, &str)> = vec![
+            // A collection the field doesn't link to, and one it links to that holds no files.
+            (
+                uploads(),
+                one(upload("secrets", M1, json!({}))),
+                format!("{at}.relationTo"),
+                "can't link to `secrets`; expected one of: posts, media, docs",
+            ),
+            (
+                uploads(),
+                one(upload("posts", P1, json!({}))),
+                format!("{at}.relationTo"),
+                "can't hold files from `posts`; expected one of: docs, media",
+            ),
+            (
+                fields(json!({"relationTo": ["media"]})),
+                one(upload("media", M1, json!({}))),
+                format!("{at}.relationTo"),
+                "this field can't hold files",
+            ),
+            (
+                fields(json!({"features": ["bold"], "relationTo": ["media"],
+                    "upload": {"collections": {"media": {}}}})),
+                one(upload("media", M1, json!({}))),
+                "body.content.0".into(),
+                "the `upload` feature isn't turned on for this field",
+            ),
+            // Its fields answer to its collection's.
+            (
+                uploads(),
+                one(upload("media", M1, json!({"caption": "x", "stray": 1}))),
+                format!("{at}.fields.stray"),
+                "unknown field",
+            ),
+            (
+                uploads(),
+                one(upload("docs", M2, json!({"caption": "x"}))),
+                format!("{at}.fields.caption"),
+                "unknown field",
+            ),
+            (
+                uploads(),
+                one(upload("media", M1, json!({}))),
+                format!("{at}.fields.caption"),
+                "is required",
+            ),
+            (
+                uploads(),
+                one(upload(
+                    "media",
+                    M1,
+                    json!({"caption": "x", "credit": "nope"}),
+                )),
+                format!("{at}.fields.credit"),
+                "expected a document ID",
+            ),
+            (
+                uploads(),
+                one(upload("media", M1, json!("x"))),
+                format!("{at}.fields"),
+                "expected an object",
+            ),
+            (
+                uploads(),
+                one(upload("media", M1, json!({"caption": "a\u{0}"}))),
+                format!("{at}.fields.caption"),
+                "must not contain the NUL character",
+            ),
+            // The node itself.
+            (
+                uploads(),
+                one(upload("media", "nope", json!({"caption": "x"}))),
+                format!("{at}.value"),
+                "expected a document ID",
+            ),
+            (
+                uploads(),
+                one(json!({"type": "upload", "attrs": {"relationTo": "media"}})),
+                format!("{at}.value"),
+                "is required",
+            ),
+            (
+                uploads(),
+                one(
+                    json!({"type": "upload", "attrs": {"relationTo": "media", "value": M1, "alt": "x"}}),
+                ),
+                format!("{at}.alt"),
+                "unknown attribute `alt`",
+            ),
+            (
+                uploads(),
+                one(json!({"type": "upload", "attrs": {"relationTo": "media", "slug": "a"}})),
+                format!("{at}.slug"),
+                "unknown attribute `slug`",
+            ),
+            (
+                uploads(),
+                one(para(json!([upload("docs", M2, json!({}))]))),
+                "body.content.0.content.0".into(),
+                "`upload` can't go inside `paragraph`",
+            ),
+            // Rich text in its fields counts toward the limits of the text it's in (W1-R18).
+            (
+                uploads(),
+                one(upload(
+                    "media",
+                    M1,
+                    json!({"caption": "x", "note": nested(30)}),
+                )),
+                format!("{at}.fields.note{}", ".content.0".repeat(32)),
+                "nests more than 32 levels deep",
+            ),
+            (
+                uploads(),
+                one(upload(
+                    "media",
+                    M1,
+                    json!({"caption": "x", "note":
+                        doc(json!((0..50_000).map(|_| json!({"type": "horizontalRule"})).collect::<Vec<_>>()))
+                    }),
+                )),
+                format!("{at}.fields.note.content.49999"),
+                "holds more than 50000 nodes",
+            ),
+        ];
+        for (fields, body, path, message) in cases {
+            let errors = check(&fields, body.clone()).expect_err(&format!("accepted {body}"));
+            assert_eq!(errors.len(), 1, "{errors:?}");
+            assert_eq!(
+                (errors[0].path.as_str(), errors[0].message.as_str()),
+                (path.as_str(), message),
+                "for {}",
+                body.to_string().chars().take(300).collect::<String>()
+            );
+        }
+    }
+
+    #[test]
+    fn upload_nodes_are_links() {
+        let fields = uploads();
+        let body = doc(json!([
+            para(json!([linked(
+                json!({"doc": {"relationTo": "posts", "value": P1}})
+            )])),
+            upload("media", M1, json!({"caption": "c", "credit": A1})),
+            upload("docs", M2, json!({}))
+        ]));
+        let stored = check(&fields, body).unwrap();
+        let found: Vec<(String, String, String, String)> = relations(&fields, &stored)
+            .into_iter()
+            .map(|r| (r.path, r.at, r.field, r.id.to_string()))
+            .collect();
+        let row = |p: &str, at: &str, f: &str, id: &str| (p.into(), at.into(), f.into(), id.into());
+        // The node keys on its field, as other links in the text do; its fields' links on
+        // its collection, past `@`, which no block type's slug can start with.
+        assert_eq!(
+            found,
+            [
+                row(
+                    "body.0",
+                    "body.content.0.content.0.marks.0.attrs.doc.value",
+                    "body",
+                    P1
+                ),
+                row("body.1", "body.content.1.attrs.value", "body", M1),
+                row(
+                    "body.1.credit",
+                    "body.content.1.attrs.fields.credit",
+                    "body.@media.credit",
+                    A1
+                ),
+                row("body.2", "body.content.2.attrs.value", "body", M2),
+            ]
+        );
+        assert_eq!(
+            links(&stored["body"])
+                .into_iter()
+                .map(|(at, _)| at)
+                .collect::<Vec<_>>(),
+            [
+                "content.0.content.0.marks.0.attrs.doc",
+                "content.1.attrs",
+                "content.2.attrs"
+            ]
+        );
+        // The two walkers count the same items.
+        let read: Vec<bool> = items(&stored["body"])
+            .iter()
+            .map(|(_, i)| matches!(i, Item::Upload(_)))
+            .collect();
+        let mut written = Vec::new();
+        each_item_mut(&mut stored["body"].clone(), &mut |k, item| {
+            written.push((k, matches!(item, ItemMut::Upload(_))))
+        });
+        assert_eq!(written, read.into_iter().enumerate().collect::<Vec<_>>());
+
+        // Populating swaps the node's `value` and its fields' links for the documents.
+        let mut populated = stored.clone();
+        map_relations(&fields, &mut populated, &mut |path, id| {
+            Some(json!({"id": id, "path": path}))
+        });
+        let node = &populated["body"]["content"][1]["attrs"];
+        assert_eq!(node["relationTo"], "media");
+        assert_eq!(node["value"], json!({"id": M1, "path": "body.1"}));
+        assert_eq!(node["fields"]["credit"]["path"], "body.1.credit");
+        assert_eq!(node["fields"]["caption"], "c");
+    }
+
+    #[test]
+    fn upload_views_offer_each_made_size() {
+        let view = upload_view(&cover()).unwrap();
+        let u = |name: &str| format!("https://cms.example/api/media/file/{name}");
+        assert_eq!(
+            view,
+            UploadView {
+                url: u("a.png"),
+                width: Some(800),
+                height: Some(600),
+                alt: Some("Cover".into()),
+                mime_type: "image/png".into(),
+                filename: "a.png".into(),
+                // By width: the JPEG size only by its WebP copy, the size not made not at all.
+                srcset: vec![
+                    (u("a-40x30.webp"), 40),
+                    (u("a-400x300.png"), 400),
+                    (u("a-400x300.webp"), 400),
+                ],
+            }
+        );
+        // No URL, as when it's hidden from the caller: nothing to show.
+        let mut hidden = cover();
+        hidden.insert("url".into(), Value::Null);
+        assert_eq!(upload_view(&hidden), None);
     }
 
     #[test]
