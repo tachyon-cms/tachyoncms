@@ -628,8 +628,6 @@ pub async fn publish_in(
             )
             .execute(&mut *tx)
             .await?;
-            // Published as it was saved, into its folder as that is now.
-            crate::folders::check_filed_in(&mut *tx, id, DocCopy::Published).await?;
         }
     }
     // Drafts imply versions, so a collection that publishes always keeps a history to add to.
@@ -1065,8 +1063,5 @@ pub(crate) async fn sync_relations(
     )
     .execute(&mut *conn)
     .await?;
-    if relations.iter().any(|r| r.path == "folder") {
-        crate::folders::check_filed_in(conn, from_doc, copy).await?;
-    }
     Ok(())
 }

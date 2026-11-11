@@ -258,6 +258,10 @@ pub async fn create_account_with(
         &profile.relations,
     )
     .await?;
+    // A new account filed in a folder is a filing.
+    if users.schema.folders && profile.data.get("folder").is_some_and(|f| !f.is_null()) {
+        crate::folders::check_filed_in(&mut tx, id, crate::documents::DocCopy::Published).await?;
+    }
     sqlx::query!(
         "INSERT INTO accounts (user_id, tenant_id, email, password_hash, role) VALUES ($1, $2, $3, $4, $5)",
         id,

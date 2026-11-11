@@ -855,6 +855,9 @@ async fn folders_take_the_anonymous_default(pool: PgPool) {
         404,
     );
     assert_eq!(ids(&anon, "/api/folders").await, vec![f]);
+    // Profiles read like content wherever linked, signed out too, so a folder for them does.
+    let people = folder(&app, "People", None, &["users"]).await;
+    ok(&anon, "GET", &format!("/api/folders/{people}"), Value::Null).await;
 }
 
 /// A folder moved with what's inside it must leave its deepest folder 64 levels down at
@@ -1374,10 +1377,11 @@ async fn profiles_file_by_the_folders_list(pool: PgPool) {
     assert_eq!(error_path(&res), "folder", "{}", res.json);
 }
 
-/// A document restored from the trash goes back into its folder, which must still be
-/// there and still hold its collection.
+/// A document restored from the trash goes back into its folder, which must still be there,
+/// as for any link (Ruling T5-1). What it lists was judged when the document was filed, and
+/// isn't again.
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn restoring_rechecks_the_folder(pool: PgPool) {
+async fn restoring_keeps_the_folder(pool: PgPool) {
     let d = dir();
     let app = admin(&pool, &d).await;
     schema(
@@ -1420,7 +1424,7 @@ async fn restoring_rechecks_the_folder(pool: PgPool) {
         &call(&app, "GET", &format!("/api/posts/{p}"), Value::Null).await,
         404,
     );
-    // Its folder no longer holding posts.
+    // Its folder no longer listing posts.
     let narrowed = folder(&app, "Narrowed", None, &["posts"]).await;
     let q = id(&ok(
         &app,
@@ -1438,20 +1442,182 @@ async fn restoring_rechecks_the_folder(pool: PgPool) {
     )
     .await;
     let res = restore(q.clone()).await;
-    assert_problem(&res, 422);
-    assert_eq!(error_path(&res), "folder", "{}", res.json);
-    assert_problem(
-        &call(&app, "GET", &format!("/api/posts/{q}"), Value::Null).await,
-        404,
-    );
-    // Back to holding them, it restores.
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+/// Narrowing a folder's list stops new filings only: what's already inside stays editable,
+/// publishable and restorable.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn narrowing_keeps_whats_inside(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    for slug in ["posts", "pages"] {
+        schema(
+            &app,
+            json!({"slug": slug, "folders": true, "versions": {"drafts": true},
+                   "fields": [{"name": "title", "type": "text"}]}),
+        )
+        .await;
+    }
+    let n = folder(&app, "N", None, &["posts", "pages"]).await;
+    let page = id(&ok(
+        &app,
+        "POST",
+        "/api/pages",
+        json!({"title": "t", "folder": n}),
+    )
+    .await);
     ok(
         &app,
         "PATCH",
-        &format!("/api/folders/{narrowed}"),
+        &format!("/api/folders/{n}"),
         json!({"collections": ["posts"]}),
     )
     .await;
-    let res = restore(q.clone()).await;
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/pages/{page}"),
+        json!({"title": "edited"}),
+    )
+    .await;
     assert_eq!(res.status, 200, "{}", res.json);
+    let res = call(
+        &app,
+        "POST",
+        &format!("/api/pages/{page}/publish"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    ok(&app, "DELETE", &format!("/api/pages/{page}"), Value::Null).await;
+    let res = call(
+        &app,
+        "POST",
+        &format!("/api/pages/trash/{page}/restore"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let live = ok(
+        &app,
+        "GET",
+        &format!("/api/pages/{page}?depth=0"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(live["folder"], n.as_str());
+    // Filing another one there is refused.
+    let other = id(&ok(&app, "POST", "/api/pages", json!({"title": "o"})).await);
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/pages/{other}"),
+        json!({"folder": n}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+}
+
+/// Trashed documents move only for callers who may reach the trash: everything there
+/// takes `delete`.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn trashed_contents_take_delete(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "folders": true, "access": {"delete": {"role": "admin"}},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let e1 = folder(&app, "E1", None, &[]).await;
+    let e2 = folder(&app, "E2", None, &[]).await;
+    let p = id(&ok(
+        &app,
+        "POST",
+        "/api/posts",
+        json!({"title": "t", "folder": e1}),
+    )
+    .await);
+    ok(&app, "DELETE", &format!("/api/posts/{p}"), Value::Null).await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    assert_problem(
+        &call(&editor, "GET", "/api/posts/trash", Value::Null).await,
+        403,
+    );
+    let res = call(
+        &editor,
+        "DELETE",
+        &format!("/api/folders/{e1}?moveContentsTo={e2}"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 403);
+    let held: Option<String> =
+        sqlx::query_scalar("SELECT published ->> 'folder' FROM documents WHERE id = $1")
+            .bind(p.parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(held.as_deref(), Some(e1.as_str()), "nothing moved");
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{e1}?moveContentsTo={e2}"),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 204, "{}", res.json);
+}
+
+/// Turning folders on over a field of its own called `folder` keeps the values stored, and
+/// those documents stay editable: only a change of folder is judged.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn folders_on_keeps_stored_folders(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    schema(
+        &app,
+        json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let notes = json!({"slug": "notes", "fields": [
+        {"name": "title", "type": "text"},
+        {"name": "folder", "type": "relationship", "relationTo": "folders"}]});
+    schema(&app, notes.clone()).await;
+    let posts_only = folder(&app, "Posts", None, &["posts"]).await;
+    let note = id(&ok(
+        &app,
+        "POST",
+        "/api/notes",
+        json!({"title": "t", "folder": posts_only}),
+    )
+    .await);
+    let mut on = notes.clone();
+    on["folders"] = json!(true);
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/notes",
+        json!({"schema": on, "confirm": true}),
+    )
+    .await;
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/notes/{note}"),
+        json!({"title": "edited"}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/notes/{note}"),
+        json!({"folder": posts_only}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "unchanged is no change: {}", res.json);
 }

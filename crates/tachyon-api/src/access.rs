@@ -564,7 +564,7 @@ impl Access {
         if readable.len() == listable.len() {
             return Compiled::Allow;
         }
-        // Stored lists only name collections with folders, and never an empty one.
+        // Stored lists name listable collections, never an empty one.
         let mut any: Vec<Value> = readable
             .iter()
             .map(|s| json!({"collections": {"contains": s}}))
@@ -1009,6 +1009,14 @@ impl Access {
     /// only what they created when either right is own-only. The trash shows a document
     /// only this way, so one it doesn't reach is a 404.
     pub(crate) fn trash_readable(&self, c: &Collection) -> Result<Readable, ApiError> {
+        let read = self.trash_rules(c)?;
+        self.write_copy(c)?;
+        Ok(read)
+    }
+
+    /// `trash_readable`, without making the request one that works on drafts: what a write
+    /// already reading in another copy judges a trashed document by.
+    pub(crate) fn trash_rules(&self, c: &Collection) -> Result<Readable, ApiError> {
         self.may_write(Action::Delete, c)?;
         let (read, delete) = self
             .write_rules(Action::Delete, c)
@@ -1018,7 +1026,6 @@ impl Access {
             // `may_write` refused a drafts collection whose drafts they can't read.
             None => Readable::published(read),
         };
-        self.write_copy(c)?;
         let owner = match self.own_only(Action::Delete, c) {
             true => Some(self.user_id().ok_or_else(|| self.refuse())?),
             false => read.owner,

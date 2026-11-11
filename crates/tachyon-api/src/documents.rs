@@ -319,6 +319,7 @@ pub async fn create(
         if moves {
             folders::check_place(&mut tx, doc.id).await?;
         }
+        folders::check_filed(&mut tx, &c, doc.id, copy, None, doc.data.0.get("folder")).await?;
         filtered_links(
             &mut tx,
             &state,
@@ -578,6 +579,8 @@ pub async fn update(
         if moves {
             folders::lock(&mut tx).await?;
         }
+        // The locked copy's folder, so only a change of it is judged.
+        let mut filed_before = None;
         let doc = documents::update_in(
             &mut tx,
             c.id,
@@ -587,6 +590,7 @@ pub async fn update(
             actor,
             guard.as_ref(),
             |current| {
+                filed_before = current.get("folder").cloned();
                 let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
                 vouched_links(&next, &link_ids(&c, current), &vouched)?;
                 let from = checked.as_ref().and_then(|(_, f)| f.edits);
@@ -612,6 +616,8 @@ pub async fn update(
         if moves {
             folders::check_place(&mut tx, id).await?;
         }
+        let after = doc.data.0.get("folder");
+        folders::check_filed(&mut tx, &c, id, copy, filed_before.as_ref(), after).await?;
         let data = &doc.data.0;
         filtered_links(
             &mut tx,

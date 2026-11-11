@@ -52,6 +52,25 @@ fn bad_move(message: &str) -> ApiError {
     }])
 }
 
+/// Judges a write of `copy` of document `id` of `c` that moved it from folder `before` to
+/// `after` (the stored values, `None` for none): filed into a folder that lists others but
+/// not `c`, it's refused. Unchanged, it isn't judged, so a folder whose list narrowed keeps
+/// what's already in it editable.
+pub(crate) async fn check_filed(
+    tx: &mut PgConnection,
+    c: &Collection,
+    id: Uuid,
+    copy: DocCopy,
+    before: Option<&Value>,
+    after: Option<&Value>,
+) -> Result<(), ApiError> {
+    let after = after.filter(|v| !v.is_null());
+    if !c.schema.folders || c.schema.slug == FOLDERS || after.is_none() || before == after {
+        return Ok(());
+    }
+    Ok(folders::check_filed_in(tx, id, copy).await?)
+}
+
 /// Deletes folder `id` of `c` (under `guard`, judging `copy`), first moving what files into
 /// it, documents and folders, in the trash or not, to `to` (`None`: the root). One
 /// transaction, on one connection: any refusal or failure leaves everything as it was.
@@ -155,11 +174,19 @@ async fn move_one(
         // Judged on the locked row: the read and update rules, and the creator where
         // either right is the caller's own documents only.
         let (read, write) = access.guard_rules(Action::Update, dc)?;
+        let mut own = read.owner.is_some();
+        let mut guard = both(read.filter, write);
+        // Everything in the trash takes `delete` too (plan call 9).
+        if item.trashed {
+            let trash = access.trash_rules(dc)?;
+            own |= trash.owner.is_some();
+            guard = both(guard, trash.filter);
+        }
         let actor = access.actor(Action::Update, dc).map(|a| Actor {
-            own_only: a.own_only || read.owner.is_some(),
+            own_only: a.own_only || own,
             ..a
         });
-        (actor, both(read.filter, write))
+        (actor, guard)
     };
     // A live copy with a draft beside it changes only by publishing.
     if item.copy == DocCopy::Published && dc.schema.drafts() {
@@ -170,7 +197,7 @@ async fn move_one(
         }
     }
     let patch = json!({ "folder": to });
-    documents::update_any_in(
+    let doc = documents::update_any_in(
         tx,
         dc.id,
         dc.schema_version,
@@ -191,9 +218,9 @@ async fn move_one(
         },
     )
     .await?;
-    // A folder takes what's inside it along, which must still fit.
+    // A folder takes what's inside it along, which must still fit; a move is a filing.
     if dc.schema.slug == FOLDERS {
         check_place(tx, item.id).await?;
     }
-    Ok(())
+    check_filed(tx, dc, item.id, item.copy, None, doc.data.0.get("folder")).await
 }

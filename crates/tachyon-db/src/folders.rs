@@ -362,10 +362,10 @@ pub async fn lists_in(conn: &mut PgConnection, id: Uuid) -> Result<Option<Vec<St
 
 /// Refuses `copy` of document `from_doc`, its links just stored, filed in a folder whose
 /// `collections` lists others but not its own collection; one that lists none holds any.
-/// Every write of a link goes through here, so every write of a `folder` is judged: a
-/// create, update, publish, restore, move, profile write or schema change alike. Folders
-/// nest whatever they list.
-pub(crate) async fn check_filed_in(
+/// Only a write that changes the copy's folder is judged: a create, an edit or a move into
+/// one. A publish or a restore keeps what was judged when it was filed, and a folder whose
+/// list narrows keeps what's already inside. Folders nest whatever they list.
+pub async fn check_filed_in(
     conn: &mut PgConnection,
     from_doc: Uuid,
     copy: DocCopy,

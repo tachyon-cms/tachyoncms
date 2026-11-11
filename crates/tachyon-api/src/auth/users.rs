@@ -379,6 +379,7 @@ pub(crate) async fn update(
             id: i.user_id,
             own_only: false,
         });
+        let mut filed_before = None;
         let doc = documents::update_in(
             &mut tx,
             users.id,
@@ -388,6 +389,7 @@ pub(crate) async fn update(
             who,
             None,
             |current| {
+                filed_before = current.get("folder").cloned();
                 let next = apply(current)?;
                 vouched_links(&next, &link_ids(&users, current), vouched)?;
                 Ok(next)
@@ -395,6 +397,16 @@ pub(crate) async fn update(
         )
         .await
         .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller, None))?;
+        let after = doc.data.0.get("folder");
+        crate::folders::check_filed(
+            &mut tx,
+            &users,
+            id,
+            DocCopy::Published,
+            filed_before.as_ref(),
+            after,
+        )
+        .await?;
         let sent = Sent::Keys(&profile);
         filtered_links(
             &mut tx,
