@@ -27,7 +27,7 @@ use tachyon_core::{Field, FieldError, FieldKind};
 use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, FileRow, NewFile};
 pub(crate) use tachyon_media::fetch::Spool;
-use tachyon_media::fetch::{FetchError, HEAD};
+use tachyon_media::fetch::{FetchError, HEAD, MAX_URL};
 use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
 use tachyon_media::storage::object_key;
@@ -61,7 +61,8 @@ pub(crate) enum UploadBody {
 /// (`{"file": {"url": "…"}}` in the payload).
 pub(crate) enum Incoming {
     Spooled(Spool),
-    Url(String),
+    /// With the request's time limit, lengthened as the fetch starts.
+    Url(String, Option<crate::Limit>),
 }
 
 impl Incoming {
@@ -69,17 +70,23 @@ impl Incoming {
     /// takes no URLs, a 422 at `file.url` when this one can't be fetched, a 413 past the
     /// collection's limit.
     pub(crate) async fn spool(self, state: &AppState, u: &Upload) -> Result<Spool, ApiError> {
-        let raw = match self {
+        let (raw, limit) = match self {
             Self::Spooled(spool) => return Ok(spool),
-            Self::Url(raw) => raw,
+            Self::Url(raw, limit) => (raw, limit),
         };
         if u.paste_url == PasteUrl::Off {
             return Err(ApiError::BadRequest(
                 "this collection doesn't take URLs".into(),
             ));
         }
+        if raw.len() > MAX_URL {
+            return Err(at_url("this URL is too long".into()));
+        }
         let url = Url::parse(&raw).map_err(|_| at_url("this isn't a URL".into()))?;
         let cap = u.filesize_limit.unwrap_or(state.media.max_file_size);
+        if let Some(limit) = limit {
+            limit.lengthen();
+        }
         state
             .fetch
             .to_spool(&url, u, cap, &state.media.temp_dir)
@@ -121,23 +128,20 @@ impl UploadBody {
     /// `file_limit` (no `file` part at all when `None`), and at most one `_payload` part of
     /// JSON; any other part is a 400 naming it. A body cut off midway is a 400, and leaves no
     /// spool file behind.
-    /// A URL in the body lengthens the request's time limit to the upload one.
+    /// A URL in the body carries the request's time limit, for its fetch to lengthen.
     pub(crate) async fn read(
         req: Request,
         file_limit: Option<u64>,
         temp_dir: &Path,
     ) -> Result<Self, ApiError> {
         let limit = req.extensions().get::<crate::Limit>().cloned();
-        let body = Self::read_body(req, file_limit, temp_dir).await?;
-        if let (
-            Self::Upload {
-                file: Incoming::Url(_),
-                ..
-            },
-            Some(limit),
-        ) = (&body, limit)
+        let mut body = Self::read_body(req, file_limit, temp_dir).await?;
+        if let Self::Upload {
+            file: Incoming::Url(_, at),
+            ..
+        } = &mut body
         {
-            limit.lengthen();
+            *at = limit;
         }
         Ok(body)
     }
@@ -248,7 +252,7 @@ impl UploadBody {
         match &file["url"] {
             Value::String(url) => Ok(Self::Upload {
                 payload,
-                file: Incoming::Url(url.clone()),
+                file: Incoming::Url(url.clone(), None),
             }),
             _ => Err(at_url("expected a URL".into())),
         }

@@ -359,7 +359,7 @@ async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Ne
         Some(_) => limits.uploads,
         None => limits.normal,
     };
-    let until = Limit::new(now + limit, now + limits.uploads);
+    let until = Limit::new(now + limit, limits.uploads + limits.normal);
     req.extensions_mut().insert(Deadline(now + limit));
     req.extensions_mut().insert(until.clone());
     let run = next.run(req);
@@ -378,22 +378,24 @@ async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Ne
     }
 }
 
-/// When `time_limit` ends a request. A body found to carry a file only once it's read, a
-/// URL in JSON, lengthens it to the upload limit, as a file part has it from the start.
+/// When `time_limit` ends a request. A URL found in the body lengthens it as its fetch
+/// starts, past every check before it (`lengthen`).
 #[derive(Clone)]
 pub(crate) struct Limit(Arc<LimitAt>);
 
 struct LimitAt {
     at: std::sync::Mutex<tokio::time::Instant>,
-    uploads: tokio::time::Instant,
+    /// What a fetch gets from its start: its own timeout, then the normal limit for what
+    /// follows, so the fetch's timeout always ends it first.
+    fetch: Duration,
     moved: tokio::sync::Notify,
 }
 
 impl Limit {
-    fn new(at: tokio::time::Instant, uploads: tokio::time::Instant) -> Self {
+    fn new(at: tokio::time::Instant, fetch: Duration) -> Self {
         Self(Arc::new(LimitAt {
             at: std::sync::Mutex::new(at),
-            uploads,
+            fetch,
             moved: tokio::sync::Notify::new(),
         }))
     }
@@ -407,9 +409,10 @@ impl Limit {
         self.0.moved.notify_one();
     }
 
-    /// To the upload limit, counted from when the request came in.
+    /// For a fetch starting now: `[uploads] timeout` and then the normal limit.
     pub(crate) fn lengthen(&self) {
-        self.set(self.0.uploads.max(self.at()));
+        let fetch = tokio::time::Instant::now() + self.0.fetch;
+        self.set(fetch.max(self.at()));
     }
 }
 
@@ -640,70 +643,128 @@ mod tests {
         }
     }
 
-    /// A body with `file.url` in it, JSON or a multipart `_payload`, gets the upload limit
-    /// once it's read, as a file part does from the start; signed out with `?wait=true`
-    /// too, as a file part does.
-    #[tokio::test]
-    async fn a_pasted_url_gets_the_upload_time_limit() {
+    /// A pasted URL lifts the request's limit only as its fetch starts, past every check
+    /// before it, and then to the fetch's own timeout plus the normal limit, so a slow
+    /// upstream is the fetch's 422, not the request's 503. Each route is a collection:
+    /// `on` fetches and then works 300 ms, `off` takes no URLs, `refused` is turned away
+    /// before the fetch (as a field-write refusal is), `slow` fetches from a server too slow.
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_pasted_url_gets_the_upload_time_limit(pool: sqlx::PgPool) {
+        use tachyon_core::uploads::{PasteUrl, SkipSafeFetch, Upload};
+        use tachyon_media::fixtures::{response, serve};
         let temp = tempfile::Builder::new()
             .prefix("tachyon-limit-")
             .tempdir()
             .unwrap();
-        let dir = temp.path().to_path_buf();
-        let read = move |req: Request<Body>| {
-            let dir = dir.clone();
+        let limits = TimeLimits {
+            normal: Duration::from_millis(50),
+            uploads: Duration::from_millis(500),
+        };
+        let state = AppState {
+            pool: pool.clone(),
+            schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
+            auth: Arc::new(auth::AuthState::new(Default::default()).unwrap()),
+            inline_rows: collections::INLINE_ROWS,
+            media: Arc::new(UploadsConfig {
+                temp_dir: temp.path().to_path_buf(),
+                timeout: limits.uploads,
+                ..UploadsConfig::default()
+            }),
+            fetch: tachyon_media::fetch::SafeFetch::new(limits.uploads).unwrap(),
+        };
+        let fast = serve(|_| vec![response("200 OK", &["Content-Length: 2"], b"hi")]).await;
+        let slow = serve(|_| {
+            let mut pieces = vec![response("200 OK", &["Content-Length: 20"], b"a")];
+            pieces.extend((0..19).map(|_| b"a".to_vec()));
+            pieces
+        })
+        .await;
+        let pasted = move |req: Request<Body>| {
+            let state = state.clone();
             async move {
-                let body = uploads::UploadBody::read(req, Some(1_000), &dir).await;
-                tokio::time::sleep(Duration::from_millis(300)).await;
-                match body {
-                    Ok(uploads::UploadBody::Upload { .. }) => "pasted",
-                    _ => "not pasted",
+                let route = req.uri().path().trim_start_matches("/api/").to_owned();
+                let u = Upload {
+                    paste_url: if route == "off" {
+                        PasteUrl::Off
+                    } else {
+                        PasteUrl::On
+                    },
+                    skip_safe_fetch: SkipSafeFetch::All,
+                    ..Upload::default()
+                };
+                let late = || tokio::time::sleep(Duration::from_millis(300));
+                let body = uploads::UploadBody::read(req, Some(1_000), &state.media.temp_dir).await;
+                let Ok(uploads::UploadBody::Upload { file, .. }) = body else {
+                    late().await;
+                    return "not pasted".into_response();
+                };
+                if route == "refused" {
+                    late().await;
+                    return ApiError::Forbidden("no".into()).into_response();
+                }
+                match file.spool(&state, &u).await {
+                    Ok(_) => {
+                        late().await;
+                        "fetched".into_response()
+                    }
+                    Err(e) if route == "slow" => e.into_response(),
+                    Err(e) => {
+                        late().await;
+                        e.into_response()
+                    }
                 }
             }
         };
-        let limits = TimeLimits {
-            normal: Duration::from_millis(50),
-            uploads: Duration::from_secs(5),
-        };
         let routes = Router::new()
-            .route("/api/{collection}", post(read.clone()))
-            .route("/api/{collection}/{id}", axum::routing::patch(read))
+            .route("/api/{collection}", post(pasted.clone()))
+            .route("/api/{collection}/{id}", axum::routing::patch(pasted))
             .layer(axum::middleware::from_fn_with_state(limits, anonymous_wait));
         let app = layers(routes, limits);
-        let json = r#"{"file": {"url": "https://example.com/a.png"}}"#;
+        let json =
+            |addr: std::net::SocketAddr| format!(r#"{{"file": {{"url": "http://{addr}/a.txt"}}}}"#);
         let part = format!(
-            "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{json}\r\n--x--\r\n"
+            "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{}\r\n--x--\r\n",
+            json(fast)
         );
-        let multipart = "multipart/form-data; boundary=x";
+        let (kind, multipart) = ("application/json", "multipart/form-data; boundary=x");
         for (method, uri, kind, body, status) in [
+            ("POST", "/api/on", kind, json(fast), StatusCode::OK),
+            ("PATCH", "/api/on/1", kind, json(fast), StatusCode::OK),
             (
                 "POST",
-                "/api/images",
-                "application/json",
-                json.to_owned(),
+                "/api/on?wait=true",
+                kind,
+                json(fast),
                 StatusCode::OK,
             ),
-            (
-                "PATCH",
-                "/api/images/1",
-                "application/json",
-                json.to_owned(),
-                StatusCode::OK,
-            ),
+            ("POST", "/api/on", multipart, part, StatusCode::OK),
             (
                 "POST",
-                "/api/images?wait=true",
-                "application/json",
-                json.to_owned(),
-                StatusCode::OK,
-            ),
-            ("POST", "/api/images", multipart, part, StatusCode::OK),
-            (
-                "POST",
-                "/api/images",
-                "application/json",
-                r#"{"alt": "x"}"#.to_owned(),
+                "/api/off",
+                kind,
+                json(fast),
                 StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "POST",
+                "/api/refused",
+                kind,
+                json(fast),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "POST",
+                "/api/on",
+                kind,
+                r#"{"alt": "x"}"#.into(),
+                StatusCode::SERVICE_UNAVAILABLE,
+            ),
+            (
+                "POST",
+                "/api/slow",
+                kind,
+                json(slow),
+                StatusCode::UNPROCESSABLE_ENTITY,
             ),
         ] {
             let req = Request::builder()
@@ -715,6 +776,7 @@ mod tests {
             let res = app.clone().oneshot(req).await.unwrap();
             assert_eq!(res.status(), status, "{method} {uri} {kind}");
         }
+        assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
     }
 
     #[test]

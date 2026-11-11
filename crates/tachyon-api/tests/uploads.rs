@@ -1583,6 +1583,10 @@ async fn paste_url_allow_list_and_cap(pool: PgPool) {
         ),
         "expected a URL"
     );
+    // A URL past 8 KiB is refused before it's read.
+    let long = format!("http://{listed}/{}", "a".repeat(8 * 1024));
+    let res = call(&app, "POST", "/api/files", Some(pasted(&long, "x"))).await;
+    assert_eq!(at_url(&res), "this URL is too long");
     // A collection that takes no URLs says so.
     collection(&app, "nourls", json!({"upload": {"pasteURL": false}})).await;
     let res = call(
