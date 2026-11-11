@@ -7,15 +7,20 @@ use serde_json::{Map, Value, json};
 use super::{MAX_START, RenderCtx, UploadView, from_markdown, slug_refs_mut, to_markdown, to_text};
 use crate::schema::{Field, FieldKind};
 
-/// A callout holding text (which may hold an aside holding text) and a video leaf, and
-/// files from `media`.
+/// A callout holding text (which may hold an aside holding text, and files) and a video
+/// leaf, and files from `media` whose nodes carry a caption, a number and a note.
 fn field() -> Field {
     serde_json::from_value(json!({"name": "body", "type": "richText",
         "relationTo": ["posts", "authors", "media"],
-        "upload": {"collections": {"media": {}}}, "blocks": [
+        "upload": {"collections": {"media": {"fields": [
+            {"name": "caption", "type": "text"},
+            {"name": "n", "type": "number"},
+            {"name": "note", "type": "richText"}
+        ]}}}, "blocks": [
         {"slug": "callout", "fields": [
             {"name": "kind", "type": "text"},
-            {"name": "body", "type": "richText", "relationTo": ["posts"], "blocks": [
+            {"name": "body", "type": "richText", "relationTo": ["posts", "media"],
+             "upload": {"collections": {"media": {}}}, "blocks": [
                 {"slug": "aside", "fields": [
                     {"name": "tone", "type": "text"},
                     {"name": "text", "type": "richText"}]}
@@ -259,12 +264,40 @@ fn inline(r: &mut Rng, rels: &[&str], breaks: bool) -> Vec<Value> {
     nodes
 }
 
-/// Which rich text a block sits in: the field's, a callout's or an aside's.
+/// Which rich text a block sits in: the field's, a callout's or an aside's (or a file's
+/// note, which is as plain).
 #[derive(Clone, Copy)]
 enum In {
     Root,
     Callout,
     Aside,
+}
+
+/// An upload node of either file, if text at `at` holds files; at the root, with fields.
+fn upload(r: &mut Rng, at: In, depth: usize) -> Option<Value> {
+    let mut attrs = json!({"relationTo": "media", "value": FILES[r.n(FILES.len())]});
+    match at {
+        In::Aside => return None,
+        In::Callout => {}
+        In::Root => {
+            let mut fields = Map::new();
+            if r.n(2) == 0 {
+                fields.insert("caption".into(), val(r).into());
+            }
+            if r.n(3) == 0 {
+                fields.insert(
+                    "n".into(),
+                    [json!(30), json!(-2), json!(1.5)][r.n(3)].clone(),
+                );
+            }
+            if r.n(3) == 0 {
+                let note = json!({"type": "doc", "content": blocks(r, In::Aside, depth + 1, 2)});
+                fields.insert("note".into(), note);
+            }
+            attrs["fields"] = fields.into();
+        }
+    }
+    Some(json!({"type": "upload", "attrs": attrs}))
 }
 
 impl In {
@@ -293,6 +326,12 @@ fn blocks(r: &mut Rng, at: In, depth: usize, max: usize) -> Vec<Value> {
 
 fn block(r: &mut Rng, at: In, depth: usize) -> Value {
     let rels = at.rels();
+    // Deep in lists, quotes and cells too.
+    if r.n(12) == 0
+        && let Some(file) = upload(r, at, depth)
+    {
+        return file;
+    }
     match r.n(if depth >= 3 { 4 } else { 14 }) {
         0 | 1 => para(inline(r, rels, true)),
         2 => {
@@ -331,9 +370,10 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
                     };
                     let cells: Vec<Value> = (0..cols)
                         .map(|_| {
-                            let content = match r.n(5) {
+                            let content = match r.n(6) {
                                 0 => blocks(r, at, 3, 2),
                                 1 => vec![empty()],
+                                2 => upload(r, at, 3).map_or_else(|| vec![empty()], |f| vec![f]),
                                 _ => vec![para(inline(r, rels, true))],
                             };
                             json!({"type": t, "content": content})
@@ -352,10 +392,7 @@ fn block(r: &mut Rng, at: In, depth: usize) -> Value {
         },
         // A paragraph that is only hard breaks: an empty line in an editor.
         10 => para((0..1 + r.n(2)).map(|_| br()).collect()),
-        // A file the caller can't read is left out, so only a readable one comes back.
-        11 if matches!(at, In::Root) => {
-            json!({"type": "upload", "attrs": {"relationTo": "media", "value": FILES[0]}})
-        }
+        11 => upload(r, at, depth).unwrap_or_else(|| para(inline(r, rels, true))),
         _ => match at {
             In::Root if r.n(2) == 0 => {
                 let mut fields = Map::new();
@@ -454,7 +491,7 @@ const ORDER: [&str; 6] = ["bold", "italic", "underline", "strike", "link", "code
 /// paragraph, code blocks end lines with `\n`, `start: 1` and empty `fields` go, a
 /// table's first row is its header, and empty paragraphs go wherever a sibling sits
 /// beside them, a quote or item keeping one if that's all it holds (R39, R41). An upload
-/// node keeps nothing but its file, by ID.
+/// node the caller can't read goes (R24); one alone in a cell loses its fields (R39).
 fn normal(v: &Value) -> Value {
     let Value::Object(o) = v else {
         return match v {
@@ -468,7 +505,16 @@ fn normal(v: &Value) -> Value {
         .and_then(Value::as_str)
         .unwrap_or("")
         .to_owned();
-    if matches!(kind.as_str(), "tableCell" | "tableHeader") {
+    let readable = |n: &Value| n["type"] != "upload" || n["attrs"]["value"] == FILES[0];
+    if matches!(kind.as_str(), "tableCell" | "tableHeader")
+        && let Some([only]) = o["content"].as_array().map(Vec::as_slice)
+        && only["type"] == "upload"
+        && readable(only)
+    {
+        let mut only = only.clone();
+        only["attrs"].as_object_mut().unwrap().remove("fields");
+        o.insert("content".into(), json!([only]));
+    } else if matches!(kind.as_str(), "tableCell" | "tableHeader") {
         let line = cell_inline(&o["content"]);
         let p = match line.is_empty() {
             true => json!({"type": "paragraph"}),
@@ -514,7 +560,9 @@ fn normal(v: &Value) -> Value {
         "doc" | "blockquote" | "listItem" | "taskItem"
     ) && let Some(Value::Array(content)) = o.get_mut("content")
     {
-        content.retain(|b| *b != empty() && *b != json!({"type": "paragraph", "content": []}));
+        content.retain(|b| {
+            *b != empty() && *b != json!({"type": "paragraph", "content": []}) && readable(b)
+        });
         if content.is_empty() && kind != "doc" {
             content.push(empty());
         }
@@ -779,8 +827,9 @@ fn markdown_block_fuzz_round_trips() {
     );
 }
 
-/// Untrusted Markdown built around images: refused or read, never a panic, and anything
-/// read holds upload nodes only where an image named `media:` alone in its paragraph.
+/// Untrusted Markdown built around images and file directives: refused or read, never a
+/// panic, and anything read holds upload nodes only where an image or directive named a
+/// `media:` file.
 #[test]
 fn markdown_image_input_fuzz() {
     const PARTS: &[&str] = &[
@@ -820,6 +869,11 @@ fn markdown_image_input_fuzz() {
         "::",
         ":::callout\n",
         "\n:::",
+        "::media:",
+        ":::media:media/",
+        "{caption=\"c\"}",
+        "{note=\"x\"}",
+        "{n=\"1\"}",
     ];
     let kind = field().kind;
     let mut r = Rng(0x2545_f491_4f6c_dd1d);
@@ -830,9 +884,8 @@ fn markdown_image_input_fuzz() {
         };
         let mut found = 0;
         super::each_node(&doc, &mut |n| found += usize::from(n["type"] == "upload"));
-        assert!(
-            found <= src.matches("](media:").count(),
-            "{src:?} read as {doc}"
-        );
+        // `:::media:` holds a `::media:`, so each directive counts once.
+        let named = src.matches("](media:").count() + src.matches("::media:").count();
+        assert!(found <= named, "{src:?} read as {doc}");
     }
 }
