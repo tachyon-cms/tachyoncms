@@ -15,7 +15,7 @@ use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, Renamed, SizeLock};
 use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_media::image::{self as picture, ImageError, Made, Original, SizeOut};
-use tachyon_media::storage::Storage;
+use tachyon_media::storage::{Storage, StorageError};
 use tempfile::NamedTempFile;
 use time::OffsetDateTime;
 use tokio::io::AsyncWriteExt;
@@ -138,7 +138,9 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
     }
     let cap = picture::cap(&u, state.media.max_pixels);
     let original = {
-        let fetched = fetch(storage, &file.key, &state.media.temp_dir).await?;
+        let fetched = fetch(storage, &file.key, &state.media.temp_dir)
+            .await
+            .map_err(retry)?;
         open(fetched.path(), cap, u.with_metadata).await?
     };
     let focal = u.focal_point.then_some((file.focal_x, file.focal_y));
@@ -220,15 +222,19 @@ fn file_of(job: &Job) -> Result<Uuid, JobError> {
 }
 
 /// The object at `key`, copied into a new file in `dir` that's deleted when it drops.
-async fn fetch(storage: &Storage, key: &str, dir: &Path) -> Result<NamedTempFile, JobError> {
-    let got = storage.get_range(key, None).await.map_err(retry)?;
-    let file = NamedTempFile::new_in(dir).map_err(retry)?;
-    let mut out = tokio::fs::File::from_std(file.reopen().map_err(retry)?);
+pub(crate) async fn fetch(
+    storage: &Storage,
+    key: &str,
+    dir: &Path,
+) -> Result<NamedTempFile, StorageError> {
+    let got = storage.get_range(key, None).await?;
+    let file = NamedTempFile::new_in(dir)?;
+    let mut out = tokio::fs::File::from_std(file.reopen()?);
     let mut chunks = got.into_stream();
     while let Some(chunk) = chunks.next().await {
-        out.write_all(&chunk.map_err(retry)?).await.map_err(retry)?;
+        out.write_all(&chunk?).await?;
     }
-    out.flush().await.map_err(retry)?;
+    out.flush().await?;
     Ok(file)
 }
 

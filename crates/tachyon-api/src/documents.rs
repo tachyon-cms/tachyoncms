@@ -34,8 +34,9 @@ use crate::populate::{
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
-    UploadBody, check_and_process, file_limit, focal_of, persist, require_file, scope_of,
-    server_fields, settle_server_set, taken_or_abandoned, with_fields,
+    UploadBody, check_and_process, edit_of, edited, file_limit, focal_moved, focal_of, persist,
+    require_file, scope_of, server_fields, settle_server_set, take_edits, taken_or_abandoned,
+    with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -283,9 +284,7 @@ pub async fn create(
     };
     let targets = link_targets(&state, &c).await?;
     // Checked as the document will be, server-set fields and all, before anything is stored.
-    let would = checked
-        .as_ref()
-        .map(|(u, f)| server_fields(u, f, &f.spool.name));
+    let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
     let input = with_fields(&body, would.as_ref());
     let mut prepared = validate_document_in(mode_for(copy), c.schema.data(), &input, None)
         .map_err(ApiError::Validation)
@@ -492,10 +491,11 @@ pub async fn update(
     }
     // Read only now, so a caller who may not change this document never gets a byte spooled.
     let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
-    let (sent, file) = match body {
+    let (mut sent, file) = match body {
         UploadBody::Json(v) => (v, None),
         UploadBody::Upload { payload, file } => (payload, Some(file)),
     };
+    let edits = take_edits(&c, &mut sent, file.is_some())?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
@@ -507,14 +507,19 @@ pub async fn update(
             .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &sent, Some(current)))))
     };
     let mut patch = settle(&stored)?;
+    // The focal point an edit ends at is written into the patch, for the field rules and
+    // validation to judge like any other value.
+    let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some());
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
-    // Decoded only once the write is allowed.
-    let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(file)) => {
+    // Decoded only once the write is allowed. An edit makes its new file as a replacement
+    // would arrive, and goes the same way from here.
+    let checked = match (&c.schema.upload, file, &edit) {
+        (Some(u), Some(file), _) => {
             let spool = file.spool(&state, u).await?;
             Some((u, check_and_process(&state, u, spool).await?))
         }
+        (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e).await?.map(|f| (u, f)),
         _ => None,
     };
     let targets = link_targets(&state, &c).await?;
@@ -534,9 +539,7 @@ pub async fn update(
         next.data.extend(fields.cloned().unwrap_or_default());
         Ok::<_, ApiError>(next)
     };
-    let would = checked
-        .as_ref()
-        .map(|(u, f)| server_fields(u, f, &f.spool.name));
+    let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
     // Links the patch adds are checked against the stored document, then again against the
     // locked one, in case it changed in between.
     let dry = apply(&stored, would.as_ref())?;
@@ -561,9 +564,18 @@ pub async fn update(
             |current| {
                 let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
                 vouched_links(&next, &link_ids(&c, current), &vouched)?;
-                if let Some(s) = &saved {
-                    next.file = FileChange::Set(s.file.id);
-                }
+                let from = checked.as_ref().and_then(|(_, f)| f.edits);
+                next.file = match (&saved, from) {
+                    (Some(s), Some(from)) => FileChange::Edit {
+                        from,
+                        to: s.file.id,
+                    },
+                    (Some(s), None) => FileChange::Set(s.file.id),
+                    (None, _) => {
+                        focal_moved(&c, &patch, &stored, current)?;
+                        FileChange::Keep
+                    }
+                };
                 Ok(next)
             },
         )

@@ -691,7 +691,8 @@ async fn server_set_fields_are_refused(pool: PgPool) {
     assert_problem(&res, 422);
     assert_eq!(res.json["errors"][0]["path"], "mimeType");
     // What a read gave back, unchanged, focal point included, writes fine; so do the values
-    // filled on read, which are never stored.
+    // filled on read, which are never stored. A focal point sent unchanged keeps the file
+    // (a changed one remakes it: `upload_edits.rs`).
     let got = ok(&app, "GET", &one, None).await;
     let mut back = writable(&got);
     back["alt"] = "edited".into();

@@ -7,6 +7,7 @@
 //! validation). Only then is a `pending` row reserved and the object stored, and a document
 //! write that fails after that gives the row up, so its cleanup deletes the object at once.
 
+use std::io::Read as _;
 use std::path::Path;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -21,16 +22,19 @@ use futures_util::Stream;
 use multer::{Constraints, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
 use tachyon_core::uploads::{
-    PasteUrl, SERVER_SET, Upload, mime_allowed, restricted, sanitize_filename,
+    CropRect, PasteUrl, SERVER_SET, UPLOAD_EDITS, Upload, UploadEdits, mime_allowed, restricted,
+    sanitize_filename,
 };
 use tachyon_core::{Field, FieldError, FieldKind};
+use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
+use tachyon_db::documents;
 use tachyon_db::files::{self, FileRow, NewFile};
 pub(crate) use tachyon_media::fetch::Spool;
 use tachyon_media::fetch::{FetchError, HEAD, MAX_URL};
 use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
-use tachyon_media::storage::object_key;
+use tachyon_media::storage::{Storage, object_key};
 use tachyon_media::svg::{self, SvgError};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
@@ -114,14 +118,27 @@ fn at_url(message: String) -> ApiError {
     }])
 }
 
-/// A spooled file that passed every check, with what was learnt about it.
+/// A file that passed every check, with what was learnt about it: one sent and spooled,
+/// or an edit of the document's stored one.
 pub(crate) struct Checked {
-    pub spool: Spool,
-    pub mime: &'static str,
+    /// The name it's stored under, before `reserve` numbers it.
+    pub name: String,
+    pub source: Source,
+    pub mime: String,
     pub filesize: u64,
     pub width: Option<u32>,
     pub height: Option<u32>,
     pub blurhash: Option<String>,
+    /// For an edit, the file it was made from, which the document must still hold.
+    pub edits: Option<Uuid>,
+}
+
+/// Where a checked file's bytes are.
+pub(crate) enum Source {
+    /// In a spool file, to be stored.
+    Spool(Spool),
+    /// Already stored, under `key` in `storage`, to be copied there: a focal point moved.
+    Copy { storage: String, key: String },
 }
 
 /// A reserved and stored file, with the server-set fields the document takes from it.
@@ -505,12 +522,12 @@ pub(crate) async fn check_and_process(
             spool.name
         )));
     }
-    let path = spool.file.path().to_path_buf();
     let (mut mime, mut width, mut height, mut blurhash) = (mime, None, None, None);
-    // The spool moves into the blocking work and comes back with its result: should the
-    // request be dropped meanwhile, the work still owns it and deletes it when done, so
-    // nothing it writes outlives it.
     if mime == "image/svg+xml" {
+        let path = spool.file.path().to_path_buf();
+        // The spool moves into the blocking work and comes back with its result: should the
+        // request be dropped meanwhile, the work still owns it and deletes it when done, so
+        // nothing it writes outlives it.
         let (back, clean) = blocking(move || {
             let clean = (|| {
                 let bytes = std::fs::read(&path)
@@ -532,38 +549,12 @@ pub(crate) async fn check_and_process(
         spool.len = clean.bytes.len() as u64;
         (width, height) = (clean.width, clean.height);
     } else if picture::decodes(mime) {
-        let (at, head) = (path.clone(), spool.head.clone());
-        let probe = blocking(move || picture::probe(&at, &head))
-            .await?
-            .map_err(image_refused)?;
-        let max_pixels = state.media.max_pixels;
-        picture::check_cap(&probe, picture::cap(u, max_pixels)).map_err(image_refused)?;
-        let permit = Decoding::permit().await;
-        let (u, out_dir) = (u.clone(), state.media.temp_dir.clone());
-        let (back, done) = blocking(move || {
-            let _decoding = Decoding::running(permit);
-            let done = picture::process_original(&path, &probe, &u, max_pixels, &out_dir).and_then(
-                |done| {
-                    // Over the spool, so a request never holds more than its spool once
-                    // the permit is given back.
-                    if done.path != path {
-                        std::fs::rename(&done.path, &path).map_err(|e| {
-                            let _ = std::fs::remove_file(&done.path);
-                            ImageError::Internal(format!("can't replace a spooled upload: {e}"))
-                        })?;
-                    }
-                    Ok(done)
-                },
-            );
-            (spool, done)
-        })
-        .await?;
+        let (back, done) =
+            processed(state, u, spool, image_refused, picture::process_original).await?;
         spool = back;
-        let done = done.map_err(image_refused)?;
         if done.mime != mime {
             spool.name = with_extension(&spool.name, done.mime);
         }
-        spool.len = done.filesize;
         (mime, width, height, blurhash) = (
             done.mime,
             Some(done.width),
@@ -572,13 +563,68 @@ pub(crate) async fn check_and_process(
         );
     }
     Ok(Checked {
+        name: spool.name.clone(),
         filesize: spool.len,
-        spool,
-        mime,
+        source: Source::Spool(spool),
+        mime: mime.to_owned(),
         width,
         height,
         blurhash,
+        edits: None,
     })
+}
+
+/// The image in `spool` made into what's stored by `work`: read from its headers and held
+/// to the pixel cap before anything is decoded, then decoded behind `DECODES`. The result
+/// replaces the spool file, whose length it takes. `refused` says what an image error
+/// answers.
+async fn processed(
+    state: &AppState,
+    u: &Upload,
+    mut spool: Spool,
+    refused: fn(ImageError) -> ApiError,
+    work: impl FnOnce(
+        &Path,
+        &picture::Probe,
+        &Upload,
+        u64,
+        &Path,
+    ) -> Result<picture::Processed, ImageError>
+    + Send
+    + 'static,
+) -> Result<(Spool, picture::Processed), ApiError> {
+    let path = spool.file.path().to_path_buf();
+    let (at, head) = (path.clone(), spool.head.clone());
+    let probe = blocking(move || picture::probe(&at, &head))
+        .await?
+        .map_err(refused)?;
+    let max_pixels = state.media.max_pixels;
+    picture::check_cap(&probe, picture::cap(u, max_pixels)).map_err(refused)?;
+    let permit = Decoding::permit().await;
+    let (u, out_dir) = (u.clone(), state.media.temp_dir.clone());
+    // The spool moves into the blocking work and comes back with its result: should the
+    // request be dropped meanwhile, the work still owns it and deletes it when done, so
+    // nothing it writes outlives it.
+    let (back, done) = blocking(move || {
+        let _decoding = Decoding::running(permit);
+        let done = work(&path, &probe, &u, max_pixels, &out_dir).and_then(|done| {
+            // Over the spool, so a request never holds more than its spool once the permit
+            // is given back.
+            if done.path != path {
+                std::fs::rename(&done.path, &path).map_err(|e| {
+                    let _ = std::fs::remove_file(&done.path);
+                    ImageError::Internal(format!("can't replace a spooled upload: {e}"))
+                })?;
+            }
+            Ok(done)
+        });
+        (spool, done)
+    })
+    .await?;
+    spool = back;
+    let done = done.map_err(refused)?;
+    spool.len = done.filesize;
+    Ok((spool, done))
 }
 
 /// `name` with the extension of `mime`, for an original re-encoded in another format.
@@ -600,7 +646,7 @@ pub(crate) fn server_fields(u: &Upload, f: &Checked, filename: &str) -> Map<Stri
         .collect();
     let mut out = Map::new();
     out.insert("filename".into(), filename.into());
-    out.insert("mimeType".into(), f.mime.into());
+    out.insert("mimeType".into(), f.mime.clone().into());
     out.insert("filesize".into(), f.filesize.into());
     out.insert("width".into(), f.width.into());
     out.insert("height".into(), f.height.into());
@@ -730,6 +776,241 @@ pub(crate) fn focal_of(data: &Map<String, Value>) -> (f32, f32) {
     (at("focalX"), at("focalY"))
 }
 
+/// What a PATCH without a new file asks of the document's stored image: `uploadEdits`, or
+/// a `focalX`/`focalY` other than the one stored. Either makes a new file (call 2); the
+/// focal point it ends at is in the patch.
+pub(crate) struct Edit {
+    pub crop: Option<CropRect>,
+    /// Only the focal fields changed: a document with no image to remake keeps its file.
+    pub plain: bool,
+}
+
+fn at_edits(path: &str, message: &str) -> ApiError {
+    ApiError::Validation(vec![FieldError {
+        path: format!("{UPLOAD_EDITS}{path}"),
+        message: message.into(),
+    }])
+}
+
+/// The answer when the file an edit started from went away before it was stored.
+fn gone_meanwhile() -> ApiError {
+    ApiError::Conflict(
+        "This document's file changed while it was being edited. Reload and try again.".into(),
+    )
+}
+
+/// `uploadEdits`, taken out of `sent` (a body for `c`), read and checked against what `c`
+/// allows: a 400 beside a new file, a 422 at each key it can't take. A collection without
+/// files leaves it in, for validation to refuse like any unknown field.
+pub(crate) fn take_edits(
+    c: &Collection,
+    sent: &mut Value,
+    with_file: bool,
+) -> Result<Option<UploadEdits>, ApiError> {
+    let (Some(u), Value::Object(o)) = (&c.schema.upload, sent) else {
+        return Ok(None);
+    };
+    let Some(v) = o.remove(UPLOAD_EDITS) else {
+        return Ok(None);
+    };
+    if with_file {
+        return Err(ApiError::BadRequest(format!(
+            "`{UPLOAD_EDITS}` edits the stored file; send it without a new one"
+        )));
+    }
+    let edits = UploadEdits::parse(&v).map_err(ApiError::Validation)?;
+    if edits.crop.is_some() && !u.crop {
+        return Err(at_edits(
+            ".crop",
+            "this collection's images can't be cropped",
+        ));
+    }
+    if edits.focal_point.is_some() && !u.focal_point {
+        return Err(at_edits(
+            ".focalPoint",
+            "this collection's images have no focal point",
+        ));
+    }
+    Ok(Some(edits))
+}
+
+/// The focal point `data` holds, the default where it holds none or `null`.
+fn focal_in(data: &Map<String, Value>) -> (f64, f64) {
+    let at = |k: &str| data.get(k).and_then(Value::as_f64).unwrap_or(50.0);
+    (at("focalX"), at("focalY"))
+}
+
+/// The edit `patch` (with `edits`, taken out of it) makes to `stored`'s image, when it
+/// makes one. With `uploadEdits`, the focal point it ends at is written into `patch`, so
+/// the field rules and validation judge it: `uploadEdits.focalPoint`, else what `patch`
+/// sends, else 50/50 for a crop and the stored one otherwise. Without it, only a
+/// collection with `focalPoint` remakes its file for a new focal point, and not when a new
+/// file is sent; a focal value that isn't a number is left for validation to refuse.
+pub(crate) fn edit_of(
+    c: &Collection,
+    edits: Option<UploadEdits>,
+    patch: &mut Value,
+    stored: &Map<String, Value>,
+    with_file: bool,
+) -> Option<Edit> {
+    let (Some(u), Value::Object(p)) = (&c.schema.upload, patch) else {
+        return None;
+    };
+    // `null` is the default, as on create; `None` inside for a value that isn't a number.
+    let sent = |k: &str| p.get(k).map(|v| v.as_f64().or(v.is_null().then_some(50.0)));
+    let Some(edits) = edits else {
+        let (x, y) = (sent("focalX"), sent("focalY"));
+        if !u.focal_point || with_file || x == Some(None) || y == Some(None) {
+            return None;
+        }
+        let was = focal_in(stored);
+        let now = (x.flatten().unwrap_or(was.0), y.flatten().unwrap_or(was.1));
+        return (now != was).then_some(Edit {
+            crop: None,
+            plain: true,
+        });
+    };
+    let (x, y) = match edits.focal_point {
+        Some(f) => (f.x, f.y),
+        None => {
+            let base = match edits.crop {
+                Some(_) => (50.0, 50.0),
+                None => focal_in(stored),
+            };
+            let pick = |k, b: f64| sent(k).unwrap_or(Some(b));
+            match (pick("focalX", base.0), pick("focalY", base.1)) {
+                (Some(x), Some(y)) => (x, y),
+                // Validation refuses it.
+                _ => base,
+            }
+        }
+    };
+    // Whole numbers as integers, as they'd be sent.
+    let number = |v: f64| match v.fract() == 0.0 {
+        true => Value::from(v as i64),
+        false => Value::from(v),
+    };
+    p.insert("focalX".into(), number(x));
+    p.insert("focalY".into(), number(y));
+    Some(Edit {
+        crop: edits.crop,
+        plain: false,
+    })
+}
+
+/// A 409 when `patch` keeps the focal point `stored` had but the locked document,
+/// `current`, has another: its file was remade for that one meanwhile, and writing the old
+/// values back would leave the document and its file disagreeing.
+pub(crate) fn focal_moved(
+    c: &Collection,
+    patch: &Value,
+    stored: &Map<String, Value>,
+    current: &Map<String, Value>,
+) -> Result<(), ApiError> {
+    let sends = patch.get("focalX").is_some() || patch.get("focalY").is_some();
+    if c.schema.upload.is_some() && sends && focal_in(stored) != focal_in(current) {
+        return Err(gone_meanwhile());
+    }
+    Ok(())
+}
+
+/// The new file `e` makes from the image copy `copy` of document `id` holds: cropped from
+/// the stored original (fetched, then cut behind `DECODES` like any upload), or for a new
+/// focal point alone a copy of it made inside storage. `None` for a plain focal edit of a
+/// document with no image; a 422 at `uploadEdits` for an edit of one.
+pub(crate) async fn edited(
+    state: &AppState,
+    c: &Collection,
+    u: &Upload,
+    id: Uuid,
+    copy: DocCopy,
+    e: &Edit,
+) -> Result<Option<Checked>, ApiError> {
+    let none = |message: &str| match e.plain {
+        true => Ok(None),
+        false => Err(at_edits("", message)),
+    };
+    let Some(from) = documents::file_of(&state.pool, c.id, id, copy).await? else {
+        return none("this document has no file to edit");
+    };
+    let row = files::get(&state.pool, from).await?;
+    if picture::size_format(&row.mime_type).is_none() {
+        return none("only images can be cropped or given a focal point");
+    }
+    let dimension = |d: Option<i32>| d.and_then(|d| u32::try_from(d).ok());
+    let mut checked = Checked {
+        name: row.filename.clone(),
+        source: Source::Copy {
+            storage: row.storage.clone(),
+            key: row.key.clone(),
+        },
+        mime: row.mime_type.clone(),
+        filesize: u64::try_from(row.filesize).unwrap_or_default(),
+        width: dimension(row.width),
+        height: dimension(row.height),
+        blurhash: row.blurhash.clone(),
+        edits: Some(from),
+    };
+    let Some(crop) = &e.crop else {
+        return Ok(Some(checked));
+    };
+    let (Some(w), Some(h)) = (checked.width, checked.height) else {
+        return Err(at_edits(".crop", "this image's size isn't known"));
+    };
+    let rect = crop
+        .pixels(w, h)
+        .map_err(|e| ApiError::Validation(vec![e]))?;
+    let storage = state.media.storages.get(&row.storage).ok_or_else(|| {
+        ApiError::Internal(format!("no storage named `{}` is configured", row.storage))
+    })?;
+    let spool = fetch_spool(storage, &row.key, &state.media.temp_dir, &row.filename).await?;
+    let crop_refused = |e: ImageError| match e {
+        ImageError::Internal(what) => ApiError::Internal(what),
+        e => at_edits(".crop", &e.to_string()),
+    };
+    let (spool, done) = processed(
+        state,
+        u,
+        spool,
+        crop_refused,
+        move |path, probe, u, max, out| picture::crop(path, probe, rect, u, max, out),
+    )
+    .await?;
+    checked.mime = done.mime.to_owned();
+    checked.filesize = done.filesize;
+    (checked.width, checked.height) = (Some(done.width), Some(done.height));
+    checked.blurhash = done.blurhash;
+    checked.source = Source::Spool(spool);
+    Ok(Some(checked))
+}
+
+/// The object at `key` in a spool file in `dir`, named `name`: a 409 when it's gone.
+async fn fetch_spool(
+    storage: &Storage,
+    key: &str,
+    dir: &Path,
+    name: &str,
+) -> Result<Spool, ApiError> {
+    let file = crate::media_jobs::fetch(storage, key, dir)
+        .await
+        .map_err(|e| match e.is_not_found() {
+            true => gone_meanwhile(),
+            false => ApiError::Internal(format!("can't read a stored file: {e}")),
+        })?;
+    let read = |e: std::io::Error| ApiError::Internal(format!("can't read a stored file: {e}"));
+    let len = file.as_file().metadata().map_err(read)?.len();
+    let mut head = Vec::with_capacity(HEAD);
+    std::io::Read::take(file.reopen().map_err(read)?, HEAD as u64)
+        .read_to_end(&mut head)
+        .map_err(read)?;
+    Ok(Spool {
+        file,
+        len,
+        head,
+        name: name.to_owned(),
+    })
+}
+
 /// Reserves `f` for `document` (the one being updated, if any) under its sanitised name,
 /// numbered on a clash within `scope`, and stores it. A store that fails gives the
 /// reservation up.
@@ -742,17 +1023,23 @@ pub(crate) async fn persist(
     focal: (f32, f32),
     document: Option<Uuid>,
 ) -> Result<Stored, ApiError> {
-    let storage = state.media.storages.get(&u.storage).ok_or_else(|| {
-        ApiError::Internal(format!("no storage named `{}` is configured", u.storage))
-    })?;
+    // A copy stays in the storage it's copied within.
+    let name = match &f.source {
+        Source::Copy { storage, .. } => storage,
+        Source::Spool(_) => &u.storage,
+    };
+    let storage =
+        state.media.storages.get(name).ok_or_else(|| {
+            ApiError::Internal(format!("no storage named `{name}` is configured"))
+        })?;
     let too_big = |what: &str| ApiError::Internal(format!("{what} doesn't fit a database integer"));
     let dimension = |d: Option<u32>| d.map(i32::try_from).transpose();
     let new = NewFile {
         collection_id: c.id,
-        storage: &u.storage,
-        filename: &f.spool.name,
+        storage: name,
+        filename: &f.name,
         scope,
-        mime_type: f.mime,
+        mime_type: &f.mime,
         filesize: i64::try_from(f.filesize).map_err(|_| too_big("the file size"))?,
         width: dimension(f.width).map_err(|_| too_big("the width"))?,
         height: dimension(f.height).map_err(|_| too_big("the height"))?,
@@ -766,12 +1053,19 @@ pub(crate) async fn persist(
         object_key(static_dir, &c.schema.slug, id, name).map_err(|e| e.to_string())
     })
     .await?;
-    if let Err(e) = storage
-        .put_file(&file.key, f.spool.file.path(), f.mime)
-        .await
-    {
+    let stored = match &f.source {
+        Source::Spool(spool) => storage
+            .put_file(&file.key, spool.file.path(), &f.mime)
+            .await
+            .map(|_| ()),
+        Source::Copy { key, .. } => storage.copy(key, &file.key).await,
+    };
+    if let Err(e) = stored {
         abandon(state, file.id).await;
-        return Err(ApiError::Internal(format!("can't store an upload: {e}")));
+        return Err(match e.is_not_found() {
+            true => gone_meanwhile(),
+            false => ApiError::Internal(format!("can't store an upload: {e}")),
+        });
     }
     let fields = server_fields(u, f, &file.filename);
     Ok(Stored { file, fields })
