@@ -235,16 +235,21 @@ fn failed(e: reqwest::Error) -> FetchError {
 /// Whether any of `patterns` matches `url`, as `allowList` and `skipSafeFetch` entries do.
 /// `protocol` is `https` when unset; `hostname` takes a leading `*.` for one label or `**.`
 /// for any number; `pathname` takes `*` within a segment, `**` across them, and a trailing
-/// `/` that may be left off; `port` and `search` match exactly. An empty value is unset.
+/// `/` that may be left off; `port` matches exactly, and unset means the protocol's default
+/// port only; `search` matches exactly. An empty value is unset.
 pub fn pattern_allows(patterns: &[UrlPattern], url: &Url) -> bool {
     let set = |v: &Option<String>| v.clone().filter(|v| !v.is_empty());
     patterns.iter().any(|p| {
         let protocol = set(&p.protocol).unwrap_or_else(|| "https".into());
-        let port = url.port().map(|p| p.to_string()).unwrap_or_default();
+        // `url` holds no port when it's the scheme's default.
+        let port = url.port_or_known_default().map(|p| p.to_string());
         let search = url.query().map(|q| format!("?{q}")).unwrap_or_default();
         protocol.trim_end_matches(':') == url.scheme()
             && host_matches(&p.hostname, url.host_str().unwrap_or_default())
-            && set(&p.port).is_none_or(|want| want == port)
+            && match set(&p.port) {
+                Some(want) => Some(want) == port,
+                None => url.port().is_none(),
+            }
             && set(&p.search).is_none_or(|want| want == search)
             && set(&p.pathname).is_none_or(|want| path_matches(&want, url.path()))
     })
@@ -375,10 +380,20 @@ mod tests {
             "https unless set"
         );
         assert!(!allows(host.clone(), "https://a.example.com/"));
-        assert!(
-            allows(host, "https://example.com:8443/"),
-            "any port unless set"
-        );
+        // Without a port, the protocol's default port only.
+        assert!(allows(host.clone(), "https://example.com:443/"));
+        assert!(!allows(host, "https://example.com:8443/"));
+        let http = serde_json::json!({"protocol": "http", "hostname": "example.com"});
+        assert!(allows(http.clone(), "http://example.com:80/"));
+        assert!(!allows(http, "http://example.com:8080/"));
+        // With one, that port alone, the default included when it's named.
+        let port = serde_json::json!({"hostname": "example.com", "port": "8443"});
+        assert!(allows(port.clone(), "https://example.com:8443/"));
+        assert!(!allows(port.clone(), "https://example.com/"));
+        assert!(!allows(port, "https://example.com:9443/"));
+        let named = serde_json::json!({"hostname": "example.com", "port": "443"});
+        assert!(allows(named.clone(), "https://example.com/"));
+        assert!(allows(named, "https://example.com:443/"));
         let one = serde_json::json!({"hostname": "*.example.com"});
         assert!(allows(one.clone(), "https://a.example.com/"));
         assert!(!allows(one.clone(), "https://a.b.example.com/"));
@@ -413,7 +428,11 @@ mod tests {
         assert!(allows(slash.clone(), "https://x.io/a"));
         assert!(allows(slash, "https://x.io/a/"));
         let empty = serde_json::json!({"hostname": "x.io", "port": "", "pathname": ""});
-        assert!(allows(empty, "https://x.io:9/any"));
+        assert!(allows(empty.clone(), "https://x.io/any"));
+        assert!(
+            !allows(empty, "https://x.io:9/any"),
+            "an empty port is unset"
+        );
     }
 
     #[test]
@@ -459,5 +478,36 @@ mod tests {
             guarded(&Url::parse("http://127.0.0.1/").unwrap(), &skip),
             Ok(false)
         ));
+        // skipSafeFetch reads its patterns the same way: no port, the default port only.
+        let skip_one = Upload {
+            skip_safe_fetch: SkipSafeFetch::AllowList(pattern(
+                serde_json::json!({"protocol": "http", "hostname": "127.0.0.1"}),
+            )),
+            ..Upload::default()
+        };
+        assert!(matches!(
+            guarded(&Url::parse("http://127.0.0.1/").unwrap(), &skip_one),
+            Ok(false)
+        ));
+        assert_eq!(refusal_for("http://127.0.0.1:8080/", &skip_one), PRIVATE);
+        // Skipping the guard never skips the allowList.
+        let listed = Upload {
+            paste_url: PasteUrl::AllowList(pattern(serde_json::json!({"hostname": "example.com"}))),
+            skip_safe_fetch: SkipSafeFetch::All,
+            ..Upload::default()
+        };
+        assert!(refusal_for("http://127.0.0.1/", &listed).contains("allowList"));
+        assert!(refusal_for("https://other.com/", &listed).contains("allowList"));
+        assert!(matches!(
+            guarded(&Url::parse("https://example.com/").unwrap(), &listed),
+            Ok(false)
+        ));
+    }
+
+    fn refusal_for(url: &str, u: &Upload) -> String {
+        match guarded(&Url::parse(url).unwrap(), u) {
+            Err(FetchError::Refused(m)) => m,
+            other => panic!("{url}: {other:?}"),
+        }
     }
 }
