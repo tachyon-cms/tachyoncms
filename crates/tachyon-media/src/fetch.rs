@@ -19,13 +19,18 @@ use reqwest::header::LOCATION;
 use reqwest::redirect::Policy;
 use reqwest::{Client, StatusCode};
 use tachyon_core::net::is_public_addr;
-use tachyon_core::uploads::{PasteUrl, SkipSafeFetch, Upload, UrlPattern, sanitize_filename};
+use tachyon_core::uploads::{
+    PasteUrl, SkipSafeFetch, Upload, UrlPattern, pattern_host, sanitize_filename,
+};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use url::{Host, Url};
 
 /// How much of a file is kept in memory for sniffing.
 pub const HEAD: usize = 8 * 1024;
+/// The longest URL a fetch takes, on any hop. A browser or CDN URL never needs more, and
+/// it bounds every check made on one.
+pub const MAX_URL: usize = 8 * 1024;
 /// The most redirects a fetch follows.
 pub const MAX_REDIRECTS: usize = 5;
 /// What a target on a non-public address is refused with. It never names the address.
@@ -185,6 +190,9 @@ impl SafeFetch {
 /// `skipSafeFetch` names it.
 fn guarded(url: &Url, u: &Upload) -> Result<bool, FetchError> {
     let refused = |m: &str| Err(FetchError::Refused(m.into()));
+    if url.as_str().len() > MAX_URL {
+        return refused("this URL is too long");
+    }
     if !matches!(url.scheme(), "http" | "https") {
         return refused("only http and https URLs can be fetched");
     }
@@ -258,8 +266,13 @@ pub fn pattern_allows(patterns: &[UrlPattern], url: &Url) -> bool {
     })
 }
 
+/// `host`, as `url` gives it, against a pattern's hostname; both are read the same way
+/// (`pattern_host`), and a pattern that isn't a hostname matches nothing.
 fn host_matches(pattern: &str, host: &str) -> bool {
-    let pattern = pattern.to_ascii_lowercase();
+    let Some(pattern) = pattern_host(pattern) else {
+        return false;
+    };
+    let host = host.strip_suffix('.').unwrap_or(host);
     if let Some(base) = pattern.strip_prefix("**.") {
         host.strip_suffix(base)
             .and_then(|s| s.strip_suffix('.'))
@@ -287,16 +300,59 @@ fn path_matches(pattern: &str, path: &str) -> bool {
     glob(pattern.as_bytes(), path.as_bytes())
 }
 
-/// `*` is anything but `/`, `**` anything.
+/// A `pathname` glob's pieces.
+#[derive(Clone, Copy, PartialEq)]
+enum Piece {
+    Byte(u8),
+    /// `*`: anything but `/`.
+    Star,
+    /// `**`: anything.
+    Stars,
+}
+
+/// Whether `s` matches glob `p`, in O(|p|·|s|) time with no recursion: one row of "the
+/// first j pieces match what's been read" per byte of `s`. A two-pointer match that
+/// backtracks to the last star alone can't be used, as a `*` that can't cross a `/` may
+/// need an earlier `**` to take it.
 fn glob(p: &[u8], s: &[u8]) -> bool {
-    match p {
-        [] => s.is_empty(),
-        [b'*', b'*', rest @ ..] => (0..=s.len()).any(|i| glob(rest, &s[i..])),
-        [b'*', rest @ ..] => (0..=s.len())
-            .take_while(|i| *i == 0 || s[i - 1] != b'/')
-            .any(|i| glob(rest, &s[i..])),
-        [c, rest @ ..] => s.first() == Some(c) && glob(rest, &s[1..]),
+    let mut pieces = Vec::with_capacity(p.len());
+    let mut i = 0;
+    while i < p.len() {
+        match (p[i], p.get(i + 1)) {
+            (b'*', Some(b'*')) => {
+                pieces.push(Piece::Stars);
+                i += 2;
+            }
+            (b'*', _) => {
+                pieces.push(Piece::Star);
+                i += 1;
+            }
+            (c, _) => {
+                pieces.push(Piece::Byte(c));
+                i += 1;
+            }
+        }
     }
+    // Matching nothing so far: only stars.
+    let mut row = vec![false; pieces.len() + 1];
+    row[0] = true;
+    for (j, piece) in pieces.iter().enumerate() {
+        row[j + 1] = row[j] && !matches!(piece, Piece::Byte(_));
+    }
+    let mut next = vec![false; pieces.len() + 1];
+    for &c in s {
+        next[0] = false;
+        for (j, piece) in pieces.iter().enumerate() {
+            next[j + 1] = match *piece {
+                Piece::Byte(b) => row[j] && b == c,
+                // Empty here, or taking `c` too.
+                Piece::Star => next[j] || (row[j + 1] && c != b'/'),
+                Piece::Stars => next[j] || row[j + 1],
+            };
+        }
+        std::mem::swap(&mut row, &mut next);
+    }
+    row[pieces.len()]
 }
 
 /// `url`'s last path segment, percent-decoded and sanitised.
@@ -438,6 +494,94 @@ mod tests {
         );
     }
 
+    /// However many wildcards and however long the path, matching is linear in the path.
+    #[test]
+    fn a_long_path_matches_quickly() {
+        let started = std::time::Instant::now();
+        let p = serde_json::json!({"hostname": "x.io", "pathname": "/i/*-*-*.png"});
+        let long = format!("https://x.io/i/{}", "-".repeat(100_000));
+        assert!(!allows(p.clone(), &long));
+        assert!(allows(p, &format!("{long}.png")));
+        let deep = serde_json::json!({"hostname": "x.io", "pathname": "/**/**/**/x"});
+        assert!(!allows(
+            deep,
+            &format!("https://x.io/{}", "a/".repeat(50_000))
+        ));
+        assert!(
+            started.elapsed() < std::time::Duration::from_secs(1),
+            "{:?}",
+            started.elapsed()
+        );
+    }
+
+    /// The recursive matcher `glob` replaced, kept as the reference for what a glob means.
+    fn slow_glob(p: &[u8], s: &[u8]) -> bool {
+        match p {
+            [] => s.is_empty(),
+            [b'*', b'*', rest @ ..] => (0..=s.len()).any(|i| slow_glob(rest, &s[i..])),
+            [b'*', rest @ ..] => (0..=s.len())
+                .take_while(|i| *i == 0 || s[i - 1] != b'/')
+                .any(|i| slow_glob(rest, &s[i..])),
+            [c, rest @ ..] => s.first() == Some(c) && slow_glob(rest, &s[1..]),
+        }
+    }
+
+    /// `glob` agrees with the recursive matcher on short patterns and paths, fixed seed.
+    #[test]
+    fn glob_agrees_with_the_recursive_matcher() {
+        let mut seed: u64 = 0x5eed;
+        let mut next = |n: usize| {
+            seed ^= seed << 13;
+            seed ^= seed >> 7;
+            seed ^= seed << 17;
+            (seed % n as u64) as usize
+        };
+        for _ in 0..50_000 {
+            let mut word = |alphabet: &[u8], most: usize| -> Vec<u8> {
+                (0..next(most))
+                    .map(|_| alphabet[next(alphabet.len())])
+                    .collect()
+            };
+            let p = word(b"ab/*", 8);
+            let s = word(b"ab/", 10);
+            assert_eq!(
+                glob(&p, &s),
+                slow_glob(&p, &s),
+                "{:?} {:?}",
+                String::from_utf8_lossy(&p),
+                String::from_utf8_lossy(&s)
+            );
+        }
+    }
+
+    /// Hostnames compare as the URL reads them: case, punycode, one trailing dot and IPv6
+    /// brackets don't matter on either side.
+    #[test]
+    fn hostnames_are_normalised_on_both_sides() {
+        let host = |h: &str| serde_json::json!({"protocol": "http", "hostname": h});
+        for (pattern, url) in [
+            ("example.com", "http://example.com./"),
+            ("Example.COM.", "http://example.com/"),
+            ("bücher.de", "http://bücher.de/"),
+            ("bücher.de", "http://xn--bcher-kva.de/"),
+            ("xn--bcher-kva.de", "http://BÜCHER.de/"),
+            ("*.bücher.de", "http://a.bücher.de./"),
+            ("**.example.com", "http://a.b.example.com./"),
+            ("::1", "http://[::1]/"),
+            ("[::1]", "http://[0:0::1]/"),
+            ("2001:DB8::1", "http://[2001:db8:0::1]/"),
+            ("127.1", "http://127.0.0.1/"),
+        ] {
+            assert!(allows(host(pattern), url), "{pattern} vs {url}");
+        }
+        assert!(!allows(host("example.com"), "http://example.com../"));
+        assert!(!allows(host("::1"), "http://[::2]/"));
+        assert!(
+            !allows(host("exa mple.com"), "http://example.com/"),
+            "fails closed"
+        );
+    }
+
     #[test]
     fn filenames_come_from_the_last_segment() {
         let name = |u: &str| filename_of(&Url::parse(u).unwrap());
@@ -458,6 +602,8 @@ mod tests {
         assert!(refusal("file:///etc/passwd").contains("http and https"));
         assert!(refusal("https://user:pw@example.com/").contains("user name"));
         assert!(refusal("https://user@example.com/").contains("user name"));
+        let long = format!("https://example.com/{}", "a".repeat(MAX_URL));
+        assert_eq!(refusal(&long), "this URL is too long");
         for private in [
             "http://127.0.0.1/",
             "http://[::1]/",
