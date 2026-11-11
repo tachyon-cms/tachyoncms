@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fl.filename FROM files fl\n           WHERE fl.tenant_id = $1 AND fl.collection_id = $2 AND fl.scope = $3\n             AND fl.id IS DISTINCT FROM $8\n             AND (fl.filename = $5\n                  OR (starts_with(fl.filename, $6) AND right(fl.filename, length($7)) = $7))\n             AND ((fl.state = 'pending'\n                   AND (fl.document_id IS DISTINCT FROM $4 OR $4 IS NULL OR fl.issued_to IS NOT NULL))\n                  OR EXISTS (\n                      SELECT 1 FROM documents d\n                      WHERE d.tenant_id = $1 AND d.collection_id = $2\n                        AND d.deleted_at IS NULL AND d.id IS DISTINCT FROM $4\n                        AND (d.published_file = fl.id OR d.draft_file = fl.id)))",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filename",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "filename"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Uuid",
+        "Text",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "60e858e05b034e3ae67234cf61b3fbcc41e681b9f844b4b29c407b97a4f40be2"
+}

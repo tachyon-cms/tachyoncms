@@ -129,16 +129,20 @@ impl Incoming {
 
 impl Incoming {
     /// The file checked and made what's stored (`check_and_process`), from wherever it
-    /// comes: one put in storage by the client is claimed for the caller first.
+    /// comes: one put in storage by the client is claimed for the caller first, for
+    /// `document` when it's an update's. A refusal after the claim gives that file up.
     pub(crate) async fn checked(
         self,
         state: &AppState,
         access: &crate::access::Access,
         c: &Collection,
         u: &Upload,
+        document: Option<Uuid>,
     ) -> Result<Checked, ApiError> {
         match self {
-            Self::Client(f, limit) => claimed(state, access, c, u, &f, limit.as_ref()).await,
+            Self::Client(f, limit) => {
+                claimed(state, access, c, u, &f, limit.as_ref(), document).await
+            }
             other => {
                 let spool = other.spool(state, u).await?;
                 check_and_process(state, u, spool).await
@@ -153,28 +157,27 @@ fn unclaimed() -> ApiError {
     at_file("no upload by this name is waiting for you; ask for upload instructions first".into())
 }
 
-/// Gives up a claimed file when dropped: the request that claimed it failed, or ended,
-/// and its object goes now. Once a document took it, it's live, and giving up a live
-/// file does nothing.
-pub(crate) struct Claim {
-    pool: sqlx::PgPool,
-    id: Uuid,
-}
-
-impl Drop for Claim {
-    fn drop(&mut self) {
-        let (pool, file) = (self.pool.clone(), self.id);
-        // Dropped with the request, which may be cancelled: the work can't wait inside it.
-        // Without a runtime (shutting down), the cleanup `reserve` queued still runs.
-        if let Ok(rt) = tokio::runtime::Handle::try_current() {
-            rt.spawn(async move { abandon_on(&pool, file).await });
-        }
+/// `result`; when it's a refusal, the file a client put in storage that this request
+/// claimed (`claimed`) is given up first, in its own transaction, with its cleanup due
+/// now. A request cut off midway leaves its file pending, issued to nobody, for the cleanup
+/// its reserve queued.
+pub(crate) async fn or_give_up<T>(
+    state: &AppState,
+    claimed: Option<Uuid>,
+    result: Result<T, ApiError>,
+) -> Result<T, ApiError> {
+    if result.is_err()
+        && let Some(file) = claimed
+    {
+        abandon(state, file).await;
     }
+    result
 }
 
 /// File `f`, put in storage by the client, claimed for the caller and checked as an upload
 /// is: past the limit by its stored size (413), then downloaded and sniffed, with the time
-/// an upload gets. Any refusal from here on gives it up (`Claim`).
+/// an upload gets. Only a file issued for `document` (an update's), or for no document,
+/// is claimed. Any refusal from here on gives it up.
 async fn claimed(
     state: &AppState,
     access: &crate::access::Access,
@@ -182,18 +185,27 @@ async fn claimed(
     u: &Upload,
     f: &ClientFile,
     limit: Option<&crate::Limit>,
+    document: Option<Uuid>,
 ) -> Result<Checked, ApiError> {
     let Some(user) = access.user_id() else {
         return Err(unclaimed());
     };
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, access.key_id()).await?;
+    let key = access.key_id();
+    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, key, document).await?;
     tx.commit().await.map_err(DbError::from)?;
     let row = row.ok_or_else(unclaimed)?;
-    let claim = Claim {
-        pool: state.pool.clone(),
-        id: row.id,
-    };
+    let id = row.id;
+    or_give_up(state, Some(id), checked_claim(state, u, row, limit).await).await
+}
+
+/// `claimed`'s file `row`, checked.
+async fn checked_claim(
+    state: &AppState,
+    u: &Upload,
+    row: FileRow,
+    limit: Option<&crate::Limit>,
+) -> Result<Checked, ApiError> {
     let storage = state.media.storages.get(&row.storage).ok_or_else(|| {
         ApiError::Internal(format!("no storage named `{}` is configured", row.storage))
     })?;
@@ -233,7 +245,6 @@ async fn claimed(
             spool,
             file: Box::new(row),
             rewritten,
-            _claim: claim,
         },
         other => other,
     };
@@ -308,8 +319,17 @@ pub(crate) enum Source {
         spool: Spool,
         file: Box<FileRow>,
         rewritten: bool,
-        _claim: Claim,
     },
+}
+
+impl Checked {
+    /// The file a client put in storage that this request claimed, if it's one.
+    pub(crate) fn claimed(&self) -> Option<Uuid> {
+        match &self.source {
+            Source::Claimed { file, .. } => Some(file.id),
+            _ => None,
+        }
+    }
 }
 
 /// A reserved and stored file, with the server-set fields the document takes from it.
@@ -1341,11 +1361,7 @@ pub(crate) async fn persist(
 /// failed, so its object is deleted now rather than after the grace. Should even that
 /// fail, the cleanup `reserve` queued still runs once the grace is over.
 async fn abandon(state: &AppState, file: Uuid) {
-    abandon_on(&state.pool, file).await;
-}
-
-async fn abandon_on(pool: &sqlx::PgPool, file: Uuid) {
-    if let Err(error) = files::abandon(pool, file).await {
+    if let Err(error) = files::abandon(&state.pool, file).await {
         tracing::warn!(%error, %file, "couldn't give up an upload; it's cleaned up within the hour");
     }
 }
@@ -1372,6 +1388,11 @@ struct Ask {
     filename: String,
     mime_type: String,
     filesize: u64,
+    /// The document whose file this replaces, for an update to take.
+    id: Option<String>,
+    /// The values the document will have, for a `filenameCompoundIndex` to number the name
+    /// within; a replacement's are written over the stored document's.
+    data: Option<Map<String, Value>>,
 }
 
 /// `POST /api/{collection}/upload-instructions`: where and how the caller puts a file in
@@ -1419,10 +1440,30 @@ async fn upload_instructions_in(
     slug: &str,
     body: Value,
 ) -> Result<Json<Value>, ApiError> {
-    let c = crate::documents::collection(state, slug)?;
-    access.scope(tachyon_core::auth::Action::Create, &c.schema.slug)?;
-    let user = access.user_id().filter(|_| access.may_create(&c));
-    let Some(user) = user else {
+    use tachyon_core::auth::Action;
+    let ask: Ask = serde_json::from_value(body)
+        .map_err(|e| ApiError::BadRequest(format!("bad upload instructions request: {e}")))?;
+    // A replacement is judged as the update that takes it, refusals and all; a new file as
+    // the create.
+    let (c, replaces) = match &ask.id {
+        Some(id) => {
+            access.scope(Action::Update, slug)?;
+            let id = crate::documents::parse_id(id)?;
+            let c = crate::documents::collection(state, slug)?;
+            access.may_write(Action::Update, &c)?;
+            let (copy, ..) = crate::documents::may_update(state, access, &c, id).await?;
+            (c, Some((id, copy)))
+        }
+        None => {
+            let c = crate::documents::collection(state, slug)?;
+            access.scope(Action::Create, &c.schema.slug)?;
+            if !access.may_create(&c) {
+                return Err(access.refuse());
+            }
+            (c, None)
+        }
+    };
+    let Some(user) = access.user_id() else {
         return Err(access.refuse());
     };
     let Some(u) = &c.schema.upload else {
@@ -1430,8 +1471,6 @@ async fn upload_instructions_in(
             "this collection doesn't take files".into(),
         ));
     };
-    let ask: Ask = serde_json::from_value(body)
-        .map_err(|e| ApiError::BadRequest(format!("bad upload instructions request: {e}")))?;
     let storage = state.media.storages.get(&u.storage).ok_or_else(|| {
         ApiError::Internal(format!("no storage named `{}` is configured", u.storage))
     })?;
@@ -1456,13 +1495,22 @@ async fn upload_instructions_in(
     }
     let name = sanitize_filename(&ask.filename);
     type_allowed(u, &mime, &name)?;
+    // Numbered in the scope the write will store it in, so the name given is the one kept.
+    // The document replaced must be there, as for the update; its values are the base.
+    let mut values = match replaces {
+        Some((id, copy)) => documents::get(&state.pool, c.id, id, copy).await?.data.0,
+        None => Map::new(),
+    };
+    values.extend(ask.data.clone().unwrap_or_default());
+    values.insert("filename".into(), name.clone().into());
+    let scope = scope_of(u, &values);
     let filesize = i64::try_from(ask.filesize)
         .map_err(|_| ApiError::Internal("the file size doesn't fit a database integer".into()))?;
     let new = NewFile {
         collection_id: c.id,
         storage: &u.storage,
         filename: &name,
-        scope: "",
+        scope: &scope,
         mime_type: &mime,
         filesize,
         width: None,
@@ -1470,7 +1518,7 @@ async fn upload_instructions_in(
         focal: (50.0, 50.0),
         blurhash: None,
         issued_to: Some((user, access.key_id())),
-        document: None,
+        document: replaces.map(|(id, _)| id),
     };
     let static_dir = u.static_dir.as_deref();
     let issued = files::issue(&state.pool, &new, |id, name| {

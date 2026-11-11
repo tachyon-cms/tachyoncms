@@ -35,9 +35,9 @@ use crate::populate::{
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
-    UploadBody, edit_of, edited, file_limit, file_writes, focal_moved, focal_of, persist,
-    require_file, scope_of, server_fields, settle_server_set, take_edits, taken_or_abandoned,
-    with_fields,
+    UploadBody, edit_of, edited, file_limit, file_writes, focal_moved, focal_of, or_give_up,
+    persist, require_file, scope_of, server_fields, settle_server_set, take_edits,
+    taken_or_abandoned, with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -279,63 +279,70 @@ pub async fn create(
     access.writes(&c, &body, Action::Create, None)?;
     // Decoded only once the write is allowed.
     let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(file)) => Some((u, file.checked(&state, &access, &c, u).await?)),
+        (Some(u), Some(file)) => Some((u, file.checked(&state, &access, &c, u, None).await?)),
         _ => None,
     };
-    let targets = link_targets(&state, &c).await?;
-    // Checked as the document will be, server-set fields and all, before anything is stored.
-    let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
-    // The file is written too: field rules on what it sets apply to it.
-    access.writes(&c, &file_writes(would.as_ref(), None), Action::Create, None)?;
-    let input = with_fields(&body, would.as_ref());
-    let mut prepared = validate_document_in(mode_for(copy), c.schema.data(), &input, None)
-        .map_err(ApiError::Validation)
-        .and_then(|data| prepare(&targets, &c, data))
-        .map_err(|e| hide(e, &input))?;
-    check_links(&state, &access, &prepared, &Held::new()).await?;
-    let stored = match &checked {
-        Some((u, f)) => {
-            let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
-            Some(persist(&state, &c, u, f, &scope, focal, None).await?)
-        }
-        None => None,
-    };
-    if let Some(s) = &stored {
-        prepared.data.extend(s.fields.clone());
-        prepared.file = FileChange::Set(s.file.id);
-    }
-    let by = access.actor(Action::Create, &c).map(|a| a.id);
-    let (doc, sizes) = taken_or_abandoned(&state, stored.as_ref(), async {
-        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-        if moves {
-            folders::lock(&mut tx).await?;
-        }
-        let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
-            .await
-            .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
-        if moves {
-            folders::check_place(&mut tx, doc.id).await?;
-        }
-        folders::check_filed(&mut tx, &c, doc.id, copy, None, doc.data.0.get("folder")).await?;
-        filtered_links(
-            &mut tx,
-            &state,
-            &access,
-            &c,
-            &doc.data.0,
-            Sent::All,
-            access.linked(),
-        )
-        .await?;
-        record(&mut tx, &c, &doc, copy, by, false).await?;
-        let sizes = match &stored {
-            Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+    // A file a client put in storage, claimed above, is given up if the write is refused.
+    let claimed = checked.as_ref().and_then(|(_, f)| f.claimed());
+    let written = async {
+        let targets = link_targets(&state, &c).await?;
+        // Checked as the document will be, server-set fields and all, before anything is stored.
+        let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
+        // The file is written too: field rules on what it sets apply to it.
+        access.writes(&c, &file_writes(would.as_ref(), None), Action::Create, None)?;
+        let input = with_fields(&body, would.as_ref());
+        let mut prepared = validate_document_in(mode_for(copy), c.schema.data(), &input, None)
+            .map_err(ApiError::Validation)
+            .and_then(|data| prepare(&targets, &c, data))
+            .map_err(|e| hide(e, &input))?;
+        check_links(&state, &access, &prepared, &Held::new()).await?;
+        let stored = match &checked {
+            Some((u, f)) => {
+                let (scope, focal) = (scope_of(u, &prepared.data), focal_of(&prepared.data));
+                Some(persist(&state, &c, u, f, &scope, focal, None).await?)
+            }
             None => None,
         };
-        tx.commit().await.map_err(DbError::from)?;
-        Ok((doc, sizes))
-    })
-    .await?;
+        if let Some(s) = &stored {
+            prepared.data.extend(s.fields.clone());
+            prepared.file = FileChange::Set(s.file.id);
+        }
+        let by = access.actor(Action::Create, &c).map(|a| a.id);
+        taken_or_abandoned(&state, stored.as_ref(), async {
+            let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+            if moves {
+                folders::lock(&mut tx).await?;
+            }
+            let doc =
+                documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
+                    .await
+                    .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+            if moves {
+                folders::check_place(&mut tx, doc.id).await?;
+            }
+            folders::check_filed(&mut tx, &c, doc.id, copy, None, doc.data.0.get("folder")).await?;
+            filtered_links(
+                &mut tx,
+                &state,
+                &access,
+                &c,
+                &doc.data.0,
+                Sent::All,
+                access.linked(),
+            )
+            .await?;
+            record(&mut tx, &c, &doc, copy, by, false).await?;
+            let sizes = match &stored {
+                Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+                None => None,
+            };
+            tx.commit().await.map_err(DbError::from)?;
+            Ok((doc, sizes))
+        })
+        .await
+    }
+    .await;
+    let (doc, sizes) = or_give_up(&state, claimed, written).await?;
     let doc = waited(&state, &c, doc, copy, sizes.filter(|_| wait), deadline).await;
     Ok((
         StatusCode::CREATED,
@@ -456,26 +463,28 @@ pub async fn get(
     ))
 }
 
-pub async fn update(
-    State(state): State<AppState>,
-    access: Access,
-    path: Result<Path<(String, String)>, PathRejection>,
-    RawQuery(raw): RawQuery,
-    req: Request,
-) -> Result<Json<Value>, ApiError> {
-    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
-    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
-    access.scope(Action::Update, &slug)?;
-    let id = parse_id(&id)?;
-    let c = collection(&state, &slug)?;
-    access.may_write(Action::Update, &c)?;
-    let (autosave, wait) = update_params(raw.as_deref(), &c)?;
-    let deadline = deadline(&req);
-    let copy = access.write_copy(&c)?;
+/// The copy an update of document `id` of `c` writes, the guard it runs under and who it
+/// runs as, or the refusal it gets. The update rule and ownership are judged on the stored
+/// document before a byte of the body is read, so a refused caller never has a file spooled
+/// or stored; the lock judges again. Upload instructions for a replacement ask the same.
+pub(crate) async fn may_update(
+    state: &AppState,
+    access: &Access,
+    c: &Collection,
+    id: Uuid,
+) -> Result<
+    (
+        DocCopy,
+        Option<tachyon_core::query::Filter>,
+        Option<documents::Actor>,
+    ),
+    ApiError,
+> {
+    let copy = access.write_copy(c)?;
     let guard = access
-        .write_guard(&state.pool, Action::Update, &c, id)
+        .write_guard(&state.pool, Action::Update, c, id)
         .await?;
-    let actor = access.actor(Action::Update, &c);
+    let actor = access.actor(Action::Update, c);
     // The update rule and ownership, judged on the stored document before a byte of the body
     // is read, so a refused caller never has a file spooled or stored. The lock judges again.
     let own = actor.filter(|a| a.own_only).map(|a| a.id);
@@ -498,6 +507,25 @@ pub async fn update(
             .into());
         }
     }
+    Ok((copy, guard, actor))
+}
+
+pub async fn update(
+    State(state): State<AppState>,
+    access: Access,
+    path: Result<Path<(String, String)>, PathRejection>,
+    RawQuery(raw): RawQuery,
+    req: Request,
+) -> Result<Json<Value>, ApiError> {
+    let Path((slug, id)) = path.map_err(|_| ApiError::NotFound)?;
+    // Checked again later; here so a key's 403 comes before a malformed ID's 404.
+    access.scope(Action::Update, &slug)?;
+    let id = parse_id(&id)?;
+    let c = collection(&state, &slug)?;
+    access.may_write(Action::Update, &c)?;
+    let (autosave, wait) = update_params(raw.as_deref(), &c)?;
+    let deadline = deadline(&req);
+    let (copy, guard, actor) = may_update(&state, &access, &c, id).await?;
     // Read only now, so a caller who may not change this document never gets a byte spooled.
     let body = UploadBody::read(req, file_limit(&state, &c), &state.media.temp_dir).await?;
     let (mut sent, file) = match body {
@@ -528,110 +556,119 @@ pub async fn update(
     // Decoded only once the write is allowed. An edit makes its new file as a replacement
     // would arrive, and goes the same way from here.
     let checked = match (&c.schema.upload, file, &edit) {
-        (Some(u), Some(file), _) => Some((u, file.checked(&state, &access, &c, u).await?)),
+        (Some(u), Some(file), _) => {
+            Some((u, file.checked(&state, &access, &c, u, Some(id)).await?))
+        }
         (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e, deadline.limit.as_ref())
             .await?
             .map(|f| (u, f)),
         _ => None,
     };
-    let targets = link_targets(&state, &c).await?;
-    // Validated with the server-set fields the file brings; those are written in after, as
-    // they are, `null`s included.
-    let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
-        settle(current)?;
-        access.writes(&c, &patch, Action::Update, Some(current))?;
-        // A new file writes what it sets: the field rules judge what changes. The dry run
-        // judges the name as sent, this run the one `reserve` numbered, which only it knows;
-        // a refusal here gives up what was stored.
-        let file = file_writes(fields, Some(current));
-        access.writes(&c, &file, Action::Update, Some(current))?;
-        let input = with_fields(&patch, fields);
-        let mut next = validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))
-            .map_err(ApiError::Validation)
-            .and_then(|data| prepare(&targets, &c, data))
-            .map_err(|e| {
-                let doc = merged(c.schema.data(), &input, Some(current));
-                access.hide(&c, e, Some(&doc))
-            })?;
-        next.data.extend(fields.cloned().unwrap_or_default());
-        Ok::<_, ApiError>(next)
-    };
-    let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
-    // Links the patch adds are checked against the stored document, then again against the
-    // locked one, in case it changed in between.
-    let dry = apply(&stored, would.as_ref())?;
-    let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
-    let saved = match &checked {
-        Some((u, f)) => {
-            let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));
-            Some(persist(&state, &c, u, f, &scope, focal, Some(id)).await?)
-        }
-        None => None,
-    };
-    let (doc, sizes) = taken_or_abandoned(&state, saved.as_ref(), async {
-        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-        if moves {
-            folders::lock(&mut tx).await?;
-        }
-        // The locked copy's folder, so only a change of it is judged.
-        let mut filed_before = None;
-        let doc = documents::update_in(
-            &mut tx,
-            c.id,
-            c.schema_version,
-            id,
-            copy,
-            actor,
-            guard.as_ref(),
-            |current| {
-                filed_before = current.get("folder").cloned();
-                let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
-                vouched_links(&next, &link_ids(&c, current), &vouched)?;
-                let from = checked.as_ref().and_then(|(_, f)| f.edits);
-                next.file = match (&saved, from) {
-                    (Some(s), Some(from)) => {
-                        focal_moved(&c, &patch, &stored, current)?;
-                        FileChange::Edit {
-                            from,
-                            to: s.file.id,
-                        }
-                    }
-                    (Some(s), None) => FileChange::Set(s.file.id),
-                    (None, _) => {
-                        focal_moved(&c, &patch, &stored, current)?;
-                        FileChange::Keep
-                    }
-                };
-                Ok(next)
-            },
-        )
-        .await
-        .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
-        if moves {
-            folders::check_place(&mut tx, id).await?;
-        }
-        let after = doc.data.0.get("folder");
-        folders::check_filed(&mut tx, &c, id, copy, filed_before.as_ref(), after).await?;
-        let data = &doc.data.0;
-        filtered_links(
-            &mut tx,
-            &state,
-            &access,
-            &c,
-            data,
-            Sent::Keys(&sent),
-            access.linked(),
-        )
-        .await?;
-        record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
-        let sizes = match &saved {
-            Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+    // A file a client put in storage, claimed above, is given up if the write is refused.
+    let claimed = checked.as_ref().and_then(|(_, f)| f.claimed());
+    let written = async {
+        let targets = link_targets(&state, &c).await?;
+        // Validated with the server-set fields the file brings; those are written in after, as
+        // they are, `null`s included.
+        let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
+            settle(current)?;
+            access.writes(&c, &patch, Action::Update, Some(current))?;
+            // A new file writes what it sets: the field rules judge what changes. The dry run
+            // judges the name as sent, this run the one `reserve` numbered, which only it knows;
+            // a refusal here gives up what was stored.
+            let file = file_writes(fields, Some(current));
+            access.writes(&c, &file, Action::Update, Some(current))?;
+            let input = with_fields(&patch, fields);
+            let mut next =
+                validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))
+                    .map_err(ApiError::Validation)
+                    .and_then(|data| prepare(&targets, &c, data))
+                    .map_err(|e| {
+                        let doc = merged(c.schema.data(), &input, Some(current));
+                        access.hide(&c, e, Some(&doc))
+                    })?;
+            next.data.extend(fields.cloned().unwrap_or_default());
+            Ok::<_, ApiError>(next)
+        };
+        let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
+        // Links the patch adds are checked against the stored document, then again against the
+        // locked one, in case it changed in between.
+        let dry = apply(&stored, would.as_ref())?;
+        let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
+        let saved = match &checked {
+            Some((u, f)) => {
+                let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));
+                Some(persist(&state, &c, u, f, &scope, focal, Some(id)).await?)
+            }
             None => None,
         };
-        tx.commit().await.map_err(DbError::from)?;
-        Ok((doc, sizes))
-    })
-    .await?;
+        taken_or_abandoned(&state, saved.as_ref(), async {
+            let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+            if moves {
+                folders::lock(&mut tx).await?;
+            }
+            // The locked copy's folder, so only a change of it is judged.
+            let mut filed_before = None;
+            let doc = documents::update_in(
+                &mut tx,
+                c.id,
+                c.schema_version,
+                id,
+                copy,
+                actor,
+                guard.as_ref(),
+                |current| {
+                    filed_before = current.get("folder").cloned();
+                    let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
+                    vouched_links(&next, &link_ids(&c, current), &vouched)?;
+                    let from = checked.as_ref().and_then(|(_, f)| f.edits);
+                    next.file = match (&saved, from) {
+                        (Some(s), Some(from)) => {
+                            focal_moved(&c, &patch, &stored, current)?;
+                            FileChange::Edit {
+                                from,
+                                to: s.file.id,
+                            }
+                        }
+                        (Some(s), None) => FileChange::Set(s.file.id),
+                        (None, _) => {
+                            focal_moved(&c, &patch, &stored, current)?;
+                            FileChange::Keep
+                        }
+                    };
+                    Ok(next)
+                },
+            )
+            .await
+            .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
+            if moves {
+                folders::check_place(&mut tx, id).await?;
+            }
+            let after = doc.data.0.get("folder");
+            folders::check_filed(&mut tx, &c, id, copy, filed_before.as_ref(), after).await?;
+            let data = &doc.data.0;
+            filtered_links(
+                &mut tx,
+                &state,
+                &access,
+                &c,
+                data,
+                Sent::Keys(&sent),
+                access.linked(),
+            )
+            .await?;
+            record(&mut tx, &c, &doc, copy, actor.map(|a| a.id), autosave).await?;
+            let sizes = match &saved {
+                Some(s) => queue_sizes(&mut tx, &c, s.file.id).await?,
+                None => None,
+            };
+            tx.commit().await.map_err(DbError::from)?;
+            Ok((doc, sizes))
+        })
+        .await
+    }
+    .await;
+    let (doc, sizes) = or_give_up(&state, claimed, written).await?;
     let doc = waited(&state, &c, doc, copy, sizes.filter(|_| wait), deadline).await;
     respond(&state, &access, c, &doc, copy, 1).await
 }

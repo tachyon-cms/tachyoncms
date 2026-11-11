@@ -93,7 +93,8 @@ fn cleanup(id: Uuid, run_at: OffsetDateTime) -> NewJob<'static> {
 
 /// The first free name for `filename` in `collection_id` and `scope`, inside `conn`'s
 /// transaction: `a.png`, then `a-1.png`, `a-2.png`… A name is taken by the current file of
-/// another live document (either copy) or by a pending file not uploaded for `document`. A
+/// another live document (either copy), by a pending file not uploaded for `document`, and
+/// by one issued to a client and not yet claimed, whichever document it's for. A
 /// version's file and `document`'s own don't count, so an edit or a replacement keeps its
 /// name. Names in `also` count as taken too, and file `except`'s doesn't. Holds the
 /// numbering lock of the collection and scope until the transaction ends.
@@ -121,7 +122,8 @@ pub(crate) async fn free_name(
              AND fl.id IS DISTINCT FROM $8
              AND (fl.filename = $5
                   OR (starts_with(fl.filename, $6) AND right(fl.filename, length($7)) = $7))
-             AND ((fl.state = 'pending' AND (fl.document_id IS DISTINCT FROM $4 OR $4 IS NULL))
+             AND ((fl.state = 'pending'
+                   AND (fl.document_id IS DISTINCT FROM $4 OR $4 IS NULL OR fl.issued_to IS NOT NULL))
                   OR EXISTS (
                       SELECT 1 FROM documents d
                       WHERE d.tenant_id = $1 AND d.collection_id = $2
@@ -856,7 +858,8 @@ pub async fn holders(pool: &PgPool, file: Uuid) -> Result<Vec<(Uuid, DocCopy)>, 
 }
 
 /// Takes the pending file of `collection_id` named `filename` that was issued to `user` with
-/// `key` (none for a session), within its grace. Once taken it's issued to nobody, so no
+/// `key` (none for a session), within its grace, for `document`: one issued for no document
+/// is taken by any write, one issued for a document only by that document's update. Once taken it's issued to nobody, so no
 /// other request can take it: of two at once, the second waits for the first's row lock
 /// and then finds nothing. It stays pending, for the write that takes it to make live or
 /// give up, or for its cleanup.
@@ -866,6 +869,7 @@ pub async fn claim_pending(
     filename: &str,
     user: Uuid,
     key: Option<Uuid>,
+    document: Option<Uuid>,
 ) -> Result<Option<FileRow>, DbError> {
     Ok(sqlx::query_as!(
         FileRow,
@@ -873,6 +877,7 @@ pub async fn claim_pending(
            WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3 AND state = 'pending'
              AND issued_to = $4 AND issued_key IS NOT DISTINCT FROM $5
              AND created_at + make_interval(secs => $6) > now()
+             AND (document_id IS NULL OR document_id = $7)
              AND id = (SELECT id FROM files
                        WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3
                          AND state = 'pending' AND issued_to = $4
@@ -888,6 +893,7 @@ pub async fn claim_pending(
         user,
         key,
         PENDING_GRACE.as_secs_f64(),
+        document,
     )
     .fetch_optional(&mut *tx)
     .await?)
