@@ -1690,6 +1690,60 @@ mod tests {
     }
 
     #[test]
+    fn relations_name_their_schema_position() {
+        let up = |name: &str| json!({"name": name, "type": "upload", "relationTo": "media"});
+        let doc_block = json!({"slug": "doc", "fields": [up("file")]});
+        let f = fields(json!([
+            {"name": "rows", "type": "array", "fields": [
+                {"name": "blockType", "type": "text"},
+                up("a"),
+                {"name": "x", "type": "group", "fields": [up("a")]},
+                {"name": "nested", "type": "array", "fields": [up("a")]},
+                {"name": "parts", "type": "blocks", "blocks": [doc_block]}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [doc_block]},
+            {"name": "body", "type": "richText", "relationTo": ["media"], "blocks": [doc_block]},
+            {"name": "attachments", "type": "upload", "relationTo": "media", "hasMany": true},
+            {"type": "tabs", "tabs": [{"name": "seo", "label": "SEO", "fields": [up("image")]}]}
+        ]));
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let body = json!({"type": "doc", "content": [
+            {"type": "relationship", "attrs": {"relationTo": "media", "value": id}},
+            {"type": "block", "attrs": {"blockType": "doc", "fields": {"file": id}}}
+        ]});
+        let doc = ok(
+            &f,
+            json!({
+                "rows": [{
+                    "blockType": "x", "a": id, "x": {"a": id}, "nested": [{"a": id}],
+                    "parts": [{"blockType": "doc", "file": id}]
+                }],
+                "layout": [{"blockType": "doc", "file": id}],
+                "body": body,
+                "attachments": [id, id],
+                "seo": {"image": id}
+            }),
+        );
+        let keys: Vec<String> = relations(&f, &doc).into_iter().map(|r| r.field).collect();
+        // A row's own `blockType` text field doesn't make it a block row.
+        assert_eq!(
+            keys,
+            [
+                "rows.[].a",
+                "rows.[].x.a",
+                "rows.[].nested.[].a",
+                "rows.[].parts.doc.file",
+                "layout.doc.file",
+                "body",
+                "body.doc.file",
+                "attachments",
+                "attachments",
+                "seo.image",
+            ]
+        );
+    }
+
+    #[test]
     fn normalize_date_time_pads_to_milliseconds() {
         assert_eq!(
             normalize_date_time("2026-10-12T09:30:00+02:00").as_deref(),
