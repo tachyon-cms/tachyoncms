@@ -114,6 +114,8 @@ pub struct Options {
     /// The most rows a schema change or preview may scan inside its request; a bigger one
     /// runs on a job worker. `None` is 2,000; tests lower it.
     pub schema_inline_rows: Option<i64>,
+    /// How long a request without a file may take. `None` is 30 s; tests lower it.
+    pub request_timeout: Option<Duration>,
     pub uploads: UploadsConfig,
 }
 
@@ -254,7 +256,7 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
     let storages: Vec<String> = state.media.storages.0.keys().cloned().collect();
     media_jobs::seed_sweep(&state.pool, &storages).await?;
     let limits = TimeLimits {
-        normal: Duration::from_secs(30),
+        normal: options.request_timeout.unwrap_or(Duration::from_secs(30)),
         uploads: state.media.timeout,
     };
     let routes = routes
@@ -406,7 +408,7 @@ impl Limit {
         self.0.arrival + self.0.limits.uploads + self.0.limits.normal
     }
 
-    fn at(&self) -> tokio::time::Instant {
+    pub(crate) fn at(&self) -> tokio::time::Instant {
         *self.0.at.lock().unwrap_or_else(|e| e.into_inner())
     }
 

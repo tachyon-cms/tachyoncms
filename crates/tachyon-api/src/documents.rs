@@ -335,13 +335,34 @@ pub async fn create(
     ))
 }
 
-/// When the request's time is up, if a time limit is set on it.
-fn deadline(req: &Request) -> Option<tokio::time::Instant> {
-    req.extensions().get::<crate::Deadline>().map(|d| d.0)
+/// What ends a `?wait`: its own cap (`Deadline`, the normal limit for a signed-out
+/// caller), and the request's live limit, which a fetch moves. Read when the wait starts.
+struct WaitEnd {
+    cap: Option<tokio::time::Instant>,
+    limit: Option<crate::Limit>,
 }
 
-/// `doc` read again once its file's sizes job `sizes` has finished, or once `deadline` is
-/// a second away, whichever comes first (call 5); `doc` itself with no job to wait for.
+impl WaitEnd {
+    fn now(&self) -> Option<tokio::time::Instant> {
+        let limit = self.limit.as_ref().map(crate::Limit::at);
+        match (self.cap, limit) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
+}
+
+/// When a `?wait` on `req` must end, if a time limit is set on it.
+fn deadline(req: &Request) -> WaitEnd {
+    WaitEnd {
+        cap: req.extensions().get::<crate::Deadline>().map(|d| d.0),
+        limit: req.extensions().get::<crate::Limit>().cloned(),
+    }
+}
+
+/// `doc` read again once its file's sizes job `sizes` has finished, or once `deadline`, as
+/// it stands when the wait starts, is a second away, whichever comes first (call 5); `doc`
+/// itself with no job to wait for.
 /// Polled, so it works whichever server runs the job.
 async fn waited(
     state: &AppState,
@@ -349,12 +370,13 @@ async fn waited(
     doc: Document,
     copy: DocCopy,
     sizes: Option<Uuid>,
-    deadline: Option<tokio::time::Instant>,
+    deadline: WaitEnd,
 ) -> Document {
     const EVERY: std::time::Duration = std::time::Duration::from_millis(200);
     let Some(job) = sizes else { return doc };
     // Without a time limit on the request (a router built without one), 30 s at most.
     let deadline = deadline
+        .now()
         .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30));
     let until = Some(deadline - std::time::Duration::from_secs(1));
     loop {

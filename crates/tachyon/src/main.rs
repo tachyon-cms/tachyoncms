@@ -107,6 +107,7 @@ async fn main() -> anyhow::Result<()> {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
                 jobs,
                 schema_inline_rows: None,
+                request_timeout: None,
                 uploads: config.uploads_config().map_err(anyhow::Error::msg)?,
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
