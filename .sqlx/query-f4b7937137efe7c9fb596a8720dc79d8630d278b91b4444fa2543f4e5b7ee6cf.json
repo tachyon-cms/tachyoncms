@@ -1,0 +1,26 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT CASE WHEN $4 THEN draft_file ELSE published_file END\n         FROM documents\n         WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL\n           AND CASE WHEN $4 THEN draft IS NOT NULL ELSE published IS NOT NULL END",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "published_file",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Bool"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "f4b7937137efe7c9fb596a8720dc79d8630d278b91b4444fa2543f4e5b7ee6cf"
+}

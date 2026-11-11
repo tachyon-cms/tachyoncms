@@ -6,6 +6,7 @@ use std::collections::BTreeMap;
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 
+use crate::FieldError;
 use crate::schema::{Admin, Field, FieldKind};
 
 /// `upload` on a collection: where its files go and what's made from them. Names and
@@ -1112,9 +1113,314 @@ pub(crate) fn check_raw(upload: &Value) -> Result<(), String> {
         .map_err(|e| format!("upload: {e}"))
 }
 
+/// `uploadEdits` on a PATCH: a crop of the stored original, a new focal point, or both.
+/// Read by `UploadEdits::parse`, which refuses unknown keys as `deny_unknown_fields` would,
+/// but at their own path.
+#[derive(Debug, Clone, PartialEq)]
+pub struct UploadEdits {
+    pub crop: Option<CropRect>,
+    pub focal_point: Option<FocalPoint>,
+}
+
+/// A crop of the stored original, as it's shown: upright, the way `width` and `height`
+/// describe it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CropRect {
+    pub x: f64,
+    pub y: f64,
+    pub width: f64,
+    pub height: f64,
+    pub unit: CropUnit,
+}
+
+/// `"px"` (the default) or `"%"`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CropUnit {
+    Px,
+    Percent,
+}
+
+/// Percent across and down, 0 to 100.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct FocalPoint {
+    pub x: f64,
+    pub y: f64,
+}
+
+/// Where `uploadEdits` sits in a request body, for error paths.
+pub const UPLOAD_EDITS: &str = "uploadEdits";
+
+fn edit_error(path: &str, message: &str) -> FieldError {
+    FieldError {
+        path: format!("{UPLOAD_EDITS}{path}"),
+        message: message.into(),
+    }
+}
+
+/// The object at `path` with only `keys`, an error at each other key.
+fn edit_object<'a>(
+    v: &'a Value,
+    path: &str,
+    keys: &[&str],
+    errors: &mut Vec<FieldError>,
+) -> Option<&'a serde_json::Map<String, Value>> {
+    let Some(o) = v.as_object() else {
+        errors.push(edit_error(path, "expected an object"));
+        return None;
+    };
+    for k in o.keys().filter(|k| !keys.contains(&k.as_str())) {
+        errors.push(edit_error(&format!("{path}.{k}"), "unknown field"));
+    }
+    Some(o)
+}
+
+/// The finite number at `key` of `o`, an error when it's missing or isn't one.
+fn edit_number(
+    o: &serde_json::Map<String, Value>,
+    path: &str,
+    key: &str,
+    errors: &mut Vec<FieldError>,
+) -> Option<f64> {
+    let n = o.get(key).and_then(Value::as_f64).filter(|n| n.is_finite());
+    if n.is_none() {
+        errors.push(edit_error(&format!("{path}.{key}"), "expected a number"));
+    }
+    n
+}
+
+impl UploadEdits {
+    /// `v`, the value of `uploadEdits`; every problem found, each at its own path under
+    /// `uploadEdits`. A crop's values can't be negative; a focal point's are 0 to 100.
+    pub fn parse(v: &Value) -> Result<Self, Vec<FieldError>> {
+        let mut errors = Vec::new();
+        let mut edits = UploadEdits {
+            crop: None,
+            focal_point: None,
+        };
+        if let Some(o) = edit_object(v, "", &["crop", "focalPoint"], &mut errors) {
+            if let Some(c) = o.get("crop") {
+                edits.crop = parse_crop(c, &mut errors);
+            }
+            if let Some(f) = o.get("focalPoint") {
+                edits.focal_point = parse_focal(f, &mut errors);
+            }
+        }
+        if errors.is_empty() {
+            Ok(edits)
+        } else {
+            Err(errors)
+        }
+    }
+}
+
+fn parse_crop(v: &Value, errors: &mut Vec<FieldError>) -> Option<CropRect> {
+    let path = ".crop";
+    let o = edit_object(v, path, &["x", "y", "width", "height", "unit"], errors)?;
+    let unit = match o.get("unit") {
+        None => Some(CropUnit::Px),
+        Some(u) if u == "px" => Some(CropUnit::Px),
+        Some(u) if u == "%" => Some(CropUnit::Percent),
+        Some(_) => {
+            errors.push(edit_error(".crop.unit", "expected \"px\" or \"%\""));
+            None
+        }
+    };
+    let mut at = |key| {
+        let n = edit_number(o, path, key, errors)?;
+        if n < 0.0 {
+            errors.push(edit_error(&format!("{path}.{key}"), "can't be negative"));
+            return None;
+        }
+        Some(n)
+    };
+    let (x, y, width, height) = (at("x"), at("y"), at("width"), at("height"));
+    Some(CropRect {
+        x: x?,
+        y: y?,
+        width: width?,
+        height: height?,
+        unit: unit?,
+    })
+}
+
+fn parse_focal(v: &Value, errors: &mut Vec<FieldError>) -> Option<FocalPoint> {
+    let path = ".focalPoint";
+    let o = edit_object(v, path, &["x", "y"], errors)?;
+    let mut at = |key| {
+        let n = edit_number(o, path, key, errors)?;
+        if !(0.0..=100.0).contains(&n) {
+            errors.push(edit_error(&format!("{path}.{key}"), "must be 0 to 100"));
+            return None;
+        }
+        Some(n)
+    };
+    let (x, y) = (at("x"), at("y"));
+    Some(FocalPoint { x: x?, y: y? })
+}
+
+impl CropRect {
+    /// The crop of a `width`×`height` image as whole pixels `(x, y, width, height)`. A `%`
+    /// value is a percentage of the image's width (`x`, `width`) or height (`y`,
+    /// `height`). Each value, in either unit, is rounded to the nearest pixel on its own,
+    /// halves away from zero. Refused, at the key, when the result has no area or reaches
+    /// past the image.
+    pub fn pixels(&self, width: u32, height: u32) -> Result<(u32, u32, u32, u32), FieldError> {
+        let to_px = |v: f64, whole: u32| match self.unit {
+            CropUnit::Px => v.round(),
+            CropUnit::Percent => (v * f64::from(whole) / 100.0).round(),
+        };
+        let at = |key: &str, message: &str| edit_error(&format!(".crop.{key}"), message);
+        // Every value is finite and not negative, so this only saturates far past the image.
+        let px = |v: f64, whole: u32| to_px(v, whole).min(f64::from(u32::MAX)) as u32;
+        let (x, w) = (px(self.x, width), px(self.width, width));
+        let (y, h) = (px(self.y, height), px(self.height, height));
+        if w == 0 {
+            return Err(at("width", "the crop has no area"));
+        }
+        if h == 0 {
+            return Err(at("height", "the crop has no area"));
+        }
+        if x >= width {
+            return Err(at(
+                "x",
+                &format!("past the image, which is {width} pixels wide"),
+            ));
+        }
+        if y >= height {
+            return Err(at(
+                "y",
+                &format!("past the image, which is {height} pixels high"),
+            ));
+        }
+        if u64::from(x) + u64::from(w) > u64::from(width) {
+            return Err(at(
+                "width",
+                &format!("reaches past the image, which is {width} pixels wide"),
+            ));
+        }
+        if u64::from(y) + u64::from(h) > u64::from(height) {
+            return Err(at(
+                "height",
+                &format!("reaches past the image, which is {height} pixels high"),
+            ));
+        }
+        Ok((x, y, w, h))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn upload_edits_are_read_with_paths() {
+        let e = UploadEdits::parse(&json!({
+            "crop": {"x": 10, "y": 12.5, "width": 40, "height": 37.5, "unit": "%"},
+            "focalPoint": {"x": 20, "y": 80}
+        }))
+        .unwrap();
+        assert_eq!(e.focal_point, Some(FocalPoint { x: 20.0, y: 80.0 }));
+        let crop = e.crop.unwrap();
+        assert_eq!(crop.unit, CropUnit::Percent);
+        assert_eq!(crop.pixels(1000, 800), Ok((100, 100, 400, 300)));
+        let px =
+            UploadEdits::parse(&json!({"crop": {"x": 100, "y": 100, "width": 400, "height": 300}}))
+                .unwrap();
+        assert_eq!(px.crop.unwrap().pixels(1000, 800), Ok((100, 100, 400, 300)));
+        let paths = |v: Value| -> Vec<String> {
+            UploadEdits::parse(&v)
+                .unwrap_err()
+                .into_iter()
+                .map(|e| e.path)
+                .collect()
+        };
+        assert_eq!(paths(json!({"spin": 1})), ["uploadEdits.spin"]);
+        assert_eq!(paths(json!([])), ["uploadEdits"]);
+        assert_eq!(
+            paths(json!({"crop": {"x": 0, "y": 0, "width": 1, "height": 1, "z": 1}})),
+            ["uploadEdits.crop.z"]
+        );
+        assert_eq!(
+            paths(json!({"crop": {"x": -1, "y": "a", "width": 1, "height": 1, "unit": "em"}})),
+            [
+                "uploadEdits.crop.unit",
+                "uploadEdits.crop.x",
+                "uploadEdits.crop.y"
+            ]
+        );
+        assert_eq!(paths(json!({"crop": {"x": 0}})).len(), 3);
+        assert_eq!(
+            paths(json!({"focalPoint": {"x": 101, "y": -0.5}})),
+            ["uploadEdits.focalPoint.x", "uploadEdits.focalPoint.y"]
+        );
+        assert_eq!(
+            paths(json!({"focalPoint": {"x": 1, "y": 2, "z": 3}})),
+            ["uploadEdits.focalPoint.z"]
+        );
+        assert!(UploadEdits::parse(&json!({"focalPoint": {"x": 0, "y": 100}})).is_ok());
+    }
+
+    #[test]
+    fn crops_stay_inside_the_image() {
+        let rect = |x, y, width, height, unit| CropRect {
+            x,
+            y,
+            width,
+            height,
+            unit,
+        };
+        let at = |r: CropRect| r.pixels(1000, 800).map_err(|e| e.path);
+        assert_eq!(
+            at(rect(0.0, 0.0, 1000.0, 800.0, CropUnit::Px)),
+            Ok((0, 0, 1000, 800))
+        );
+        assert_eq!(
+            at(rect(0.0, 0.0, 100.0, 100.0, CropUnit::Percent)),
+            Ok((0, 0, 1000, 800))
+        );
+        // Halves round away from zero, each value on its own.
+        assert_eq!(at(rect(0.5, 0.4, 1.5, 2.5, CropUnit::Px)), Ok((1, 0, 2, 3)));
+        assert_eq!(
+            at(rect(0.05, 0.0, 0.05, 50.0, CropUnit::Percent)),
+            Ok((1, 0, 1, 400))
+        );
+        for (r, path) in [
+            (
+                rect(0.0, 0.0, 0.0, 10.0, CropUnit::Px),
+                "uploadEdits.crop.width",
+            ),
+            (
+                rect(0.0, 0.0, 10.0, 0.4, CropUnit::Px),
+                "uploadEdits.crop.height",
+            ),
+            (
+                rect(0.0, 0.0, 0.04, 10.0, CropUnit::Percent),
+                "uploadEdits.crop.width",
+            ),
+            (
+                rect(1000.0, 0.0, 1.0, 1.0, CropUnit::Px),
+                "uploadEdits.crop.x",
+            ),
+            (
+                rect(0.0, 800.0, 1.0, 1.0, CropUnit::Px),
+                "uploadEdits.crop.y",
+            ),
+            (
+                rect(600.0, 0.0, 401.0, 1.0, CropUnit::Px),
+                "uploadEdits.crop.width",
+            ),
+            (
+                rect(0.0, 50.0, 1.0, 50.1, CropUnit::Percent),
+                "uploadEdits.crop.height",
+            ),
+            (
+                rect(0.0, 0.0, 1e300, 1.0, CropUnit::Px),
+                "uploadEdits.crop.width",
+            ),
+        ] {
+            assert_eq!(at(r.clone()), Err(path.to_owned()), "{r:?}");
+        }
+    }
 
     #[test]
     fn pattern_hosts_are_read_as_urls_read_them() {

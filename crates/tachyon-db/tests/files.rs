@@ -1077,3 +1077,53 @@ async fn a_deferred_job_keeps_its_attempts_up_to_a_cap(pool: PgPool) {
         "past the cap it must spend an attempt"
     );
 }
+
+/// An edit takes the copy only while it still holds the file the edit was made from.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_edit_needs_the_file_it_was_made_from(pool: PgPool) {
+    let c = seed(&pool).await;
+    let a = reserve(&pool, &c, "a.png", "", None).await.id;
+    let doc = draft_with(&pool, &c, a).await;
+    assert_eq!(
+        documents::file_of(&pool, c.id, doc, DocCopy::Draft)
+            .await
+            .unwrap(),
+        Some(a)
+    );
+    assert!(matches!(
+        documents::file_of(&pool, c.id, doc, DocCopy::Published).await,
+        Err(DbError::NotFound)
+    ));
+    let b = reserve(&pool, &c, "a.png", "", Some(doc)).await.id;
+    let other = reserve(&pool, &c, "a.png", "", Some(doc)).await.id;
+    let (db, c) = (&pool, &c);
+    let edit = move |from, to| async move {
+        let mut tx = db.begin().await.unwrap();
+        let done = documents::update_in::<DbError>(
+            &mut tx,
+            c.id,
+            c.schema_version,
+            doc,
+            DocCopy::Draft,
+            None,
+            None,
+            |_| Ok(with_file(FileChange::Edit { from, to })),
+        )
+        .await;
+        if done.is_ok() {
+            tx.commit().await.unwrap();
+        }
+        done.map(|_| ())
+    };
+    assert!(matches!(edit(other, b).await, Err(DbError::Refused(_))));
+    assert_eq!(state(&pool, b).await, "pending", "not taken");
+    edit(a, b).await.unwrap();
+    assert_eq!(state(&pool, b).await, "live");
+    assert_eq!(
+        documents::file_of(&pool, c.id, doc, DocCopy::Draft)
+            .await
+            .unwrap(),
+        Some(b)
+    );
+    assert_eq!(state(&pool, a).await, "gone", "nothing else held it");
+}

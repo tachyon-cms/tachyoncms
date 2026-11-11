@@ -729,6 +729,59 @@ fn process_unguarded(
     })
 }
 
+/// The original `input`, as `probe` read it, cut to `rect` (`x, y, width, height` in whole
+/// pixels of the picture as shown: upright, as `Processed` describes it) on every frame,
+/// and re-encoded in its own format. It goes through the decode `process_original` uses,
+/// held to the same cap, and keeps what that keeps: the ICC profile, and with
+/// `withMetadata` EXIF (orientation reset to 1) and XMP. `trimOptions`, `resizeOptions`
+/// and `formatOptions` aren't applied again: the stored original already had them.
+pub fn crop(
+    input: &Path,
+    probe: &Probe,
+    rect: (u32, u32, u32, u32),
+    u: &Upload,
+    max_pixels: u64,
+    out_dir: &Path,
+) -> Result<Processed, ImageError> {
+    let _working = Working::start();
+    unpanicked(|| crop_unguarded(input, probe, rect, u, max_pixels, out_dir))
+}
+
+fn crop_unguarded(
+    input: &Path,
+    probe: &Probe,
+    (x, y, w, h): (u32, u32, u32, u32),
+    u: &Upload,
+    max_pixels: u64,
+    out_dir: &Path,
+) -> Result<Processed, ImageError> {
+    let cap = cap(u, max_pixels);
+    check_cap(probe, cap)?;
+    let bytes = std::fs::read(input).map_err(internal)?;
+    let mut decoded = decode(&bytes, probe, cap, probe.frames > 1, u.with_metadata)?;
+    let first = &decoded.frames[0].image;
+    let fits = |at: u32, len: u32, whole: u32| {
+        len > 0 && u64::from(at) + u64::from(len) <= u64::from(whole)
+    };
+    if !fits(x, w, first.width()) || !fits(y, h, first.height()) {
+        return Err(ImageError::Corrupt(format!(
+            "a {w}×{h} crop at {x}, {y} doesn't fit a {}×{} image",
+            first.width(),
+            first.height()
+        )));
+    }
+    for f in &mut decoded.frames {
+        f.image = f.image.crop_imm(x, y, w, h);
+    }
+    let again = Upload {
+        trim_options: None,
+        resize_options: None,
+        format_options: None,
+        ..u.clone()
+    };
+    transform_and_encode(decoded, &bytes, probe, &again, max_pixels, out_dir)
+}
+
 /// `d` trimmed, resized and encoded as `u` says, into a new file in `out_dir`.
 fn transform_and_encode(
     d: Decoded,
@@ -1465,6 +1518,71 @@ mod tests {
         let out = run(&w.encoder().bytes(), &upload(serde_json::json!({}))).unwrap();
         assert_eq!(exif_of(&out.path), None);
         assert_eq!((out.width, out.height), (8, 8));
+    }
+
+    #[test]
+    fn a_crop_cuts_the_picture_as_shown() {
+        let d = dir();
+        let u = upload(serde_json::json!({}));
+        let rgb = RgbImage::from_fn(1000, 800, |x, y| {
+            ::image::Rgb([
+                if x < 500 { 255 } else { 0 },
+                if y < 400 { 255 } else { 0 },
+                0,
+            ])
+        });
+        let png = encoded(&DynamicImage::ImageRgb8(rgb), Codec::Png);
+        let input = file(&d, &png);
+        let p = probe(&input, &png).unwrap();
+        let out = crop(&input, &p, (500, 400, 400, 300), &u, 50_000_000, &d).unwrap();
+        assert_eq!((out.width, out.height, out.mime), (400, 300, "image/png"));
+        assert!(out.blurhash.is_some());
+        let made = ::image::load_from_memory(&std::fs::read(&out.path).unwrap())
+            .unwrap()
+            .to_rgb8();
+        assert_eq!(made.dimensions(), (400, 300));
+        assert_eq!(
+            made.get_pixel(0, 0).0,
+            [0, 0, 0],
+            "the bottom-right quarter"
+        );
+        // Past the edge, or empty: refused, nothing written.
+        for rect in [(700, 0, 301, 10), (0, 0, 0, 10), (0, 800, 1, 1)] {
+            assert!(matches!(
+                crop(&input, &p, rect, &u, 50_000_000, &d),
+                Err(ImageError::Corrupt(_))
+            ));
+        }
+        // Held to the cap like any decode.
+        let small = upload(serde_json::json!({"constructorOptions": {"limitInputPixels": 1000}}));
+        assert!(matches!(
+            crop(&input, &p, (0, 0, 10, 10), &small, 50_000_000, &d),
+            Err(ImageError::TooManyPixels { .. })
+        ));
+        // A turned JPEG keeping its metadata is cut where it's shown: 200 across, 400 down.
+        let jpeg = with_exif(
+            encoded(&gradient(400, 200), Codec::Jpeg),
+            exif(Some(6), true),
+        );
+        let input = file(&d, &jpeg);
+        let p = probe(&input, &jpeg).unwrap();
+        let keep = upload(serde_json::json!({"withMetadata": true}));
+        let out = crop(&input, &p, (0, 0, 200, 100), &keep, 50_000_000, &d).unwrap();
+        assert_eq!((out.width, out.height), (200, 100));
+        let stored = ::image::load_from_memory(&std::fs::read(&out.path).unwrap()).unwrap();
+        assert_eq!(
+            (stored.width(), stored.height()),
+            (200, 100),
+            "upright, orientation 1"
+        );
+        // Every frame of an animation is cut.
+        let g = moving_gif(10, 10, 3);
+        let input = file(&d, &g);
+        let p = probe(&input, &g).unwrap();
+        let out = crop(&input, &p, (2, 2, 5, 4), &u, 50_000_000, &d).unwrap();
+        assert_eq!((out.width, out.height, out.mime), (5, 4, "image/gif"));
+        let again = probe(&out.path, &std::fs::read(&out.path).unwrap()).unwrap();
+        assert_eq!((again.width, again.height, again.frames), (5, 4, 3));
     }
 
     #[test]

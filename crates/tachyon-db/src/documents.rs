@@ -85,9 +85,20 @@ pub enum FileChange {
     Set(Uuid),
     /// Points the copy at no file.
     Clear,
+    /// Points the copy at `to`, an edit of `from`: refused when the copy no longer holds
+    /// `from`, since `to` was made from it.
+    Edit { from: Uuid, to: Uuid },
 }
 
 impl FileChange {
+    /// The file the copy takes, when it takes one.
+    pub fn taken(self) -> Option<Uuid> {
+        match self {
+            FileChange::Set(f) | FileChange::Edit { to: f, .. } => Some(f),
+            FileChange::Keep | FileChange::Clear => None,
+        }
+    }
+
     /// The copy's file after the write, `current` before it. A file it sets goes live, and
     /// must be one of `collection_id`'s. Both are locked first, in ID order.
     async fn apply(
@@ -96,23 +107,51 @@ impl FileChange {
         collection_id: Uuid,
         current: Option<Uuid>,
     ) -> Result<Option<Uuid>, DbError> {
-        if let FileChange::Set(f) = self {
-            crate::files::lock_in(tx, &[current, Some(f)]).await?;
-        } else if self == FileChange::Clear {
-            crate::files::lock_in(tx, &[current]).await?;
-        }
-        Ok(match self {
-            FileChange::Keep => current,
-            FileChange::Set(f) => {
-                crate::files::go_live_in(tx, collection_id, f).await?;
-                Some(f)
+        let Some(f) = self.taken() else {
+            if self == FileChange::Clear {
+                crate::files::lock_in(tx, &[current]).await?;
+                return Ok(None);
             }
-            FileChange::Clear => None,
-        })
+            return Ok(current);
+        };
+        crate::files::lock_in(tx, &[current, Some(f)]).await?;
+        if let FileChange::Edit { from, .. } = self
+            && current != Some(from)
+        {
+            return Err(DbError::Refused(
+                "This document's file changed while it was being edited. Reload and try again."
+                    .into(),
+            ));
+        }
+        crate::files::go_live_in(tx, collection_id, f).await?;
+        Ok(Some(f))
     }
 }
 
-/// `data` as the copy taking file `f` (a `FileChange::Set`, its row locked) should hold it:
+/// The file `copy` of live document `id` of `collection_id` holds, if any; `NotFound`
+/// without that copy.
+pub async fn file_of(
+    pool: &PgPool,
+    collection_id: Uuid,
+    id: Uuid,
+    copy: DocCopy,
+) -> Result<Option<Uuid>, DbError> {
+    sqlx::query_scalar!(
+        "SELECT CASE WHEN $4 THEN draft_file ELSE published_file END
+         FROM documents
+         WHERE tenant_id = $1 AND collection_id = $2 AND id = $3 AND deleted_at IS NULL
+           AND CASE WHEN $4 THEN draft IS NOT NULL ELSE published IS NOT NULL END",
+        DEFAULT_TENANT,
+        collection_id,
+        id,
+        copy == DocCopy::Draft,
+    )
+    .fetch_optional(pool)
+    .await?
+    .ok_or(DbError::NotFound)
+}
+
+/// `data` as the copy taking file `f` (a `FileChange::Set` or `Edit`, its row locked) should hold it:
 /// each size `data` lists takes the entry the file's row has, when a job has made it. The
 /// `data` came from elsewhere (a version, a draft), read before the lock, and a size job
 /// may have filled the file's sizes since; with the file locked, none can now until this
@@ -123,7 +162,7 @@ async fn with_filled_sizes(
     change: FileChange,
     data: &Map<String, Value>,
 ) -> Result<Option<Map<String, Value>>, DbError> {
-    let (FileChange::Set(f), Some(Value::Object(sizes))) = (change, data.get("sizes")) else {
+    let (Some(f), Some(Value::Object(sizes))) = (change.taken(), data.get("sizes")) else {
         return Ok(None);
     };
     let filled = sqlx::query_scalar!(
@@ -513,10 +552,7 @@ pub async fn publish_in(
     .ok_or(DbError::NotFound)?;
     let change = doc.map_or(FileChange::Keep, |d| d.file);
     // The published copy's file is the one replaced: all of them at once, in ID order.
-    let set = match change {
-        FileChange::Set(f) => Some(f),
-        _ => None,
-    };
+    let set = change.taken();
     crate::files::lock_in(tx, &[held.published_file, held.draft_file, set]).await?;
     let file = change.apply(&mut *tx, c.id, held.draft_file).await?;
     let filled = match doc {
