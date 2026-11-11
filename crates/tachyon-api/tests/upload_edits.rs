@@ -626,19 +626,33 @@ async fn edits_are_draft_saves(pool: PgPool) {
     );
     let small = &got["sizes"]["s"]["url"];
     assert!(small.as_str().unwrap().ends_with("?draft=true"), "{small}");
-    // Who may read drafts gets the cropped file, and its size.
-    let image = served(&app, url).await;
+    // Who may read drafts gets the cropped file, and its size, never to be cached.
+    let cache = |h: &axum::http::HeaderMap| h["cache-control"].to_str().unwrap().to_owned();
+    let (_, headers, body) = fetch_with(&app, url).await;
+    assert_eq!(cache(&headers), "private, no-store");
+    let image = image::load_from_memory(&body).unwrap();
     assert_eq!((image.width(), image.height()), (50, 40));
-    assert_eq!(served(&app, small).await.width(), 20);
-    // Anyone else gets the published file there, with what they'd get without asking.
+    let (_, headers, body) = fetch_with(&app, small).await;
+    assert_eq!(cache(&headers), "private, no-store", "a size too");
+    assert_eq!(image::load_from_memory(&body).unwrap().width(), 20);
+    // Anyone else gets the published file there, with the plain url's headers but for the
+    // one every `?draft=true` answer carries, whoever asks.
     let anonymous = self::app(&pool, &d).await;
     let plain = json!("http://localhost:3000/api/images/file/a.png");
     let (status, mut headers, body) = fetch_with(&anonymous, url).await;
     let (status_without, mut headers_without, body_without) = fetch_with(&anonymous, &plain).await;
     assert_eq!((status, status_without), (StatusCode::OK, StatusCode::OK));
+    assert_eq!(cache(&headers), "private, no-store");
+    assert_eq!(
+        cache(&headers_without),
+        "public, no-cache",
+        "the plain url keeps its own"
+    );
     // Every request has its own ID; nothing else may differ.
-    headers.remove("x-request-id");
-    headers_without.remove("x-request-id");
+    for h in [&mut headers, &mut headers_without] {
+        h.remove("x-request-id");
+        h.remove("cache-control");
+    }
     assert_eq!(headers, headers_without);
     assert!(body == body_without, "the same bytes");
     let image = image::load_from_memory(&body).unwrap();

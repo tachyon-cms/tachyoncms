@@ -122,7 +122,16 @@ async fn serve_file(
     };
     set(ETAG, &etag);
     set(LAST_MODIFIED, &modified);
-    set(CACHE_CONTROL, if found.public { PUBLIC } else { PRIVATE });
+    // A `?draft=true` answer is never stored, whoever asks and whichever copy it gives: a
+    // shared cache could otherwise hand one caller's answer to another.
+    set(
+        CACHE_CONTROL,
+        if found.public && !draft {
+            PUBLIC
+        } else {
+            PRIVATE
+        },
+    );
     set(CONTENT_TYPE, &found.mime);
     set(CONTENT_DISPOSITION, &disposition);
     set(ACCEPT_RANGES, "bytes");
