@@ -10,6 +10,7 @@ use tachyon_core::schema::NEAR_IN_JOIN;
 use tachyon_core::select::{Select, parse_select};
 use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
+use uuid::Uuid;
 
 use crate::ApiError;
 use crate::access::Access;
@@ -189,6 +190,22 @@ pub(crate) fn create_params(raw: Option<&str>) -> Result<bool, ApiError> {
 /// Refuses any query parameter, for a write that takes none.
 pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())
+}
+
+/// `?moveContentsTo` for deleting a folder: `root`, another folder's ID, or `None`
+/// without it. Inner `None` is the root.
+pub(crate) fn move_params(raw: Option<&str>) -> Result<Option<Option<Uuid>>, ApiError> {
+    let params = params(raw, &["moveContentsTo"])?;
+    Ok(match single(&params, "moveContentsTo")? {
+        None => None,
+        Some("root") => Some(None),
+        Some(id) => Some(Some(id.parse().map_err(|_| {
+            ApiError::Validation(vec![tachyon_core::FieldError {
+                path: "moveContentsTo".into(),
+                message: "must be root or a folder's ID".into(),
+            }])
+        })?)),
+    })
 }
 
 /// `?limit&page` for a list without filters, such as a document's versions.

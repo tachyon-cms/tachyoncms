@@ -2341,6 +2341,7 @@ const KNOWN: &[(&str, &str, &[&str])] = &[
             "title",
         ],
     ),
+    ("collections", "folders", &["collections", "folder", "name"]),
     ("collections", "inbox", &["body"]),
     ("collections", "users", &["name"]),
     ("globals", "home", &["banner", "live", "memo"]),
@@ -2701,9 +2702,9 @@ async fn access_answers_match_what_the_api_allows(pool: PgPool) {
         // Only what the caller can do something with is listed.
         lists_only_what_it_allows(who, &raw);
         let (collections, globals): (&[&str], &[&str]) = match *who {
-            "anonymous" => (&["inbox", "notes", "posts", "users"], &["home"]),
+            "anonymous" => (&["folders", "inbox", "notes", "posts", "users"], &["home"]),
             "key" => (&["notes", "posts"], &[]),
-            _ => (&["inbox", "notes", "posts", "users"], &["home"]),
+            _ => (&["folders", "inbox", "notes", "posts", "users"], &["home"]),
         };
         assert_eq!(keys(&raw["collections"]), collections, "{who}");
         assert_eq!(keys(&raw["globals"]), globals, "{who}");

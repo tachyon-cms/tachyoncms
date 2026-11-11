@@ -6,6 +6,7 @@ mod collections;
 mod documents;
 mod error;
 mod files;
+mod folders;
 mod globals;
 mod jobs;
 mod joins;
@@ -144,6 +145,8 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
     tachyon_db::auth::ensure_users_collection(&pool).await?;
+    // So are folders, which any collection with `folders` links into.
+    tachyon_db::folders::ensure_folders_collection(&pool).await?;
     let schemas = Arc::new(Schemas::load(&pool).await?);
     // Builds any index a failed change left missing, in the background: a big build, or one
     // waiting on another server's, mustn't keep this one from answering.

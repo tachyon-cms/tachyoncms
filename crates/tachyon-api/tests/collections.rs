@@ -18,7 +18,14 @@ async fn create_and_list_collections(pool: PgPool) {
 
     let res = send(&app, "GET", "/api/admin/collections", None).await;
     assert_eq!(res.status, 200);
-    assert_eq!(res.json["docs"][0]["schema"]["slug"], "posts");
+    let slugs: Vec<&str> = res.json["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|d| d["schema"]["slug"].as_str().unwrap())
+        .collect();
+    // The system collections are listed too.
+    assert_eq!(slugs, ["folders", "posts", "users"]);
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

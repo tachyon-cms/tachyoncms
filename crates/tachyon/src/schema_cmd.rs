@@ -11,6 +11,7 @@ use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
+use tachyon_db::folders::{FOLDERS, check_folders_schema, ensure_folders_collection};
 use tachyon_db::schema_change::{self, ChangeError, ConfirmationScope, Preview, Save};
 use tachyon_db::{collections, indexes};
 
@@ -156,6 +157,11 @@ pub async fn run(
     apply: Option<bool>,
 ) -> anyhow::Result<String> {
     let wanted = parse_bundle(text)?;
+    // The folders are the system's, made when the server starts; a file using them may
+    // come first.
+    if wanted.iter().any(|s| s.folders || s.slug == FOLDERS) {
+        ensure_folders_collection(pool).await?;
+    }
     let existing = collections::list(pool).await?;
     let is_new = |slug: &str| !existing.iter().any(|c| c.schema.0.slug == slug);
 
@@ -227,6 +233,7 @@ pub async fn run(
         // change's own check.
         if wanted.iter().any(|w| w.slug == s.slug) {
             check_users_schema(s)
+                .and_then(|()| check_folders_schema(s, is_new(&s.slug)))
                 .and_then(|()| works(s))
                 .with_context(|| s.slug.clone())?;
         } else {
@@ -356,6 +363,37 @@ mod tests {
             .await
             .unwrap();
         assert!(out.contains("= posts unchanged"), "{out}");
+    }
+
+    /// A file can turn folders on before any server has made the folders collection, and
+    /// the folders then list it.
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_file_files_into_folders(pool: PgPool) {
+        let file = json!({"collections": [{"slug": "posts", "folders": true, "fields": [
+            {"name": "title", "type": "text"}]}]})
+        .to_string();
+        run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        let folders = collections::get_by_slug(&pool, FOLDERS).await.unwrap();
+        let listed = folders
+            .schema
+            .0
+            .fields
+            .iter()
+            .find(|f| f.name == "collections");
+        assert!(
+            matches!(&listed.unwrap().kind, tachyon_core::FieldKind::Select { options, .. }
+                if options.iter().map(|o| o.value()).eq(["posts"])),
+            "{:?}",
+            folders.schema.0
+        );
+        // Exported and applied again, the folders are a change like any other.
+        let file = export(&pool).await.unwrap();
+        let out = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(out.contains("= folders unchanged"), "{out}");
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]

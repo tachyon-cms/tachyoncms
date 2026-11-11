@@ -439,6 +439,7 @@ async fn run_in(
             ));
         }
         crate::auth::check_users_schema(s.schema).map_err(|e| own(s.slug, e))?;
+        crate::folders::check_folders_schema(s.schema, s.new).map_err(|e| own(s.slug, e))?;
     }
     if write.is_some() {
         // Every schema save holds R42's lock to its commit (W1-R16), so what's read below
@@ -771,6 +772,14 @@ async fn run_in(
         .fetch_one(&mut *tx)
         .await?;
     }
+    // The folders list which collections file into them.
+    let enabled = world
+        .iter()
+        .map(|(s, _)| s)
+        .filter(|s| s.folders && s.kind == CollectionKind::Collection)
+        .map(|s| s.slug.clone())
+        .collect();
+    crate::folders::refresh_in(&mut *tx, enabled).await?;
     for s in saves {
         // Delivered to every listening server when the transaction commits.
         sqlx::query!("SELECT pg_notify('tachyon_schema', $1)", s.slug)

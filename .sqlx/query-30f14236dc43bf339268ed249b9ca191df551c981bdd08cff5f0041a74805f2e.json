@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT d.collection_id, d.id, r.copy FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           WHERE r.tenant_id = $1 AND r.to_doc = $2 AND r.field_path = 'folder'\n             AND r.from_doc <> $2 AND d.deleted_at IS NULL\n           ORDER BY d.id, r.copy",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "copy",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relations",
+            "name": "copy"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "30f14236dc43bf339268ed249b9ca191df551c981bdd08cff5f0041a74805f2e"
+}

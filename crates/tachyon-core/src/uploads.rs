@@ -508,7 +508,14 @@ fn built_ins(u: &Upload) -> Vec<Field> {
 /// Whether a user field tries another type is `check`'s to refuse.
 pub fn upload_fields(u: &Upload, user: &[Field]) -> Vec<Field> {
     let mut out = user.to_vec();
-    for b in built_ins(u) {
+    merge_built_ins(&mut out, built_ins(u));
+    out
+}
+
+/// `built` added to `out`, each deep-merged with a same-named field there: that one keeps
+/// its label, admin options and access rules, and takes the rest from the built-in.
+pub(crate) fn merge_built_ins(out: &mut Vec<Field>, built: Vec<Field>) {
+    for b in built {
         match out.iter_mut().find(|f| f.name == b.name) {
             Some(f) => {
                 let read_only = b.admin.read_only;
@@ -523,7 +530,6 @@ pub fn upload_fields(u: &Upload, user: &[Field]) -> Vec<Field> {
             None => out.push(b),
         }
     }
-    out
 }
 
 /// The type the built-in field `name` has, when it's one.

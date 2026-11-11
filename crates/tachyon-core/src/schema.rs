@@ -24,6 +24,10 @@ pub const RESERVED_SLUGS: &[&str] = &[
     "upload-instructions",
 ];
 
+/// The slug of the system collection folders live in. Not reserved: it's made at startup,
+/// and a schema can't create another (`tachyon_db::folders::check_folders_schema`).
+pub const FOLDERS: &str = "folders";
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
     pub slug: String,
@@ -85,6 +89,14 @@ impl PartialEq for CollectionSchema {
             other.folders,
         )
     }
+}
+
+/// The `folder` field `folders: true` adds: a link to one folder.
+fn folder_field() -> Field {
+    serde_json::from_value(serde_json::json!({
+        "name": "folder", "type": "relationship", "relationTo": FOLDERS
+    }))
+    .expect("the folder field is valid")
 }
 
 /// `upload` as a flag or as options. Options equal to the defaults are written back as
@@ -1490,10 +1502,14 @@ impl CollectionSchema {
     pub fn data(&self) -> &[Field] {
         self.data.get_or_init(|| {
             let data = data_fields(&self.fields);
-            match &self.upload {
+            let mut out = match &self.upload {
                 Some(u) => crate::uploads::upload_fields(u, &data),
                 None => data.into_owned(),
+            };
+            if self.folders {
+                crate::uploads::merge_built_ins(&mut out, vec![folder_field()]);
             }
+            out
         })
     }
 
@@ -1789,6 +1805,9 @@ impl CollectionSchema {
         }
         let mut out = Vec::new();
         walk(&self.fields, &mut out);
+        if self.folders {
+            out.push(FOLDERS);
+        }
         out.sort_unstable();
         out.dedup();
         out
@@ -1894,6 +1913,9 @@ impl CollectionSchema {
         if let Some(u) = &self.upload {
             self.check_upload(u)?;
         }
+        if self.folders {
+            self.check_folders()?;
+        }
         if self.url.is_some() && self.kind != CollectionKind::Collection {
             return Err(SchemaError::InvalidOption(
                 "url: only collections have pages of their own".into(),
@@ -1931,6 +1953,23 @@ impl CollectionSchema {
             ));
         }
         check_layout(&self.fields, data, "fields", "", &[])?;
+        // The system folders list the collections filed in them, which may be none yet.
+        let listed;
+        let data = match data
+            .iter()
+            .position(|f| self.slug == FOLDERS && f.name == "collections")
+        {
+            Some(i) if matches!(&data[i].kind, FieldKind::Select { options, .. } if options.is_empty()) =>
+            {
+                let mut with = data.to_vec();
+                if let FieldKind::Select { options, .. } = &mut with[i].kind {
+                    options.push(SelectOption::Value(FOLDERS.into()));
+                }
+                listed = with;
+                &listed[..]
+            }
+            _ => data,
+        };
         check_fields(data, Level::Top, data, "", false, &[])?;
         if self.kind == CollectionKind::Global
             && let Some(j) = self.join_fields().first()
@@ -1962,6 +2001,29 @@ impl CollectionSchema {
             && !(100..=600_000).contains(&a.interval)
         {
             return Err(SchemaError::InvalidOption(AUTOSAVE_INTERVAL.into()));
+        }
+        Ok(())
+    }
+
+    fn check_folders(&self) -> Result<(), SchemaError> {
+        if self.kind != CollectionKind::Collection {
+            return Err(SchemaError::UnknownOption {
+                field: String::new(),
+                option: "folders".into(),
+            });
+        }
+        if self.slug == FOLDERS {
+            return Err(SchemaError::InvalidOption(
+                "folders: folders nest through their own folder field, so they can't be filed in folders".into(),
+            ));
+        }
+        if let Some(f) = data_fields(&self.fields).iter().find(|f| {
+            f.name == "folder" && (f.kind.name() != "relationship" || f.virtual_path.is_some())
+        }) {
+            return Err(SchemaError::InvalidField {
+                field: f.name.clone(),
+                message: "is built in to collections with folders as a relationship to folders; it can take a label, admin options and access rules, not another type".into(),
+            });
         }
         Ok(())
     }
@@ -5306,5 +5368,63 @@ mod tests {
             Err(SchemaError::ReservedSlug("upload-instructions".into()))
         );
         assert!(!RESERVED_SLUGS.contains(&"folders"));
+    }
+
+    #[test]
+    fn folders_add_a_folder_field() {
+        // Any collection, upload or not, users too, gets a `folder` link to the folders.
+        for on in [
+            json!({"slug": "posts", "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+            json!({"slug": "media", "folders": true, "upload": true, "fields": []}),
+            json!({"slug": "users", "folders": true, "fields": [{"name": "name", "type": "text"}]}),
+        ] {
+            let s = schema(on);
+            assert_eq!(s.check(), Ok(()), "{}", s.slug);
+            let folder = s.data().iter().find(|f| f.name == "folder").unwrap();
+            let link = folder.kind.link().expect("a relationship");
+            assert!(!link.has_many && link.relation_to.targets() == [FOLDERS]);
+            assert!(s.relation_targets().contains(&FOLDERS));
+        }
+        let off = schema(json!({"slug": "posts", "fields": []}));
+        assert!(off.data().iter().all(|f| f.name != "folder"));
+        // A field of its own called `folder` keeps its label, not its type.
+        let labelled = schema(json!({"slug": "posts", "folders": true, "fields": [
+            {"name": "folder", "type": "relationship", "relationTo": "folders", "label": "Where"}]}));
+        assert_eq!(labelled.check(), Ok(()));
+        let f = labelled.data().iter().find(|f| f.name == "folder").unwrap();
+        assert_eq!(f.label.as_deref(), Some("Where"));
+        assert_eq!(labelled.data().len(), 1);
+        let retyped = schema(json!({"slug": "posts", "folders": true, "fields": [
+            {"name": "folder", "type": "text"}]}));
+        assert!(
+            matches!(retyped.check(), Err(SchemaError::InvalidField { ref field, .. }) if field == "folder"),
+            "{:?}",
+            retyped.check()
+        );
+        // Globals and shared blocks hold no documents to file, and folders nest by `folder`.
+        for kind in ["global", "block"] {
+            let s = schema(
+                json!({"slug": "site", "kind": kind, "folders": true, "fields": [
+                {"name": "title", "type": "text"}]}),
+            );
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::UnknownOption {
+                    field: String::new(),
+                    option: "folders".into()
+                })
+            );
+        }
+        let own = schema(json!({"slug": FOLDERS, "folders": true, "fields": [
+            {"name": "name", "type": "text"}]}));
+        assert!(matches!(own.check(), Err(SchemaError::InvalidOption(_))));
+        // The system folders' `collections` may list none yet; any other select needs one.
+        let system = schema(json!({"slug": FOLDERS, "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "collections", "type": "select", "options": [], "multiple": true}]}));
+        assert_eq!(system.check(), Ok(()));
+        let other = schema(json!({"slug": "posts", "fields": [
+            {"name": "collections", "type": "select", "options": [], "multiple": true}]}));
+        assert!(other.check().is_err());
     }
 }

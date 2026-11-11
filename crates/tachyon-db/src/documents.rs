@@ -676,6 +676,20 @@ pub async fn delete_as(
     copy: DocCopy,
 ) -> Result<(), DbError> {
     let mut tx = pool.begin().await?;
+    delete_in(&mut tx, collection_id, id, actor, guard, copy).await?;
+    tx.commit().await?;
+    Ok(())
+}
+
+/// `delete_as`, inside the caller's transaction, so other changes can commit with it.
+pub async fn delete_in(
+    tx: &mut PgConnection,
+    collection_id: Uuid,
+    id: Uuid,
+    actor: Option<Actor>,
+    guard: Option<&Filter>,
+    copy: DocCopy,
+) -> Result<(), DbError> {
     // Lock first, so a concurrent write can't add a link between the check and the delete.
     let created_by = sqlx::query_scalar!(
         r#"SELECT created_by FROM documents
@@ -694,7 +708,7 @@ pub async fn delete_as(
     {
         return Err(DbError::NotOwner);
     }
-    check_guard(&mut tx, id, copy, guard).await?;
+    check_guard(&mut *tx, id, copy, guard).await?;
     // A link from either copy counts: a draft may be published later.
     let linked = sqlx::query_scalar!(
         r#"SELECT count(DISTINCT r.from_doc) AS "n!" FROM relations r
@@ -707,7 +721,7 @@ pub async fn delete_as(
     if linked > 0 {
         return Err(DbError::Referenced(linked));
     }
-    crate::auth::before_removing(&mut tx, id).await?;
+    crate::auth::before_removing(&mut *tx, id).await?;
     sqlx::query!(
         "UPDATE documents SET deleted_at = now(), updated_by = COALESCE($2, updated_by) WHERE id = $1",
         id,
@@ -717,9 +731,8 @@ pub async fn delete_as(
     .await?;
     // Nothing scheduled for it runs from the trash; the jobs' cascade only covers a purge.
     for kind in ["publish", "unpublish"] {
-        crate::jobs::cancel(&mut tx, &format!("{kind}:{id}")).await?;
+        crate::jobs::cancel(&mut *tx, &format!("{kind}:{id}")).await?;
     }
-    tx.commit().await?;
     Ok(())
 }
 

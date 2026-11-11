@@ -16,7 +16,7 @@ pub mod virtuals;
 
 pub use schema::{
     Admin, Autosave, BlockDef, BlockSource, CollectionKind, CollectionSchema, Condition,
-    ConditionTest, Drafts, Field, FieldKind, Labels, Position, RelationTo, SchemaError,
+    ConditionTest, Drafts, FOLDERS, Field, FieldKind, Labels, Position, RelationTo, SchemaError,
     SelectOption, Tab, Versions, check_upload_referrers, data_fields, explain_parse_error,
 };
 pub use validate::{

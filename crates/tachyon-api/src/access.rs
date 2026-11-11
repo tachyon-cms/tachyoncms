@@ -19,7 +19,7 @@ use tachyon_core::access::{
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{DocCopy, Filter, Readable, Target};
-use tachyon_core::{CollectionKind, CollectionSchema, Field};
+use tachyon_core::{CollectionKind, CollectionSchema, FOLDERS, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
 use tachyon_db::collections::Collection;
@@ -361,6 +361,11 @@ impl Access {
         matches!(self.allows(Action::Read, c), Compiled::Allow)
     }
 
+    /// Whether the caller may change any account, as the users routes decide.
+    pub(crate) fn manages_users(&self) -> bool {
+        manages_users(&self.principal)
+    }
+
     /// Whether the caller may do `action` to some document of `c`, if only where a filter
     /// matches.
     pub(crate) fn permits_any(&self, action: Action, c: &Collection) -> bool {
@@ -523,14 +528,59 @@ impl Access {
                 _ => Compiled::Deny,
             };
         }
-        match self.rule(action, c) {
+        let own = match self.rule(action, c) {
             Some(rule) => {
                 let lookup = |s: &str| self.schemas.lookup(s);
                 compile(rule, &self.caller(), c.schema.data(), &lookup)
             }
             None if self.by_role_in(action, slug, scoped) == Decision::Deny => Compiled::Deny,
             None => Compiled::Allow,
+        };
+        match (slug == FOLDERS && action == Action::Read, own) {
+            (true, Compiled::Allow) => self.folder_reads(c, scoped),
+            (true, Compiled::Filter(f)) => match self.folder_reads(c, scoped) {
+                Compiled::Allow => Compiled::Filter(f),
+                Compiled::Deny => Compiled::Deny,
+                Compiled::Filter(g) => Compiled::Filter(Filter::All(vec![f, g])),
+            },
+            (_, own) => own,
         }
+    }
+
+    /// The folders of `folders` the caller may read besides its own read rule: those for
+    /// a collection they can read, and those for no collection in particular. Every read
+    /// of a folder, linked or asked for, goes through it, so a hidden one is missing.
+    fn folder_reads(&self, folders: &Collection, scoped: bool) -> Compiled {
+        let enabled: Vec<Arc<Collection>> = self
+            .schemas
+            .all()
+            .into_iter()
+            .filter(|c| c.schema.folders && c.schema.kind == CollectionKind::Collection)
+            .collect();
+        let readable: Vec<&str> = enabled
+            .iter()
+            .filter(|c| self.allows_in(Action::Read, c, scoped) != Compiled::Deny)
+            .map(|c| c.schema.slug.as_str())
+            .collect();
+        if readable.len() == enabled.len() {
+            return Compiled::Allow;
+        }
+        // Stored lists only name collections with folders, and never an empty one.
+        let mut any: Vec<Value> = readable
+            .iter()
+            .map(|s| json!({"collections": {"contains": s}}))
+            .collect();
+        any.push(json!({"collections": {"exists": false}}));
+        let Value::Object(group) = json!({"or": any}) else {
+            unreachable!("an object")
+        };
+        let lookup = |s: &str| self.schemas.lookup(s);
+        compile(
+            &Rule::Where(group),
+            &self.caller(),
+            folders.schema.data(),
+            &lookup,
+        )
     }
 
     /// A refusal that mustn't say why: sign in first when signed out (Ruling F-6), else a

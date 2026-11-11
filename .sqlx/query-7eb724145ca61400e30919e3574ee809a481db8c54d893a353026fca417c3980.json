@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE up(id, depth) AS (\n               SELECT $1::uuid, 0\n               UNION ALL\n               SELECT r.to_doc, up.depth + 1 FROM up\n               JOIN relations r ON r.from_doc = up.id AND r.tenant_id = $2\n                 AND r.copy = 'published' AND r.field_path = 'folder'\n               WHERE up.depth <= $3\n           )\n           SELECT id AS \"id!\" FROM up ORDER BY depth",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id!",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "7eb724145ca61400e30919e3574ee809a481db8c54d893a353026fca417c3980"
+}

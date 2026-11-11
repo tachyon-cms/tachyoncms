@@ -24,10 +24,11 @@ use tachyon_db::versions::record_version;
 use uuid::Uuid;
 
 use crate::access::{Access, both};
+use crate::folders;
 use crate::joins::fill_joins;
 use crate::media_jobs::queue_sizes;
 use crate::params::{
-    Format, Joins, create_params, list_params, no_params, read_params, update_params,
+    Format, Joins, create_params, list_params, move_params, no_params, read_params, update_params,
 };
 use crate::populate::{
     Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
@@ -271,6 +272,8 @@ pub async fn create(
     };
     let hide = |e, body: &Value| access.hide(&c, e, Some(&merged(c.schema.data(), body, None)));
     let mut body = settle_server_set(&c, &body, None).map_err(|e| hide(e, &body))?;
+    folders::normalise(&c, &mut body);
+    let moves = folders::moves(&c, &body);
     require_file(&c, file.is_some())?;
     from_markdown(&state, &access, &c, &mut body, None).await?;
     access.writes(&c, &body, Action::Create, None)?;
@@ -307,9 +310,15 @@ pub async fn create(
     let by = access.actor(Action::Create, &c).map(|a| a.id);
     let (doc, sizes) = taken_or_abandoned(&state, stored.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        if moves {
+            folders::lock(&mut tx).await?;
+        }
         let doc = documents::insert_in(&mut tx, c.id, c.schema_version, None, copy, &prepared, by)
             .await
             .map_err(|e| access.hide(&c, unique_error(&c, e.into()), None))?;
+        if moves {
+            folders::check_place(&mut tx, doc.id).await?;
+        }
         filtered_links(
             &mut tx,
             &state,
@@ -498,6 +507,8 @@ pub async fn update(
         UploadBody::Upload { payload, file } => (payload, Some(file)),
     };
     let edits = take_edits(&c, &mut sent, file.is_some())?;
+    folders::normalise(&c, &mut sent);
+    let moves = folders::moves(&c, &sent);
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
@@ -564,6 +575,9 @@ pub async fn update(
     };
     let (doc, sizes) = taken_or_abandoned(&state, saved.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        if moves {
+            folders::lock(&mut tx).await?;
+        }
         let doc = documents::update_in(
             &mut tx,
             c.id,
@@ -595,6 +609,9 @@ pub async fn update(
         )
         .await
         .map_err(|e| access.hide(&c, unique_error(&c, e), None))?;
+        if moves {
+            folders::check_place(&mut tx, id).await?;
+        }
         let data = &doc.data.0;
         filtered_links(
             &mut tx,
@@ -681,28 +698,35 @@ pub async fn delete(
     let id = parse_id(&id)?;
     let c = collection(&state, &slug)?;
     access.may_write(Action::Delete, &c)?;
-    no_params(raw.as_deref())?;
+    let moving = match c.schema.slug == tachyon_core::FOLDERS {
+        true => move_params(raw.as_deref())?,
+        false => no_params(raw.as_deref()).map(|()| None)?,
+    };
     let copy = access.write_copy(&c)?;
     let guard = access
         .write_guard(&state.pool, Action::Delete, &c, id)
         .await?;
-    documents::delete_as(
-        &state.pool,
-        c.id,
-        id,
-        access.actor(Action::Delete, &c),
-        guard.as_ref(),
-        copy,
-    )
-    .await
-    .map_err(|e| match e {
-        // How many link here would count documents the caller may not be able to see.
+    let actor = access.actor(Action::Delete, &c);
+    match moving {
+        Some(to) => {
+            folders::delete_moving(&state, &access, &c, id, to, actor, guard.as_ref(), copy).await
+        }
+        None => documents::delete_as(&state.pool, c.id, id, actor, guard.as_ref(), copy)
+            .await
+            .map_err(|e| delete_error(&access, e)),
+    }?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// A delete's refusal: how many link here would count documents the caller may not be
+/// able to see.
+pub(crate) fn delete_error(access: &Access, e: DbError) -> ApiError {
+    match e {
         DbError::Referenced(_) if !access.unscoped_admin() => {
             ApiError::Conflict("Other documents link to this one; remove those links first".into())
         }
         e => e.into(),
-    })?;
-    Ok(StatusCode::NO_CONTENT)
+    }
 }
 
 /// The documents that link to this one, among those the caller may read.
