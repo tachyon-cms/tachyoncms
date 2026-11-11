@@ -233,14 +233,38 @@ pub async fn ancestors_in(conn: &mut PgConnection, id: Uuid) -> Result<Vec<Uuid>
     Ok(out)
 }
 
+/// How many levels of folders sit below live folder `id`: 0 with none. Counted past
+/// `MAX_DEPTH` only by one, enough to tell it's too many.
+async fn height_in(conn: &mut PgConnection, id: Uuid) -> Result<i32, DbError> {
+    Ok(sqlx::query_scalar!(
+        r#"WITH RECURSIVE down(id, depth) AS (
+               SELECT $1::uuid, 0
+               UNION ALL
+               SELECT r.from_doc, down.depth + 1 FROM down
+               JOIN relations r ON r.to_doc = down.id AND r.tenant_id = $2
+                 AND r.copy = 'published' AND r.field_path = 'folder'
+               JOIN documents d ON d.id = r.from_doc AND d.deleted_at IS NULL
+                 AND d.collection_id = (SELECT collection_id FROM documents WHERE id = $1)
+               WHERE down.depth <= $3
+           )
+           SELECT max(depth) AS "height!" FROM down"#,
+        id,
+        DEFAULT_TENANT,
+        MAX_DEPTH,
+    )
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
 /// Why folder `id`, as just written in `conn`, can't sit where it is: inside itself, or
-/// under more than `MAX_DEPTH` folders. Run under `lock_tree_in`.
+/// with its deepest folder (itself, or one inside it) under more than `MAX_DEPTH` others.
+/// Run under `lock_tree_in`.
 pub async fn check_place_in(conn: &mut PgConnection, id: Uuid) -> Result<(), DbError> {
     let up = ancestors_in(conn, id).await?;
     let message = if up[1..].contains(&id) {
         "can't be this folder or one inside it"
-    } else if up.len() > MAX_DEPTH as usize + 1 {
-        "is too deep; folders nest 64 levels at most"
+    } else if up.len() - 1 + height_in(conn, id).await? as usize > MAX_DEPTH as usize {
+        "would put a folder too deep; folders nest 64 levels at most"
     } else {
         return Ok(());
     };

@@ -5,7 +5,7 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 use tachyon_core::auth::Action;
 use tachyon_core::query::Filter;
-use tachyon_core::{FOLDERS, FieldError, validate_document_in};
+use tachyon_core::{FOLDERS, FieldError, merged, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::auth::USERS;
@@ -89,6 +89,24 @@ pub(crate) async fn delete_moving(
             .map_err(|e| match e {
                 // Hidden from them is still a document they may not change.
                 ApiError::NotFound => access.refuse(),
+                // Named by the document that can't move, at the parameter that moved it.
+                ApiError::Validation(errors) => ApiError::Validation(
+                    errors
+                        .into_iter()
+                        .map(|f| FieldError {
+                            path: "moveContentsTo".into(),
+                            message: format!(
+                                "{} {doc} can't be moved: {}{}",
+                                dc.schema.slug,
+                                match f.path.is_empty() {
+                                    true => String::new(),
+                                    false => format!("{} ", f.path),
+                                },
+                                f.message
+                            ),
+                        })
+                        .collect(),
+                ),
                 e => e,
             })?;
     }
@@ -136,8 +154,16 @@ async fn move_one(
             validate_document_in(mode_for(copy), dc.schema.data(), &patch, Some(current))
                 .map_err(ApiError::Validation)
                 .and_then(|data| prepare(&targets, dc, data))
+                .map_err(|e| {
+                    let doc = merged(dc.schema.data(), &patch, Some(current));
+                    access.hide(dc, e, Some(&doc))
+                })
         },
     )
     .await?;
+    // A folder takes what's inside it along, which must still fit.
+    if dc.schema.slug == FOLDERS {
+        check_place(tx, doc).await?;
+    }
     Ok(())
 }

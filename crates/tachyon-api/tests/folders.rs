@@ -672,3 +672,152 @@ async fn folder_enabled_collections_are_listed(pool: PgPool) {
     let got = ok(&app, "GET", &format!("/api/folders/{none}"), Value::Null).await;
     assert!(got.get("collections").is_none(), "{got}");
 }
+
+/// Signed out, folders answer as a collection only signed-in callers may use, unless a
+/// rule of their own opens them.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn folders_are_closed_to_anonymous(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    let closed = json!({"signedIn": true});
+    schema(
+        &app,
+        json!({"slug": "closed", "access": {"read": closed, "create": closed, "update": closed, "delete": closed},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let f = folder(&app, "F", None, &[]).await;
+    let c = id(&ok(&app, "POST", "/api/closed", json!({"title": "t"})).await);
+    let anon = router(&pool, &d).await;
+    for (folders, other) in [
+        ("/api/folders".to_owned(), "/api/closed".to_owned()),
+        (format!("/api/folders/{f}"), format!("/api/closed/{c}")),
+    ] {
+        let (a, b) = (
+            call(&anon, "GET", &folders, Value::Null).await,
+            call(&anon, "GET", &other, Value::Null).await,
+        );
+        assert_eq!(a.status, b.status, "{folders}: {} vs {}", a.json, b.json);
+        assert_eq!(a.json["detail"], b.json["detail"]);
+        assert!(!a.status.is_success());
+    }
+    let res = call(&anon, "POST", "/api/folders", json!({"name": "N"})).await;
+    let other = call(&anon, "POST", "/api/closed", json!({"title": "N"})).await;
+    assert_eq!(res.status, other.status, "{}", res.json);
+    let access = ok(&anon, "GET", "/api/access", Value::Null).await;
+    assert!(access["collections"].get("folders").is_none(), "{access}");
+    let access = ok(&app, "GET", "/api/access", Value::Null).await;
+    assert!(access["collections"].get("folders").is_some(), "{access}");
+
+    // A rule of their own opens them.
+    let mut s =
+        ok(&app, "GET", "/api/admin/collections/folders", Value::Null).await["schema"].clone();
+    s["access"] = json!({"read": true});
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/folders",
+        json!({"schema": s}),
+    )
+    .await;
+    let anon = router(&pool, &d).await;
+    assert_eq!(ids(&anon, "/api/folders").await, vec![f]);
+}
+
+/// A folder moved with what's inside it must leave its deepest folder 64 levels down at
+/// most, whether it's moved itself or with a deleted folder's contents.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn moved_subtrees_stay_within_depth(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    // chain[n] has n folders above it.
+    let mut chain = vec![folder(&app, "0", None, &[]).await];
+    for n in 1..=62 {
+        let above = chain[n - 1].clone();
+        chain.push(folder(&app, &n.to_string(), Some(&above), &[]).await);
+    }
+    // s, with two levels below it.
+    let s = folder(&app, "S", None, &[]).await;
+    let s1 = folder(&app, "S1", Some(&s), &[]).await;
+    folder(&app, "S2", Some(&s1), &[]).await;
+    let at = |s: &str| format!("/api/folders/{s}");
+    let res = call(&app, "PATCH", &at(&s), json!({"folder": chain[62]})).await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "folder", "{}", res.json);
+    // Exactly 64 down.
+    ok(&app, "PATCH", &at(&s), json!({"folder": chain[61]})).await;
+    ok(&app, "PATCH", &at(&s), json!({"folder": null})).await;
+
+    let y = folder(&app, "Y", None, &[]).await;
+    ok(&app, "PATCH", &at(&s), json!({"folder": y})).await;
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{y}?moveContentsTo={}", chain[62]),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "moveContentsTo", "{}", res.json);
+    assert!(
+        res.json.to_string().contains(&s),
+        "names the folder: {}",
+        res.json
+    );
+    ok(&app, "GET", &at(&y), Value::Null).await;
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{y}?moveContentsTo={}", chain[61]),
+        Value::Null,
+    )
+    .await;
+    assert_eq!(res.status, 204, "{}", res.json);
+}
+
+/// A move is an update of each document, validated in full: one that no longer validates
+/// stops it, named by collection and ID.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_move_names_the_document_that_fails(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    let notes =
+        json!({"slug": "notes", "folders": true, "fields": [{"name": "title", "type": "text"}]});
+    schema(&app, notes.clone()).await;
+    let f = folder(&app, "F", None, &[]).await;
+    let n = id(&ok(
+        &app,
+        "POST",
+        "/api/notes",
+        json!({"title": "t", "folder": f}),
+    )
+    .await);
+    let mut required = notes.clone();
+    required["fields"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"name": "summary", "type": "text", "required": true}));
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/notes",
+        json!({"schema": required, "confirm": true}),
+    )
+    .await;
+    let res = call(
+        &app,
+        "DELETE",
+        &format!("/api/folders/{f}?moveContentsTo=root"),
+        Value::Null,
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(error_path(&res), "moveContentsTo", "{}", res.json);
+    let message = res.json["errors"][0]["message"].as_str().unwrap();
+    assert!(
+        message.contains("notes") && message.contains(&n) && message.contains("summary"),
+        "{message}"
+    );
+    let doc = ok(&app, "GET", &format!("/api/notes/{n}?depth=0"), Value::Null).await;
+    assert_eq!(doc["folder"], f.as_str(), "nothing moved");
+}
