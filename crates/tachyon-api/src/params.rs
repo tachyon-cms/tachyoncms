@@ -158,13 +158,13 @@ pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
 }
 
 /// A file read's `?id`, the document holding it, taken only where `filenameCompoundIndex`
-/// lets documents share a name. `?draft` is checked as a document read's is; the route
-/// serves a draft's file to who may read it either way.
+/// lets documents share a name, and its `?draft`: prefer a draft's file of that name. Not
+/// refused for a caller who can't read drafts, who gets what they'd get without it, so it
+/// can't tell them whether a draft holds the name.
 pub(crate) fn file_params(
     raw: Option<&str>,
     c: &Collection,
-    access: &Access,
-) -> Result<Option<uuid::Uuid>, ApiError> {
+) -> Result<(Option<uuid::Uuid>, bool), ApiError> {
     let shared = c
         .schema
         .upload
@@ -172,10 +172,11 @@ pub(crate) fn file_params(
         .is_some_and(|u| u.filename_compound_index.is_some());
     let allowed: &[&str] = if shared { &["draft", "id"] } else { &["draft"] };
     let params = params(raw, allowed)?;
-    draft(&params, c, access)?;
-    single(&params, "id")?
+    let draft = flag(&params, "draft").map_err(|_| bad("`draft` must be true or false"))?;
+    let id = single(&params, "id")?
         .map(|id| uuid::Uuid::try_parse(id).map_err(|_| bad("`id` must be a document ID")))
-        .transpose()
+        .transpose()?;
+    Ok((id, draft && c.schema.drafts()))
 }
 
 /// `?wait=true` on a create, the only parameter it takes: answer once the file's sizes

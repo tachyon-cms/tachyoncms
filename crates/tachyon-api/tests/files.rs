@@ -477,9 +477,14 @@ async fn private_files_stay_private(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json());
     assert_eq!(res.header("cache-control"), "private, no-store");
     not_found(&fetch(&viewer, "/api/drafted/file/d.png").await, "viewer");
-    assert_problem_raw(
+    // Asking for drafts without the right to read them gets what not asking gets.
+    not_found(
         &fetch(&anon, "/api/drafted/file/d.png?draft=true").await,
-        401,
+        "anonymous, asking for drafts",
+    );
+    not_found(
+        &fetch(&viewer, "/api/drafted/file/d.png?draft=true").await,
+        "viewer, asking for drafts",
     );
     let res = fetch(&editor, "/api/drafted/file/d.png?draft=true").await;
     assert_eq!(res.status, 200, "{}", res.json());
@@ -660,11 +665,12 @@ async fn a_restored_version_serves_its_old_file(pool: PgPool) {
     )
     .await;
     assert_eq!(restored["filename"], "a.png");
+    // A draft's file, read as the draft: its url asks for the draft's.
     assert_eq!(
         restored["url"],
-        "http://localhost:3000/api/images/file/a.png"
+        "http://localhost:3000/api/images/file/a.png?draft=true"
     );
-    let draft_url = format!("{}?draft=true", path_of(&restored["url"]));
+    let draft_url = path_of(&restored["url"]);
     let res = fetch(&app, &draft_url).await;
     assert_eq!(res.status, 200, "{}", res.json());
     assert_eq!(
@@ -830,7 +836,7 @@ async fn urls_are_filled_on_every_read(pool: PgPool) {
     let doc = put(&app, "public_drafts", &png(4, 4), "cat.png", None).await;
     assert_eq!(
         doc["url"],
-        "http://localhost:3000/api/public_drafts/file/cat.png"
+        "http://localhost:3000/api/public_drafts/file/cat.png?draft=true"
     );
     // Nor when a signed-out caller can't read everything.
     let doc = put(&app, "public_members", &png(4, 4), "cat.png", None).await;

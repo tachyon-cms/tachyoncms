@@ -81,8 +81,8 @@ async fn serve_file(
     if !access.permits_any(Action::Read, &c) {
         return Err(access.hidden());
     }
-    let id = file_params(raw.as_deref(), &c, &access)?;
-    let found = find(&state, &access, &c, &name, id)
+    let (id, draft) = file_params(raw.as_deref(), &c)?;
+    let found = find(&state, &access, &c, &name, id, draft)
         .await?
         .ok_or(ApiError::NotFound)?;
     let storage = state
@@ -192,22 +192,25 @@ struct Found {
 
 /// The file named `name` the caller may read: held by the published copy of a document
 /// they may read, or else by the draft of one whose draft they may read (`read_copy`
-/// judges each copy), document `id` when given, through the field that names it. Trashed
-/// documents hold nothing here (`holders`).
+/// judges each copy), document `id` when given, through the field that names it. With
+/// `draft`, drafts they may read come first, as a draft request reads (T4-1); one they
+/// can't read is passed over, so they get what they'd get without it. Trashed documents
+/// hold nothing here (`holders`).
 async fn find(
     state: &AppState,
     access: &Access,
     c: &Collection,
     name: &str,
     id: Option<Uuid>,
+    draft: bool,
 ) -> Result<Option<Found>, ApiError> {
     let candidates = files::by_name(&state.pool, c.id, name).await?;
     // An original's name wins over a size of another file that happens to share it.
     let originals = candidates.iter().any(|f| f.filename == name);
     let anonymous = access.anonymous();
-    // Every published holder of every file with the name before any draft holder: a
-    // replace keeps the name, so an older file a draft holds can share it with the
-    // published one.
+    // Every published holder of every file with the name before any draft holder, or the
+    // other way round with `draft`: a replace or an edit keeps the name, so the draft's
+    // file and the published one can share it.
     let mut held = Vec::new();
     for file in candidates {
         let Some((field, mime)) = served_as(&file, name, originals) else {
@@ -225,7 +228,12 @@ async fn find(
         }
     }
     // Stable, so within each copy files keep their order by ID.
-    held.sort_by_key(|(_, _, _, _, copy)| *copy != DocCopy::Published);
+    let first = if draft {
+        DocCopy::Draft
+    } else {
+        DocCopy::Published
+    };
+    held.sort_by_key(|(_, _, _, _, copy)| *copy != first);
     for (file, field, mime, doc, copy) in held {
         if access.read_copy(&state.pool, c, doc, copy).await?.is_none() {
             continue;
@@ -435,6 +443,9 @@ pub(crate) fn fill_upload_urls(
     let Some(u) = &c.schema.upload else { return };
     let storage = state.media.storages.get(&u.storage);
     let shared = u.filename_compound_index.is_some();
+    // Read as a draft, a document's file is the draft's, which may share its name with the
+    // published one's: its urls ask for the draft's.
+    let draft = access.drafts() && c.schema.drafts();
     let link = |name: &str| -> Value {
         let direct = key
             .zip(storage)
@@ -446,6 +457,7 @@ pub(crate) fn fill_upload_urls(
                     &c.schema.slug,
                     name,
                     shared.then_some(id),
+                    draft,
                 )
             })
             .map_or(Value::Null, Value::String)
@@ -502,8 +514,9 @@ pub(crate) fn fill_upload_urls(
     }
 }
 
-/// `{public_url}/api/{collection}/file/{name}`, with `?id=` when documents may share names.
-fn route_url(base: &str, slug: &str, name: &str, id: Option<Uuid>) -> Option<String> {
+/// `{public_url}/api/{collection}/file/{name}`, with `?id=` when documents may share names
+/// and `?draft=true` for a draft's file.
+fn route_url(base: &str, slug: &str, name: &str, id: Option<Uuid>, draft: bool) -> Option<String> {
     let mut url = Url::parse(base).ok()?;
     url.path_segments_mut()
         .ok()?
@@ -511,6 +524,9 @@ fn route_url(base: &str, slug: &str, name: &str, id: Option<Uuid>) -> Option<Str
         .extend(["api", slug, "file", name]);
     if let Some(id) = id {
         url.query_pairs_mut().append_pair("id", &id.to_string());
+    }
+    if draft {
+        url.query_pairs_mut().append_pair("draft", "true");
     }
     Some(url.into())
 }
@@ -615,12 +631,16 @@ mod tests {
     fn route_urls_encode_the_name() {
         let id = Uuid::nil();
         assert_eq!(
-            route_url("http://localhost:3000", "media", "a b#.png", None).unwrap(),
+            route_url("http://localhost:3000", "media", "a b#.png", None, false).unwrap(),
             "http://localhost:3000/api/media/file/a%20b%23.png"
         );
         assert_eq!(
-            route_url("https://x.test/cms/", "media", "a.png", Some(id)).unwrap(),
+            route_url("https://x.test/cms/", "media", "a.png", Some(id), false).unwrap(),
             format!("https://x.test/cms/api/media/file/a.png?id={id}")
+        );
+        assert_eq!(
+            route_url("https://x.test/", "media", "a.png", Some(id), true).unwrap(),
+            format!("https://x.test/api/media/file/a.png?id={id}&draft=true")
         );
     }
 }

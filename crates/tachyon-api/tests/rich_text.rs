@@ -1429,9 +1429,11 @@ async fn upload_nodes_follow_draft_links(pool: PgPool) {
         res.json["body"].as_str().unwrap().to_owned()
     };
     let draft = format!("/api/pages/{page}?draft=true");
+    // Read as a draft, each file's link asks for the draft's; the route gives the published
+    // file to who can't read it.
     let img = |name: &str| {
         format!(
-            "<img src=\"http://localhost:3000/api/shots/file/{name}\" width=\"4\" height=\"4\" alt=\"{name}\">"
+            "<img src=\"http://localhost:3000/api/shots/file/{name}?draft=true\" width=\"4\" height=\"4\" alt=\"{name}\">"
         )
     };
     assert_eq!(
