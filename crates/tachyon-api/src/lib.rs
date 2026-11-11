@@ -424,8 +424,14 @@ impl Limit {
     /// always comes first. What follows the fetch keeps the rest, as a multipart upload's
     /// processing does.
     pub(crate) fn fetching(&self) -> tokio::time::Instant {
-        self.set(self.last());
+        self.lengthen();
         self.0.arrival + self.0.limits.uploads
+    }
+
+    /// Lets the request run to its last moment: for work an upload's limit is meant for
+    /// (a paste's fetch, a crop's fetch and decode), once the request is authorised.
+    pub(crate) fn lengthen(&self) {
+        self.set(self.last());
     }
 }
 

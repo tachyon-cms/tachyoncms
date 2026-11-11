@@ -125,17 +125,25 @@ async fn post(app: &Router, slug: &str, bytes: &[u8], name: &str) -> Value {
 
 /// The bytes `url` (a full URL) is served with, and the status.
 async fn fetch(app: &Router, url: &Value) -> (StatusCode, Vec<u8>) {
+    let (status, _, body) = fetch_with(app, url).await;
+    (status, body)
+}
+
+/// `fetch`, with the response's headers.
+async fn fetch_with(app: &Router, url: &Value) -> (StatusCode, axum::http::HeaderMap, Vec<u8>) {
     let url = Url::parse(url.as_str().unwrap_or_else(|| panic!("no url: {url}"))).unwrap();
+    let uri = match url.query() {
+        Some(q) => format!("{}?{q}", url.path()),
+        None => url.path().to_owned(),
+    };
     let res = app
         .clone()
-        .oneshot(Request::get(url.path()).body(Body::empty()).unwrap())
+        .oneshot(Request::get(uri).body(Body::empty()).unwrap())
         .await
         .unwrap();
-    let status = res.status();
-    (
-        status,
-        res.into_body().collect().await.unwrap().to_bytes().to_vec(),
-    )
+    let (status, headers) = (res.status(), res.headers().clone());
+    let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, headers, body)
 }
 
 /// The image `url` serves, decoded.
@@ -574,7 +582,9 @@ async fn edits_obey_field_rules(pool: PgPool) {
 }
 
 /// On a collection with drafts, an edit is a draft save: the published copy keeps its file
-/// until the draft is published.
+/// until the draft is published. Read as a draft, the file's urls ask for the draft's, and
+/// the route gives it to who may read drafts; anyone else gets the published file at that
+/// url, exactly as without the parameter.
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn edits_are_draft_saves(pool: PgPool) {
     let d = dirs();
@@ -582,8 +592,8 @@ async fn edits_are_draft_saves(pool: PgPool) {
     collection(
         &app,
         "images",
-        json!(true),
-        json!({"versions": {"drafts": true}}),
+        json!({"imageSizes": [{"name": "s", "width": 20}]}),
+        json!({"versions": {"drafts": true}, "access": {"read": true}}),
     )
     .await;
     let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
@@ -598,13 +608,53 @@ async fn edits_are_draft_saves(pool: PgPool) {
     };
     let (published, _) = files_of().await;
     let crop = json!({"uploadEdits": {"crop": {"x": 0, "y": 0, "width": 50, "height": 40}}});
-    let got = ok(&app, "PATCH", &format!("/api/images/{id}"), Some(crop)).await;
+    let got = ok(
+        &app,
+        "PATCH",
+        &format!("/api/images/{id}?wait=true"),
+        Some(crop),
+    )
+    .await;
     assert_eq!(got["width"], 50);
     let (still, draft) = files_of().await;
     assert_eq!(still, published, "the published copy keeps its file");
     assert_ne!(draft, published);
+    let url = &got["url"];
+    assert_eq!(
+        url,
+        "http://localhost:3000/api/images/file/a.png?draft=true"
+    );
+    let small = &got["sizes"]["s"]["url"];
+    assert!(small.as_str().unwrap().ends_with("?draft=true"), "{small}");
+    // Who may read drafts gets the cropped file, and its size.
+    let image = served(&app, url).await;
+    assert_eq!((image.width(), image.height()), (50, 40));
+    assert_eq!(served(&app, small).await.width(), 20);
+    // Anyone else gets the published file there, with what they'd get without asking.
+    let anonymous = self::app(&pool, &d).await;
+    let plain = json!("http://localhost:3000/api/images/file/a.png");
+    let (status, mut headers, body) = fetch_with(&anonymous, url).await;
+    let (status_without, mut headers_without, body_without) = fetch_with(&anonymous, &plain).await;
+    assert_eq!((status, status_without), (StatusCode::OK, StatusCode::OK));
+    // Every request has its own ID; nothing else may differ.
+    headers.remove("x-request-id");
+    headers_without.remove("x-request-id");
+    assert_eq!(headers, headers_without);
+    assert!(body == body_without, "the same bytes");
+    let image = image::load_from_memory(&body).unwrap();
+    assert_eq!(
+        (image.width(), image.height()),
+        (100, 80),
+        "the published file"
+    );
+    // A read of the published copy links to it plainly.
+    let read = ok(&app, "GET", &format!("/api/images/{id}"), None).await;
+    assert_eq!(read["url"], plain);
+    assert_eq!(read["width"], 100);
     ok(&app, "POST", &format!("/api/images/{id}/publish"), None).await;
     assert_eq!(files_of().await, (draft, draft));
+    let image = served(&anonymous, &plain).await;
+    assert_eq!((image.width(), image.height()), (50, 40), "published now");
 }
 
 /// A write that sends back the focal point it read, after another edit remade the file
@@ -645,4 +695,184 @@ async fn a_stale_focal_point_isnt_written_back(pool: PgPool) {
         (row.focal_x, row.focal_y, row.state.as_str()),
         (20.0, 30.0, "live")
     );
+}
+
+/// Two plain focal writes on a collection without `focalPoint` are only field writes: the
+/// later one wins, with no file to disagree with.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn field_only_focal_writes_dont_conflict(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({"focalPoint": false}), json!({})).await;
+    let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
+    let id: Uuid = doc["id"].as_str().unwrap().parse().unwrap();
+    let one = format!("/api/images/{id}");
+    let pause = tachyon_api::pause_next_update(id);
+    let first = tokio::spawn({
+        let (app, one) = (app.clone(), one.clone());
+        async move { call(&app, "PATCH", &one, json!({"focalX": 10})).await }
+    });
+    pause.reached().await;
+    ok(&app, "PATCH", &one, Some(json!({"focalX": 20}))).await;
+    pause.resume();
+    let res = first.await.unwrap();
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(ok(&app, "GET", &one, None).await["focalX"], 10);
+}
+
+/// A focal write that read the document before another edit remade its file is refused,
+/// even when the file it then finds is that edit's: it would cut sizes around a point the
+/// document doesn't end at.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_focal_edit_racing_another_is_refused(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!(true), json!({})).await;
+    let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
+    let id: Uuid = doc["id"].as_str().unwrap().parse().unwrap();
+    let one = format!("/api/images/{id}");
+    let pause = tachyon_api::pause_next_update(id);
+    let first = tokio::spawn({
+        let (app, one) = (app.clone(), one.clone());
+        async move { call(&app, "PATCH", &one, json!({"focalX": 70})).await }
+    });
+    pause.reached().await;
+    let edits = json!({"uploadEdits": {"focalPoint": {"x": 20, "y": 30}}});
+    ok(&app, "PATCH", &one, Some(edits)).await;
+    let edited = held(&pool, &doc["id"]).await;
+    let rows = count(&pool, "SELECT count(*) FROM files WHERE state <> 'gone'").await;
+    pause.resume();
+    let res = first.await.unwrap();
+    assert_problem(&res, 409);
+    assert_eq!(held(&pool, &doc["id"]).await, edited);
+    let now = ok(&app, "GET", &one, None).await;
+    assert_eq!((&now["focalX"], &now["focalY"]), (&json!(20), &json!(30)));
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM files WHERE state <> 'gone'").await,
+        rows,
+        "the refused write's file is given up"
+    );
+}
+
+/// `uploadEdits` with nothing in it, or beside focal values that aren't numbers, makes
+/// nothing.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn empty_or_bad_edits_make_nothing(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "images",
+        json!({"imageSizes": [{"name": "s", "width": 10}]}),
+        json!({}),
+    )
+    .await;
+    let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
+    let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
+    let file = held(&pool, &doc["id"]).await;
+    let rows = count(&pool, "SELECT count(*) FROM files").await;
+    let jobs = count(
+        &pool,
+        "SELECT count(*) FROM jobs WHERE kind = 'image_sizes'",
+    )
+    .await;
+    let got = ok(
+        &app,
+        "PATCH",
+        &one,
+        Some(json!({"uploadEdits": {}, "alt": "x"})),
+    )
+    .await;
+    assert_eq!(got["alt"], "x");
+    let crop = json!({"x": 0, "y": 0, "width": 10, "height": 10});
+    for (body, path) in [
+        (
+            json!({"focalX": "abc", "uploadEdits": {"crop": crop}}),
+            "focalX",
+        ),
+        (
+            json!({"focalX": 30, "focalY": "abc", "uploadEdits": {"crop": crop}}),
+            "focalY",
+        ),
+        (
+            json!({"focalY": [], "uploadEdits": {"focalPoint": {"x": 1, "y": 1}}}),
+            "focalY",
+        ),
+    ] {
+        let res = call(&app, "PATCH", &one, body).await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], path, "{}", res.json);
+    }
+    assert_eq!(held(&pool, &doc["id"]).await, file);
+    assert_eq!(count(&pool, "SELECT count(*) FROM files").await, rows);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM jobs WHERE kind = 'image_sizes'"
+        )
+        .await,
+        jobs
+    );
+    assert_eq!(ok(&app, "GET", &one, None).await["focalX"], 50);
+}
+
+/// A new file writes what it sets, so field rules on those fields judge it: a rule on
+/// `filename` stops a replacement that renames the file, and a rule on `width` stops a crop,
+/// on update and on create. What a write leaves as it was isn't judged.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn field_rules_cover_what_a_new_file_sets(pool: PgPool) {
+    let d = dirs();
+    let admin = admin(&pool, &d).await;
+    let admins = json!({"role": "admin"});
+    collection(
+        &admin,
+        "named",
+        json!(true),
+        json!({"fields": [{"name": "filename", "type": "text", "access": {"update": admins, "create": admins}}]}),
+    )
+    .await;
+    collection(
+        &admin,
+        "sized",
+        json!(true),
+        json!({"fields": [{"name": "width", "type": "number", "access": {"update": admins}}]}),
+    )
+    .await;
+    let image = png(fixtures::gradient(100, 80));
+    let named = post(&admin, "named", &image, "a.png").await;
+    let sized = post(&admin, "sized", &image, "a.png").await;
+    add_user(&pool, "ed@example.com", "editor").await;
+    let editor = signed_in(app(&pool, &d).await, "ed@example.com").await;
+    let named_one = format!("/api/named/{}", named["id"].as_str().unwrap());
+    let sized_one = format!("/api/sized/{}", sized["id"].as_str().unwrap());
+    let crop = json!({"uploadEdits": {"crop": {"x": 0, "y": 0, "width": 10, "height": 10}}});
+    let rows = count(&pool, "SELECT count(*) FROM files").await;
+
+    // `filename` locked: a renaming replacement and a create with a file are refused.
+    let res = upload(&editor, "PATCH", &named_one, Some(&image), "b.png", None).await;
+    assert_problem(&res, 403);
+    let res = upload(&editor, "POST", "/api/named", Some(&image), "c.png", None).await;
+    assert_problem(&res, 403);
+    // `width` locked: a crop changes it, a focal point alone doesn't.
+    assert_problem(&call(&editor, "PATCH", &sized_one, crop.clone()).await, 403);
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM files").await,
+        rows,
+        "nothing made"
+    );
+    let focal = json!({"uploadEdits": {"focalPoint": {"x": 10, "y": 10}}});
+    ok(&editor, "PATCH", &sized_one, Some(focal)).await;
+    // A crop and a same-name replacement keep `filename`, so its rule doesn't stop them.
+    let got = ok(&editor, "PATCH", &named_one, Some(crop)).await;
+    assert_eq!(
+        (&got["width"], &got["filename"]),
+        (&json!(10), &json!("a.png"))
+    );
+    let res = upload(&editor, "PATCH", &named_one, Some(&image), "a.png", None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["width"], 100);
+    // The Admin the rules allow is judged the same way, and passes.
+    let res = upload(&admin, "PATCH", &named_one, Some(&image), "b.png", None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["filename"], "b.png");
 }

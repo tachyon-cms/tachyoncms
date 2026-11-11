@@ -655,6 +655,23 @@ pub(crate) fn server_fields(u: &Upload, f: &Checked, filename: &str) -> Map<Stri
     out
 }
 
+/// The server-set fields of `fields` (a new file's) whose value differs from `stored`'s, as
+/// a write for the field rules to judge: a write that brings a file writes these. `sizes`
+/// is left out, as it's the server's alone and every new file empties it.
+pub(crate) fn file_writes(
+    fields: Option<&Map<String, Value>>,
+    stored: Option<&Map<String, Value>>,
+) -> Value {
+    let was = |k: &str| stored.and_then(|s| s.get(k)).unwrap_or(&Value::Null);
+    let changed: Map<String, Value> = fields
+        .into_iter()
+        .flatten()
+        .filter(|(k, v)| *k != "sizes" && *v != was(k))
+        .map(|(k, v)| (k.clone(), v.clone()))
+        .collect();
+    Value::Object(changed)
+}
+
 /// `input` with `fields` written over it, for validating what the document will hold.
 pub(crate) fn with_fields(input: &Value, fields: Option<&Map<String, Value>>) -> Value {
     let mut out = input.clone();
@@ -819,6 +836,10 @@ pub(crate) fn take_edits(
         )));
     }
     let edits = UploadEdits::parse(&v).map_err(ApiError::Validation)?;
+    // Asking for nothing is no edit: the patch is judged as if it never came.
+    if edits.crop.is_none() && edits.focal_point.is_none() {
+        return Ok(None);
+    }
     if edits.crop.is_some() && !u.crop {
         return Err(at_edits(
             ".crop",
@@ -845,31 +866,44 @@ fn focal_in(data: &Map<String, Value>) -> (f64, f64) {
 /// the field rules and validation judge it: `uploadEdits.focalPoint`, else what `patch`
 /// sends, else 50/50 for a crop and the stored one otherwise. Without it, only a
 /// collection with `focalPoint` remakes its file for a new focal point, and not when a new
-/// file is sent; a focal value that isn't a number is left for validation to refuse.
+/// file is sent; a focal value that isn't a number is left for validation to refuse. With
+/// it, such a value is a 422 at its key before anything is made, since the edit would
+/// otherwise write over it.
 pub(crate) fn edit_of(
     c: &Collection,
     edits: Option<UploadEdits>,
     patch: &mut Value,
     stored: &Map<String, Value>,
     with_file: bool,
-) -> Option<Edit> {
+) -> Result<Option<Edit>, ApiError> {
     let (Some(u), Value::Object(p)) = (&c.schema.upload, patch) else {
-        return None;
+        return Ok(None);
     };
     // `null` is the default, as on create; `None` inside for a value that isn't a number.
     let sent = |k: &str| p.get(k).map(|v| v.as_f64().or(v.is_null().then_some(50.0)));
     let Some(edits) = edits else {
         let (x, y) = (sent("focalX"), sent("focalY"));
         if !u.focal_point || with_file || x == Some(None) || y == Some(None) {
-            return None;
+            return Ok(None);
         }
         let was = focal_in(stored);
         let now = (x.flatten().unwrap_or(was.0), y.flatten().unwrap_or(was.1));
-        return (now != was).then_some(Edit {
+        return Ok((now != was).then_some(Edit {
             crop: None,
             plain: true,
-        });
+        }));
     };
+    let bad: Vec<FieldError> = ["focalX", "focalY"]
+        .into_iter()
+        .filter(|k| sent(k) == Some(None))
+        .map(|k| FieldError {
+            path: k.into(),
+            message: "expected a number".into(),
+        })
+        .collect();
+    if !bad.is_empty() {
+        return Err(ApiError::Validation(bad));
+    }
     let (x, y) = match edits.focal_point {
         Some(f) => (f.x, f.y),
         None => {
@@ -877,12 +911,8 @@ pub(crate) fn edit_of(
                 Some(_) => (50.0, 50.0),
                 None => focal_in(stored),
             };
-            let pick = |k, b: f64| sent(k).unwrap_or(Some(b));
-            match (pick("focalX", base.0), pick("focalY", base.1)) {
-                (Some(x), Some(y)) => (x, y),
-                // Validation refuses it.
-                _ => base,
-            }
+            let pick = |k, b: f64| sent(k).flatten().unwrap_or(b);
+            (pick("focalX", base.0), pick("focalY", base.1))
         }
     };
     // Whole numbers as integers, as they'd be sent.
@@ -892,23 +922,29 @@ pub(crate) fn edit_of(
     };
     p.insert("focalX".into(), number(x));
     p.insert("focalY".into(), number(y));
-    Some(Edit {
+    Ok(Some(Edit {
         crop: edits.crop,
         plain: false,
-    })
+    }))
 }
 
-/// A 409 when `patch` keeps the focal point `stored` had but the locked document,
-/// `current`, has another: its file was remade for that one meanwhile, and writing the old
-/// values back would leave the document and its file disagreeing.
+/// A 409 when `patch` sends a focal point over `stored` but the locked document, `current`,
+/// has another: its file was remade for that one meanwhile, and writing over it would
+/// leave the document and its file disagreeing. Only where a focal point remakes the file
+/// (`focalPoint` on, an image stored); elsewhere it's a field, and the last write wins.
 pub(crate) fn focal_moved(
     c: &Collection,
     patch: &Value,
     stored: &Map<String, Value>,
     current: &Map<String, Value>,
 ) -> Result<(), ApiError> {
+    let remakes = c.schema.upload.as_ref().is_some_and(|u| u.focal_point)
+        && stored
+            .get("mimeType")
+            .and_then(Value::as_str)
+            .is_some_and(|m| picture::size_format(m).is_some());
     let sends = patch.get("focalX").is_some() || patch.get("focalY").is_some();
-    if c.schema.upload.is_some() && sends && focal_in(stored) != focal_in(current) {
+    if remakes && sends && focal_in(stored) != focal_in(current) {
         return Err(gone_meanwhile());
     }
     Ok(())
@@ -925,6 +961,7 @@ pub(crate) async fn edited(
     id: Uuid,
     copy: DocCopy,
     e: &Edit,
+    limit: Option<&crate::Limit>,
 ) -> Result<Option<Checked>, ApiError> {
     let none = |message: &str| match e.plain {
         true => Ok(None),
@@ -963,6 +1000,11 @@ pub(crate) async fn edited(
     let storage = state.media.storages.get(&row.storage).ok_or_else(|| {
         ApiError::Internal(format!("no storage named `{}` is configured", row.storage))
     })?;
+    // Every check is behind it: fetching and cutting the original gets the time an upload
+    // does, as a pasted URL's fetch does.
+    if let Some(limit) = limit {
+        limit.lengthen();
+    }
     let spool = fetch_spool(storage, &row.key, &state.media.temp_dir, &row.filename).await?;
     let crop_refused = |e: ImageError| match e {
         ImageError::Internal(what) => ApiError::Internal(what),

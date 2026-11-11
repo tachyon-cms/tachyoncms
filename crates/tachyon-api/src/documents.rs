@@ -34,9 +34,9 @@ use crate::populate::{
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
-    UploadBody, check_and_process, edit_of, edited, file_limit, focal_moved, focal_of, persist,
-    require_file, scope_of, server_fields, settle_server_set, take_edits, taken_or_abandoned,
-    with_fields,
+    UploadBody, check_and_process, edit_of, edited, file_limit, file_writes, focal_moved, focal_of,
+    persist, require_file, scope_of, server_fields, settle_server_set, take_edits,
+    taken_or_abandoned, with_fields,
 };
 use crate::{ApiError, AppState};
 
@@ -285,6 +285,8 @@ pub async fn create(
     let targets = link_targets(&state, &c).await?;
     // Checked as the document will be, server-set fields and all, before anything is stored.
     let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
+    // The file is written too: field rules on what it sets apply to it.
+    access.writes(&c, &file_writes(would.as_ref(), None), Action::Create, None)?;
     let input = with_fields(&body, would.as_ref());
     let mut prepared = validate_document_in(mode_for(copy), c.schema.data(), &input, None)
         .map_err(ApiError::Validation)
@@ -500,6 +502,7 @@ pub async fn update(
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
     let stored = documents::get(&state.pool, c.id, id, copy).await?.data.0;
+    paused(id).await;
     // Server-set fields are only compared, here and again against the locked document, and
     // never written from the patch: the stored ones, or the new file's, stay.
     let settle = |current: &Map<String, Value>| {
@@ -509,7 +512,7 @@ pub async fn update(
     let mut patch = settle(&stored)?;
     // The focal point an edit ends at is written into the patch, for the field rules and
     // validation to judge like any other value.
-    let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some());
+    let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some())?;
     from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     // Decoded only once the write is allowed. An edit makes its new file as a replacement
@@ -519,7 +522,9 @@ pub async fn update(
             let spool = file.spool(&state, u).await?;
             Some((u, check_and_process(&state, u, spool).await?))
         }
-        (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e).await?.map(|f| (u, f)),
+        (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e, deadline.limit.as_ref())
+            .await?
+            .map(|f| (u, f)),
         _ => None,
     };
     let targets = link_targets(&state, &c).await?;
@@ -528,6 +533,9 @@ pub async fn update(
     let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
         settle(current)?;
         access.writes(&c, &patch, Action::Update, Some(current))?;
+        // A new file writes what it sets: the field rules judge what changes.
+        let file = file_writes(fields, Some(current));
+        access.writes(&c, &file, Action::Update, Some(current))?;
         let input = with_fields(&patch, fields);
         let mut next = validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))
             .map_err(ApiError::Validation)
@@ -551,7 +559,6 @@ pub async fn update(
         }
         None => None,
     };
-    paused(id).await;
     let (doc, sizes) = taken_or_abandoned(&state, saved.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         let doc = documents::update_in(
@@ -567,10 +574,13 @@ pub async fn update(
                 vouched_links(&next, &link_ids(&c, current), &vouched)?;
                 let from = checked.as_ref().and_then(|(_, f)| f.edits);
                 next.file = match (&saved, from) {
-                    (Some(s), Some(from)) => FileChange::Edit {
-                        from,
-                        to: s.file.id,
-                    },
+                    (Some(s), Some(from)) => {
+                        focal_moved(&c, &patch, &stored, current)?;
+                        FileChange::Edit {
+                            from,
+                            to: s.file.id,
+                        }
+                    }
                     (Some(s), None) => FileChange::Set(s.file.id),
                     (None, _) => {
                         focal_moved(&c, &patch, &stored, current)?;
@@ -620,7 +630,7 @@ pub struct Pause {
 }
 
 impl Pause {
-    /// Waits until the update has read its document and is about to lock it.
+    /// Waits until the update has read its stored document.
     pub async fn reached(&self) {
         self.reached.notified().await;
     }
@@ -630,7 +640,8 @@ impl Pause {
     }
 }
 
-/// Pauses the next update of document `id`, after its checks and before its lock.
+/// Pauses the next update of document `id`, just after it reads the stored document and
+/// before anything that follows: its checks, its file's work and its lock.
 #[doc(hidden)]
 pub fn pause_next_update(id: Uuid) -> Arc<Pause> {
     let pause = Arc::new(Pause::default());
