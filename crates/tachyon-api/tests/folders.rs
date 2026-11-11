@@ -1621,3 +1621,100 @@ async fn folders_on_keeps_stored_folders(pool: PgPool) {
     .await;
     assert_eq!(res.status, 200, "unchanged is no change: {}", res.json);
 }
+
+/// A move writes each copy holding the link, so each is judged by the rules against itself:
+/// the live copy as it's live, the draft as it's drafted. Either one failing refuses the
+/// whole move, for update rules and, in the trash, delete rules alike.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn each_copy_is_judged_as_itself(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    let ok_only = json!({"title": {"equals": "ok"}});
+    schema(
+        &app,
+        json!({"slug": "posts", "folders": true, "versions": {"drafts": true},
+               "access": {"update": ok_only},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "notes", "folders": true, "versions": {"drafts": true},
+               "access": {"delete": ok_only},
+               "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    let editor = as_role(&pool, &d, "editor@example.com", "editor").await;
+    // A document filed in a new folder, live as `live` and drafted as `draft`.
+    let filed = |slug: &'static str, live: &'static str, draft: &'static str, trash: bool| {
+        let app = app.clone();
+        async move {
+            let f = folder(&app, "F", None, &[]).await;
+            let p = id(&ok(
+                &app,
+                "POST",
+                &format!("/api/{slug}"),
+                json!({"title": live, "folder": f}),
+            )
+            .await);
+            ok(
+                &app,
+                "POST",
+                &format!("/api/{slug}/{p}/publish"),
+                Value::Null,
+            )
+            .await;
+            ok(
+                &app,
+                "PATCH",
+                &format!("/api/{slug}/{p}"),
+                json!({"title": draft}),
+            )
+            .await;
+            if trash {
+                ok(&app, "DELETE", &format!("/api/{slug}/{p}"), Value::Null).await;
+            }
+            (f, p)
+        }
+    };
+    let held = |p: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, (Option<String>, Option<String>)>(
+                "SELECT published ->> 'folder', draft ->> 'folder' FROM documents WHERE id = $1",
+            )
+            .bind(p.parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    for (slug, trash) in [("posts", false), ("notes", true)] {
+        for (live, draft, moves) in [
+            ("ok", "bad", false),
+            ("bad", "ok", false),
+            ("ok", "ok", true),
+        ] {
+            let (f, p) = filed(slug, live, draft, trash).await;
+            let res = call(
+                &editor,
+                "DELETE",
+                &format!("/api/folders/{f}?moveContentsTo=root"),
+                Value::Null,
+            )
+            .await;
+            let case = format!("{slug}: live {live}, draft {draft}");
+            if moves {
+                assert_eq!(res.status, 204, "{case}: {}", res.json);
+                assert_eq!(held(p).await, (None, None), "{case}");
+            } else {
+                assert_problem(&res, 403);
+                assert_eq!(
+                    held(p).await,
+                    (Some(f.clone()), Some(f)),
+                    "{case}: nothing moved"
+                );
+            }
+        }
+    }
+}

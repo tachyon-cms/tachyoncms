@@ -196,6 +196,9 @@ async fn move_one(
             Compiled::Filter(f) => guard = both(guard, Some(f)),
         }
     }
+    // Each copy holding the link is its own item, and `update_any_in` judges the guard on
+    // that copy as it's stored: the live rewrite by the live copy, the draft's by the draft.
+    // Both run in the move's transaction, so either refusing moves nothing.
     let patch = json!({ "folder": to });
     let doc = documents::update_any_in(
         tx,
