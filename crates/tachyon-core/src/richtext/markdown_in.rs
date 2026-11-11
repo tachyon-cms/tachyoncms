@@ -282,9 +282,10 @@ impl<'s, 'k> Reader<'s, 'k> {
         let mut found = Vec::new();
         for (n, &start) in self.starts.iter().enumerate() {
             let end = self.starts.get(n + 1).copied().unwrap_or(self.src.len());
-            let Some(at) = directive_at(&self.src[start..end]).map(|i| start + i) else {
+            let Some((offset, _)) = directive_at(&self.src[start..end]) else {
                 continue;
             };
+            let at = start + offset;
             let colons = out[at..].iter().take_while(|&&b| b == b':').count();
             out[at] = b'#';
             out[at + 1..at + colons].fill(b' ');
@@ -323,10 +324,15 @@ impl<'s, 'k> Reader<'s, 'k> {
             self.event(event, line)?;
         }
         if let Some(&line) = self.directives.keys().min() {
-            return Err((
-                line,
-                "a directive must start its own line, indented less than four spaces".into(),
-            ));
+            let src_line = self.src.lines().nth(line - 1).unwrap_or("");
+            let in_list = directive_at(src_line).is_some_and(|(_, listed)| listed);
+            let msg = if in_list {
+                "a directive can't sit inside a list item; put it on its own line, outside the list"
+                    .to_string()
+            } else {
+                "a directive must start its own line, indented less than four spaces".to_string()
+            };
+            return Err((line, msg));
         }
         if let Some(Frame {
             line,
@@ -927,8 +933,8 @@ fn list(
 }
 
 /// Where a line's directive starts, past any quote markers, list markers and task boxes,
-/// however many: the first of at least two colons.
-fn directive_at(line: &str) -> Option<usize> {
+/// plus whether the line has a list marker.
+fn directive_at(line: &str) -> Option<(usize, bool)> {
     let b = line.as_bytes();
     let skip = |mut i: usize| {
         while b.get(i).is_some_and(|c| b" \t>".contains(c)) {
@@ -948,7 +954,11 @@ fn directive_at(line: &str) -> Option<usize> {
         let marker = match b.get(i) {
             Some(b'-' | b'+' | b'*') => 1,
             _ if listed && boxed => 3,
-            _ if digits > 0 && b.get(i + digits).is_some_and(|c| b".)".contains(c)) => digits + 1,
+            _ if (1..=9).contains(&digits)
+                && b.get(i + digits).is_some_and(|c| b".)".contains(c)) =>
+            {
+                digits + 1
+            }
             _ => 0,
         };
         match b.get(i + marker) {
@@ -957,7 +967,7 @@ fn directive_at(line: &str) -> Option<usize> {
         }
         listed = true;
     }
-    b[i..].starts_with(b"::").then_some(i)
+    b[i..].starts_with(b"::").then_some((i, listed))
 }
 
 /// `{key="value" …}`: values double-quoted, with `\\`, `\"`, `\n` and `\r` escaped, as
@@ -1345,6 +1355,21 @@ mod tests {
                 "",
                 "line 2: a directive must start its own line, indented less than four spaces"
                     .into(),
+            ),
+            // #49: the directive sits inside a task item, so it never reaches the parser
+            // as a block; the message names the list rather than claiming the line isn't
+            // the directive's own.
+            (
+                &b,
+                "- [ ] ::video{url=\"x\"}",
+                "",
+                "line 1: a directive can't sit inside a list item; put it on its own line, outside the list".into(),
+            ),
+            (
+                &b,
+                "* [x] ::video{url=\"x\"}",
+                "",
+                "line 1: a directive can't sit inside a list item; put it on its own line, outside the list".into(),
             ),
             (
                 &b,
