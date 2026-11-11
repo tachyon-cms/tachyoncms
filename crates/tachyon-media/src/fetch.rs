@@ -88,6 +88,9 @@ impl SafeFetch {
                 .no_brotli()
                 .no_deflate()
                 .no_zstd()
+                // One fetch per paste: an idle socket kept per host would only hold a file
+                // descriptor, for as many hosts as a caller can name.
+                .pool_max_idle_per_host(0)
                 .dns_resolver(r)
                 .build()
                 .map_err(|e| format!("can't set up the URL fetch client: {e}"))
