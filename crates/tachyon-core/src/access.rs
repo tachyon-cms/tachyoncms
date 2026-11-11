@@ -654,7 +654,7 @@ fn inside(f: &Field) -> Vec<&[Field]> {
         kind => kind
             .node_types()
             .into_iter()
-            .map(|(_, fields)| fields)
+            .map(|(_, _, fields)| fields)
             .collect(),
     }
 }
@@ -866,10 +866,10 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
         // Block and upload nodes, wherever they sit in the text, are stripped as block
         // rows are.
         if let (FieldKind::RichText { .. }, Some(text)) = (&v.kind, doc.get_mut(&f.name)) {
-            crate::richtext::field_nodes_mut(text, &mut |key, attrs| match f
+            crate::richtext::field_nodes_mut(text, &mut |upload, key, attrs| match f
                 .kind
-                .node_type(key)
-                .zip(v.kind.node_type(key))
+                .node_type(upload, key)
+                .zip(v.kind.node_type(upload, key))
             {
                 Some((all, kept)) => {
                     if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
@@ -877,7 +877,7 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
                     }
                 }
                 None => {
-                    let own = crate::richtext::node_own_keys(key);
+                    let own = crate::richtext::node_own_keys(upload);
                     attrs.retain(|k, _| own.contains(&k.as_str()))
                 }
             });
@@ -995,10 +995,12 @@ fn walk(
                 .and_then(crate::richtext::node_type_key);
             level = peers
                 .iter()
-                .flat_map(|f| match key.as_deref().and_then(|k| f.kind.node_type(k)) {
-                    Some(fields) => vec![fields],
-                    None => inside(f),
-                })
+                .flat_map(
+                    |f| match key.as_ref().and_then(|(u, k)| f.kind.node_type(*u, k)) {
+                        Some(fields) => vec![fields],
+                        None => inside(f),
+                    },
+                )
                 .collect();
             value = (false, false);
             if rest.is_empty() {
@@ -1190,32 +1192,32 @@ pub fn unwritable(
             }
             // Block and upload nodes, wherever they sit, as block rows.
             FieldKind::RichText { .. } => {
-                let nodes = |values: &[&'v Value]| -> Vec<(String, &'v Map<String, Value>)> {
+                type Nodes<'v> = Vec<(bool, String, &'v Map<String, Value>)>;
+                let nodes = |values: &[&'v Value]| -> Nodes<'v> {
                     values
                         .iter()
                         .flat_map(|v| crate::richtext::field_nodes(v))
                         .collect()
                 };
-                // The `fields` of the nodes of type `key`.
-                let of_key = |nodes: &[(String, &'v Map<String, Value>)], key: &str| {
+                // The `fields` of the nodes of type `key`, upload nodes if `upload`.
+                let of_key = |nodes: &Nodes<'v>, upload: bool, key: &str| {
                     nodes
                         .iter()
-                        .filter(|(k, _)| k == key)
-                        .filter_map(|(_, attrs)| attrs.get("fields"))
+                        .filter(|(u, k, _)| *u == upload && k == key)
+                        .filter_map(|(_, _, attrs)| attrs.get("fields"))
                         .collect::<Vec<&'v Value>>()
                 };
                 let (sent, stored) = (nodes(sent), stored.map(nodes));
-                for (key, fields) in f.kind.node_types() {
+                for (upload, key, fields) in f.kind.node_types() {
                     let (mine, held) = (
-                        of_key(&sent, &key),
-                        stored.as_deref().map(|s| of_key(s, &key)),
+                        of_key(&sent, upload, &key),
+                        stored.as_ref().map(|s| of_key(s, upload, &key)),
                     );
                     // Counted by node, not by `fields`: a node holding none still replaces
                     // what one of its type held.
-                    let none = |nodes: &[(String, &Map<String, Value>)]| {
-                        !nodes.iter().any(|(k, _)| *k == key)
-                    };
-                    if stored.as_deref().is_some_and(none) && none(&sent) {
+                    let none =
+                        |nodes: &Nodes| !nodes.iter().any(|(u, k, _)| *u == upload && *k == key);
+                    if stored.as_ref().is_some_and(none) && none(&sent) {
                         continue;
                     }
                     replaced(fields, &mine, held.as_deref(), path, action, caller, out);
@@ -1279,8 +1281,8 @@ pub fn unwritable(
                     }
                 }
                 (FieldKind::RichText { .. }, text) => {
-                    for (key, attrs) in crate::richtext::field_nodes(text) {
-                        let fields = f.kind.node_type(&key).unwrap_or(&[]);
+                    for (upload, key, attrs) in crate::richtext::field_nodes(text) {
+                        let fields = f.kind.node_type(upload, &key).unwrap_or(&[]);
                         if let Some(Value::Object(sent)) = attrs.get("fields") {
                             walk(fields, sent, None, &path, action, caller, out);
                         }
@@ -1974,6 +1976,46 @@ mod tests {
         assert_eq!(created(json!({"caption": "c"})), ["body.caption"]);
         assert_eq!(created(json!({"meta": {"x": "x"}})), ["body.meta.x"]);
         assert!(created(json!({"credit": "c"})).is_empty());
+    }
+
+    #[test]
+    fn a_block_type_starting_with_at_is_no_upload_node() {
+        let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media"],
+            "blocks": [{"slug": "hero", "fields": [{"name": "credit", "type": "text", "access": ed}]}],
+            "upload": {"collections": {"media": {"fields": [
+                {"name": "caption", "type": "text", "access": ed},
+                {"name": "credit", "type": "text"}
+            ]}}}}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let viewer = signed_in("viewer");
+        // The node's type says block, so `@media` is an unknown block type, whatever it reads.
+        let doc = json!({"body": {"type": "doc", "content": [{"type": "block", "attrs": {
+            "id": "b1", "blockType": "@media", "fields": {"caption": "c", "credit": "ann"}}}]}});
+        let doc = doc.as_object().unwrap();
+
+        let mut read = doc.clone();
+        strip_unreadable(s.data(), &mut read, &viewer);
+        assert_eq!(
+            read["body"]["content"][0]["attrs"],
+            json!({"id": "b1", "blockType": "@media"})
+        );
+
+        // Unknown, so every node type's `credit` answers, and hero's is hidden.
+        let hidden = FieldError {
+            path: "body.content.0.attrs.fields.credit".into(),
+            message: "is required".into(),
+        };
+        let errors = visible_errors(s.data(), vec![hidden], &viewer, Some(doc));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "");
+
+        // No node type's fields, so not media's `caption`, sent or replaced.
+        assert!(unwritable(&s.fields, doc, Action::Create, &viewer, None).is_empty());
+        assert!(unwritable(&s.fields, doc, Action::Update, &viewer, Some(doc)).is_empty());
     }
 
     #[test]

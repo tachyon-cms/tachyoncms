@@ -165,10 +165,10 @@ fn each_node_at(
             each_node_at(child, kind, &join(path, &format!("content.{i}")), f);
         }
     }
-    if let Some(key) = super::node_type_key(obj)
+    if let Some((upload, key)) = super::node_type_key(obj)
         && let Some(Value::Object(attrs)) = obj.get_mut("attrs")
     {
-        let defs = kind.node_type(&key).unwrap_or(&[]);
+        let defs = kind.node_type(upload, &key).unwrap_or(&[]);
         if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
             for (name, text) in fields.iter_mut() {
                 if let Some(def) = defs.iter().find(|d| d.name == *name)

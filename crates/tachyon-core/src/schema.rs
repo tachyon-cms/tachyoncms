@@ -707,7 +707,7 @@ pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
                 .kind
                 .node_types()
                 .iter()
-                .any(|(_, fields)| has_layout(fields)),
+                .any(|(_, _, fields)| has_layout(fields)),
             kind => kind.is_layout(),
         })
     }
@@ -1344,15 +1344,16 @@ impl FieldKind {
         }
     }
 
-    /// The kinds of row or node that hold fields of their own, each with its key: a
-    /// `blocks` or rich text field's block types by slug, then a rich text field's upload
-    /// nodes by `upload_node_key` (`@media`). A shared block not expanded has none.
-    pub fn node_types(&self) -> Vec<(Cow<'_, str>, &[Field])> {
+    /// The kinds of row or node that hold fields of their own, each with whether it's an
+    /// upload node and its key: a `blocks` or rich text field's block types by slug, then a
+    /// rich text field's upload nodes by `upload_node_key` (`@media`). A shared block not
+    /// expanded has none.
+    pub fn node_types(&self) -> Vec<(bool, Cow<'_, str>, &[Field])> {
         let blocks = self
             .block_sources()
             .iter()
             .filter_map(BlockSource::def)
-            .map(|b| (Cow::Borrowed(b.slug.as_str()), b.fields.as_slice()));
+            .map(|b| (false, Cow::Borrowed(b.slug.as_str()), b.fields.as_slice()));
         let uploads = match self {
             Self::RichText {
                 upload: Some(u), ..
@@ -1362,7 +1363,7 @@ impl FieldKind {
         let uploads = uploads
             .into_iter()
             .flatten()
-            .map(|(c, n)| (Cow::Owned(upload_node_key(c)), n.fields.as_slice()));
+            .map(|(c, n)| (true, Cow::Owned(upload_node_key(c)), n.fields.as_slice()));
         blocks.chain(uploads).collect()
     }
 
@@ -1390,12 +1391,25 @@ impl FieldKind {
         }
     }
 
-    /// The fields of the node type `key` names, as `node_types` keys them.
-    pub fn node_type(&self, key: &str) -> Option<&[Field]> {
-        match key.strip_prefix('@') {
-            Some(c) => self.upload_node(c).map(|n| n.fields.as_slice()),
-            None => self.block(key).map(|b| b.fields.as_slice()),
+    /// The fields of the node type `key` names, as `node_types` keys them, among the upload
+    /// nodes if `upload` and the block types if not. The node's kind decides, never its key.
+    pub fn node_type(&self, upload: bool, key: &str) -> Option<&[Field]> {
+        match upload {
+            true => key
+                .strip_prefix('@')
+                .and_then(|c| self.upload_node(c))
+                .map(|n| n.fields.as_slice()),
+            false => self.block(key).map(|b| b.fields.as_slice()),
         }
+    }
+
+    /// The node type a schema path's segment `key` names (`layout.hero`, `body.@media`), with
+    /// whether it's an upload node. The schema's own keys decide, since no block slug can be
+    /// an upload node's key.
+    pub fn node_type_at(&self, key: &str) -> Option<(bool, &[Field])> {
+        [false, true]
+            .into_iter()
+            .find_map(|upload| self.node_type(upload, key).map(|f| (upload, f)))
     }
 
     /// The collections this field links to as upload links: an upload field's targets, or
@@ -2484,7 +2498,7 @@ fn fields_at<'a>(fields: &'a [Field], path: &str) -> Vec<&'a Field> {
             .kind
             .node_types()
             .into_iter()
-            .flat_map(|(_, fields)| fields_at(fields, rest))
+            .flat_map(|(_, _, fields)| fields_at(fields, rest))
             .collect(),
         _ => Vec::new(),
     }
@@ -2516,8 +2530,8 @@ fn field_steps<'a>(
             f.kind
                 .node_types()
                 .into_iter()
-                .filter(|(key, _)| only.is_none_or(|k| k == key))
-                .find_map(|(_, fields)| field_steps(fields, rest, &here, within))?
+                .filter(|(_, key, _)| only.is_none_or(|k| k == key))
+                .find_map(|(_, _, fields)| field_steps(fields, rest, &here, within))?
         }
         _ => return None,
     };
@@ -3327,7 +3341,7 @@ mod tests {
             .unwrap();
         assert_eq!(placed, [("b.@media.layout".to_owned(), "cta".to_owned())]);
         let data = expanded.data();
-        let fields = &data[0].kind.node_type("@media").unwrap();
+        let fields = &data[0].kind.node_type(true, "@media").unwrap();
         // The row dissolves; the shared block is in place, its condition named from the top.
         assert_eq!(
             fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),

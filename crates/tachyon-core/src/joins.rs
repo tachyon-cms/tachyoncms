@@ -39,7 +39,7 @@ fn pattern(fields: &[Field], path: &str) -> Option<String> {
                 .kind
                 .node_types()
                 .into_iter()
-                .filter_map(|(_, fields)| pattern(fields, rest))
+                .filter_map(|(_, _, fields)| pattern(fields, rest))
             {
                 if !shapes.contains(&shape) {
                     shapes.push(shape);

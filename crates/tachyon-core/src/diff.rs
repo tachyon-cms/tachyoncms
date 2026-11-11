@@ -301,22 +301,18 @@ fn compare(
                     });
                 }
                 let (a, b) = (o.kind.node_types(), n.kind.node_types());
-                let what = |key: &str| {
-                    if key.starts_with('@') {
-                        "upload"
-                    } else {
-                        "block"
-                    }
-                };
-                for (key, old_fields) in &a {
+                let what = |upload: bool| if upload { "upload" } else { "block" };
+                for (upload, key, old_fields) in &a {
                     let old_type_path = join(&old_path, key);
                     let new_type_path = join(&new_path, key);
-                    let Some((_, new_fields)) = b.iter().find(|(k, _)| k == key) else {
+                    let Some((_, _, new_fields)) =
+                        b.iter().find(|(u, k, _)| u == upload && k == key)
+                    else {
                         // Rows of this type are kept as they are, so validation counts the
                         // documents still using it.
                         out.push(Change::Removed {
                             path: old_type_path,
-                            kind: what(key),
+                            kind: what(*upload),
                         });
                         continue;
                     };
@@ -336,10 +332,13 @@ fn compare(
                         links,
                     )?;
                 }
-                for (key, _) in b.iter().filter(|(k, _)| !a.iter().any(|(ok, _)| ok == k)) {
+                for (upload, key, _) in b
+                    .iter()
+                    .filter(|(u, k, _)| !a.iter().any(|(ou, ok, _)| ou == u && ok == k))
+                {
                     out.push(Change::Added {
                         path: join(&new_path, key),
-                        kind: what(key),
+                        kind: what(*upload),
                     });
                 }
             }
@@ -446,7 +445,7 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
             FieldKind::Blocks { .. } | FieldKind::RichText { .. } => match segments.next() {
                 Some(key) => {
                     found = None;
-                    f.kind.node_type(key)?
+                    f.kind.node_type_at(key)?.1
                 }
                 None => &[],
             },
@@ -456,11 +455,17 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     found
 }
 
-/// Calls `f` on the fields of each block or upload node of type `key` (`node_types`) in
-/// rich text `text`.
-fn for_nodes_of(text: &mut Value, key: &str, f: &mut impl FnMut(&mut Map<String, Value>)) {
-    crate::richtext::field_nodes_mut(text, &mut |k, attrs| {
-        if k == key
+/// Calls `f` on the fields of each block or upload node (`upload`) of type `key`
+/// (`node_types`) in rich text `text`.
+fn for_nodes_of(
+    text: &mut Value,
+    upload: bool,
+    key: &str,
+    f: &mut impl FnMut(&mut Map<String, Value>),
+) {
+    crate::richtext::field_nodes_mut(text, &mut |u, k, attrs| {
+        if u == upload
+            && k == key
             && let Some(Value::Object(fields)) = attrs.get_mut("fields")
         {
             f(fields);
@@ -643,11 +648,11 @@ fn rename_batch(
                 }
                 (kind @ FieldKind::RichText { .. }, Some(text)) => {
                     let [key, rest @ ..] = rest else { return };
-                    let Some(fields) = kind.node_type(key) else {
+                    let Some((upload, fields)) = kind.node_type_at(key) else {
                         return;
                     };
                     let type_path = join(&old_path, key);
-                    for_nodes_of(text, key, &mut |inner| {
+                    for_nodes_of(text, upload, key, &mut |inner| {
                         rename_batch(inner, fields, rest, &type_path, renames, batch)
                     });
                 }
@@ -740,11 +745,11 @@ fn relink_at(
                     let [key, rest @ ..] = rest else {
                         return false;
                     };
-                    let Some(fields) = kind.node_type(key) else {
+                    let Some((upload, fields)) = kind.node_type_at(key) else {
                         return false;
                     };
                     let mut dropped = false;
-                    for_nodes_of(text, key, &mut |inner| {
+                    for_nodes_of(text, upload, key, &mut |inner| {
                         dropped |= relink_at(fields, inner, rest, change)
                     });
                     dropped
@@ -828,8 +833,8 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
             }
             // So is a block or upload node; its fields are pruned like a row's.
             (kind @ FieldKind::RichText { .. }, Some(text)) => {
-                crate::richtext::field_nodes_mut(text, &mut |key, attrs| {
-                    let Some(fields) = kind.node_type(key) else {
+                crate::richtext::field_nodes_mut(text, &mut |upload, key, attrs| {
+                    let Some(fields) = kind.node_type(upload, key) else {
                         return;
                     };
                     if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
