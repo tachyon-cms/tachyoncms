@@ -336,7 +336,9 @@ pub async fn create(
 }
 
 /// What ends a `?wait`: its own cap (`Deadline`, the normal limit for a signed-out
-/// caller), and the request's live limit, which a fetch moves. Read when the wait starts.
+/// caller), or the request's live limit if that's earlier. It never is today; it's read
+/// so a change that lowers the limit again still ends the wait in time. Read when the wait
+/// starts.
 struct WaitEnd {
     cap: Option<tokio::time::Instant>,
     limit: Option<crate::Limit>,
@@ -349,6 +351,15 @@ impl WaitEnd {
             (Some(a), Some(b)) => Some(a.min(b)),
             (a, b) => a.or(b),
         }
+    }
+
+    /// When the wait gives up: a second before `now`, or 29 s from now without a limit (a
+    /// router built without one).
+    fn ends(&self) -> tokio::time::Instant {
+        let at = self
+            .now()
+            .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30));
+        at - std::time::Duration::from_secs(1)
     }
 }
 
@@ -374,11 +385,7 @@ async fn waited(
 ) -> Document {
     const EVERY: std::time::Duration = std::time::Duration::from_millis(200);
     let Some(job) = sizes else { return doc };
-    // Without a time limit on the request (a router built without one), 30 s at most.
-    let deadline = deadline
-        .now()
-        .unwrap_or_else(|| tokio::time::Instant::now() + std::time::Duration::from_secs(30));
-    let until = Some(deadline - std::time::Duration::from_secs(1));
+    let until = Some(deadline.ends());
     loop {
         match jobs::status(&state.pool, job).await {
             Ok(Some(s)) if !matches!(s.state.as_str(), "queued" | "running") => break,
@@ -668,4 +675,37 @@ pub async fn references(
         });
     }
     Ok(Json(json!({ "docs": refs })))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::time::Instant;
+
+    /// A live limit lowered below the wait's cap still ends the wait, a second before it.
+    #[tokio::test]
+    async fn a_lowered_limit_ends_the_wait() {
+        let now = Instant::now();
+        let limits = crate::TimeLimits {
+            normal: Duration::from_secs(30),
+            uploads: Duration::from_secs(600),
+        };
+        let limit = crate::Limit::new(now, now + limits.uploads, limits);
+        let end = WaitEnd {
+            cap: Some(now + Duration::from_secs(600)),
+            limit: Some(limit.clone()),
+        };
+        assert_eq!(
+            end.ends(),
+            now + Duration::from_secs(599),
+            "the cap, less a second"
+        );
+        limit.set(now + Duration::from_secs(20));
+        assert_eq!(
+            end.ends(),
+            now + Duration::from_secs(19),
+            "the live limit, less a second"
+        );
+    }
 }

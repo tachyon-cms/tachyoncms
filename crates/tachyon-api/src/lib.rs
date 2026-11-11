@@ -659,7 +659,7 @@ mod tests {
     /// limit: the fetch gets until arrival + `timeout`, so a slow upstream is its 422, not
     /// the request's 503, and what follows the fetch has the rest of the bound, as a
     /// multipart upload has. Each route is a collection: `on` fetches and then works 10 ms,
-    /// `work` works 300 ms after its fetch, inside the bound, `long` 700 ms, past it,
+    /// `work` works 1 s after its fetch, inside the bound, `long` 3 s, past it,
     /// `off` takes no URLs, `refused` is turned away before the fetch (as a field-write
     /// refusal is), `slow` fetches from a server too slow.
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -672,8 +672,9 @@ mod tests {
             .tempdir()
             .unwrap();
         let limits = TimeLimits {
-            normal: Duration::from_millis(100),
-            uploads: Duration::from_millis(500),
+            // Every outcome is at least 400 ms from its edge, for loaded runners.
+            normal: Duration::from_millis(500),
+            uploads: Duration::from_millis(2_000),
         };
         let state = AppState {
             pool: pool.clone(),
@@ -689,8 +690,8 @@ mod tests {
         };
         let fast = serve(|_| vec![response("200 OK", &["Content-Length: 2"], b"hi")]).await;
         let slow = serve(|_| {
-            let mut pieces = vec![response("200 OK", &["Content-Length: 20"], b"a")];
-            pieces.extend((0..19).map(|_| b"a".to_vec()));
+            let mut pieces = vec![response("200 OK", &["Content-Length: 30"], b"a")];
+            pieces.extend((0..29).map(|_| b"a".to_vec()));
             pieces
         })
         .await;
@@ -710,18 +711,18 @@ mod tests {
                 let work = |ms| tokio::time::sleep(Duration::from_millis(ms));
                 let body = uploads::UploadBody::read(req, Some(1_000), &state.media.temp_dir).await;
                 let Ok(uploads::UploadBody::Upload { file, .. }) = body else {
-                    work(300).await;
+                    work(1_000).await;
                     return "not pasted".into_response();
                 };
                 if route == "refused" {
-                    work(300).await;
+                    work(1_000).await;
                     return ApiError::Forbidden("no".into()).into_response();
                 }
                 match file.spool(&state, &u).await {
                     Ok(_) => {
                         let ms = match route.as_str() {
-                            "work" => 300,
-                            "long" => 700,
+                            "work" => 1_000,
+                            "long" => 3_000,
                             _ => 10,
                         };
                         work(ms).await;
@@ -729,7 +730,7 @@ mod tests {
                     }
                     Err(e) if route == "slow" => e.into_response(),
                     Err(e) => {
-                        work(300).await;
+                        work(1_000).await;
                         e.into_response()
                     }
                 }
@@ -782,7 +783,7 @@ mod tests {
         // fetch's 422 comes by arrival + `timeout`, not a whole `timeout` after it starts.
         let body = part(slow).into_bytes();
         let (head, rest) = body.split_at(10);
-        let pieces = vec![(0, head.to_vec()), (350, rest.to_vec())];
+        let pieces = vec![(0, head.to_vec()), (1_400, rest.to_vec())];
         let dripped = futures_util::stream::iter(pieces).then(|(ms, bytes)| async move {
             tokio::time::sleep(Duration::from_millis(ms)).await;
             Ok::<_, std::io::Error>(bytes)
@@ -800,7 +801,7 @@ mod tests {
         let detail = res.into_body().collect().await.unwrap().to_bytes();
         assert!(String::from_utf8_lossy(&detail).contains("file.url"));
         assert!(
-            took < limits.uploads + Duration::from_millis(100),
+            took < limits.uploads + Duration::from_millis(500),
             "{took:?}"
         );
         assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());

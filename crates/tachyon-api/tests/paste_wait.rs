@@ -1,5 +1,5 @@
-//! A pasted URL's `?wait=true`, in a process of its own: what follows the fetch has the
-//! normal limit, so it mustn't queue for decodes behind other tests' images.
+//! A pasted URL's `?wait=true`, in a process of its own, so its timings don't queue for
+//! decode permits (`DECODES`, per process) behind other tests' images.
 
 mod common;
 
@@ -24,8 +24,10 @@ fn pasted(url: &str, alt: &str) -> Value {
 }
 
 /// A signed-in `?wait=true` paste whose sizes job never finishes answers with what's made
-/// so far, as call 5 says, before the request's limit: the wait ends with the limit the
-/// request has once its fetch is done, not the longer one it came in with.
+/// so far, as call 5 says: its wait ends a second before its cap (the upload limit from
+/// arrival), well before the request's own limit, so it never answers 503 after the
+/// document is made. Limits: normal 3 s, uploads 4 s; each wait ends about 3 s in, 4 s
+/// before the request would.
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn a_pasted_waits_end_before_the_request_does(pool: PgPool) {
     let base = tempfile::Builder::new()
