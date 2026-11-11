@@ -673,54 +673,90 @@ async fn folder_enabled_collections_are_listed(pool: PgPool) {
     assert!(got.get("collections").is_none(), "{got}");
 }
 
-/// Signed out, folders answer as a collection only signed-in callers may use, unless a
-/// rule of their own opens them.
+/// Signed out, folders take the same defaults as a collection with no rules, and the
+/// folder filter still hides those for collections the caller can't read.
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn folders_are_closed_to_anonymous(pool: PgPool) {
+async fn folders_take_the_anonymous_default(pool: PgPool) {
     let d = dir();
     let app = admin(&pool, &d).await;
-    let closed = json!({"signedIn": true});
     schema(
         &app,
-        json!({"slug": "closed", "access": {"read": closed, "create": closed, "update": closed, "delete": closed},
+        json!({"slug": "open", "fields": [{"name": "title", "type": "text"}]}),
+    )
+    .await;
+    schema(
+        &app,
+        json!({"slug": "private_docs", "folders": true, "access": {"read": {"signedIn": true}},
                "fields": [{"name": "title", "type": "text"}]}),
     )
     .await;
     let f = folder(&app, "F", None, &[]).await;
-    let c = id(&ok(&app, "POST", "/api/closed", json!({"title": "t"})).await);
+    let private = folder(&app, "Private", None, &["private_docs"]).await;
+    let o = id(&ok(&app, "POST", "/api/open", json!({"title": "t"})).await);
     let anon = router(&pool, &d).await;
     for (folders, other) in [
-        ("/api/folders".to_owned(), "/api/closed".to_owned()),
-        (format!("/api/folders/{f}"), format!("/api/closed/{c}")),
+        ("/api/folders".to_owned(), "/api/open".to_owned()),
+        (format!("/api/folders/{f}"), format!("/api/open/{o}")),
     ] {
         let (a, b) = (
             call(&anon, "GET", &folders, Value::Null).await,
             call(&anon, "GET", &other, Value::Null).await,
         );
         assert_eq!(a.status, b.status, "{folders}: {} vs {}", a.json, b.json);
-        assert_eq!(a.json["detail"], b.json["detail"]);
-        assert!(!a.status.is_success());
+        assert!(a.status.is_success(), "{}", a.json);
     }
-    let res = call(&anon, "POST", "/api/folders", json!({"name": "N"})).await;
-    let other = call(&anon, "POST", "/api/closed", json!({"title": "N"})).await;
-    assert_eq!(res.status, other.status, "{}", res.json);
+    for (method, folders, other, body) in [
+        (
+            "POST",
+            "/api/folders".to_owned(),
+            "/api/open".to_owned(),
+            json!({"name": "N", "title": "N"}),
+        ),
+        (
+            "PATCH",
+            format!("/api/folders/{f}"),
+            format!("/api/open/{o}"),
+            json!({"name": "N", "title": "N"}),
+        ),
+        (
+            "DELETE",
+            format!("/api/folders/{f}"),
+            format!("/api/open/{o}"),
+            Value::Null,
+        ),
+    ] {
+        let a = call(&anon, method, &folders, body.clone()).await;
+        let b = call(&anon, method, &other, body).await;
+        assert_eq!(
+            (a.status, &a.json["detail"]),
+            (b.status, &b.json["detail"]),
+            "{method} {folders}"
+        );
+    }
     let access = ok(&anon, "GET", "/api/access", Value::Null).await;
-    assert!(access["collections"].get("folders").is_none(), "{access}");
-    let access = ok(&app, "GET", "/api/access", Value::Null).await;
-    assert!(access["collections"].get("folders").is_some(), "{access}");
-
-    // A rule of their own opens them.
-    let mut s =
-        ok(&app, "GET", "/api/admin/collections/folders", Value::Null).await["schema"].clone();
-    s["access"] = json!({"read": true});
-    ok(
-        &app,
-        "PUT",
-        "/api/admin/collections/folders",
-        json!({"schema": s}),
-    )
-    .await;
-    let anon = router(&pool, &d).await;
+    // Listed like any collection; reads are conditional on the folder filter only.
+    assert_eq!(access["collections"]["open"]["read"], true, "{access}");
+    assert_eq!(
+        access["collections"]["folders"]["read"], "conditional",
+        "{access}"
+    );
+    for k in ["create", "update", "delete"] {
+        assert_eq!(
+            access["collections"]["folders"][k], access["collections"]["open"][k],
+            "{k}"
+        );
+    }
+    // A folder only for what they can't read is missing.
+    assert_problem(
+        &call(
+            &anon,
+            "GET",
+            &format!("/api/folders/{private}"),
+            Value::Null,
+        )
+        .await,
+        404,
+    );
     assert_eq!(ids(&anon, "/api/folders").await, vec![f]);
 }
 

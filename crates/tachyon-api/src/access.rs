@@ -533,10 +533,6 @@ impl Access {
                 let lookup = |s: &str| self.schemas.lookup(s);
                 compile(rule, &self.caller(), c.schema.data(), &lookup)
             }
-            // Folders are for signed-in callers unless a rule of their own opens them.
-            None if slug == FOLDERS && matches!(self.principal, Principal::Anonymous) => {
-                Compiled::Deny
-            }
             None if self.by_role_in(action, slug, scoped) == Decision::Deny => Compiled::Deny,
             None => Compiled::Allow,
         };
