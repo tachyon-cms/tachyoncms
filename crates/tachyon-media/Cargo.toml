@@ -17,17 +17,19 @@ img-parts.workspace = true
 infer.workspace = true
 jpeg-encoder.workspace = true
 quick-xml.workspace = true
+reqwest.workspace = true
 serde_json.workspace = true
 tachyon-core.workspace = true
 tempfile.workspace = true
 webp.workspace = true
 object_store.workspace = true
 thiserror.workspace = true
-tokio = { workspace = true, features = ["fs", "io-util"] }
+tokio = { workspace = true, features = ["fs", "io-util", "net", "rt", "time"] }
 url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "macros", "process", "rt-multi-thread"] }
 
 [lints]
 workspace = true

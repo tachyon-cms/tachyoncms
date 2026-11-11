@@ -653,3 +653,53 @@ pub fn bitmap_icon() -> Vec<u8> {
     out.extend_from_slice(&dib);
     out
 }
+
+/// An HTTP server on 127.0.0.1 for fetch tests. Each request is answered with the pieces
+/// `answer` gives for its request target (`/a.png`, or a proxy's whole URL), written raw
+/// 200 ms apart, and its connection closed.
+pub async fn serve(
+    answer: impl Fn(&str) -> Vec<Vec<u8>> + Send + Sync + 'static,
+) -> std::net::SocketAddr {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr = listener.local_addr().unwrap();
+    let answer = std::sync::Arc::new(answer);
+    tokio::spawn(async move {
+        while let Ok((mut conn, _)) = listener.accept().await {
+            let answer = answer.clone();
+            tokio::spawn(async move {
+                let mut head = Vec::new();
+                let mut buf = [0u8; 1024];
+                while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                    match conn.read(&mut buf).await {
+                        Ok(0) | Err(_) => return,
+                        Ok(n) => head.extend_from_slice(&buf[..n]),
+                    }
+                }
+                let head = String::from_utf8_lossy(&head);
+                let target = head.split(' ').nth(1).unwrap_or_default().to_owned();
+                for (i, piece) in answer(&target).into_iter().enumerate() {
+                    if i > 0 {
+                        tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+                    }
+                    if conn.write_all(&piece).await.is_err() {
+                        return;
+                    }
+                }
+                let _ = conn.shutdown().await;
+            });
+        }
+    });
+    addr
+}
+
+/// A raw HTTP response: `status` and its reason, `headers` as written, then `body`.
+pub fn response(status: &str, headers: &[&str], body: &[u8]) -> Vec<u8> {
+    let mut out = format!("HTTP/1.1 {status}\r\nConnection: close\r\n").into_bytes();
+    for h in headers {
+        out.extend_from_slice(format!("{h}\r\n").as_bytes());
+    }
+    out.extend_from_slice(b"\r\n");
+    out.extend_from_slice(body);
+    out
+}

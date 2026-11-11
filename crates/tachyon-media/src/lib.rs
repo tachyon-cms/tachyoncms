@@ -1,3 +1,4 @@
+pub mod fetch;
 #[doc(hidden)]
 pub mod fixtures;
 pub mod image;

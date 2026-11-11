@@ -3380,6 +3380,7 @@ dependencies = [
  "jpeg-encoder",
  "object_store",
  "quick-xml 0.42.0",
+ "reqwest",
  "serde_json",
  "tachyon-core",
  "tempfile",
