@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use uuid::Uuid;
 
-use crate::schema::{BlockSource, FieldKind};
+use crate::schema::{BlockSource, Field, FieldKind};
 use crate::validate::{FieldError, slugify};
 
 mod html;
@@ -611,26 +611,7 @@ impl Check<'_, '_> {
                 },
             );
         };
-        let empty = Map::new();
-        let fields = match attrs.get("fields") {
-            None | Some(Value::Null) => &empty,
-            Some(Value::Object(f)) => f,
-            Some(_) => return self.fail(at("fields"), "expected an object"),
-        };
-        // As a block node's fields: one level below the node, whatever came before.
-        let outer = self.budget.depth;
-        self.budget.depth = depth;
-        let mode = self.budget.mode;
-        crate::validate::check_object(
-            &node.fields,
-            fields,
-            &[],
-            &at("fields"),
-            &mut self.errors,
-            Some(&mut *self.budget),
-            mode,
-        );
-        self.budget.depth = outer;
+        self.node_fields(&node.fields, attrs, path, depth);
     }
 
     /// A block node's type, ID and fields. Rich text in its fields nests below `depth`.
@@ -668,22 +649,35 @@ impl Check<'_, '_> {
             }
             Some(_) => return self.fail(at("id"), "expected a block ID"),
         }
+        self.node_fields(&block.fields, attrs, path, depth);
+    }
+
+    /// The `fields` of a block or upload node at `path`, the node at `depth`, against
+    /// `defs`: missing or `null` holds nothing. They count toward the text's limits.
+    fn node_fields(
+        &mut self,
+        defs: &[Field],
+        attrs: &Map<String, Value>,
+        path: &str,
+        depth: usize,
+    ) {
+        let at = format!("{path}.attrs.fields");
         let empty = Map::new();
         let fields = match attrs.get("fields") {
             None | Some(Value::Null) => &empty,
             Some(Value::Object(f)) => f,
-            Some(_) => return self.fail(at("fields"), "expected an object"),
+            Some(_) => return self.fail(at, "expected an object"),
         };
-        // Every field of this node starts one level below it, so a block node
-        // deeper inside one field must not carry its depth to the next.
+        // Every field of this node starts one level below it, so a node deeper inside
+        // one field must not carry its depth to the next.
         let outer = self.budget.depth;
         self.budget.depth = depth;
         let mode = self.budget.mode;
         crate::validate::check_object(
-            &block.fields,
+            defs,
             fields,
             &[],
-            &at("fields"),
+            &at,
             &mut self.errors,
             Some(&mut *self.budget),
             mode,
