@@ -30,6 +30,7 @@ const V6_REFUSED: &[(u128, u8)] = &[
     (0x3fff << 112, 20),          // documentation
     (0xfc00 << 112, 7),           // unique local, fd00:ec2::254 included
     (0xfe80 << 112, 10),          // link-local
+    (0xfec0 << 112, 10),          // site-local, deprecated but still routed by some stacks
     (0xff00 << 112, 8),           // multicast
 ];
 
@@ -40,7 +41,7 @@ fn in_range(addr: u128, net: u128, len: u8, bits: u32) -> bool {
 
 /// Whether `ip` is a public address a fetch made for someone else may connect to: not
 /// loopback, private, link-local, shared, reserved, documentation or multicast. An IPv6
-/// address that carries an IPv4 one (mapped, compatible, NAT64, 6to4, Teredo) is judged by
+/// address that carries an IPv4 one (mapped, translated, compatible, NAT64, 6to4, Teredo) is judged by
 /// the IPv4 inside it.
 pub fn is_public_addr(ip: IpAddr) -> bool {
     match ip {
@@ -65,8 +66,10 @@ fn public_v6(ip: Ipv6Addr) -> bool {
         return false;
     }
     let v4 = |bits: u128| Ipv4Addr::from((bits & 0xffff_ffff) as u32);
-    // Mapped (::ffff:0:0/96), compatible (::/96) and NAT64 (64:ff9b::/96): the last 32 bits.
+    // Mapped (::ffff:0:0/96), translated (::ffff:0:0:0/96), compatible (::/96) and NAT64
+    // (64:ff9b::/96): the last 32 bits.
     if in_range(addr, 0xffff << 32, 96, 128)
+        || in_range(addr, 0xffff << 48, 96, 128)
         || in_range(addr, 0, 96, 128)
         || in_range(addr, 0x0064_ff9b << 96, 96, 128)
     {
@@ -162,6 +165,9 @@ mod tests {
             "fe80::",
             "fe80::1",
             "febf:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
+            "fec0::",
+            "fed0::1",
+            "feff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
             "ff00::",
             "ff02::1",
             "ffff:ffff:ffff:ffff:ffff:ffff:ffff:ffff",
@@ -169,6 +175,10 @@ mod tests {
         // IPv4 inside IPv6 is judged as itself.
         refused(&[
             "::ffff:127.0.0.1",
+            // IPv4-translated (SIIT, ::ffff:0:0:0/96).
+            "::ffff:0:127.0.0.1",
+            "::ffff:0:10.0.0.1",
+            "::ffff:0:a9fe:a9fe",
             "::ffff:10.0.0.1",
             "::ffff:169.254.169.254",
             "::127.0.0.1",
@@ -198,6 +208,7 @@ mod tests {
             "2606:4700::1111",
             "2a00:1450:4001::1",
             "::ffff:8.8.8.8",
+            "::ffff:0:8.8.8.8",
             "64:ff9b::808:808",
             "2002:808:808::1",
             "2001:0:808:808:0:0:f7f7:f7f7",
