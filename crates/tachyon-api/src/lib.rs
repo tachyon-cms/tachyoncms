@@ -40,6 +40,8 @@ use tachyon_media::storage::Storages;
 use tower_http::catch_panic::CatchPanicLayer;
 
 pub use collections::check_upload;
+#[doc(hidden)]
+pub use documents::{Pause, pause_next_update};
 pub use error::ApiError;
 pub use jobs::{JobsConfig, RunningJobs};
 use schemas::Schemas;

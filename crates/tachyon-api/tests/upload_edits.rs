@@ -606,3 +606,43 @@ async fn edits_are_draft_saves(pool: PgPool) {
     ok(&app, "POST", &format!("/api/images/{id}/publish"), None).await;
     assert_eq!(files_of().await, (draft, draft));
 }
+
+/// A write that sends back the focal point it read, after another edit remade the file
+/// for a new one, is refused: writing the old value over the new file would leave the
+/// document and its file disagreeing.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_stale_focal_point_isnt_written_back(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!(true), json!({})).await;
+    let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
+    let id: Uuid = doc["id"].as_str().unwrap().parse().unwrap();
+    let one = format!("/api/images/{id}");
+    // The first write reads the document, then waits before it locks it.
+    let pause = tachyon_api::pause_next_update(id);
+    let first = tokio::spawn({
+        let (app, one) = (app.clone(), one.clone());
+        async move { call(&app, "PATCH", &one, json!({"focalX": 50, "alt": "stale"})).await }
+    });
+    pause.reached().await;
+    let edits = json!({"uploadEdits": {"focalPoint": {"x": 20, "y": 30}}});
+    let got = ok(&app, "PATCH", &one, Some(edits)).await;
+    assert_eq!(got["focalX"], 20);
+    let edited = held(&pool, &doc["id"]).await;
+    pause.resume();
+    let res = first.await.unwrap();
+    assert_problem(&res, 409);
+    assert_eq!(
+        held(&pool, &doc["id"]).await,
+        edited,
+        "the edit's file stays"
+    );
+    let now = ok(&app, "GET", &one, None).await;
+    assert_eq!((&now["focalX"], &now["focalY"]), (&json!(20), &json!(30)));
+    assert_ne!(now["alt"], "stale");
+    let row = files::get(&pool, edited).await.unwrap();
+    assert_eq!(
+        (row.focal_x, row.focal_y, row.state.as_str()),
+        (20.0, 30.0, "live")
+    );
+}

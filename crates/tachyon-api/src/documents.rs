@@ -551,6 +551,7 @@ pub async fn update(
         }
         None => None,
     };
+    paused(id).await;
     let (doc, sizes) = taken_or_abandoned(&state, saved.as_ref(), async {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         let doc = documents::update_in(
@@ -603,6 +604,55 @@ pub async fn update(
     .await?;
     let doc = waited(&state, &c, doc, copy, sizes.filter(|_| wait), deadline).await;
     respond(&state, &access, c, &doc, copy, 1).await
+}
+
+/// Updates to pause, by document, once each: how a test puts another write between an
+/// update's read of its document and its lock. `ARMED` keeps the lookup off every update.
+static PAUSES: std::sync::Mutex<Vec<(Uuid, Arc<Pause>)>> = std::sync::Mutex::new(Vec::new());
+static ARMED: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// An update held before it locks its document, until `resume`.
+#[doc(hidden)]
+#[derive(Default)]
+pub struct Pause {
+    reached: tokio::sync::Notify,
+    go: tokio::sync::Notify,
+}
+
+impl Pause {
+    /// Waits until the update has read its document and is about to lock it.
+    pub async fn reached(&self) {
+        self.reached.notified().await;
+    }
+
+    pub fn resume(&self) {
+        self.go.notify_one();
+    }
+}
+
+/// Pauses the next update of document `id`, after its checks and before its lock.
+#[doc(hidden)]
+pub fn pause_next_update(id: Uuid) -> Arc<Pause> {
+    let pause = Arc::new(Pause::default());
+    PAUSES.lock().unwrap().push((id, pause.clone()));
+    ARMED.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+    pause
+}
+
+async fn paused(id: Uuid) {
+    if ARMED.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+        return;
+    }
+    let found = {
+        let mut all = PAUSES.lock().unwrap();
+        let at = all.iter().position(|(doc, _)| *doc == id);
+        at.map(|i| all.remove(i).1)
+    };
+    if let Some(p) = found {
+        ARMED.fetch_sub(1, std::sync::atomic::Ordering::SeqCst);
+        p.reached.notify_one();
+        p.go.notified().await;
+    }
 }
 
 pub async fn delete(
