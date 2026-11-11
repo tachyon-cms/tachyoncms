@@ -153,6 +153,8 @@ async fn redirects_are_bounded_and_checked() {
             "/ftp" => redirect("ftp://example.com/a"),
             "/file" => redirect("file:///etc/passwd"),
             "/userinfo" => redirect("http://me:pw@example.com/a"),
+            // Over the cap, and not a URL: refused for its length, unparsed.
+            "/long" => redirect(&format!("http://[{}", "a".repeat(9 * 1024))),
             p if p.starts_with("/to/") => ok(b"done"),
             _ => redirect(&format!("/r/{}", n + 1)),
         }
@@ -179,6 +181,8 @@ async fn redirects_are_bounded_and_checked() {
         let m = refusal(fetch(&format!("http://{addr}{path}"), &open()).await);
         assert!(m.contains("http and https"), "{path}: {m}");
     }
+    let m = refusal(fetch(&format!("http://{addr}/long"), &open()).await);
+    assert_eq!(m, "this URL is too long");
     let m = refusal(fetch(&format!("http://{addr}/userinfo"), &open()).await);
     assert!(m.contains("user name"), "{m}");
 }

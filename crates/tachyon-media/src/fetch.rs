@@ -147,14 +147,14 @@ impl SafeFetch {
                 )));
             }
             hops += 1;
-            at = res
-                .headers()
-                .get(LOCATION)
-                .and_then(|l| l.to_str().ok())
-                .and_then(|l| at.join(l).ok())
-                .ok_or_else(|| {
-                    FetchError::Refused("this URL redirects without saying where".into())
-                })?;
+            let location = res.headers().get(LOCATION).and_then(|l| l.to_str().ok());
+            // Measured before it's parsed, as the first URL is.
+            if location.is_some_and(|l| l.len() > MAX_URL) {
+                return Err(FetchError::Refused("this URL is too long".into()));
+            }
+            at = location.and_then(|l| at.join(l).ok()).ok_or_else(|| {
+                FetchError::Refused("this URL redirects without saying where".into())
+            })?;
         };
         if res.status() != StatusCode::OK {
             return Err(FetchError::Status(res.status().as_u16()));
