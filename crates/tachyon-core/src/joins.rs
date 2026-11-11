@@ -1,7 +1,7 @@
 //! Join fields: the documents of another collection that link to this one, found through
 //! the `relations` table on read and never stored.
 
-use crate::schema::{BlockSource, Field, FieldKind};
+use crate::schema::{Field, FieldKind};
 
 pub use crate::schema::JoinField;
 
@@ -31,13 +31,15 @@ fn pattern(fields: &[Field], path: &str) -> Option<String> {
         (FieldKind::Array { fields, .. }, Some(rest)) => {
             Some(format!(r"{head}\.\d+\.{}", pattern(fields, rest)?))
         }
-        // A rich text block node's links are stored like a block row's: `body.<k>.<name>`.
-        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
+        // A rich text block or upload node's links are stored like a block row's:
+        // `body.<k>.<name>`.
+        (FieldKind::Blocks { .. } | FieldKind::RichText { .. }, Some(rest)) => {
             let mut shapes: Vec<String> = Vec::new();
-            for shape in blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .filter_map(|b| pattern(&b.fields, rest))
+            for shape in f
+                .kind
+                .node_types()
+                .into_iter()
+                .filter_map(|(_, fields)| pattern(fields, rest))
             {
                 if !shapes.contains(&shape) {
                     shapes.push(shape);

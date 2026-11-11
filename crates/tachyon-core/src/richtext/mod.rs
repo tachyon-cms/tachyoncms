@@ -967,33 +967,58 @@ pub(crate) fn each_item_mut(value: &mut Value, f: &mut impl FnMut(usize, ItemMut
     });
 }
 
-/// The `attrs` of every block node in `value`, at any depth.
-pub(crate) fn blocks(value: &Value) -> Vec<&Map<String, Value>> {
-    block_attrs(value)
+/// The key of the node type a block or upload node's `attrs` name, as
+/// `FieldKind::node_type` takes it: the block type's slug, or `@<collection>`.
+fn node_key(upload: bool, attrs: &Map<String, Value>) -> String {
+    let named = |k: &str| attrs.get(k).and_then(Value::as_str).unwrap_or("");
+    match upload {
+        true => crate::schema::upload_node_key(named("relationTo")),
+        false => named("blockType").to_owned(),
+    }
+}
+
+/// What a block or upload node of a type the schema doesn't know keeps, by its key: its
+/// type and identity, not its fields.
+pub(crate) fn node_own_keys(key: &str) -> &'static [&'static str] {
+    match key.starts_with('@') {
+        true => &["relationTo", "value"],
+        false => crate::schema::BLOCK_ROW_KEYS,
+    }
+}
+
+/// The key of `node`'s type, if it's a block or upload node (see `node_key`).
+pub(crate) fn node_type_key(node: &Map<String, Value>) -> Option<String> {
+    let attrs = node.get("attrs")?.as_object()?;
+    match node.get("type").and_then(Value::as_str) {
+        Some("block") => Some(node_key(false, attrs)),
+        Some("upload") => Some(node_key(true, attrs)),
+        _ => None,
+    }
+}
+
+/// The `attrs` of every block and upload node in `value`, at any depth, each with the key
+/// of its type (`node_key`): the nodes that hold fields.
+pub(crate) fn field_nodes(value: &Value) -> Vec<(String, &Map<String, Value>)> {
+    items(value)
         .into_iter()
-        .filter_map(Value::as_object)
+        .filter_map(|(_, item)| match item {
+            Item::Block(attrs) => Some((node_key(false, attrs), attrs)),
+            Item::Upload(attrs) => attrs.as_object().map(|a| (node_key(true, a), a)),
+            Item::Link(_) => None,
+        })
         .collect()
 }
 
-/// `blocks`, each as the `attrs` value itself.
-pub(crate) fn block_attrs(value: &Value) -> Vec<&Value> {
-    let mut out = Vec::new();
-    each_node(value, &mut |node| {
-        if node.get("type").and_then(Value::as_str) == Some("block")
-            && let Some(attrs @ Value::Object(_)) = node.get("attrs")
-        {
-            out.push(attrs);
-        }
-    });
-    out
-}
-
-/// Calls `f` on the `attrs` of every block node in `value`, at any depth.
-pub(crate) fn blocks_mut(value: &mut Value, f: &mut impl FnMut(&mut Map<String, Value>)) {
-    each_item_mut(value, &mut |_, item| {
-        if let ItemMut::Block(attrs) = item {
-            f(attrs);
-        }
+/// Calls `f` on the `attrs` of every block and upload node in `value`, at any depth, with
+/// the key of its type (`node_key`).
+pub(crate) fn field_nodes_mut(
+    value: &mut Value,
+    f: &mut impl FnMut(&str, &mut Map<String, Value>),
+) {
+    each_item_mut(value, &mut |_, item| match item {
+        ItemMut::Block(attrs) => f(&node_key(false, attrs), attrs),
+        ItemMut::Upload(attrs) => f(&node_key(true, attrs), attrs),
+        ItemMut::Link(_) => {}
     });
 }
 

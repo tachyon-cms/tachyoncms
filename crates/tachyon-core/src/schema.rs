@@ -703,10 +703,11 @@ pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
     fn has_layout(fields: &[Field]) -> bool {
         fields.iter().any(|f| match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => has_layout(fields),
-            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks
+            FieldKind::Blocks { .. } | FieldKind::RichText { .. } => f
+                .kind
+                .node_types()
                 .iter()
-                .filter_map(BlockSource::def)
-                .any(|b| has_layout(&b.fields)),
+                .any(|(_, fields)| has_layout(fields)),
             kind => kind.is_layout(),
         })
     }
@@ -766,12 +767,8 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
             }),
             FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
                 let mut f = f.clone();
-                if let FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } =
-                    &mut f.kind
-                {
-                    for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                        b.fields = flatten(&b.fields);
-                    }
+                for (_, fields) in f.kind.node_types_mut() {
+                    *fields = flatten(fields);
                 }
                 out.push(f)
             }
@@ -1101,6 +1098,20 @@ fn check_layout(
                         &enter(within, &path, &block.slug),
                     )?;
                 }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (c, node) in &u.collections {
+                        check_layout(
+                            &node.fields,
+                            root,
+                            &format!("{here}.upload.collections.{c}.fields"),
+                            &path,
+                            &enter(within, &path, &upload_node_key(c)),
+                        )?;
+                    }
+                }
             }
             FieldKind::Tabs { tabs } => {
                 for (t, tab) in tabs.iter().enumerate() {
@@ -1330,6 +1341,60 @@ impl FieldKind {
                 upload: Some(u), ..
             } => u.collections.get(collection),
             _ => None,
+        }
+    }
+
+    /// The kinds of row or node that hold fields of their own, each with its key: a
+    /// `blocks` or rich text field's block types by slug, then a rich text field's upload
+    /// nodes by `upload_node_key` (`@media`). A shared block not expanded has none.
+    pub fn node_types(&self) -> Vec<(Cow<'_, str>, &[Field])> {
+        let blocks = self
+            .block_sources()
+            .iter()
+            .filter_map(BlockSource::def)
+            .map(|b| (Cow::Borrowed(b.slug.as_str()), b.fields.as_slice()));
+        let uploads = match self {
+            Self::RichText {
+                upload: Some(u), ..
+            } => Some(u.collections.iter()),
+            _ => None,
+        };
+        let uploads = uploads
+            .into_iter()
+            .flatten()
+            .map(|(c, n)| (Cow::Owned(upload_node_key(c)), n.fields.as_slice()));
+        blocks.chain(uploads).collect()
+    }
+
+    /// `node_types`, to change.
+    pub fn node_types_mut(&mut self) -> Vec<(String, &mut Vec<Field>)> {
+        match self {
+            Self::Blocks { blocks, .. } => blocks
+                .iter_mut()
+                .filter_map(BlockSource::def_mut)
+                .map(|b| (b.slug.clone(), &mut b.fields))
+                .collect(),
+            Self::RichText { blocks, upload, .. } => {
+                let blocks = blocks
+                    .iter_mut()
+                    .filter_map(BlockSource::def_mut)
+                    .map(|b| (b.slug.clone(), &mut b.fields));
+                let uploads = upload.iter_mut().flat_map(|u| {
+                    u.collections
+                        .iter_mut()
+                        .map(|(c, n)| (upload_node_key(c), &mut n.fields))
+                });
+                blocks.chain(uploads).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The fields of the node type `key` names, as `node_types` keys them.
+    pub fn node_type(&self, key: &str) -> Option<&[Field]> {
+        match key.strip_prefix('@') {
+            Some(c) => self.upload_node(c).map(|n| n.fields.as_slice()),
+            None => self.block(key).map(|b| b.fields.as_slice()),
         }
     }
 
@@ -1758,9 +1823,11 @@ impl CollectionSchema {
         lookup: impl Fn(&str) -> Option<S>,
     ) -> Result<(), SchemaError> {
         for (path, f) in self.upload_links() {
-            let (option, filter_options) = match &f.kind {
-                FieldKind::Upload { filter_options, .. } => ("relationTo", filter_options),
-                _ => ("upload.collections", &None),
+            let (option, what, filter_options) = match &f.kind {
+                FieldKind::Upload { filter_options, .. } => {
+                    ("relationTo", "an upload field links", filter_options)
+                }
+                _ => ("upload.collections", "upload nodes link", &None),
             };
             for slug in f.kind.upload_targets() {
                 let found = if slug == self.slug {
@@ -1774,10 +1841,6 @@ impl CollectionSchema {
                     None => continue,
                 };
                 if target.upload.is_none() {
-                    let what = match option {
-                        "relationTo" => "an upload field links",
-                        _ => "upload nodes link",
-                    };
                     return Err(SchemaError::At {
                         path: format!("fields.{path}.{option}"),
                         message: format!(
@@ -2274,7 +2337,8 @@ fn unknown_in_fields(
 pub const MAX_BLOCK_NESTING: usize = 8;
 
 /// The one walk over a raw field tree. Calls `visit` on every field at any depth (inside
-/// groups, lists, layout fields and inline block types, not references) with the data path
+/// groups, lists, layout fields, inline block types, not references, and rich text's upload
+/// nodes) with the data path
 /// of the list it sits in (`layout`, block types not named) and its schema-change path
 /// (`layout.hero`, see `diff::Renames`). `visit` runs before a field's insides are walked,
 /// so it may replace them.
@@ -2305,13 +2369,12 @@ fn visit_fields(
                     visit_fields(&mut tab.fields, &d, &c, visit)?;
                 }
             }
-            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
-                for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                    let c = join(&inner_change, &b.slug);
-                    visit_fields(&mut b.fields, &inner_data, &c, visit)?;
+            kind => {
+                for (key, fields) in kind.node_types_mut() {
+                    let c = join(&inner_change, &key);
+                    visit_fields(fields, &inner_data, &c, visit)?;
                 }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -2417,13 +2480,12 @@ fn fields_at<'a>(fields: &'a [Field], path: &str) -> Vec<&'a Field> {
         (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, Some(rest)) => {
             fields_at(fields, rest)
         }
-        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
-            blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .flat_map(|b| fields_at(&b.fields, rest))
-                .collect()
-        }
+        (FieldKind::Blocks { .. } | FieldKind::RichText { .. }, Some(rest)) => f
+            .kind
+            .node_types()
+            .into_iter()
+            .flat_map(|(_, fields)| fields_at(fields, rest))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -2449,70 +2511,18 @@ fn field_steps<'a>(
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
             field_steps(fields, rest, &here, within)?
         }
-        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+        FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
             let only = within.iter().find(|(p, _)| *p == here).map(|(_, s)| s);
-            blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .filter(|b| only.is_none_or(|slug| *slug == b.slug))
-                .find_map(|b| field_steps(&b.fields, rest, &here, within))?
+            f.kind
+                .node_types()
+                .into_iter()
+                .filter(|(key, _)| only.is_none_or(|k| k == key))
+                .find_map(|(_, fields)| field_steps(fields, rest, &here, within))?
         }
         _ => return None,
     };
     steps.insert(0, f);
     Some(steps)
-}
-
-/// Refuses, at any depth in an upload node's fields, what nothing reads there yet: field
-/// access rules and admin conditions, virtual and layout fields, and shared blocks. Field
-/// rules and schema changes walk block nodes, not upload nodes, so these would be ignored.
-fn plain_node_fields(fields: &[Field]) -> Result<(), String> {
-    for f in fields {
-        let what = if f.access.is_some() {
-            "access rules"
-        } else if f.admin.condition.is_some() {
-            "admin conditions"
-        } else if f.virtual_path.is_some() {
-            "virtual fields"
-        } else if f.kind.is_layout() {
-            "row, collapsible or tabs fields"
-        } else if f
-            .kind
-            .block_sources()
-            .iter()
-            .any(|b| matches!(b, BlockSource::Ref(_)))
-        {
-            "shared blocks"
-        } else {
-            ""
-        };
-        if !what.is_empty() {
-            let name = match f.name.as_str() {
-                "" => f.kind.name(),
-                name => name,
-            };
-            return Err(format!("`{name}`: upload nodes can't hold {what} yet"));
-        }
-        match &f.kind {
-            FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
-                plain_node_fields(fields)?
-            }
-            kind => {
-                for b in kind.block_sources().iter().filter_map(BlockSource::def) {
-                    plain_node_fields(&b.fields)?;
-                }
-                if let FieldKind::RichText {
-                    upload: Some(u), ..
-                } = kind
-                {
-                    for node in u.collections.values() {
-                        plain_node_fields(&node.fields)?;
-                    }
-                }
-            }
-        }
-    }
-    Ok(())
 }
 
 pub(crate) fn is_identifier(s: &str, allow_upper: bool) -> bool {
@@ -2785,11 +2795,11 @@ fn check_fields(
                                 "upload.collections names `{slug}`, which relationTo doesn't list"
                             )));
                         }
-                        plain_node_fields(&node.fields).map_err(|m| {
-                            invalid(format!("upload.collections.{slug}.fields: {m}"))
-                        })?;
-                        let path = join(&join(prefix, &f.name), &upload_node_key(slug));
-                        check_fields(&node.fields, Level::Nested, root, &path, true, within)?;
+                        // As a block node's fields: named by the field's path, inside
+                        // the node's type.
+                        let path = join(prefix, &f.name);
+                        let within = enter(within, &path, &upload_node_key(slug));
+                        check_fields(&node.fields, Level::Nested, root, &path, true, &within)?;
                     }
                 }
             }
@@ -3266,35 +3276,68 @@ mod tests {
                 node(json!([{"name": "t", "type": "text", "default": 3}])),
                 "field `t`: default: expected text",
             ),
-            // What nothing reads inside upload nodes yet is refused, at any depth.
-            (
-                node(
-                    json!([{"name": "t", "type": "text", "access": {"read": {"role": "editor"}}}]),
-                ),
-                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold access rules yet",
-            ),
+            // Checked as a block node's fields are: a condition sees its own node's type,
+            // and a virtual field sits in a list.
             (
                 node(json!([{"name": "g", "type": "group", "fields": [
                     {"name": "t", "type": "text", "admin": {"condition": {"field": "x", "exists": true}}}
                 ]}])),
-                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold admin conditions yet",
+                "field `t`: admin.condition refers to `x`, which isn't a field",
             ),
             (
-                node(json!([{"type": "row", "fields": [{"name": "t", "type": "text"}]}])),
-                "field `b`: upload.collections.media.fields: `row`: upload nodes can't hold row, collapsible or tabs fields yet",
+                json!({"name": "b", "type": "richText", "relationTo": ["media"],
+                "blocks": [{"slug": "quote", "fields": [{"name": "q", "type": "text"}]}],
+                "upload": {"collections": {"media": {"fields": [
+                    {"name": "t", "type": "text", "admin": {"condition": {"field": "b.q", "exists": true}}}
+                ]}}}}),
+                "field `t`: admin.condition refers to `b.q`, which isn't a field",
+            ),
+            (
+                node(
+                    json!([{"type": "row", "fields": [{"name": "t", "type": "text", "label": " "}]},
+                    {"type": "collapsible", "fields": []}]),
+                ),
+                "field `fields.0.upload.collections.media.fields.1`: collapsible fields need a label",
             ),
             (
                 node(json!([{"name": "t", "type": "text", "virtual": "x.y"}])),
-                "field `b`: upload.collections.media.fields: `t`: upload nodes can't hold virtual fields yet",
-            ),
-            (
-                node(json!([{"name": "l", "type": "blocks", "blocks": [{"blockRef": "cta"}]}])),
-                "field `b`: upload.collections.media.fields: `l`: upload nodes can't hold shared blocks yet",
+                "field `t`: virtual fields can't be inside a list yet",
             ),
         ] {
             let s = schema(json!({"slug": "p", "fields": [f]}));
             assert_eq!(s.check().unwrap_err().to_string(), message);
         }
+        // What block nodes' fields hold, upload nodes' do: field rules, conditions on their
+        // own node's fields, layout fields, and shared blocks.
+        let rich = schema(json!({"slug": "p", "fields": [node(json!([
+            {"name": "caption", "type": "text", "access": {"read": {"roles": ["editor"]}}},
+            {"type": "row", "fields": [
+                {"name": "credit", "type": "text", "admin": {"condition": {"field": "b.caption", "exists": true}}}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]))]}));
+        assert_eq!(rich.check(), Ok(()));
+        assert_eq!(rich.block_refs(), ["cta"]);
+        let cta = schema(json!({"slug": "cta", "kind": "block", "fields": [
+            {"name": "label", "type": "text", "admin": {"condition": {"field": "style", "exists": true}}},
+            {"name": "style", "type": "text"}
+        ]}));
+        let (expanded, placed) = rich
+            .expand_placed(|s: &str| (s == "cta").then(|| cta.clone()))
+            .unwrap();
+        assert_eq!(placed, [("b.@media.layout".to_owned(), "cta".to_owned())]);
+        let data = expanded.data();
+        let fields = &data[0].kind.node_type("@media").unwrap();
+        // The row dissolves; the shared block is in place, its condition named from the top.
+        assert_eq!(
+            fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["caption", "credit", "layout"]
+        );
+        let label = &fields[2].kind.block("cta").unwrap().fields[0];
+        assert_eq!(
+            label.admin.condition.as_ref().unwrap().field,
+            "b.layout.style"
+        );
         // Unknown options are named, inside the nodes' fields too.
         for (raw, option) in [
             (

@@ -7,8 +7,7 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::schema::{
-    BLOCK_ROW_KEYS, BlockDef, BlockSource, CollectionSchema, Field, FieldKind, RelationTo,
-    SchemaError, data_fields,
+    BLOCK_ROW_KEYS, CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields,
 };
 use crate::uploads::Upload;
 
@@ -292,49 +291,55 @@ fn compare(
                 compare(a, b, &old_path, &new_path, renames, out, links)?;
             }
             // Block types are matched by slug, and their paths name it: `layout.hero.heading`.
-            // A rich text field's block types are matched the same way.
-            (
-                FieldKind::Blocks { blocks: a, .. } | FieldKind::RichText { blocks: a, .. },
-                FieldKind::Blocks { blocks: b, .. } | FieldKind::RichText { blocks: b, .. },
-            ) if o.kind.name() == n.kind.name() => {
-                let a: Vec<&BlockDef> = a.iter().filter_map(BlockSource::def).collect();
-                let b: Vec<&BlockDef> = b.iter().filter_map(BlockSource::def).collect();
+            // A rich text field's block types are matched the same way, and its upload
+            // nodes by collection (`body.@media.caption`).
+            (FieldKind::Blocks { .. }, FieldKind::Blocks { .. })
+            | (FieldKind::RichText { .. }, FieldKind::RichText { .. }) => {
                 if options(o) != options(n) {
                     out.push(Change::OptionsChanged {
                         path: new_path.clone(),
                     });
                 }
-                for old_block in &a {
-                    let old_block_path = join(&old_path, &old_block.slug);
-                    let new_block_path = join(&new_path, &old_block.slug);
-                    let Some(new_block) = b.iter().find(|nb| nb.slug == old_block.slug) else {
+                let (a, b) = (o.kind.node_types(), n.kind.node_types());
+                let what = |key: &str| {
+                    if key.starts_with('@') {
+                        "upload"
+                    } else {
+                        "block"
+                    }
+                };
+                for (key, old_fields) in &a {
+                    let old_type_path = join(&old_path, key);
+                    let new_type_path = join(&new_path, key);
+                    let Some((_, new_fields)) = b.iter().find(|(k, _)| k == key) else {
                         // Rows of this type are kept as they are, so validation counts the
                         // documents still using it.
                         out.push(Change::Removed {
-                            path: old_block_path,
-                            kind: "block",
+                            path: old_type_path,
+                            kind: what(key),
                         });
                         continue;
                     };
-                    if old_block.labels != new_block.labels {
+                    let labels = |kind: &FieldKind| kind.block(key).map(|b| b.labels.clone());
+                    if labels(&o.kind) != labels(&n.kind) {
                         out.push(Change::OptionsChanged {
-                            path: new_block_path.clone(),
+                            path: new_type_path.clone(),
                         });
                     }
                     compare(
-                        &old_block.fields,
-                        &new_block.fields,
-                        &old_block_path,
-                        &new_block_path,
+                        old_fields,
+                        new_fields,
+                        &old_type_path,
+                        &new_type_path,
                         renames,
                         out,
                         links,
                     )?;
                 }
-                for new_block in b.iter().filter(|nb| !a.iter().any(|ob| ob.slug == nb.slug)) {
+                for (key, _) in b.iter().filter(|(k, _)| !a.iter().any(|(ok, _)| ok == k)) {
                     out.push(Change::Added {
-                        path: join(&new_path, &new_block.slug),
-                        kind: "block",
+                        path: join(&new_path, key),
+                        kind: what(key),
                     });
                 }
             }
@@ -415,14 +420,20 @@ fn options(f: &Field) -> Field {
     f.name.clear();
     match &mut f.kind {
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields.clear(),
-        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks.clear(),
+        FieldKind::Blocks { blocks, .. } => blocks.clear(),
+        // Its block types and upload nodes are compared one by one.
+        FieldKind::RichText { blocks, upload, .. } => {
+            blocks.clear();
+            *upload = None;
+        }
         _ => {}
     }
     f
 }
 
 /// The field at a rename path, where a path into blocks names the block type
-/// (`layout.hero.heading`). A block type itself isn't a field, so it can't be renamed.
+/// (`layout.hero.heading`), and one into rich text's upload nodes their collection
+/// (`body.@media.caption`). A block type itself isn't a field, so it can't be renamed.
 fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     let mut segments = path.split('.');
     let mut current = fields;
@@ -433,9 +444,9 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
         current = match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
             FieldKind::Blocks { .. } | FieldKind::RichText { .. } => match segments.next() {
-                Some(slug) => {
+                Some(key) => {
                     found = None;
-                    &f.kind.block(slug)?.fields
+                    f.kind.node_type(key)?
                 }
                 None => &[],
             },
@@ -445,10 +456,11 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     found
 }
 
-/// Calls `f` on the fields of each block node of type `slug` in rich text `text`.
-fn for_nodes_of(text: &mut Value, slug: &str, f: &mut impl FnMut(&mut Map<String, Value>)) {
-    crate::richtext::blocks_mut(text, &mut |attrs| {
-        if attrs.get("blockType").and_then(Value::as_str) == Some(slug)
+/// Calls `f` on the fields of each block or upload node of type `key` (`node_types`) in
+/// rich text `text`.
+fn for_nodes_of(text: &mut Value, key: &str, f: &mut impl FnMut(&mut Map<String, Value>)) {
+    crate::richtext::field_nodes_mut(text, &mut |k, attrs| {
+        if k == key
             && let Some(Value::Object(fields)) = attrs.get_mut("fields")
         {
             f(fields);
@@ -630,13 +642,13 @@ fn rename_batch(
                     }
                 }
                 (kind @ FieldKind::RichText { .. }, Some(text)) => {
-                    let [slug, rest @ ..] = rest else { return };
-                    let Some(block) = kind.block(slug) else {
+                    let [key, rest @ ..] = rest else { return };
+                    let Some(fields) = kind.node_type(key) else {
                         return;
                     };
-                    let block_path = join(&old_path, slug);
-                    for_nodes_of(text, slug, &mut |inner| {
-                        rename_batch(inner, &block.fields, rest, &block_path, renames, batch)
+                    let type_path = join(&old_path, key);
+                    for_nodes_of(text, key, &mut |inner| {
+                        rename_batch(inner, fields, rest, &type_path, renames, batch)
                     });
                 }
                 _ => {}
@@ -725,15 +737,15 @@ fn relink_at(
                     })
                 }
                 (Some(kind @ FieldKind::RichText { .. }), Some(text)) => {
-                    let [slug, rest @ ..] = rest else {
+                    let [key, rest @ ..] = rest else {
                         return false;
                     };
-                    let Some(block) = kind.block(slug) else {
+                    let Some(fields) = kind.node_type(key) else {
                         return false;
                     };
                     let mut dropped = false;
-                    for_nodes_of(text, slug, &mut |inner| {
-                        dropped |= relink_at(&block.fields, inner, rest, change)
+                    for_nodes_of(text, key, &mut |inner| {
+                        dropped |= relink_at(fields, inner, rest, change)
                     });
                     dropped
                 }
@@ -814,15 +826,14 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
                     inner.extend(keys);
                 }
             }
-            // So is a block node; its fields are pruned like a row's.
+            // So is a block or upload node; its fields are pruned like a row's.
             (kind @ FieldKind::RichText { .. }, Some(text)) => {
-                crate::richtext::blocks_mut(text, &mut |attrs| {
-                    let slug = attrs.get("blockType").and_then(Value::as_str);
-                    let Some(block) = slug.and_then(|s| kind.block(s)) else {
+                crate::richtext::field_nodes_mut(text, &mut |key, attrs| {
+                    let Some(fields) = kind.node_type(key) else {
                         return;
                     };
                     if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
-                        prune(&block.fields, inner);
+                        prune(fields, inner);
                     }
                 })
             }
@@ -1744,6 +1755,86 @@ mod tests {
         assert_eq!(
             doc["layout"][1]["l"], id,
             "the other block type's field is untouched"
+        );
+    }
+
+    #[test]
+    fn upload_node_fields_change_by_collection() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let page = |collections: Value| {
+            schema(
+                json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+                "relationTo": ["media", "docs"], "upload": {"collections": collections}}]}),
+            )
+        };
+        let old = page(json!({
+            "media": {"fields": [
+                {"name": "caption", "type": "text"},
+                {"name": "gone", "type": "text"},
+                {"name": "by", "type": "relationship", "relationTo": "posts"}
+            ]},
+            "docs": {"fields": [{"name": "caption", "type": "text"}]}
+        }));
+        let new = page(json!({"media": {"fields": [
+            {"name": "alt_text", "type": "text"},
+            {"name": "by", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "added", "type": "text", "default": "a"}
+        ]}}));
+        let r = renames(&[("body.@media.caption", "alt_text")]);
+        let d = diff(&old, &new, &r).unwrap();
+        // Each collection's node fields are compared on their own, not as the field's options.
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Removed {
+                    path: "body.@docs".into(),
+                    kind: "upload"
+                },
+                Change::Renamed {
+                    from: "body.@media.caption".into(),
+                    to: "body.@media.alt_text".into()
+                },
+                Change::Removed {
+                    path: "body.@media.gone".into(),
+                    kind: "text"
+                },
+                Change::Relinked {
+                    path: "body.@media.by".into(),
+                    from: "posts".into(),
+                    to: "posts, pages".into()
+                },
+                Change::Added {
+                    path: "body.@media.added".into(),
+                    kind: "text"
+                },
+            ]
+        );
+        assert!(
+            diff(&new, &old, &Renames::new())
+                .unwrap()
+                .changes
+                .contains(&Change::Added {
+                    path: "body.@docs".into(),
+                    kind: "upload"
+                })
+        );
+        let file = |to: &str, fields: Value| json!({"type": "upload", "attrs": {"relationTo": to, "value": id, "fields": fields}});
+        // A block node of a type named like a collection is left alone.
+        let doc = json!({"body": {"type": "doc", "content": [
+            {"type": "blockquote", "content": [file("media", json!({"caption": "c", "gone": "g", "by": id}))]},
+            file("docs", json!({"caption": "d"})),
+            {"type": "block", "attrs": {"blockType": "media", "fields": {"caption": "b"}}}
+        ]}});
+        let mut migrated = migrate_document(&new.fields, &r, doc.as_object().unwrap());
+        assert!(!relink(&new.fields, &mut migrated, &d.links));
+        assert_eq!(
+            Value::Object(migrated),
+            json!({"body": {"type": "doc", "content": [
+                {"type": "blockquote", "content": [file("media", json!({"alt_text": "c",
+                    "by": {"relationTo": "posts", "value": id}, "added": "a"}))]},
+                file("docs", json!({"caption": "d"})),
+                {"type": "block", "attrs": {"blockType": "media", "fields": {"caption": "b"}}}
+            ]}})
         );
     }
 
