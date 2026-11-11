@@ -269,7 +269,7 @@ pub fn pattern_allows(patterns: &[UrlPattern], url: &Url) -> bool {
 /// `host`, as `url` gives it, against a pattern's hostname; both are read the same way
 /// (`pattern_host`), and a pattern that isn't a hostname matches nothing.
 fn host_matches(pattern: &str, host: &str) -> bool {
-    let Some(pattern) = pattern_host(pattern) else {
+    let Ok(pattern) = pattern_host(pattern) else {
         return false;
     };
     let host = host.strip_suffix('.').unwrap_or(host);

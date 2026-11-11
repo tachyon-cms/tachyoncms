@@ -289,23 +289,30 @@ pub struct UrlPattern {
 
 /// An `allowList` or `skipSafeFetch` hostname as a URL's host is read: lowercase,
 /// punycode, without one trailing dot, an IPv6 address in brackets, with a leading `*.` or
-/// `**.` kept. `None` when it isn't a hostname.
-pub fn pattern_host(raw: &str) -> Option<String> {
+/// `**.` kept. Refused, with why, when it isn't a hostname or can never match one.
+pub fn pattern_host(raw: &str) -> Result<String, &'static str> {
+    const NOT: &str = "isn't a hostname";
     let (wild, rest) = ["**.", "*."]
         .iter()
         .find_map(|w| raw.strip_prefix(w).map(|r| (*w, r)))
         .unwrap_or(("", raw));
+    if rest.starts_with('*') {
+        return Err("is a wildcard without a domain, which can never match");
+    }
     let rest = rest.strip_suffix('.').unwrap_or(rest);
     if rest.is_empty() {
-        return None;
+        return Err(NOT);
     }
     let bracketed = if rest.contains(':') && !rest.starts_with('[') {
         format!("[{rest}]")
     } else {
         rest.to_owned()
     };
-    let host = url::Host::parse(&bracketed).ok()?;
-    Some(format!("{wild}{host}"))
+    let host = url::Host::parse(&bracketed).map_err(|_| NOT)?;
+    if !wild.is_empty() && !matches!(host, url::Host::Domain(_)) {
+        return Err("puts a wildcard before an IP address, which can never match");
+    }
+    Ok(format!("{wild}{host}"))
 }
 
 /// The fields every upload collection has.
@@ -915,10 +922,9 @@ fn url_pattern(v: &Value, path: &str) -> Result<(), String> {
             ("hostname", |v, p| {
                 leaf::<String>(v, p)?;
                 let raw = v.as_str().unwrap_or_default();
-                match pattern_host(raw) {
-                    Some(_) => Ok(()),
-                    None => Err(format!("{p}: `{raw}` isn't a hostname")),
-                }
+                pattern_host(raw)
+                    .map(drop)
+                    .map_err(|why| format!("{p}: `{raw}` {why}"))
             }),
             ("port", text),
             ("pathname", text),
@@ -1123,10 +1129,24 @@ mod tests {
             ("2001:DB8::1", "[2001:db8::1]"),
             ("127.1", "127.0.0.1"),
         ] {
-            assert_eq!(pattern_host(raw).as_deref(), Some(want), "{raw}");
+            assert_eq!(pattern_host(raw).as_deref(), Ok(want), "{raw}");
         }
-        for bad in ["", ".", "exa mple.com", "a/b", "[::1", "*.", "x:y"] {
-            assert_eq!(pattern_host(bad), None, "{bad}");
+        for bad in [
+            "",
+            ".",
+            "exa mple.com",
+            "a/b",
+            "[::1",
+            "*.",
+            "x:y",
+            "*",
+            "**",
+            "*.10.0.0.1",
+            "**.[::1]",
+            "*.::1",
+            "*.*.example.com",
+        ] {
+            assert!(pattern_host(bad).is_err(), "{bad}");
         }
     }
 

@@ -5026,6 +5026,26 @@ mod tests {
                 "upload.skipSafeFetch.0.hostname: `[::1` isn't a hostname",
             ),
             (
+                json!({"pasteURL": {"allowList": [{"hostname": "*.10.0.0.1"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `*.10.0.0.1` puts a wildcard before an IP address, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "**.[::1]"}]}),
+                "upload.skipSafeFetch.0.hostname: `**.[::1]` puts a wildcard before an IP address, which can never match",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "*"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `*` is a wildcard without a domain, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "**"}]}),
+                "upload.skipSafeFetch.0.hostname: `**` is a wildcard without a domain, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "*.*.example.com"}]}),
+                "upload.skipSafeFetch.0.hostname: `*.*.example.com` is a wildcard without a domain, which can never match",
+            ),
+            (
                 json!({"modifyResponseHeaders": {"X-A": 1}}),
                 "upload.modifyResponseHeaders.X-A: ",
             ),
