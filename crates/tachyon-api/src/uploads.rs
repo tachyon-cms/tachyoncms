@@ -84,18 +84,28 @@ impl Incoming {
         }
         let url = Url::parse(&raw).map_err(|_| at_url("this isn't a URL".into()))?;
         let cap = u.filesize_limit.unwrap_or(state.media.max_file_size);
-        if let Some(limit) = limit {
-            limit.lengthen();
-        }
-        state
-            .fetch
-            .to_spool(&url, u, cap, &state.media.temp_dir)
-            .await
-            .map_err(|e| match e {
-                FetchError::TooLarge(_) => ApiError::BodyTooLarge(e.to_string()),
-                FetchError::Io(_) => ApiError::Internal(e.to_string()),
-                e => at_url(e.to_string()),
-            })
+        let fetch = state.fetch.to_spool(&url, u, cap, &state.media.temp_dir);
+        let fetched = match &limit {
+            Some(limit) => {
+                let until = limit.fetching();
+                // No time left is a timeout at once; `timeout_at` would poll the fetch first.
+                let out = if tokio::time::Instant::now() >= until {
+                    Err(FetchError::Timeout)
+                } else {
+                    tokio::time::timeout_at(until, fetch)
+                        .await
+                        .unwrap_or(Err(FetchError::Timeout))
+                };
+                limit.fetched();
+                out
+            }
+            None => fetch.await,
+        };
+        fetched.map_err(|e| match e {
+            FetchError::TooLarge(_) => ApiError::BodyTooLarge(e.to_string()),
+            FetchError::Io(_) => ApiError::Internal(e.to_string()),
+            e => at_url(e.to_string()),
+        })
     }
 }
 

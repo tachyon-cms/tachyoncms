@@ -359,7 +359,7 @@ async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Ne
         Some(_) => limits.uploads,
         None => limits.normal,
     };
-    let until = Limit::new(now + limit, limits.uploads + limits.normal);
+    let until = Limit::new(now, now + limit, limits);
     req.extensions_mut().insert(Deadline(now + limit));
     req.extensions_mut().insert(until.clone());
     let run = next.run(req);
@@ -378,26 +378,32 @@ async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Ne
     }
 }
 
-/// When `time_limit` ends a request. A URL found in the body lengthens it as its fetch
-/// starts, past every check before it (`lengthen`).
+/// When `time_limit` ends a request. A URL found in the body moves it while it's fetched,
+/// past every check before it (`fetching`, then `fetched`). However it moves, a request
+/// ends by arrival + `[uploads] timeout` + the normal limit.
 #[derive(Clone)]
 pub(crate) struct Limit(Arc<LimitAt>);
 
 struct LimitAt {
     at: std::sync::Mutex<tokio::time::Instant>,
-    /// What a fetch gets from its start: its own timeout, then the normal limit for what
-    /// follows, so the fetch's timeout always ends it first.
-    fetch: Duration,
+    arrival: tokio::time::Instant,
+    limits: TimeLimits,
     moved: tokio::sync::Notify,
 }
 
 impl Limit {
-    fn new(at: tokio::time::Instant, fetch: Duration) -> Self {
+    fn new(arrival: tokio::time::Instant, at: tokio::time::Instant, limits: TimeLimits) -> Self {
         Self(Arc::new(LimitAt {
             at: std::sync::Mutex::new(at),
-            fetch,
+            arrival,
+            limits,
             moved: tokio::sync::Notify::new(),
         }))
+    }
+
+    /// The latest any request may end.
+    fn last(&self) -> tokio::time::Instant {
+        self.0.arrival + self.0.limits.uploads + self.0.limits.normal
     }
 
     fn at(&self) -> tokio::time::Instant {
@@ -409,10 +415,18 @@ impl Limit {
         self.0.moved.notify_one();
     }
 
-    /// For a fetch starting now: `[uploads] timeout` and then the normal limit.
-    pub(crate) fn lengthen(&self) {
-        let fetch = tokio::time::Instant::now() + self.0.fetch;
-        self.set(fetch.max(self.at()));
+    /// For a fetch starting now: the request may run to its last moment, and the fetch
+    /// must end by arrival + `[uploads] timeout`, which is returned, so its own timeout
+    /// always comes first.
+    pub(crate) fn fetching(&self) -> tokio::time::Instant {
+        self.set(self.last());
+        self.0.arrival + self.0.limits.uploads
+    }
+
+    /// After the fetch, what follows gets the normal limit.
+    pub(crate) fn fetched(&self) {
+        let normal = tokio::time::Instant::now() + self.0.limits.normal;
+        self.set(normal.min(self.last()));
     }
 }
 
@@ -644,12 +658,15 @@ mod tests {
     }
 
     /// A pasted URL lifts the request's limit only as its fetch starts, past every check
-    /// before it, and then to the fetch's own timeout plus the normal limit, so a slow
-    /// upstream is the fetch's 422, not the request's 503. Each route is a collection:
-    /// `on` fetches and then works 300 ms, `off` takes no URLs, `refused` is turned away
-    /// before the fetch (as a field-write refusal is), `slow` fetches from a server too slow.
+    /// before it. The whole request ends by arrival + `[uploads] timeout` + the normal
+    /// limit: the fetch gets until arrival + `timeout`, so a slow upstream is its 422, not
+    /// the request's 503, and what follows the fetch gets the normal limit. Each route is a
+    /// collection: `on` fetches and then works 10 ms, `work` works 300 ms after its fetch,
+    /// `off` takes no URLs, `refused` is turned away before the fetch (as a field-write
+    /// refusal is), `slow` fetches from a server too slow.
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
     async fn a_pasted_url_gets_the_upload_time_limit(pool: sqlx::PgPool) {
+        use futures_util::StreamExt;
         use tachyon_core::uploads::{PasteUrl, SkipSafeFetch, Upload};
         use tachyon_media::fixtures::{response, serve};
         let temp = tempfile::Builder::new()
@@ -657,7 +674,7 @@ mod tests {
             .tempdir()
             .unwrap();
         let limits = TimeLimits {
-            normal: Duration::from_millis(50),
+            normal: Duration::from_millis(100),
             uploads: Duration::from_millis(500),
         };
         let state = AppState {
@@ -692,24 +709,24 @@ mod tests {
                     skip_safe_fetch: SkipSafeFetch::All,
                     ..Upload::default()
                 };
-                let late = || tokio::time::sleep(Duration::from_millis(300));
+                let work = |ms| tokio::time::sleep(Duration::from_millis(ms));
                 let body = uploads::UploadBody::read(req, Some(1_000), &state.media.temp_dir).await;
                 let Ok(uploads::UploadBody::Upload { file, .. }) = body else {
-                    late().await;
+                    work(300).await;
                     return "not pasted".into_response();
                 };
                 if route == "refused" {
-                    late().await;
+                    work(300).await;
                     return ApiError::Forbidden("no".into()).into_response();
                 }
                 match file.spool(&state, &u).await {
                     Ok(_) => {
-                        late().await;
+                        work(if route == "work" { 300 } else { 10 }).await;
                         "fetched".into_response()
                     }
                     Err(e) if route == "slow" => e.into_response(),
                     Err(e) => {
-                        late().await;
+                        work(300).await;
                         e.into_response()
                     }
                 }
@@ -722,43 +739,24 @@ mod tests {
         let app = layers(routes, limits);
         let json =
             |addr: std::net::SocketAddr| format!(r#"{{"file": {{"url": "http://{addr}/a.txt"}}}}"#);
-        let part = format!(
-            "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{}\r\n--x--\r\n",
-            json(fast)
-        );
+        let part = |addr| {
+            format!(
+                "--x\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{}\r\n--x--\r\n",
+                json(addr)
+            )
+        };
         let (kind, multipart) = ("application/json", "multipart/form-data; boundary=x");
+        let ok = StatusCode::OK;
+        let late = StatusCode::SERVICE_UNAVAILABLE;
         for (method, uri, kind, body, status) in [
-            ("POST", "/api/on", kind, json(fast), StatusCode::OK),
-            ("PATCH", "/api/on/1", kind, json(fast), StatusCode::OK),
-            (
-                "POST",
-                "/api/on?wait=true",
-                kind,
-                json(fast),
-                StatusCode::OK,
-            ),
-            ("POST", "/api/on", multipart, part, StatusCode::OK),
-            (
-                "POST",
-                "/api/off",
-                kind,
-                json(fast),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                "POST",
-                "/api/refused",
-                kind,
-                json(fast),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
-            (
-                "POST",
-                "/api/on",
-                kind,
-                r#"{"alt": "x"}"#.into(),
-                StatusCode::SERVICE_UNAVAILABLE,
-            ),
+            ("POST", "/api/on", kind, json(fast), ok),
+            ("PATCH", "/api/on/1", kind, json(fast), ok),
+            ("POST", "/api/on?wait=true", kind, json(fast), ok),
+            ("POST", "/api/on", multipart, part(fast), ok),
+            ("POST", "/api/work", kind, json(fast), late),
+            ("POST", "/api/off", kind, json(fast), late),
+            ("POST", "/api/refused", kind, json(fast), late),
+            ("POST", "/api/on", kind, r#"{"alt": "x"}"#.into(), late),
             (
                 "POST",
                 "/api/slow",
@@ -776,6 +774,31 @@ mod tests {
             let res = app.clone().oneshot(req).await.unwrap();
             assert_eq!(res.status(), status, "{method} {uri} {kind}");
         }
+        // A body dripped for most of the upload limit leaves its fetch only the rest: the
+        // fetch's 422 comes by arrival + `timeout`, not a whole `timeout` after it starts.
+        let body = part(slow).into_bytes();
+        let (head, rest) = body.split_at(10);
+        let pieces = vec![(0, head.to_vec()), (350, rest.to_vec())];
+        let dripped = futures_util::stream::iter(pieces).then(|(ms, bytes)| async move {
+            tokio::time::sleep(Duration::from_millis(ms)).await;
+            Ok::<_, std::io::Error>(bytes)
+        });
+        let req = Request::builder()
+            .method("POST")
+            .uri("/api/slow")
+            .header("content-type", multipart)
+            .body(Body::from_stream(dripped))
+            .unwrap();
+        let started = tokio::time::Instant::now();
+        let res = app.clone().oneshot(req).await.unwrap();
+        let took = started.elapsed();
+        assert_eq!(res.status(), StatusCode::UNPROCESSABLE_ENTITY);
+        let detail = res.into_body().collect().await.unwrap().to_bytes();
+        assert!(String::from_utf8_lossy(&detail).contains("file.url"));
+        assert!(
+            took < limits.uploads + Duration::from_millis(100),
+            "{took:?}"
+        );
         assert!(std::fs::read_dir(temp.path()).unwrap().next().is_none());
     }
 
