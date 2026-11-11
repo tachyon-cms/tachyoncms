@@ -380,9 +380,9 @@ async fn time_limit(State(limits): State<TimeLimits>, mut req: Request, next: Ne
     }
 }
 
-/// When `time_limit` ends a request. A URL found in the body moves it while it's fetched,
-/// past every check before it (`fetching`, then `fetched`). However it moves, a request
-/// ends by arrival + `[uploads] timeout` + the normal limit.
+/// When `time_limit` ends a request. A URL found in the body raises it as its fetch
+/// starts, past every check before it (`fetching`), to arrival + `[uploads] timeout` + the
+/// normal limit, which no request outlives.
 #[derive(Clone)]
 pub(crate) struct Limit(Arc<LimitAt>);
 
@@ -419,16 +419,11 @@ impl Limit {
 
     /// For a fetch starting now: the request may run to its last moment, and the fetch
     /// must end by arrival + `[uploads] timeout`, which is returned, so its own timeout
-    /// always comes first.
+    /// always comes first. What follows the fetch keeps the rest, as a multipart upload's
+    /// processing does.
     pub(crate) fn fetching(&self) -> tokio::time::Instant {
         self.set(self.last());
         self.0.arrival + self.0.limits.uploads
-    }
-
-    /// After the fetch, what follows gets the normal limit.
-    pub(crate) fn fetched(&self) {
-        let normal = tokio::time::Instant::now() + self.0.limits.normal;
-        self.set(normal.min(self.last()));
     }
 }
 
@@ -662,8 +657,9 @@ mod tests {
     /// A pasted URL lifts the request's limit only as its fetch starts, past every check
     /// before it. The whole request ends by arrival + `[uploads] timeout` + the normal
     /// limit: the fetch gets until arrival + `timeout`, so a slow upstream is its 422, not
-    /// the request's 503, and what follows the fetch gets the normal limit. Each route is a
-    /// collection: `on` fetches and then works 10 ms, `work` works 300 ms after its fetch,
+    /// the request's 503, and what follows the fetch has the rest of the bound, as a
+    /// multipart upload has. Each route is a collection: `on` fetches and then works 10 ms,
+    /// `work` works 300 ms after its fetch, inside the bound, `long` 700 ms, past it,
     /// `off` takes no URLs, `refused` is turned away before the fetch (as a field-write
     /// refusal is), `slow` fetches from a server too slow.
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -723,7 +719,12 @@ mod tests {
                 }
                 match file.spool(&state, &u).await {
                     Ok(_) => {
-                        work(if route == "work" { 300 } else { 10 }).await;
+                        let ms = match route.as_str() {
+                            "work" => 300,
+                            "long" => 700,
+                            _ => 10,
+                        };
+                        work(ms).await;
                         "fetched".into_response()
                     }
                     Err(e) if route == "slow" => e.into_response(),
@@ -755,7 +756,8 @@ mod tests {
             ("PATCH", "/api/on/1", kind, json(fast), ok),
             ("POST", "/api/on?wait=true", kind, json(fast), ok),
             ("POST", "/api/on", multipart, part(fast), ok),
-            ("POST", "/api/work", kind, json(fast), late),
+            ("POST", "/api/work", kind, json(fast), ok),
+            ("POST", "/api/long", kind, json(fast), late),
             ("POST", "/api/off", kind, json(fast), late),
             ("POST", "/api/refused", kind, json(fast), late),
             ("POST", "/api/on", kind, r#"{"alt": "x"}"#.into(), late),

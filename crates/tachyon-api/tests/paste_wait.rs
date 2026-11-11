@@ -45,7 +45,7 @@ async fn a_pasted_waits_end_before_the_request_does(pool: PgPool) {
         request_timeout: Some(Duration::from_secs(3)),
         uploads: UploadsConfig {
             temp_dir: temp.clone(),
-            timeout: Duration::from_secs(10),
+            timeout: Duration::from_secs(4),
             storages: Arc::new(storages),
             ..UploadsConfig::default()
         },

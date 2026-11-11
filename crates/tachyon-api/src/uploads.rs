@@ -89,15 +89,13 @@ impl Incoming {
             Some(limit) => {
                 let until = limit.fetching();
                 // No time left is a timeout at once; `timeout_at` would poll the fetch first.
-                let out = if tokio::time::Instant::now() >= until {
+                if tokio::time::Instant::now() >= until {
                     Err(FetchError::Timeout)
                 } else {
                     tokio::time::timeout_at(until, fetch)
                         .await
                         .unwrap_or(Err(FetchError::Timeout))
-                };
-                limit.fetched();
-                out
+                }
             }
             None => fetch.await,
         };
