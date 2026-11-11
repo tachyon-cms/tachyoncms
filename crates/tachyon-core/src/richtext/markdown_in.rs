@@ -282,9 +282,10 @@ impl<'s, 'k> Reader<'s, 'k> {
         let mut found = Vec::new();
         for (n, &start) in self.starts.iter().enumerate() {
             let end = self.starts.get(n + 1).copied().unwrap_or(self.src.len());
-            let Some(at) = directive_at(&self.src[start..end]).map(|i| start + i) else {
+            let Some((offset, _)) = directive_at(&self.src[start..end]) else {
                 continue;
             };
+            let at = start + offset;
             let colons = out[at..].iter().take_while(|&&b| b == b':').count();
             out[at] = b'#';
             out[at + 1..at + colons].fill(b' ');
@@ -323,26 +324,8 @@ impl<'s, 'k> Reader<'s, 'k> {
             self.event(event, line)?;
         }
         if let Some(&line) = self.directives.keys().min() {
-            // The line begins with a list or task marker, so the directive sits inside a
-            // checklist or ordered item and never reaches the parser as a block (#49):
-            // the author sees it at the start of the line, so the generic message reads
-            // as wrong. Name the list instead; the four-space indent keeps the old message.
-            // A directive left unparsed whose line starts with a list or task marker sits
-            // inside a list item, so it never reaches the parser as a block: the author
-            // sees it at the start of the line, and the generic message reads as wrong (#49).
-            // Name the list; every other case (the four-space indent included) keeps the old message.
             let src_line = self.src.lines().nth(line - 1).unwrap_or("");
-            let trimmed = src_line.trim_start();
-            let marker = trimmed.split_whitespace().next().unwrap_or("");
-            let after_marker = &trimmed[marker.len()..];
-            let in_list = (matches!(marker, "-" | "*" | "+") && after_marker.starts_with(' '))
-                || trimmed.starts_with("[ ] ")
-                || trimmed.starts_with("[x] ")
-                || trimmed.starts_with("[X] ")
-                || (!marker.is_empty()
-                    && marker.len() <= 9
-                    && marker.chars().all(|c| c.is_ascii_digit())
-                    && after_marker.starts_with(". "));
+            let in_list = directive_at(src_line).is_some_and(|(_, listed)| listed);
             let msg = if in_list {
                 "a directive can't sit inside a list item; put it on its own line, outside the list"
                     .to_string()
@@ -950,8 +933,8 @@ fn list(
 }
 
 /// Where a line's directive starts, past any quote markers, list markers and task boxes,
-/// however many: the first of at least two colons.
-fn directive_at(line: &str) -> Option<usize> {
+/// plus whether the line has a list marker.
+fn directive_at(line: &str) -> Option<(usize, bool)> {
     let b = line.as_bytes();
     let skip = |mut i: usize| {
         while b.get(i).is_some_and(|c| b" \t>".contains(c)) {
@@ -971,7 +954,11 @@ fn directive_at(line: &str) -> Option<usize> {
         let marker = match b.get(i) {
             Some(b'-' | b'+' | b'*') => 1,
             _ if listed && boxed => 3,
-            _ if digits > 0 && b.get(i + digits).is_some_and(|c| b".)".contains(c)) => digits + 1,
+            _ if (1..=9).contains(&digits)
+                && b.get(i + digits).is_some_and(|c| b".)".contains(c)) =>
+            {
+                digits + 1
+            }
             _ => 0,
         };
         match b.get(i + marker) {
@@ -980,7 +967,7 @@ fn directive_at(line: &str) -> Option<usize> {
         }
         listed = true;
     }
-    b[i..].starts_with(b"::").then_some(i)
+    b[i..].starts_with(b"::").then_some((i, listed))
 }
 
 /// `{key="value" …}`: values double-quoted, with `\\`, `\"`, `\n` and `\r` escaped, as
