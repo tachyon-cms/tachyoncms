@@ -5,6 +5,7 @@ pub mod auth;
 pub mod diff;
 pub mod history;
 pub mod joins;
+pub mod net;
 pub mod query;
 pub mod richtext;
 pub mod schema;
