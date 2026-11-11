@@ -5014,6 +5014,18 @@ mod tests {
                 "upload.skipSafeFetch.0.hostname: ",
             ),
             (
+                json!({"pasteURL": {"allowList": [{"hostname": "exa mple.com"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `exa mple.com` isn't a hostname",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "*.a/b"}]}),
+                "upload.skipSafeFetch.0.hostname: `*.a/b` isn't a hostname",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "[::1"}]}),
+                "upload.skipSafeFetch.0.hostname: `[::1` isn't a hostname",
+            ),
+            (
                 json!({"modifyResponseHeaders": {"X-A": 1}}),
                 "upload.modifyResponseHeaders.X-A: ",
             ),

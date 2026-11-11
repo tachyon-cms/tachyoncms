@@ -287,6 +287,27 @@ pub struct UrlPattern {
     pub search: Option<String>,
 }
 
+/// An `allowList` or `skipSafeFetch` hostname as a URL's host is read: lowercase,
+/// punycode, without one trailing dot, an IPv6 address in brackets, with a leading `*.` or
+/// `**.` kept. `None` when it isn't a hostname.
+pub fn pattern_host(raw: &str) -> Option<String> {
+    let (wild, rest) = ["**.", "*."]
+        .iter()
+        .find_map(|w| raw.strip_prefix(w).map(|r| (*w, r)))
+        .unwrap_or(("", raw));
+    let rest = rest.strip_suffix('.').unwrap_or(rest);
+    if rest.is_empty() {
+        return None;
+    }
+    let bracketed = if rest.contains(':') && !rest.starts_with('[') {
+        format!("[{rest}]")
+    } else {
+        rest.to_owned()
+    };
+    let host = url::Host::parse(&bracketed).ok()?;
+    Some(format!("{wild}{host}"))
+}
+
 /// The fields every upload collection has.
 pub const UPLOAD_FIELDS: &[&str] = &[
     "filename",
@@ -891,7 +912,14 @@ fn url_pattern(v: &Value, path: &str) -> Result<(), String> {
         &["hostname"],
         &[
             ("protocol", text),
-            ("hostname", leaf::<String>),
+            ("hostname", |v, p| {
+                leaf::<String>(v, p)?;
+                let raw = v.as_str().unwrap_or_default();
+                match pattern_host(raw) {
+                    Some(_) => Ok(()),
+                    None => Err(format!("{p}: `{raw}` isn't a hostname")),
+                }
+            }),
             ("port", text),
             ("pathname", text),
             ("search", text),
@@ -1081,6 +1109,26 @@ pub(crate) fn check_raw(upload: &Value) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pattern_hosts_are_read_as_urls_read_them() {
+        for (raw, want) in [
+            ("Example.COM", "example.com"),
+            ("example.com.", "example.com"),
+            ("bücher.de", "xn--bcher-kva.de"),
+            ("*.Bücher.de.", "*.xn--bcher-kva.de"),
+            ("**.example.com", "**.example.com"),
+            ("::1", "[::1]"),
+            ("[0:0::1]", "[::1]"),
+            ("2001:DB8::1", "[2001:db8::1]"),
+            ("127.1", "127.0.0.1"),
+        ] {
+            assert_eq!(pattern_host(raw).as_deref(), Some(want), "{raw}");
+        }
+        for bad in ["", ".", "exa mple.com", "a/b", "[::1", "*.", "x:y"] {
+            assert_eq!(pattern_host(bad), None, "{bad}");
+        }
+    }
 
     #[test]
     fn renamed_files_rename_their_sizes() {
