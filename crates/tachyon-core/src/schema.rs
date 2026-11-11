@@ -1977,6 +1977,10 @@ impl CollectionSchema {
             CollectionKind::Collection => {}
         }
         for f in data_fields(&self.fields).iter() {
+            // A write's `uploadEdits` edits the file, so no field can take it.
+            if f.name == crate::uploads::UPLOAD_EDITS {
+                return Err(SchemaError::ReservedFieldName(f.name.clone()));
+            }
             if let Some(kind) = crate::uploads::built_in_kind(u, &f.name)
                 && (f.kind.name() != kind || f.virtual_path.is_some())
             {
@@ -3466,9 +3470,16 @@ mod tests {
                 json!({"slug": "blocks", "kind": "block", "fields": []}),
                 "collection slug `blocks` is reserved",
             ),
+            (
+                json!({"slug": "media", "upload": true, "fields": [{"name": "uploadEdits", "type": "json"}]}),
+                "field name `uploadEdits` is reserved",
+            ),
         ] {
             assert_eq!(schema(bad).check().unwrap_err().to_string(), message);
         }
+        // Only an upload collection reads `uploadEdits` from a write.
+        let plain = json!({"slug": "posts", "fields": [{"name": "uploadEdits", "type": "json"}]});
+        assert_eq!(schema(plain).check(), Ok(()));
         let extra = json!({"slug": "p", "fields": [{"name": "l", "type": "blocks", "blocks": [
             {"blockRef": "cta", "slug": "x"}
         ]}]});
