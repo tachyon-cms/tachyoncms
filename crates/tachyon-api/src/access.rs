@@ -1396,6 +1396,7 @@ mod tests {
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
             media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let viewer = builtin_roles()[3].2.clone();
         let principal = Principal::User {
@@ -1458,6 +1459,7 @@ mod tests {
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
             media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let principal = Principal::User {
             identity: Identity {

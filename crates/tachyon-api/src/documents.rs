@@ -34,7 +34,7 @@ use crate::populate::{
     link_targets, populate, prepare, to_value, vouched_links,
 };
 use crate::uploads::{
-    Incoming, UploadBody, check_and_process, file_limit, focal_of, persist, require_file, scope_of,
+    UploadBody, check_and_process, file_limit, focal_of, persist, require_file, scope_of,
     server_fields, settle_server_set, taken_or_abandoned, with_fields,
 };
 use crate::{ApiError, AppState};
@@ -275,7 +275,8 @@ pub async fn create(
     access.writes(&c, &body, Action::Create, None)?;
     // Decoded only once the write is allowed.
     let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(Incoming::Spooled(spool))) => {
+        (Some(u), Some(file)) => {
+            let spool = file.spool(&state, u).await?;
             Some((u, check_and_process(&state, u, spool).await?))
         }
         _ => None,
@@ -481,7 +482,8 @@ pub async fn update(
     access.writes(&c, &patch, Action::Update, Some(&stored))?;
     // Decoded only once the write is allowed.
     let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(Incoming::Spooled(spool))) => {
+        (Some(u), Some(file)) => {
+            let spool = file.spool(&state, u).await?;
             Some((u, check_and_process(&state, u, spool).await?))
         }
         _ => None,

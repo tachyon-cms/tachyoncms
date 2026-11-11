@@ -659,6 +659,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: INLINE_ROWS,
             media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let request = json!({
             "schema": {"slug": "posts", "fields": [{"name": "headline", "type": "text"}]},

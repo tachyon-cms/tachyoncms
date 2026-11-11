@@ -53,6 +53,8 @@ pub(crate) struct AppState {
     /// See `Options::schema_inline_rows`.
     pub inline_rows: i64,
     pub media: Arc<UploadsConfig>,
+    /// For files sent as a URL.
+    pub fetch: tachyon_media::fetch::SafeFetch,
 }
 
 /// `[uploads]` and the `[storage.*]` they go to.
@@ -245,6 +247,8 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         inline_rows: options
             .schema_inline_rows
             .unwrap_or(collections::INLINE_ROWS),
+        fetch: tachyon_media::fetch::SafeFetch::new(options.uploads.timeout)
+            .map_err(StartError::Config)?,
         media: Arc::new(options.uploads),
     };
     let storages: Vec<String> = state.media.storages.0.keys().cloned().collect();

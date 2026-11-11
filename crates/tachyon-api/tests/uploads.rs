@@ -1366,3 +1366,232 @@ async fn a_file_that_panics_a_decoder_is_a_422(pool: PgPool) {
     assert_eq!(res.json["errors"][0]["path"], "file");
     assert!(files_in(&d.temp).is_empty());
 }
+
+/// A server on 127.0.0.1 answering `/{name}` with `body`, `/to/{port}` with a redirect to
+/// that port on 127.0.0.1, and anything else with a 404 that says too much.
+async fn file_server(name: &'static str, body: Vec<u8>) -> std::net::SocketAddr {
+    fixtures::serve(move |path| {
+        let piece = if path == format!("/{name}") {
+            fixtures::response(
+                "200 OK",
+                &[&format!("Content-Length: {}", body.len())],
+                &body,
+            )
+        } else if let Some(port) = path.strip_prefix("/to/") {
+            let to = format!("Location: http://127.0.0.1:{port}/{name}");
+            fixtures::response("302 Found", &[&to, "Content-Length: 0"], b"")
+        } else {
+            fixtures::response("404 Not Found", &["Content-Length: 11"], b"secret body")
+        };
+        vec![piece]
+    })
+    .await
+}
+
+fn pasted(url: &str, alt: &str) -> Value {
+    json!({"alt": alt, "file": {"url": url}})
+}
+
+/// A 422 at `file.url`, its message returned.
+fn at_url(res: &Res) -> String {
+    assert_problem(res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file.url", "{}", res.json);
+    res.json["errors"][0]["message"]
+        .as_str()
+        .unwrap()
+        .to_owned()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn paste_url_fetches_and_stores(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({"upload": {"skipSafeFetch": true}})).await;
+    let image = png(3, 2);
+    let addr = file_server("cat.png", image.clone()).await;
+    let url = format!("http://{addr}/cat.png");
+    let res = call(&app, "POST", "/api/images", Some(pasted(&url, "x"))).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let doc = &res.json;
+    assert_eq!(doc["filename"], "cat.png");
+    assert_eq!(doc["mimeType"], "image/png");
+    assert_eq!(
+        (doc["width"].clone(), doc["height"].clone()),
+        (json!(3), json!(2))
+    );
+    assert_eq!(doc["alt"], "x");
+    assert!(doc.get("file").is_none(), "{doc}");
+    let id = doc["id"].as_str().unwrap();
+    let row = files::get(&pool, held(&pool, id, "published_file").await.unwrap())
+        .await
+        .unwrap();
+    assert_eq!(std::fs::read(d.root.join(&row.key)).unwrap(), image);
+    assert!(files_in(&d.temp).is_empty(), "the spool file is gone");
+    // An update takes a URL too, and so does a multipart body without a file part.
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/images/{id}"),
+        Some(pasted(&url, "y")),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["alt"], "y");
+    let replaced = held(&pool, id, "published_file").await.unwrap();
+    assert_ne!(replaced, row.id, "a new file");
+    let res = upload(
+        &app,
+        "POST",
+        "/api/images",
+        None,
+        "",
+        Some(&pasted(&url, "z")),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert_eq!(res.json["alt"], "z");
+    assert!(files_in(&d.temp).is_empty());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn paste_url_refuses_private_targets(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "files", json!({})).await;
+    let inside = file_server("a.txt", b"internal".to_vec()).await;
+    for url in [
+        format!("http://{inside}/a.txt"),
+        "http://[::1]/".into(),
+        "http://169.254.169.254/latest/meta-data/".into(),
+        "http://localhost/".into(),
+    ] {
+        let res = call(&app, "POST", "/api/files", Some(pasted(&url, "x"))).await;
+        let message = at_url(&res);
+        assert_eq!(message, "this URL points at a private address", "{url}");
+        assert!(!res.json.to_string().contains("127.0.0.1"), "{}", res.json);
+    }
+    // Skipping the guard for one server doesn't let it redirect to another.
+    let outside = file_server("a.txt", b"public".to_vec()).await;
+    collection(
+        &app,
+        "skips",
+        json!({"upload": {"skipSafeFetch": [
+            {"protocol": "http", "hostname": "127.0.0.1", "port": outside.port().to_string()}
+        ]}}),
+    )
+    .await;
+    let res = call(
+        &app,
+        "POST",
+        "/api/skips",
+        Some(pasted(&format!("http://{outside}/a.txt"), "x")),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let hop = format!("http://{outside}/to/{}", inside.port());
+    let res = call(&app, "POST", "/api/skips", Some(pasted(&hop, "x"))).await;
+    assert_eq!(at_url(&res), "this URL points at a private address");
+    // Other schemes, credentials, an upstream error, and what isn't a URL.
+    let collection_files = |url: String| call(&app, "POST", "/api/files", Some(pasted(&url, "x")));
+    assert!(
+        at_url(&collection_files("file:///etc/passwd".into()).await).contains("http and https")
+    );
+    assert!(
+        at_url(&collection_files("http://u:p@example.com/".into()).await).contains("user name")
+    );
+    assert_eq!(
+        at_url(&collection_files("not a url".into()).await),
+        "this isn't a URL"
+    );
+    let res = call(
+        &app,
+        "POST",
+        "/api/skips",
+        Some(pasted(&format!("http://{outside}/nope"), "x")),
+    )
+    .await;
+    assert_eq!(at_url(&res), "the server answered 404");
+    assert!(!res.json.to_string().contains("secret"), "{}", res.json);
+    assert_eq!(file_rows(&pool).await, 1);
+    assert!(files_in(&d.temp).is_empty());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn paste_url_allow_list_and_cap(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    let listed = file_server("a.txt", vec![b'a'; 101]).await;
+    let other = file_server("a.txt", b"hi".to_vec()).await;
+    collection(
+        &app,
+        "files",
+        json!({"upload": {
+            "filesizeLimit": 100,
+            "skipSafeFetch": true,
+            "pasteURL": {"allowList": [
+                {"protocol": "http", "hostname": "127.0.0.1", "port": listed.port().to_string()}
+            ]}
+        }}),
+    )
+    .await;
+    let res = call(
+        &app,
+        "POST",
+        "/api/files",
+        Some(pasted(&format!("http://{other}/a.txt"), "x")),
+    )
+    .await;
+    assert!(at_url(&res).contains("allowList"), "{}", res.json);
+    // A listed server can't redirect off the list.
+    let hop = format!("http://{listed}/to/{}", other.port());
+    let res = call(&app, "POST", "/api/files", Some(pasted(&hop, "x"))).await;
+    assert!(at_url(&res).contains("allowList"), "{}", res.json);
+    let res = call(
+        &app,
+        "POST",
+        "/api/files",
+        Some(pasted(&format!("http://{listed}/a.txt"), "x")),
+    )
+    .await;
+    assert_problem(&res, 413);
+    assert!(
+        res.json["detail"].as_str().unwrap().contains("100"),
+        "{}",
+        res.json
+    );
+    assert!(files_in(&d.temp).is_empty(), "no spool left");
+    assert_eq!(file_rows(&pool).await, 0);
+    // `file` takes `url` alone, as a string.
+    let res = call(
+        &app,
+        "POST",
+        "/api/files",
+        Some(json!({"file": {"url": "http://x.io/a", "name": "b"}})),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file.name", "{}", res.json);
+    assert_eq!(
+        at_url(
+            &call(
+                &app,
+                "POST",
+                "/api/files",
+                Some(json!({"file": {"url": 3}}))
+            )
+            .await
+        ),
+        "expected a URL"
+    );
+    // A collection that takes no URLs says so.
+    collection(&app, "nourls", json!({"upload": {"pasteURL": false}})).await;
+    let res = call(
+        &app,
+        "POST",
+        "/api/nourls",
+        Some(pasted(&format!("http://{listed}/a.txt"), "x")),
+    )
+    .await;
+    assert_problem(&res, 400);
+    assert_eq!(res.json["detail"], "this collection doesn't take URLs");
+}

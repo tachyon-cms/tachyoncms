@@ -20,10 +20,14 @@ use axum::http::header::CONTENT_TYPE;
 use futures_util::Stream;
 use multer::{Constraints, Multipart, SizeLimit};
 use serde_json::{Map, Value, json};
-use tachyon_core::uploads::{SERVER_SET, Upload, mime_allowed, restricted, sanitize_filename};
+use tachyon_core::uploads::{
+    PasteUrl, SERVER_SET, Upload, mime_allowed, restricted, sanitize_filename,
+};
 use tachyon_core::{Field, FieldError, FieldKind};
 use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, FileRow, NewFile};
+pub(crate) use tachyon_media::fetch::Spool;
+use tachyon_media::fetch::{FetchError, HEAD};
 use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
 use tachyon_media::storage::object_key;
@@ -31,13 +35,12 @@ use tachyon_media::svg::{self, SvgError};
 use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
+use url::Url;
 use uuid::Uuid;
 
 use crate::documents::{JSON_LIMIT, json_body};
 use crate::{ApiError, AppState};
 
-/// How much of a file is kept in memory for sniffing.
-const HEAD: usize = 8 * 1024;
 /// Room for the parts' boundaries and headers, past the file and the payload.
 const OVERHEAD: u64 = 64 * 1024;
 /// The most a part's headers may take, with the preamble and delimiter before them; the
@@ -54,20 +57,46 @@ pub(crate) enum UploadBody {
     Upload { payload: Value, file: Incoming },
 }
 
-/// Where an upload's bytes come from.
+/// Where an upload's bytes come from: a file part already spooled, or a URL to fetch
+/// (`{"file": {"url": "…"}}` in the payload).
 pub(crate) enum Incoming {
     Spooled(Spool),
+    Url(String),
 }
 
-/// A file part, written to a temporary file in `[uploads] temp_dir` that's deleted when
-/// this is dropped.
-pub(crate) struct Spool {
-    pub file: NamedTempFile,
-    pub len: u64,
-    /// The first 8 KiB, for sniffing.
-    pub head: Vec<u8>,
-    /// The name it was sent under, sanitised.
-    pub name: String,
+impl Incoming {
+    /// The file spooled in `[uploads] temp_dir`, fetched first if it's a URL: a 400 when `u`
+    /// takes no URLs, a 422 at `file.url` when this one can't be fetched, a 413 past the
+    /// collection's limit.
+    pub(crate) async fn spool(self, state: &AppState, u: &Upload) -> Result<Spool, ApiError> {
+        let raw = match self {
+            Self::Spooled(spool) => return Ok(spool),
+            Self::Url(raw) => raw,
+        };
+        if u.paste_url == PasteUrl::Off {
+            return Err(ApiError::BadRequest(
+                "this collection doesn't take URLs".into(),
+            ));
+        }
+        let url = Url::parse(&raw).map_err(|_| at_url("this isn't a URL".into()))?;
+        let cap = u.filesize_limit.unwrap_or(state.media.max_file_size);
+        state
+            .fetch
+            .to_spool(&url, u, cap, &state.media.temp_dir)
+            .await
+            .map_err(|e| match e {
+                FetchError::TooLarge(_) => ApiError::BodyTooLarge(e.to_string()),
+                FetchError::Io(_) => ApiError::Internal(e.to_string()),
+                e => at_url(e.to_string()),
+            })
+    }
+}
+
+fn at_url(message: String) -> ApiError {
+    ApiError::Validation(vec![FieldError {
+        path: "file.url".into(),
+        message,
+    }])
 }
 
 /// A spooled file that passed every check, with what was learnt about it.
@@ -108,7 +137,7 @@ impl UploadBody {
             .starts_with("multipart/form-data")
         {
             let body = Json::<Value>::from_request(req, &()).await;
-            return json_body(body).map(Self::Json);
+            return Self::pasted(json_body(body)?, file_limit);
         }
         let boundary = multer::parse_boundary(kind)
             .map_err(|e| ApiError::BadRequest(format!("bad multipart content type: {e}")))?;
@@ -164,13 +193,44 @@ impl UploadBody {
             }
         }
         let payload = payload.unwrap_or_else(|| json!({}));
-        Ok(match spool {
-            Some(s) => Self::Upload {
+        match spool {
+            Some(s) => Ok(Self::Upload {
                 payload,
                 file: Incoming::Spooled(s),
-            },
-            None => Self::Json(payload),
-        })
+            }),
+            None => Self::pasted(payload, file_limit),
+        }
+    }
+
+    /// `payload`, as an upload of the URL in its `file` when it's `{"url": "…"}` and the
+    /// collection takes files (`file_limit`); any other key beside `url` is a 422.
+    fn pasted(mut payload: Value, file_limit: Option<u64>) -> Result<Self, ApiError> {
+        let pasting =
+            file_limit.is_some() && payload.get("file").is_some_and(|f| f.get("url").is_some());
+        let Some(Value::Object(file)) = pasting
+            .then(|| payload.as_object_mut()?.remove("file"))
+            .flatten()
+        else {
+            return Ok(Self::Json(payload));
+        };
+        let unknown: Vec<FieldError> = file
+            .keys()
+            .filter(|k| *k != "url")
+            .map(|k| FieldError {
+                path: format!("file.{k}"),
+                message: "unknown field; a file from a URL takes `url` alone".into(),
+            })
+            .collect();
+        if !unknown.is_empty() {
+            return Err(ApiError::Validation(unknown));
+        }
+        match &file["url"] {
+            Value::String(url) => Ok(Self::Upload {
+                payload,
+                file: Incoming::Url(url.clone()),
+            }),
+            _ => Err(at_url("expected a URL".into())),
+        }
     }
 }
 

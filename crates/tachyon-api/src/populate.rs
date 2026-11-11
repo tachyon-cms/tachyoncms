@@ -793,6 +793,7 @@ mod tests {
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
             media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let b = collections::create(&pool, &schema(json!({"slug": "b", "fields": []})))
             .await
