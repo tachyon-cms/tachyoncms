@@ -46,18 +46,21 @@ timeout = "10m"                 # how long one upload request may take; under 1h
 #                                             # (buckets only; a link lasts 7 days at most)
 
 # An Azure blob container. Set the account key in TACHYON_STORAGE__AZURE__ACCESS_KEY, or a
-# SAS token in ..._SAS_TOKEN; with neither, the server uses its managed identity. Only the
-# account key can sign links, so client_uploads and signed_downloads need it. For Azurite,
-# set endpoint to the account's URL, like "http://127.0.0.1:10000/devstoreaccount1".
+# SAS token in ..._SAS_TOKEN; with neither, the server uses its managed identity. Signed
+# links (client_uploads, signed_downloads) need the account key, or the managed identity
+# with sign_with_identity = true and a role with generateUserDelegationKey, such as Storage
+# Blob Delegator; the server signs one link at startup to check. For Azurite, set endpoint
+# to the account's URL, like "http://127.0.0.1:10000/devstoreaccount1".
 # [storage.azure]
 # adapter = "azure"
 # account = "mystorageaccount"
 # container = "media"
 
 # A Google Cloud Storage bucket. Point TACHYON_STORAGE__GCS__SERVICE_ACCOUNT_PATH at a
-# service account key file; without one the server uses its own Google credentials. Only
-# a key file can sign links, so client_uploads and signed_downloads need one. For
-# fake-gcs-server, set endpoint, like "http://127.0.0.1:4443".
+# service account key file; without one the server uses its own Google credentials. Signed
+# links need the key file, or those credentials with sign_with_identity = true and
+# iam.serviceAccounts.signBlob, such as Service Account Token Creator; the server signs one
+# link at startup to check. For fake-gcs-server, set endpoint, like "http://127.0.0.1:4443".
 # [storage.gcs]
 # adapter = "gcs"
 # bucket = "media"

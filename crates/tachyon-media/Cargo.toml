@@ -30,6 +30,7 @@ url.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 tokio = { workspace = true, features = ["fs", "io-util", "net", "time", "macros", "process", "rt-multi-thread"] }
 
 [lints]

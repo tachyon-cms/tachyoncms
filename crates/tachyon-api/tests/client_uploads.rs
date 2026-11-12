@@ -1906,3 +1906,90 @@ async fn azure_instructions_carry_blob_type(pool: PgPool) {
     assert_eq!(url.host_str(), Some("acct.blob.core.windows.net"));
     assert!(url.path().starts_with("/media/_staging/"), "{url}");
 }
+
+/// Signs nothing: an identity whose grant was taken away after startup.
+#[derive(Debug)]
+struct Revoked;
+
+#[async_trait::async_trait]
+impl Signer for Revoked {
+    async fn signed_url(&self, _: Method, _: &Key, _: Duration) -> object_store::Result<Url> {
+        Err(object_store::Error::Generic {
+            store: "test",
+            source: "403 AuthorizationPermissionMismatch".into(),
+        })
+    }
+
+    async fn signed_url_opts(
+        &self,
+        _: Method,
+        _: &Key,
+        _: Duration,
+        _: &SignedUrlOptions,
+    ) -> object_store::Result<Url> {
+        self.signed_url(Method::GET, &Key::from("x"), Duration::ZERO)
+            .await
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_signing_failure_is_unavailable(pool: PgPool) {
+    let d = dirs();
+    let mut c = StorageConfig::local(&d.bucket);
+    c.client_uploads = true;
+    c.public_url = Some(Url::parse("https://media.tachyoncms.com").unwrap());
+    c.signed_downloads = SignedDownloads::On {
+        mime_types: Vec::new(),
+        expires_in: Duration::from_secs(600),
+    };
+    let store = LocalFileSystem::new_with_prefix(&d.bucket).unwrap();
+    let revoked =
+        Storage::with_store("revoked", Arc::new(store), None, c).with_signer(Arc::new(Revoked));
+    let mut o = options(&d, 0);
+    let mut all = o.uploads.storages.0.clone();
+    all.insert("revoked".into(), Arc::new(revoked));
+    o.uploads.storages = Arc::new(Storages(all));
+    let app = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    let res = send(&app, "POST", "/api/setup", Some(&body.to_string())).await;
+    assert_eq!(res.status, 201, "setup: {}", res.json);
+    let app = signed_in(app, ADMIN).await;
+    collection(
+        &app,
+        "images",
+        json!({"access": {"read": true}, "upload": {"storage": "revoked"}}),
+    )
+    .await;
+
+    let res = instructions(&app, "images", "a.png", "image/png", 10).await;
+    assert_eq!(res.status, 503, "{}", res.json);
+    assert_eq!(
+        res.json["detail"],
+        "storage `revoked` can't sign links right now; try again later"
+    );
+    assert!(
+        !res.json
+            .to_string()
+            .contains("AuthorizationPermissionMismatch"),
+        "the cause is logged, not sent"
+    );
+    let states: Vec<String> = file_states(&pool, "images")
+        .await
+        .into_iter()
+        .map(|(_, state, _)| state)
+        .collect();
+    assert_eq!(states, ["gone"], "the reserved file is given up");
+
+    let res = upload(&app, "POST", "/api/images", Some(&png(4, 4)), "m.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    for method in ["GET", "HEAD"] {
+        let res = fetch(&app, method, "/api/images/file/m.png").await;
+        assert_eq!(res.status, 503, "{method}");
+        assert_eq!(res.header("location"), "", "{method}: no link");
+    }
+    // Nor does the document point at the bucket instead.
+    let res = send(&app, "GET", "/api/images", None).await;
+    let url = res.json["docs"][0]["url"].as_str().unwrap();
+    assert!(url.ends_with("/api/images/file/m.png"), "{url}");
+    assert!(!url.contains("media.tachyoncms.com"), "{url}");
+}

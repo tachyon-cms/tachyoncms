@@ -1,5 +1,6 @@
 use std::path::{Path, PathBuf};
 
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde_json::json;
@@ -654,4 +655,223 @@ async fn gcs_round_trip() {
     round_trip(&storage).await;
     // The emulator checks no signature, so only a real bucket refuses another type.
     client_put_round_trip(&storage, false).await;
+}
+
+/// Signs as the machine's identity would when it's granted to (`true`) or not (`false`).
+#[derive(Debug)]
+struct Identity(bool);
+
+#[async_trait::async_trait]
+impl object_store::signer::Signer for Identity {
+    async fn signed_url(
+        &self,
+        _: object_store::signer::Method,
+        path: &object_store::path::Path,
+        _: Duration,
+    ) -> object_store::Result<url::Url> {
+        match self.0 {
+            true => Ok(format!("https://signed.test/{path}").parse().unwrap()),
+            false => Err(object_store::Error::Generic {
+                store: "test",
+                source: "403 AuthorizationPermissionMismatch".into(),
+            }),
+        }
+    }
+}
+
+fn with_identity(mut c: StorageConfig) -> StorageConfig {
+    c.sign_with_identity = true;
+    signing(c)
+}
+
+#[test]
+fn identity_signing_is_opt_in() {
+    for (c, name) in [(signing(azure(None)), "az"), (signing(gcs(None)), "g")] {
+        let err = open(name, &c, &[]).unwrap_err();
+        assert!(err.contains("sign_with_identity = true"), "{err}");
+    }
+    let az = open("az", &with_identity(azure(None)), &[]).unwrap();
+    assert!(az.takes_client_uploads());
+    assert!(az.signs("image/png").is_some());
+    // Local and S3 storages have no such identity to sign with.
+    let s3 = StorageConfig {
+        adapter: Adapter::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            region: Some("us-east-1".into()),
+        },
+        ..StorageConfig::local("unused")
+    };
+    let root = temp_root();
+    for (c, name) in [(s3, "s3"), (StorageConfig::local(&*root), "disk")] {
+        let mut c = c;
+        c.sign_with_identity = true;
+        let err = open(name, &c, &[]).unwrap_err();
+        assert!(
+            err.starts_with(&format!("storage.{name}.sign_with_identity: ")),
+            "{err}"
+        );
+    }
+}
+
+#[tokio::test]
+async fn identity_signing_is_checked_at_startup() {
+    let opted = |c: StorageConfig, granted: bool| {
+        Storage::with_store(
+            "s",
+            Arc::new(object_store::memory::InMemory::new()),
+            None,
+            with_identity(c),
+        )
+        .with_signer(Arc::new(Identity(granted)))
+    };
+    for (c, grant) in [
+        (azure(None), "generateUserDelegationKey"),
+        (gcs(None), "iam.serviceAccounts.signBlob"),
+    ] {
+        assert!(opted(c.clone(), true).check_signing().await.is_ok());
+        let err = opted(c, false).check_signing().await.unwrap_err();
+        assert!(err.starts_with("storage.s.sign_with_identity: "), "{err}");
+        assert!(err.contains(grant), "{err}");
+        assert!(err.contains("AuthorizationPermissionMismatch"), "{err}");
+    }
+    // Without the opt-in the signer signs locally, so nothing is tried at startup.
+    let keyed = Storage::with_store(
+        "s",
+        Arc::new(object_store::memory::InMemory::new()),
+        None,
+        signing(azure(None)),
+    )
+    .with_signer(Arc::new(Identity(false)));
+    assert!(keyed.check_signing().await.is_ok());
+    // Nor when nothing here is signed.
+    let mut quiet = azure(None);
+    quiet.sign_with_identity = true;
+    let quiet = Storage::with_store(
+        "s",
+        Arc::new(object_store::memory::InMemory::new()),
+        None,
+        quiet,
+    )
+    .with_signer(Arc::new(Identity(false)));
+    assert!(quiet.check_signing().await.is_ok());
+
+    let all = tachyon_media::storage::Storages(std::collections::HashMap::from([
+        ("a".to_owned(), Arc::new(opted(azure(None), true))),
+        ("g".to_owned(), Arc::new(opted(gcs(None), false))),
+    ]));
+    assert!(all.check_signing().await.unwrap_err().contains("signBlob"));
+}
+
+/// A store that can't copy, so a copy that works went another way.
+#[derive(Debug)]
+struct NoCopy(object_store::memory::InMemory);
+
+impl std::fmt::Display for NoCopy {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "NoCopy")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for NoCopy {
+    async fn put_opts(
+        &self,
+        location: &object_store::path::Path,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &object_store::path::Path,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: &object_store::path::Path,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(object_store::Error::NotImplemented {
+            operation: "copy".into(),
+            implementer: "NoCopy".into(),
+        })
+    }
+}
+
+#[tokio::test]
+async fn azure_copies_by_streaming() {
+    let store = Arc::new(NoCopy(object_store::memory::InMemory::new()));
+    let az = Storage::with_store("az", store.clone(), None, azure(None));
+    let id = Uuid::now_v7();
+    let (from, to) = (
+        object_key(None, "images", id, "a.png").unwrap(),
+        object_key(None, "images", id, "a-1.png").unwrap(),
+    );
+    // Over a part, so the put goes in more than one.
+    let bytes: Vec<u8> = (0..12_000_000u32).map(|i| (i % 251) as u8).collect();
+    az.put_file(&from, &source(&bytes), "image/png")
+        .await
+        .unwrap();
+    az.copy(&from, &to).await.unwrap();
+    let got = az.get_range(&to, None).await.unwrap();
+    assert_eq!(
+        got.attributes
+            .get(&object_store::Attribute::ContentType)
+            .map(|v| v.as_ref()),
+        Some("image/png"),
+        "the type goes with it"
+    );
+    assert!(got.bytes().await.unwrap() == bytes, "every byte is copied");
+    // Other buckets keep their own server-side copy.
+    let s3 = StorageConfig {
+        adapter: Adapter::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            region: None,
+        },
+        ..StorageConfig::local("unused")
+    };
+    let s3 = Storage::with_store("s3", store, None, s3);
+    assert!(s3.copy(&from, &to).await.is_err());
 }

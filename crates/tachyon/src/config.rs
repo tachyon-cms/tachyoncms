@@ -117,6 +117,9 @@ pub struct StorageSettings {
     pub public_url: Option<String>,
     #[serde(default)]
     pub client_uploads: bool,
+    /// Signs through the machine's own Azure or Google identity, with no key here.
+    #[serde(default)]
+    pub sign_with_identity: bool,
     #[serde(default)]
     pub signed_downloads: SignedSetting,
     /// Only to name the right variable when one is found in the file.
@@ -281,6 +284,7 @@ impl StorageSettings {
             public_url,
             client_uploads: self.client_uploads,
             signed_downloads,
+            sign_with_identity: self.sign_with_identity,
         })
     }
 }
@@ -1077,6 +1081,17 @@ mod tests {
             }
         );
         assert!(az.takes_client_uploads());
+        // No key: the machine's identity signs only when asked to.
+        let ambient = "[storage.az]\nadapter = \"azure\"\ncontainer = \"media\"\naccount = \"acct\"\nclient_uploads = true\n";
+        assert!(
+            uploads(ambient)
+                .unwrap_err()
+                .contains("or sign_with_identity = true to sign that way")
+        );
+        let opted = uploads(&format!("{ambient}sign_with_identity = true\n")).unwrap();
+        let opted = opted.storages.get("az").unwrap();
+        assert!(opted.config().sign_with_identity);
+        assert!(opted.takes_client_uploads());
         let sas = [("TACHYON_STORAGE__AZ__SAS_TOKEN", "sv=1&sig=x")];
         assert!(
             uploads_with(azure, &sas)

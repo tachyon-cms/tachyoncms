@@ -1568,7 +1568,7 @@ async fn upload_instructions_in(
         Ok(url) => url,
         Err(e) => {
             abandon(state, file.id).await;
-            return Err(ApiError::Internal(format!("can't sign an upload: {e}")));
+            return Err(unsigned(storage.name(), "an upload", e));
         }
     };
     Ok(Json(json!({
@@ -1580,6 +1580,20 @@ async fn upload_instructions_in(
         },
         "file": {"filename": file.filename, "mimeType": mime, "filesize": ask.filesize},
     })))
+}
+
+/// A signing failure at `storage`: the store's own (a revoked grant, the cloud down) is
+/// worth trying again later; anything else is a fault here.
+pub(crate) fn unsigned(storage: &str, what: &str, e: StorageError) -> ApiError {
+    match e {
+        StorageError::Store(cause) => {
+            tracing::warn!(%cause, storage, "can't sign {what}");
+            ApiError::Unavailable(format!(
+                "storage `{storage}` can't sign links right now; try again later"
+            ))
+        }
+        other => ApiError::Internal(format!("can't sign {what}: {other}")),
+    }
 }
 
 /// Whether `mime` is a bare `type/subtype` of token characters, fit for a signed header.

@@ -24,6 +24,8 @@ pub enum ApiError {
     UnsupportedMediaType(String),
     /// The request ran past its time limit.
     Timeout,
+    /// Something this needs, such as a storage's signer, is failing for now; says what.
+    Unavailable(String),
     /// Too much is waiting on this caller already; worth asking again after `retry_after`
     /// seconds.
     TooManyRequests {
@@ -122,6 +124,12 @@ impl ApiError {
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service unavailable",
                 Some("the request took too long; try again".to_owned()),
+                None,
+            ),
+            Self::Unavailable(d) => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service unavailable",
+                Some(d),
                 None,
             ),
             Self::RangeNotSatisfiable(size) => (

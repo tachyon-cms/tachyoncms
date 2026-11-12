@@ -68,6 +68,9 @@ pub struct StorageConfig {
     pub public_url: Option<Url>,
     pub client_uploads: bool,
     pub signed_downloads: SignedDownloads,
+    /// Signs through the machine's own Azure or Google identity, a request to the cloud
+    /// that's tried once at startup (`Storage::check_signing`).
+    pub sign_with_identity: bool,
 }
 
 impl StorageConfig {
@@ -79,6 +82,7 @@ impl StorageConfig {
             public_url: None,
             client_uploads: false,
             signed_downloads: SignedDownloads::Off,
+            sign_with_identity: false,
         }
     }
 }
@@ -159,6 +163,11 @@ impl Storage {
         // `Err(why)`: the credentials can't sign, so `client_uploads` and `signed_downloads`
         // are refused at startup rather than failing on each request.
         type Opened = (Arc<dyn ObjectStore>, Result<Arc<dyn Signer>, String>);
+        if c.sign_with_identity && matches!(c.adapter, Adapter::Local { .. } | Adapter::S3 { .. }) {
+            return Err(format!(
+                "storage.{name}.sign_with_identity: only an Azure or Google storage signs through the machine's own identity"
+            ));
+        }
         let (store, signer): Opened = match &c.adapter {
             Adapter::Local { root } => {
                 std::fs::create_dir_all(root).map_err(|e| {
@@ -241,10 +250,11 @@ impl Storage {
                             "a SAS token can't sign links of its own; set the account key in {key_var} instead"
                         ))
                     }
-                    // Without a key the machine's own identity is used, which could only sign
-                    // through a request to Azure that may be refused long after startup.
+                    // Without a key the machine's own identity is used, which signs only through
+                    // a request to Azure: allowed when asked for, and tried at startup.
+                    (None, None) if endpoint.is_none() && c.sign_with_identity => Ok(()),
                     (None, None) if endpoint.is_none() => Err(format!(
-                        "the machine's own Azure identity can't sign links here; set the account key in {key_var}"
+                        "the machine's own Azure identity signs links only through a request to Azure; set the account key in {key_var}, or sign_with_identity = true to sign that way (its role needs generateUserDelegationKey)"
                     )),
                     (None, None) => {
                         return Err(format!(
@@ -253,7 +263,7 @@ impl Storage {
                     }
                 };
                 // Before the build, which may read the machine's own credentials.
-                check_signing(name, c, signs.as_ref().err())?;
+                check_signing_config(name, c, signs.as_ref().err())?;
                 let az = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
                 (az.clone(), signs.map(|()| az as Arc<dyn Signer>))
             }
@@ -282,18 +292,19 @@ impl Storage {
                         ));
                     }
                     // The machine's own account signs only through Google's IAM API, and only
-                    // when granted that too: a key file signs by itself.
+                    // when granted that too: allowed when asked for, and tried at startup.
+                    None if c.sign_with_identity => Ok(()),
                     None => Err(format!(
-                        "the machine's own Google account can't sign links here; set a service account key file's path in {path_var}"
+                        "the machine's own Google account signs links only through Google's IAM API; set a service account key file's path in {path_var}, or sign_with_identity = true to sign that way (it needs iam.serviceAccounts.signBlob)"
                     )),
                 };
                 // Before the build, which may read the machine's own credentials.
-                check_signing(name, c, signs.as_ref().err())?;
+                check_signing_config(name, c, signs.as_ref().err())?;
                 let gcs = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
                 (gcs.clone(), signs.map(|()| gcs as Arc<dyn Signer>))
             }
         };
-        check_signing(name, c, signer.as_ref().err())?;
+        check_signing_config(name, c, signer.as_ref().err())?;
         Ok(Self::with_store(name, store, signer.ok(), c.clone()))
     }
 
@@ -361,6 +372,30 @@ impl Storage {
     /// bucket URL.
     pub fn signs_any(&self) -> bool {
         matches!(self.config.signed_downloads, SignedDownloads::On { .. })
+    }
+
+    /// With `sign_with_identity`, signs one link through the machine's identity, as startup
+    /// does before serving: a grant that's missing stops the server there, not each request.
+    pub async fn check_signing(&self) -> Result<(), String> {
+        if !self.config.sign_with_identity || !(self.config.client_uploads || self.signs_any()) {
+            return Ok(());
+        }
+        let grant = match self.config.adapter {
+            Adapter::Azure { .. } => {
+                "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action on the storage account, as the Storage Blob Delegator role does"
+            }
+            _ => {
+                "iam.serviceAccounts.signBlob on itself, as the Service Account Token Creator role does"
+            }
+        };
+        let probe = format!("{STAGING}/signing-check");
+        match self.presign_get(&probe, Duration::from_secs(60)).await {
+            Ok(_) => Ok(()),
+            Err(e) => Err(format!(
+                "storage.{}.sign_with_identity: the machine's identity couldn't sign a link ({e}); grant it {grant}",
+                self.name
+            )),
+        }
     }
 
     fn signer_or_refuse(&self) -> Result<&Arc<dyn Signer>, StorageError> {
@@ -462,7 +497,37 @@ impl Storage {
     }
 
     pub async fn copy(&self, from: &str, to: &str) -> Result<(), StorageError> {
-        Ok(self.store.copy(&self.key(from)?, &self.key(to)?).await?)
+        let (from, to) = (self.key(from)?, self.key(to)?);
+        // Azure's Copy Blob may answer before the copy is done, and nothing waits on it.
+        // Streamed through here instead, the copy is whole when this returns.
+        if matches!(self.config.adapter, Adapter::Azure { .. }) {
+            return self.copy_streamed(&from, to).await;
+        }
+        Ok(self.store.copy(&from, &to).await?)
+    }
+
+    /// Reads `from` and writes it to `to` with its attributes, held a part at a time, as
+    /// `put_file` holds a file.
+    async fn copy_streamed(&self, from: &Key, to: Key) -> Result<(), StorageError> {
+        use futures_util::TryStreamExt;
+        let got = self.store.get(from).await?;
+        let mut out =
+            BufWriter::new(self.store.clone(), to).with_attributes(got.attributes.clone());
+        let mut chunks = got.into_stream();
+        let copied = async {
+            while let Some(chunk) = chunks.try_next().await? {
+                out.put(chunk).await?;
+            }
+            Ok::<_, object_store::Error>(())
+        }
+        .await;
+        match copied {
+            Ok(()) => out.shutdown().await.map_err(Into::into),
+            Err(e) => {
+                let _ = out.abort().await;
+                Err(e.into())
+            }
+        }
     }
 
     /// The staging keys (`staging_key`'s shape, nothing else) in this storage's staging
@@ -521,7 +586,11 @@ pub const MAX_SIGNED: Duration = Duration::from_secs(7 * 24 * 3600);
 /// Signing needs a bucket whose credentials sign: a storage told to sign without them is a
 /// mistake to catch at startup (`unsigned` says why), as is a link meant to outlast what a
 /// bucket signs.
-fn check_signing(name: &str, c: &StorageConfig, unsigned: Option<&String>) -> Result<(), String> {
+fn check_signing_config(
+    name: &str,
+    c: &StorageConfig,
+    unsigned: Option<&String>,
+) -> Result<(), String> {
     let local = matches!(c.adapter, Adapter::Local { .. });
     if let Some(why) = unsigned.filter(|_| !local) {
         if c.client_uploads {
@@ -665,6 +734,14 @@ impl Storages {
 
     pub fn get(&self, name: &str) -> Option<&Arc<Storage>> {
         self.0.get(name)
+    }
+
+    /// `Storage::check_signing` on each: the first that fails.
+    pub async fn check_signing(&self) -> Result<(), String> {
+        for storage in self.0.values() {
+            storage.check_signing().await?;
+        }
+        Ok(())
     }
 }
 

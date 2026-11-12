@@ -110,6 +110,14 @@ async fn main() -> anyhow::Result<()> {
                 request_timeout: None,
                 uploads: config.uploads_config().map_err(anyhow::Error::msg)?,
             };
+            // A storage that signs through the machine's identity signs once now, so a
+            // missing grant stops startup instead of failing each request.
+            options
+                .uploads
+                .storages
+                .check_signing()
+                .await
+                .map_err(anyhow::Error::msg)?;
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
             tracing::info!(addr = %config.listen, "listening");

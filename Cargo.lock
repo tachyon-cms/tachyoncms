@@ -3370,6 +3370,7 @@ dependencies = [
 name = "tachyon-media"
 version = "0.2.0"
 dependencies = [
+ "async-trait",
  "avif-decode",
  "avif-parse",
  "blurhash",

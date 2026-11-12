@@ -104,7 +104,7 @@ async fn serve_file(
         let url = storage
             .presign_get(&found.key, expires)
             .await
-            .map_err(|e| ApiError::Internal(format!("can't sign a download: {e}")))?;
+            .map_err(|e| crate::uploads::unsigned(storage.name(), "a download", e))?;
         let mut out = HeaderMap::new();
         out.insert(CACHE_CONTROL, HeaderValue::from_static(PRIVATE));
         let location = HeaderValue::from_str(url.as_str())
