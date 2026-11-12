@@ -267,7 +267,10 @@ fn probe_unguarded(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
     };
     match format {
         InputFormat::Avif => {
-            let bytes = read()?;
+            let mut bytes = read()?;
+            // What follows the last whole box is no part of it (`process_original` cuts
+            // it off, or refuses a file with no such end).
+            bytes.truncate(isobmff_end(&bytes).unwrap_or(bytes.len()));
             let parsed = avif::parse(&bytes)?;
             let (w, h) = avif::decode_bound(&parsed.primary_item)?;
             let (aw, ah) = match &parsed.alpha_item {
@@ -428,6 +431,8 @@ struct Meta {
     icc: Option<Vec<u8>>,
     exif: Option<Vec<u8>>,
     xmp: Option<Vec<u8>>,
+    /// A TIFF's own descriptive tags, carried into the TIFF it's re-encoded as.
+    tiff_tags: Vec<TiffTag>,
 }
 
 /// An image decoded: its frames (one unless all were asked for), upright, and what's kept.
@@ -542,6 +547,9 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
             if keep {
                 meta.exif = decoder.exif_metadata().ok().flatten();
                 meta.xmp = decoder.xmp_metadata().ok().flatten();
+                if p.format == InputFormat::Tiff {
+                    meta.tiff_tags = tiff_tags(bytes);
+                }
             }
             let img = DynamicImage::from_decoder(decoder).map_err(from_image)?;
             (
@@ -660,20 +668,26 @@ fn process_unguarded(
         _ => None,
     };
     // What follows the format's own end (a ZIP, a page, a vendor trailer) isn't metadata
-    // and isn't the picture: it goes, whatever `withMetadata` keeps.
+    // and isn't the picture: it goes, whatever `withMetadata` keeps. An end that can't be
+    // found, or that lies, is a file cut off: refused when strict, else re-encoded from
+    // what decodes, so no tail survives either way. A TIFF has no end to cut at, so it's
+    // always re-encoded.
     let uploaded = bytes.len();
     let end = match probe.format {
-        InputFormat::Jpeg => walked_jpeg.as_ref().map_or(uploaded, |j| j.end),
-        InputFormat::Gif => walked_gif.as_ref().map_or(uploaded, |g| g.end),
+        InputFormat::Jpeg => walked_jpeg.as_ref().and_then(|j| j.ends.then_some(j.end)),
+        InputFormat::Gif => walked_gif.as_ref().and_then(|g| g.ends.then_some(g.end)),
         InputFormat::Png => png_end(&bytes),
-        InputFormat::Webp => webp_end(&bytes),
-        _ => uploaded,
+        InputFormat::Webp => webp_end(&bytes)?,
+        InputFormat::Bmp => bmp_end(&bytes),
+        InputFormat::Ico => ico::walk(&bytes)?.entries.iter().map(|e| e.end).max(),
+        InputFormat::Avif => isobmff_end(&bytes),
+        InputFormat::Tiff => Some(uploaded),
     };
-    bytes.truncate(end);
-    let ends = walked_jpeg.as_ref().map(|j| j.ends);
-    if strict && (ends == Some(false) || walked_gif.as_ref().is_some_and(|g| !g.ends)) {
+    if strict && end.is_none() {
         return Err(ImageError::Truncated);
     }
+    let unended = end.is_none();
+    bytes.truncate(end.unwrap_or(uploaded));
     let transforms =
         u.trim_options.is_some() || u.resize_options.is_some() || u.format_options.is_some();
     let upright = !u.with_metadata
@@ -682,7 +696,9 @@ fn process_unguarded(
             probe.format,
             InputFormat::Jpeg | InputFormat::Png | InputFormat::Webp | InputFormat::Tiff
         );
-    let must_encode = !u.with_metadata && probe.strip_by_encoding;
+    let must_encode = (!u.with_metadata && probe.strip_by_encoding)
+        || probe.format == InputFormat::Tiff
+        || unended;
     let encode = transforms || upright || must_encode;
     let all = encode && probe.frames > 1;
     let decoded = match decode(&bytes, probe, cap, all, u.with_metadata) {
@@ -690,6 +706,7 @@ fn process_unguarded(
         Err(e @ (ImageError::TooManyPixels { .. } | ImageError::OverMemory)) => return Err(e),
         Err(e) if strict => return Err(e),
         // `failOn: none`: stored without what a decode would give.
+        Err(_) if unended => return Err(ImageError::Truncated),
         Err(_) if must_encode => {
             return Err(ImageError::Corrupt(
                 "its metadata can't be removed without decoding it".into(),
@@ -869,6 +886,11 @@ fn transform_and_encode(
             .filter(|_| u.with_metadata)
             .map(|e| upright_exif(&e)),
         xmp: meta.xmp.filter(|_| u.with_metadata),
+        tiff_tags: if u.with_metadata {
+            meta.tiff_tags
+        } else {
+            Vec::new()
+        },
     };
     let first = &frames[0].image;
     let (width, height, hash) = (first.width(), first.height(), blurhash(first));
@@ -889,26 +911,228 @@ fn transform_and_encode(
     })
 }
 
-/// Where a PNG ends: just past its `IEND` chunk, or the end of `bytes` without one.
-fn png_end(bytes: &[u8]) -> usize {
+/// Where a PNG ends: just past an `IEND` chunk of length 0, every chunk before it whole.
+/// `None` when there's no such end.
+fn png_end(bytes: &[u8]) -> Option<usize> {
     let mut i = 8;
     while let Some(h) = bytes.get(i..i + 8) {
         let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
-        let next = i.saturating_add(12).saturating_add(len);
+        let next = i.checked_add(12)?.checked_add(len)?;
+        if next > bytes.len() {
+            return None;
+        }
         if &h[4..] == b"IEND" {
-            return next.min(bytes.len());
+            return (len == 0).then_some(next);
         }
         i = next;
     }
-    bytes.len()
+    None
 }
 
-/// Where a WebP ends: where its RIFF header says, or the end of `bytes` if that's sooner.
-fn webp_end(bytes: &[u8]) -> usize {
-    bytes
+/// Where a WebP ends, as its RIFF header says: `None` when that's past the file's end, or
+/// when the chunks inside don't fill it exactly (bytes that are no whole chunk). A length
+/// too short to hold even `WEBP` is no WebP.
+fn webp_end(bytes: &[u8]) -> Result<Option<usize>, ImageError> {
+    let len = bytes
         .get(4..8)
         .map(|l| u32::from_le_bytes([l[0], l[1], l[2], l[3]]) as usize)
-        .map_or(bytes.len(), |len| len.saturating_add(8).min(bytes.len()))
+        .ok_or(ImageError::Truncated)?;
+    if len < 4 {
+        return Err(ImageError::Corrupt(format!(
+            "its RIFF length is {len}, too short for a WebP"
+        )));
+    }
+    let end = len + 8;
+    if end > bytes.len() {
+        return Ok(None);
+    }
+    let mut i = 12;
+    while i < end {
+        let Some(h) = bytes.get(i..i + 8).filter(|_| i + 8 <= end) else {
+            return Ok(None);
+        };
+        let size = u32::from_le_bytes([h[4], h[5], h[6], h[7]]) as usize;
+        i = match (i + 8).checked_add(size + (size & 1)) {
+            Some(next) if next <= end => next,
+            _ => return Ok(None),
+        };
+    }
+    Ok(Some(end))
+}
+
+/// Where a BMP ends, as its file header's size says: `None` when that's shorter than the
+/// headers or past the file's end.
+fn bmp_end(bytes: &[u8]) -> Option<usize> {
+    let size = bytes.get(2..6)?;
+    let size = u32::from_le_bytes([size[0], size[1], size[2], size[3]]) as usize;
+    (54..=bytes.len()).contains(&size).then_some(size)
+}
+
+/// Where an AVIF ends: after its last whole top-level box. `None` when a box runs to the
+/// end of the file (size 0), when the boxes say nothing about where it ends.
+fn isobmff_end(bytes: &[u8]) -> Option<usize> {
+    let mut i = 0;
+    while let Some(h) = bytes.get(i..i + 8) {
+        let size = match u32::from_be_bytes([h[0], h[1], h[2], h[3]]) {
+            0 => return None,
+            1 => {
+                let large = bytes.get(i + 8..i + 16)?;
+                usize::try_from(u64::from_be_bytes(large.try_into().ok()?)).ok()?
+            }
+            n => n as usize,
+        };
+        match i.checked_add(size) {
+            Some(next) if size >= 8 && next <= bytes.len() => i = next,
+            _ => break,
+        }
+    }
+    (i > 0).then_some(i)
+}
+
+/// A TIFF tag kept as bytes: its number, type, count and value. Only byte, text and
+/// undefined types, whose values read the same in either byte order.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct TiffTag {
+    tag: u16,
+    kind: u16,
+    count: u32,
+    value: Vec<u8>,
+}
+
+/// What a TIFF says about itself, carried when it's re-encoded with `withMetadata`: its
+/// description, camera, software, date, artist, host, copyright, XMP and IPTC.
+const TIFF_KEEP: [u16; 10] = [270, 271, 272, 305, 306, 315, 316, 700, 33432, 33723];
+
+/// A TIFF's byte order (`true` for big-endian) and first IFD, read with `get` only.
+fn tiff_ifd0(bytes: &[u8]) -> Option<(bool, usize)> {
+    let big = match bytes.get(..4)? {
+        b"MM\0*" => true,
+        b"II*\0" => false,
+        _ => return None,
+    };
+    Some((big, read_u32(bytes, 4, big)? as usize))
+}
+
+fn read_u16(b: &[u8], at: usize, big: bool) -> Option<u16> {
+    let x: [u8; 2] = b.get(at..at + 2)?.try_into().ok()?;
+    Some(if big {
+        u16::from_be_bytes(x)
+    } else {
+        u16::from_le_bytes(x)
+    })
+}
+
+fn read_u32(b: &[u8], at: usize, big: bool) -> Option<u32> {
+    let x: [u8; 4] = b.get(at..at + 4)?.try_into().ok()?;
+    Some(if big {
+        u32::from_be_bytes(x)
+    } else {
+        u32::from_le_bytes(x)
+    })
+}
+
+/// The `TIFF_KEEP` tags of `bytes`' first IFD that are bytes, text or undefined; any that
+/// can't be read are left out.
+fn tiff_tags(bytes: &[u8]) -> Vec<TiffTag> {
+    let Some((big, ifd)) = tiff_ifd0(bytes) else {
+        return Vec::new();
+    };
+    let n = read_u16(bytes, ifd, big).unwrap_or(0);
+    (0..usize::from(n))
+        .filter_map(|e| {
+            let at = ifd + 2 + 12 * e;
+            let tag = read_u16(bytes, at, big)?;
+            let kind = read_u16(bytes, at + 2, big)?;
+            let count = read_u32(bytes, at + 4, big)?;
+            if !TIFF_KEEP.contains(&tag) || ![1, 2, 7].contains(&kind) {
+                return None;
+            }
+            let len = count as usize;
+            let value = if len <= 4 {
+                bytes.get(at + 8..at + 8 + len)?
+            } else {
+                let from = read_u32(bytes, at + 8, big)? as usize;
+                bytes.get(from..from.checked_add(len)?)?
+            };
+            Some(TiffTag {
+                tag,
+                kind,
+                count,
+                value: value.to_vec(),
+            })
+        })
+        .collect()
+}
+
+/// `tiff`, as our encoder wrote it, with `tags` added to its first IFD: a new IFD, sorted
+/// by tag, goes at the end with the values that don't fit in an entry, and the header
+/// points at it. A tag the encoder wrote itself stays as it wrote it.
+fn with_tiff_tags(mut tiff: Vec<u8>, tags: &[TiffTag]) -> Vec<u8> {
+    let Some((big, ifd)) = tiff_ifd0(&tiff).filter(|_| !tags.is_empty()) else {
+        return tiff;
+    };
+    let Some(n) = read_u16(&tiff, ifd, big) else {
+        return tiff;
+    };
+    let Some(old) = tiff.get(ifd + 2..ifd + 2 + 12 * usize::from(n)) else {
+        return tiff;
+    };
+    let mut entries: Vec<[u8; 12]> = old.as_chunks::<12>().0.to_vec();
+    let tag_of = |e: &[u8; 12]| read_u16(e, 0, big).unwrap_or(0);
+    let added: Vec<&TiffTag> = tags
+        .iter()
+        .filter(|t| !entries.iter().any(|e| tag_of(e) == t.tag))
+        .collect();
+    let u16b = |v: u16| {
+        if big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    let u32b = |v: u32| {
+        if big {
+            v.to_be_bytes()
+        } else {
+            v.to_le_bytes()
+        }
+    };
+    // Word-aligned, as IFDs and values are.
+    if tiff.len() % 2 == 1 {
+        tiff.push(0);
+    }
+    let count = entries.len() + added.len();
+    let new_ifd = tiff.len();
+    let mut values_at = new_ifd + 2 + 12 * count + 4;
+    let mut values = Vec::new();
+    for t in &added {
+        let mut e = [0u8; 12];
+        e[..2].copy_from_slice(&u16b(t.tag));
+        e[2..4].copy_from_slice(&u16b(t.kind));
+        e[4..8].copy_from_slice(&u32b(t.count));
+        if t.value.len() <= 4 {
+            e[8..8 + t.value.len()].copy_from_slice(&t.value);
+        } else {
+            e[8..].copy_from_slice(&u32b(values_at as u32));
+            values.extend_from_slice(&t.value);
+            if t.value.len() % 2 == 1 {
+                values.push(0);
+            }
+            values_at += t.value.len() + t.value.len() % 2;
+        }
+        entries.push(e);
+    }
+    entries.sort_by_key(tag_of);
+    tiff.extend_from_slice(&u16b(count as u16));
+    for e in &entries {
+        tiff.extend_from_slice(e);
+    }
+    // Only the first IFD is rewritten; the encoder writes no other.
+    tiff.extend_from_slice(&[0; 4]);
+    tiff.extend_from_slice(&values);
+    let at = u32b(new_ifd as u32);
+    tiff[4..8].copy_from_slice(&at);
+    tiff
 }
 
 /// A new file in `dir` holding `bytes`, and its size. Nothing is left behind on failure.
@@ -1122,7 +1346,7 @@ fn encode_to(
                 let _ = e.set_icc_profile(icc.clone());
             }
             img.write_with_encoder(e).map_err(failed)?;
-            out = cursor.into_inner();
+            out = with_tiff_tags(cursor.into_inner(), &meta.tiff_tags);
         }
         InputFormat::Bmp | InputFormat::Ico => {
             let mut cursor = Cursor::new(Vec::new());
@@ -1532,29 +1756,168 @@ mod tests {
         assert!(!bytes.windows(4).any(|w| w == b"Exif"));
     }
 
+    /// The four ways an original is kept: strict or `failOn: none`, with or without
+    /// `withMetadata`.
+    fn settings() -> [(&'static str, Upload); 4] {
+        let none = serde_json::json!({"failOn": "none"});
+        [
+            ("strict", upload(serde_json::json!({}))),
+            (
+                "strict+meta",
+                upload(serde_json::json!({"withMetadata": true})),
+            ),
+            (
+                "lenient",
+                upload(serde_json::json!({"constructorOptions": none})),
+            ),
+            (
+                "lenient+meta",
+                upload(serde_json::json!({"withMetadata": true, "constructorOptions": none})),
+            ),
+        ]
+    }
+
+    const TAIL: &[u8] = b"<html><script>alert(1)</script></html>PK\x05\x06";
+
+    fn tailed(mut bytes: Vec<u8>) -> Vec<u8> {
+        bytes.extend_from_slice(TAIL);
+        bytes
+    }
+
+    /// `png` with the chunk of type `kind` changed by `edit`.
+    fn png_chunk(png: &[u8], kind: &[u8; 4], edit: impl Fn(&mut Vec<u8>, usize)) -> Vec<u8> {
+        let mut out = png.to_vec();
+        let at = (8..out.len() - 8)
+            .find(|&i| &out[i + 4..i + 8] == kind)
+            .expect("the chunk");
+        edit(&mut out, at);
+        out
+    }
+
+    fn riff_len(mut webp: Vec<u8>, len: u32) -> Vec<u8> {
+        webp[4..8].copy_from_slice(&len.to_le_bytes());
+        webp
+    }
+
     #[test]
     fn what_follows_the_end_marker_is_dropped() {
-        let tail = b"<html><script>alert(1)</script></html>PK\x05\x06";
-        for (codec, end) in [
-            (Codec::Png, &b"IEND\xAE\x42\x60\x82"[..]),
-            (Codec::Jpeg, &[0xFF, 0xD9][..]),
-            (Codec::Gif, &[0x3B][..]),
-            (Codec::WebP, &[][..]),
-        ] {
-            let clean = encoded(&gradient(8, 8), codec);
-            let mut with_tail = clean.clone();
-            with_tail.extend_from_slice(tail);
-            for meta in [false, true] {
-                let u = upload(serde_json::json!({"withMetadata": meta}));
-                let out = run(&with_tail, &u).unwrap();
+        let tiff = tiff_with_description("kept");
+        let ends: [(&str, Vec<u8>, &[u8]); 8] = [
+            (
+                "png",
+                encoded(&gradient(8, 8), Codec::Png),
+                b"IEND\xAE\x42\x60\x82",
+            ),
+            ("jpeg", encoded(&gradient(8, 8), Codec::Jpeg), &[0xFF, 0xD9]),
+            ("gif", encoded(&gradient(8, 8), Codec::Gif), &[0x3B]),
+            ("webp", encoded(&gradient(8, 8), Codec::WebP), &[]),
+            ("bmp", encoded(&gradient(8, 8), Codec::Bmp), &[]),
+            (
+                "ico",
+                ico_around(&encoded(&gradient(8, 8), Codec::Png)),
+                &[],
+            ),
+            ("avif", encoded(&gradient(8, 8), Codec::Avif), &[]),
+            ("tiff", tiff, &[]),
+        ];
+        for (name, clean, end) in ends {
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                let out = run(&tailed(clean.clone()), &u).unwrap_or_else(|e| panic!("{at}: {e}"));
                 let kept = stored(&out);
-                assert!(!has(&kept, b"<html>"), "{codec:?} {meta}: the tail stayed");
-                assert!(kept.ends_with(end), "{codec:?} {meta}");
-                assert_eq!(out.filesize, kept.len() as u64, "{codec:?} {meta}");
-                if meta {
-                    // Nothing else changes: the file is as uploaded, up to its end.
-                    assert_eq!(kept, clean, "{codec:?}");
+                assert!(!has(&kept, b"<html>"), "{at}: the tail stayed");
+                assert!(!has(&kept, b"PK\x05\x06"), "{at}: the tail stayed");
+                assert_eq!(out.filesize, kept.len() as u64, "{at}");
+                if name == "tiff" {
+                    // Re-encoded whatever is kept, a TIFF having no end to cut at; with
+                    // `withMetadata` its description comes along.
+                    assert_eq!(has(&kept, b"kept"), u.with_metadata, "{at}");
+                    assert_eq!(::image::load_from_memory(&kept).unwrap().width(), 2, "{at}");
+                    continue;
                 }
+                assert!(kept.ends_with(end), "{at}");
+                if u.with_metadata {
+                    // Nothing else changes: the file is as uploaded, up to its end.
+                    assert_eq!(kept, clean, "{at}");
+                }
+            }
+        }
+
+        // Ends that are missing or lie: refused when strict, and without the tail when
+        // not; and a RIFF length too short to hold a WebP refused either way.
+        let png = encoded(&gradient(8, 8), Codec::Png);
+        let jpeg = encoded(&gradient(8, 8), Codec::Jpeg);
+        let gif = encoded(&gradient(8, 8), Codec::Gif);
+        let webp = encoded(&gradient(8, 8), Codec::WebP);
+        let bmp = encoded(&gradient(8, 8), Codec::Bmp);
+        let no_iend = tailed(png[..png.len() - 12].to_vec());
+        let overrun = {
+            let mut p = png[..png.len() - 12].to_vec();
+            p.extend_from_slice(&1_000u32.to_be_bytes());
+            p.extend_from_slice(b"zzZz");
+            tailed(p)
+        };
+        let iend_covers = png_chunk(&tailed(png.clone()), b"IEND", |p, at| {
+            p[at..at + 4].copy_from_slice(&(TAIL.len() as u32).to_be_bytes());
+        });
+        let covers = |extra: usize| {
+            let mut w = tailed(webp.clone());
+            w.extend(std::iter::repeat_n(b'x', extra));
+            let len = (w.len() - 8) as u32;
+            riff_len(w, len)
+        };
+        let bmp_short = {
+            let mut b = tailed(bmp.clone());
+            b[2..6].copy_from_slice(&10u32.to_le_bytes());
+            b
+        };
+        let mut avif_to_eof = encoded(&gradient(8, 8), Codec::Avif);
+        let last = {
+            let mut i = 0;
+            let mut last = 0;
+            while i + 8 <= avif_to_eof.len() {
+                last = i;
+                i += u32::from_be_bytes(avif_to_eof[i..i + 4].try_into().unwrap()) as usize;
+            }
+            last
+        };
+        avif_to_eof[last..last + 4].copy_from_slice(&0u32.to_be_bytes());
+        let lying: [(&str, Vec<u8>); 10] = [
+            ("png without IEND", no_iend),
+            ("png chunk past the end", overrun),
+            ("png IEND covering the tail", iend_covers),
+            ("webp RIFF covering the tail, even", covers(0)),
+            ("webp RIFF covering the tail, odd", covers(1)),
+            (
+                "webp RIFF 0xFFFFFFFF",
+                riff_len(tailed(webp.clone()), u32::MAX),
+            ),
+            ("jpeg without EOI", tailed(jpeg[..jpeg.len() - 2].to_vec())),
+            ("gif without trailer", tailed(gif[..gif.len() - 1].to_vec())),
+            ("bmp size too small", bmp_short),
+            ("avif box running to the end", tailed(avif_to_eof)),
+        ];
+        for (name, bytes) in lying {
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                match run(&bytes, &u) {
+                    Ok(out) => {
+                        assert!(how.starts_with("lenient"), "{at}: stored when strict");
+                        let kept = stored(&out);
+                        assert!(!has(&kept, b"<html>"), "{at}: the tail stayed");
+                        assert_eq!(out.filesize, kept.len() as u64, "{at}");
+                    }
+                    Err(e) => assert!(
+                        matches!(e, ImageError::Truncated | ImageError::Corrupt(_)),
+                        "{at}: {e}"
+                    ),
+                }
+            }
+        }
+        for len in [0, 3] {
+            for (how, u) in settings() {
+                let res = run(&riff_len(webp.clone(), len), &u);
+                assert!(res.is_err(), "RIFF length {len}, {how}: stored");
             }
         }
     }
@@ -1767,8 +2130,9 @@ mod tests {
         let lenient = upload(serde_json::json!({"constructorOptions": {"failOn": "none"}}));
         let out = run(cut_jpeg, &lenient).unwrap();
         assert_eq!((out.width, out.height), (64, 64));
-        // A PNG cut inside a chunk can't be walked, so its metadata can't be taken out.
-        assert!(matches!(run(cut, &lenient), Err(ImageError::Corrupt(_))));
+        // A PNG cut inside a chunk has no end to cut a tail at and doesn't decode, so
+        // there's nothing it could be re-encoded from.
+        assert_eq!(run(cut, &lenient), Err(ImageError::Truncated));
     }
 
     #[test]

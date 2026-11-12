@@ -95,6 +95,7 @@ impl Original {
                     icc: d.meta.icc,
                     exif: d.meta.exif.map(|e| upright_exif(&e)),
                     xmp: d.meta.xmp,
+                    tiff_tags: d.meta.tiff_tags,
                 },
             })
         })
