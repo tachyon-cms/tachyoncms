@@ -270,7 +270,7 @@ fn probe_unguarded(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
             let mut bytes = read()?;
             // Read as it will be kept: only its own boxes and items (`process_original`
             // keeps the same, or refuses a file whose end can't be known).
-            if let Some(kept) = avif::keep(&bytes, true) {
+            if let Some(kept) = avif::keep(&bytes, true, 0) {
                 bytes = kept;
             }
             let parsed = avif::parse(&bytes)?;
@@ -695,7 +695,7 @@ fn process_unguarded(
         },
         InputFormat::Bmp => Own::cut(bmp_end(&bytes)),
         InputFormat::Ico => Own::replace(ico::repack(&bytes, &ico::walk(&bytes)?, u.with_metadata)),
-        InputFormat::Avif => Own::replace(avif::keep(&bytes, u.with_metadata)),
+        InputFormat::Avif => Own::replace(avif::keep(&bytes, u.with_metadata, cap)),
         // Only the bytes its IFDs reach, each where it was; gaps zeroed.
         InputFormat::Tiff if u.with_metadata => match tiff_regions(&bytes) {
             Ok(regions) => Own::Replace(zeroed_but(&bytes, &regions)),
@@ -2563,8 +2563,38 @@ mod tests {
         }
     }
 
-    /// Items an AVIF holds beside its picture: an HTML page in `idat` goes; its alpha, a
-    /// thumbnail of it, and (with `withMetadata`) any metadata describing it stay.
+    /// `a` with item `id` given the same properties (`ipma` associations) as item `like`.
+    fn avif_with_properties_of(a: &[u8], id: u16, like: u16) -> Vec<u8> {
+        let (meta, iprp, _) = meta_child(a, b"iprp").unwrap();
+        let ipma = child_boxes(a, iprp + 8, a.len())
+            .into_iter()
+            .find(|b| &b.2 == b"ipma")
+            .unwrap();
+        let body = ipma.0 + 8;
+        assert_eq!(a[body], 0, "ipma version 0: 2-byte item IDs");
+        let wide = a[body + 3] & 1 == 1;
+        let count = u32::from_be_bytes(a[body + 4..body + 8].try_into().unwrap());
+        let mut at = body + 8;
+        let mut copied = None;
+        for _ in 0..count {
+            let item = u16::from_be_bytes([a[at], a[at + 1]]);
+            let n = usize::from(a[at + 2]);
+            let len = 3 + n * if wide { 2 } else { 1 };
+            if item == like {
+                let mut e = a[at..at + len].to_vec();
+                e[..2].copy_from_slice(&id.to_be_bytes());
+                copied = Some(e);
+            }
+            at += len;
+        }
+        let mut b = avif_insert(a.to_vec(), ipma.1, &copied.unwrap(), &[meta, iprp, ipma.0]);
+        b[body + 4..body + 8].copy_from_slice(&(count + 1).to_be_bytes());
+        b
+    }
+
+    /// Items an AVIF holds beside its picture: an HTML page in `idat` goes, and so does
+    /// anything merely called a picture; its alpha, a real thumbnail of it, and (with
+    /// `withMetadata`) any metadata describing it stay.
     #[test]
     fn an_avif_keeps_only_what_belongs_to_its_picture() {
         let avif = encoded(&gradient(8, 8), Codec::Avif);
@@ -2574,9 +2604,15 @@ mod tests {
             ::image::Rgba([x as u8 * 30, y as u8 * 30, 90, (x * y * 4) as u8])
         }));
         let transparent = encoded(&rgba, Codec::Avif);
-        let thumb_bytes = b"THUMBNAIL-AV1-BYTES";
+        // A real thumbnail: the picture's own AV1 bytes as item 98, with its properties.
+        let (_, off, len) = crate::fixtures::avif_extents(&avif)[0];
+        let primary_bytes = avif[off..off + len].to_vec();
         let thumbed = avif_with_ref(
-            &avif_with_item(&avif, 98, b"av01", None, thumb_bytes, false),
+            &avif_with_properties_of(
+                &avif_with_item(&avif, 98, b"av01", None, &primary_bytes, false),
+                98,
+                1,
+            ),
             b"thmb",
             98,
             1,
@@ -2612,12 +2648,56 @@ mod tests {
                 at("rgba")
             );
             let k = kept(&thumbed);
-            assert!(has(&k, thumb_bytes), "{}: the thumbnail went", at("thmb"));
+            let copies = k.windows(len).filter(|w| *w == &primary_bytes[..]).count();
+            assert_eq!(copies, 2, "{}: the thumbnail went", at("thmb"));
             assert_eq!(pixels_of(&k), want, "{}", at("thmb"));
             let k = kept(&described);
             assert_eq!(has(&k, manifest), u.with_metadata, "{}", at("cdsc"));
             assert_eq!(pixels_of(&k), want, "{}", at("cdsc"));
         }
+        // Nothing is a picture for being called one: an HTML page declared a thumbnail, an
+        // alpha (without the alpha `auxC`) or a tile of an AV1 primary, an alpha hung off a
+        // real thumbnail, and an `av01` thumbnail holding no AV1.
+        let page = |id| avif_with_item(&avif, id, b"mime", Some("text/html"), TAIL, true);
+        let off_thumbnail = avif_with_ref(
+            &avif_with_item(&thumbed, 99, b"mime", Some("text/html"), TAIL, true),
+            b"auxl",
+            99,
+            98,
+        );
+        let fake = avif_with_ref(
+            &avif_with_properties_of(
+                &avif_with_item(&avif, 96, b"av01", None, TAIL, false),
+                96,
+                1,
+            ),
+            b"thmb",
+            96,
+            1,
+        );
+        let posing: [(&str, Vec<u8>); 5] = [
+            (
+                "page as a thumbnail",
+                avif_with_ref(&page(99), b"thmb", 99, 1),
+            ),
+            ("page as an alpha", avif_with_ref(&page(99), b"auxl", 99, 1)),
+            ("page as a tile", avif_with_ref(&page(99), b"dimg", 1, 99)),
+            ("page as a thumbnail's alpha", off_thumbnail),
+            ("av01 thumbnail of no AV1", fake),
+        ];
+        for (name, bytes) in posing {
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                let k = stored(&run(&bytes, &u).unwrap_or_else(|e| panic!("{at}: {e}")));
+                assert!(!has(&k, b"<html>"), "{at}: the page stayed");
+                assert_eq!(pixels_of(&k), want, "{at}");
+                if name.ends_with("thumbnail's alpha") {
+                    let copies = k.windows(len).filter(|w| *w == &primary_bytes[..]).count();
+                    assert_eq!(copies, 2, "{at}: the real thumbnail went");
+                }
+            }
+        }
+
         // The alpha is a picture of its own: zeroed, the pixels would differ.
         assert_ne!(
             pixels_of(&transparent),
@@ -2719,18 +2799,21 @@ mod tests {
         );
 
         let avif = encoded(&gradient(8, 8), Codec::Avif);
-        assert_eq!(avif::keep(&tailed(avif.clone()), true), Some(avif.clone()));
+        assert_eq!(
+            avif::keep(&tailed(avif.clone()), true, 50_000_000),
+            Some(avif.clone())
+        );
         let boxes = top_boxes(&avif);
         let (mdat, _, _) = *boxes.last().unwrap();
         let mut to_eof = tailed(avif.clone());
         to_eof[mdat..mdat + 4].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(
-            avif::keep(&to_eof, true),
+            avif::keep(&to_eof, true, 50_000_000),
             Some(avif.clone()),
             "size 0: shortened to its items"
         );
         assert_eq!(
-            avif::keep(&avif[..avif.len() - 1], true),
+            avif::keep(&avif[..avif.len() - 1], true, 50_000_000),
             None,
             "an item past the end"
         );
@@ -2739,7 +2822,7 @@ mod tests {
             .filter(|(s, _, _)| &avif[s + 4..s + 8] != b"meta")
             .flat_map(|&(s, _, e)| avif[s..e].to_vec())
             .collect();
-        assert_eq!(avif::keep(&no_meta, true), None, "no meta");
+        assert_eq!(avif::keep(&no_meta, true, 50_000_000), None, "no meta");
 
         let tiff = tiff_with(true, 1);
         assert_eq!(tiff_end(&tailed(tiff.clone())), Ok(tiff.len()));

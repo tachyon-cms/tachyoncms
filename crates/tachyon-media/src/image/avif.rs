@@ -660,7 +660,8 @@ struct Properties {
     icc: Option<(usize, usize)>,
 }
 
-fn properties(data: &[u8], inner: &[Box4], item: u64) -> Option<Properties> {
+/// The property boxes `ipma` associates with `item`, in order.
+fn item_properties(data: &[u8], inner: &[Box4], item: u64) -> Option<Vec<Box4>> {
     let iprp = find(inner, b"iprp")?;
     let props = boxes(data, iprp.body, iprp.end);
     let ipco = find(&props, b"ipco")?;
@@ -686,42 +687,50 @@ fn properties(data: &[u8], inner: &[Box4], item: u64) -> Option<Properties> {
         if id != item {
             continue;
         }
-        let mut p = Properties {
-            ops: Vec::new(),
-            clap: None,
-            icc: None,
-        };
-        let u32_at = |i: usize| -> Option<u32> {
-            Some(u32::from_be_bytes(data.get(i..i + 4)?.try_into().ok()?))
-        };
-        for b in indices
-            .into_iter()
-            .filter_map(|i| list.get(usize::try_from(i).ok()?.checked_sub(1)?))
-        {
-            match &b.kind {
-                b"irot" => p.ops.push(Op::Rotate(data.get(b.body)? & 3)),
-                b"imir" => p.ops.push(Op::Mirror(data.get(b.body)? & 1)),
-                b"clap" if b.end >= b.body + 32 => {
-                    let v = |k: usize| u32_at(b.body + 4 * k);
-                    p.clap = Some(Clap {
-                        width: (v(0)?, v(1)?),
-                        height: (v(2)?, v(3)?),
-                        x: (v(4)? as i32, v(5)?),
-                        y: (v(6)? as i32, v(7)?),
-                    });
-                }
-                b"colr" => {
-                    let kind = data.get(b.body..b.body + 4)?;
-                    if kind == b"prof" || kind == b"rICC" {
-                        p.icc = Some((b.body + 4, b.end));
-                    }
-                }
-                _ => {}
-            }
-        }
-        return Some(p);
+        return Some(
+            indices
+                .into_iter()
+                .filter_map(|i| list.get(usize::try_from(i).ok()?.checked_sub(1)?))
+                .copied()
+                .collect(),
+        );
     }
     None
+}
+
+fn properties(data: &[u8], inner: &[Box4], item: u64) -> Option<Properties> {
+    let found = item_properties(data, inner, item)?;
+    let mut p = Properties {
+        ops: Vec::new(),
+        clap: None,
+        icc: None,
+    };
+    let u32_at = |i: usize| -> Option<u32> {
+        Some(u32::from_be_bytes(data.get(i..i + 4)?.try_into().ok()?))
+    };
+    for b in &found {
+        match &b.kind {
+            b"irot" => p.ops.push(Op::Rotate(data.get(b.body)? & 3)),
+            b"imir" => p.ops.push(Op::Mirror(data.get(b.body)? & 1)),
+            b"clap" if b.end >= b.body + 32 => {
+                let v = |k: usize| u32_at(b.body + 4 * k);
+                p.clap = Some(Clap {
+                    width: (v(0)?, v(1)?),
+                    height: (v(2)?, v(3)?),
+                    x: (v(4)? as i32, v(5)?),
+                    y: (v(6)? as i32, v(7)?),
+                });
+            }
+            b"colr" => {
+                let kind = data.get(b.body..b.body + 4)?;
+                if kind == b"prof" || kind == b"rICC" {
+                    p.icc = Some((b.body + 4, b.end));
+                }
+            }
+            _ => {}
+        }
+    }
+    Some(p)
 }
 
 /// The EXIF orientation doing what `ops` do, found by doing both to a small picture
@@ -762,13 +771,13 @@ const META_KEEP: [&[u8; 4]; 8] = [
 /// `data` with nothing but what its picture is made of, each byte where it was so every
 /// offset still holds: `ftyp`; `meta`'s header and the bodies of its `META_KEEP` children
 /// (the headers of the others); the bytes, in `mdat` or `idat`, of the primary item, its
-/// thumbnails, the tiles they're made of and their alpha (and with `keep_metadata` the
-/// Exif and XMP items and whatever else describes the picture); and the headers of the
-/// top-level boxes these sit in. Every other byte is zeroed, other items' included, and the
+/// alpha, its thumbnails that decode as AV1 within `thumbnail_cap` pixels (none at 0), and
+/// with `keep_metadata` the Exif and XMP items and whatever else describes the picture;
+/// and the headers of the top-level boxes these sit in. Every other byte is zeroed, other items' included, and the
 /// file ends after the furthest kept one, the box holding that end shortened to it. `None`
 /// when that end can't be known: no `ftyp`, `meta` or primary item, an item kept that
 /// can't be located, or an end inside a box the walk can't reach.
-pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
+pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_cap: u64) -> Option<Vec<u8>> {
     // The top-level boxes: (start, header length, end, type, whether its size is "to the
     // end"), up to one that overruns the file.
     let mut top = Vec::new();
@@ -809,20 +818,42 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
         let wide = if *data.get(b.body)? == 0 { 2 } else { 4 };
         read(data, &mut (b.body + 4), wide, b.end)
     })?;
-    // The picture, and its thumbnails; then what each is made of (tiles, alpha); and with
-    // `keep_metadata` whatever describes the picture.
+    // An extent of length 0 runs to the end of the box it starts in, when that has one.
+    let box_end = |at: usize| {
+        top.iter()
+            .find(|b| b.0 <= at && at < b.2 && !b.4)
+            .map(|b| b.2)
+    };
+    let located = locations(data, &inner, &[], Some(&box_end)).ok()?;
+    let ranges_of = |id: u64| {
+        located
+            .iter()
+            .find(|(i, _)| *i == id)
+            .and_then(|(_, r)| r.clone())
+    };
+    // Only what a reader takes as a picture, whatever `iref` calls the rest: the primary;
+    // its alpha, as avif-parse picks it; each thumbnail of it that is an AV1 picture
+    // decoding within `thumbnail_cap`; and with `keep_metadata` what describes it.
     let refs = references(data, &inner);
-    let mut pictures = vec![primary];
-    for (kind, from, to) in &refs {
-        if kind == b"thmb" && to.contains(&primary) {
-            pictures.push(*from);
-        }
-    }
-    let mut items = pictures.clone();
+    let mut items = vec![primary];
+    let alpha = refs
+        .iter()
+        .filter(|(kind, from, to)| kind == b"auxl" && *from != primary && to.contains(&primary))
+        .map(|(_, from, _)| *from)
+        .find(|&id| is_alpha(data, &inner, id));
+    items.extend(alpha);
     for (kind, from, to) in &refs {
         match kind {
-            b"dimg" if pictures.contains(from) => items.extend(to),
-            b"auxl" if to.iter().any(|t| pictures.contains(t)) => items.push(*from),
+            b"thmb" if *from != primary && to.contains(&primary) => {
+                let bytes: Option<Vec<u8>> = ranges_of(*from).map(|r| {
+                    r.iter()
+                        .flat_map(|&(s, e)| data[s..e].iter().copied())
+                        .collect()
+                });
+                if bytes.is_some_and(|b| is_picture(data, &inner, *from, &b, thumbnail_cap)) {
+                    items.push(*from);
+                }
+            }
             b"cdsc" if keep_metadata && to.contains(&primary) => items.push(*from),
             _ => {}
         }
@@ -836,16 +867,8 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
                 .map(|(id, _)| id),
         );
     }
-    // An extent of length 0 runs to the end of the box it starts in, when that has one.
-    let box_end = |at: usize| {
-        top.iter()
-            .find(|b| b.0 <= at && at < b.2 && !b.4)
-            .map(|b| b.2)
-    };
-    let located = locations(data, &inner, &[], Some(&box_end)).ok()?;
     for id in items {
-        let (_, ranges) = located.iter().find(|(i, _)| *i == id)?;
-        kept.extend(ranges.clone()?);
+        kept.extend(ranges_of(id)?);
     }
     let cut = kept.iter().map(|r| r.1).max()?;
     let mut out = vec![0u8; cut];
@@ -869,6 +892,61 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
         }
     }
     reached.then_some(out)
+}
+
+/// The `auxC` type avif-parse takes an alpha plane by.
+const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
+
+/// Whether `item` carries the alpha `auxC` property, as avif-parse requires of the alpha
+/// item it decodes.
+fn is_alpha(data: &[u8], inner: &[Box4], item: u64) -> bool {
+    item_properties(data, inner, item)
+        .unwrap_or_default()
+        .iter()
+        .filter(|b| &b.kind == b"auxC")
+        .any(|b| {
+            // A full box: version and flags, then the type, ending in a zero.
+            let urn = data.get(b.body + 4..b.end).unwrap_or_default();
+            let urn = urn.split(|&c| c == 0).next().unwrap_or_default();
+            urn.split(|&c| c == b'?').next() == Some(ALPHA_URN)
+        })
+}
+
+/// The type `iinf` gives `item`.
+fn item_kind(data: &[u8], inner: &[Box4], item: u64) -> Option<[u8; 4]> {
+    let iinf = find(inner, b"iinf")?;
+    let count_bytes = if *data.get(iinf.body)? == 0 { 2 } else { 4 };
+    boxes(data, iinf.body + 4 + count_bytes, iinf.end)
+        .into_iter()
+        .filter(|b| &b.kind == b"infe")
+        .find_map(|infe| {
+            let version = *data.get(infe.body)?;
+            if version < 2 {
+                return None;
+            }
+            let mut at = infe.body + 4;
+            let id = read(data, &mut at, if version == 2 { 2 } else { 4 }, infe.end)?;
+            let kind = data.get(at + 2..at + 6).filter(|_| at + 6 <= infe.end)?;
+            (id == item).then(|| kind.try_into().ok()).flatten()
+        })
+}
+
+/// Whether item `item`, holding `bytes`, is an AV1 picture: typed `av01`, with an `av1C`
+/// property, and decoding on its own within `cap` pixels.
+fn is_picture(data: &[u8], inner: &[Box4], item: u64, bytes: &[u8], cap: u64) -> bool {
+    let typed = item_kind(data, inner, item) == Some(*b"av01");
+    let configured =
+        item_properties(data, inner, item).is_some_and(|p| p.iter().any(|b| &b.kind == b"av1C"));
+    let fits = decode_bound(bytes).is_ok_and(|(w, h)| u64::from(w) * u64::from(h) <= cap);
+    typed
+        && configured
+        && fits
+        && guarded(|| {
+            let limit = u32::try_from(cap).unwrap_or(u32::MAX).max(1);
+            avif_decode::decode_av1_item_limited(bytes, limit)
+                .map_err(|_| ImageError::Corrupt("this thumbnail doesn't decode".into()))
+        })
+        .is_ok()
 }
 
 /// The item references in `iref`: (type, from, to), each read within its box.

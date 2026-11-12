@@ -68,6 +68,19 @@ pub struct Decoder {
     avif: avif_parse::AvifData,
 }
 
+/// Decodes one AV1 item on its own (the bytes an AVIF item holds), on the calling thread,
+/// with frames over `frame_size_limit` pixels refused before they're allocated: whether
+/// the bytes are a picture, and its size.
+pub fn decode_av1_item_limited(av1: &[u8], frame_size_limit: u32) -> Result<(usize, usize)> {
+    let mut decoder = Rav1dDecoder::with_settings(1, frame_size_limit)?;
+    let frame = decoder.decode_frame(av1)?;
+    let size = match frame.planes()? {
+        Planes::YuvPlanes8 { y, .. } | Planes::Mono8(y) => (y.width(), y.height()),
+        Planes::YuvPlanes16 { y, .. } | Planes::Mono16(y, _) => (y.width(), y.height()),
+    };
+    Ok(size)
+}
+
 impl Decoder {
     #[inline(always)]
     pub fn from_avif(mut avif_file_data: &[u8]) -> Result<Self> {
