@@ -98,15 +98,19 @@ impl Default for UploadsSettings {
 }
 
 /// `[storage.<name>]`. Credentials aren't settings: they come only from
-/// `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID` and `..._SECRET_ACCESS_KEY`, and in the file
-/// they're an error, so a secret never sits in a config that gets copied around.
+/// `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID` and `..._SECRET_ACCESS_KEY` (S3),
+/// `..._ACCESS_KEY` or `..._SAS_TOKEN` (Azure) and `..._SERVICE_ACCOUNT_PATH` (Google), and
+/// in the file they're an error, so a secret never sits in a config that gets copied around.
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct StorageSettings {
-    /// `local` or `s3` (also R2, MinIO and other S3-compatible stores).
+    /// `local`, `s3` (also R2, MinIO and other S3-compatible stores), `azure` or `gcs`.
     pub adapter: String,
     pub root: Option<PathBuf>,
     pub bucket: Option<String>,
+    /// Azure's blob container, and the storage account it's in.
+    pub container: Option<String>,
+    pub account: Option<String>,
     pub prefix: Option<String>,
     pub endpoint: Option<String>,
     pub region: Option<String>,
@@ -119,7 +123,20 @@ pub struct StorageSettings {
     access_key_id: Option<serde::de::IgnoredAny>,
     secret_access_key: Option<serde::de::IgnoredAny>,
     session_token: Option<serde::de::IgnoredAny>,
+    access_key: Option<serde::de::IgnoredAny>,
+    sas_token: Option<serde::de::IgnoredAny>,
+    service_account_path: Option<serde::de::IgnoredAny>,
 }
+
+/// The credential keys of a `[storage.<name>]`, each read from its own environment variable.
+const CREDENTIALS: [&str; 6] = [
+    "access_key_id",
+    "secret_access_key",
+    "session_token",
+    "access_key",
+    "sas_token",
+    "service_account_path",
+];
 
 /// `signed_downloads = false | true | { mime_types = [..], expires_in = "2h" }`.
 #[derive(Debug, Deserialize)]
@@ -154,10 +171,7 @@ impl Default for SignedSetting {
 /// Environment variables that are storage credentials, which the settings never read.
 fn is_credential_var(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
-    key.starts_with("storage__")
-        && ["__access_key_id", "__secret_access_key", "__session_token"]
-            .iter()
-            .any(|c| key.ends_with(c))
+    key.starts_with("storage__") && CREDENTIALS.iter().any(|c| key.ends_with(&format!("__{c}")))
 }
 
 /// `25MB`, `25MiB`, `512KB`, `1GB` or plain bytes. `MB` is 1,000,000 bytes, `MiB` 1,048,576.
@@ -191,11 +205,15 @@ fn check_writable(dir: &std::path::Path) -> Result<(), String> {
 
 impl StorageSettings {
     fn to_config(&self, name: &str) -> Result<StorageConfig, String> {
-        for (key, set) in [
-            ("access_key_id", self.access_key_id.is_some()),
-            ("secret_access_key", self.secret_access_key.is_some()),
-            ("session_token", self.session_token.is_some()),
-        ] {
+        let set = [
+            self.access_key_id.is_some(),
+            self.secret_access_key.is_some(),
+            self.session_token.is_some(),
+            self.access_key.is_some(),
+            self.sas_token.is_some(),
+            self.service_account_path.is_some(),
+        ];
+        for (key, set) in CREDENTIALS.into_iter().zip(set) {
             if set {
                 return Err(format!(
                     "storage.{name}.{key} can't be in the config file; set {} in the environment instead",
@@ -222,9 +240,18 @@ impl StorageSettings {
                 endpoint: self.endpoint.clone(),
                 region: self.region.clone(),
             },
+            "azure" => Adapter::Azure {
+                container: needs(&self.container, "container")?,
+                account: needs(&self.account, "account")?,
+                endpoint: self.endpoint.clone(),
+            },
+            "gcs" => Adapter::Gcs {
+                bucket: needs(&self.bucket, "bucket")?,
+                endpoint: self.endpoint.clone(),
+            },
             other => {
                 return Err(format!(
-                    "storage.{name}.adapter: `{other}` isn't one; use local or s3"
+                    "storage.{name}.adapter: `{other}` isn't one; use local, s3, azure or gcs"
                 ));
             }
         };
@@ -569,7 +596,7 @@ impl Config {
 #[cfg(test)]
 #[allow(clippy::result_large_err)] // figment::Jail closures return figment::Error
 mod tests {
-    use super::Config;
+    use super::{Adapter, Config};
     use figment::Jail;
 
     fn load(toml: &str) -> Config {
@@ -968,7 +995,7 @@ mod tests {
         );
         assert_eq!(
             at("[storage.disk]\nadapter = \"ftp\"").unwrap_err(),
-            "storage.disk.adapter: `ftp` isn't one; use local or s3"
+            "storage.disk.adapter: `ftp` isn't one; use local, s3, azure or gcs"
         );
         for name in ["R2", "r__2", "_r2", "r2_", "r-2"] {
             assert_eq!(
@@ -1016,6 +1043,90 @@ mod tests {
                 expires_in: std::time::Duration::from_secs(900),
             }
         );
+    }
+
+    #[test]
+    fn azure_and_gcs_config_parse() {
+        let at = uploads;
+        assert_eq!(
+            at("[storage.az]\nadapter = \"azure\"\naccount = \"acct\"").unwrap_err(),
+            "storage.az.container is required for adapter `azure`"
+        );
+        assert_eq!(
+            at("[storage.az]\nadapter = \"azure\"\ncontainer = \"media\"").unwrap_err(),
+            "storage.az.account is required for adapter `azure`"
+        );
+        assert_eq!(
+            at("[storage.g]\nadapter = \"gcs\"").unwrap_err(),
+            "storage.g.bucket is required for adapter `gcs`"
+        );
+        let azure = "[storage.az]\nadapter = \"azure\"\ncontainer = \"media\"\naccount = \"acct\"\nendpoint = \"https://acct.blob.core.chinacloudapi.cn\"\nclient_uploads = true\n";
+        // Read from the environment by the storage, not taken for a setting in the file.
+        let key = [(
+            "TACHYON_STORAGE__AZ__ACCESS_KEY",
+            "dGFjaHlvbi10ZXN0LWtleQ==",
+        )];
+        let az = uploads_with(azure, &key).unwrap();
+        let az = az.storages.get("az").unwrap();
+        assert_eq!(
+            az.config().adapter,
+            Adapter::Azure {
+                container: "media".into(),
+                account: "acct".into(),
+                endpoint: Some("https://acct.blob.core.chinacloudapi.cn".into()),
+            }
+        );
+        assert!(az.takes_client_uploads());
+        let sas = [("TACHYON_STORAGE__AZ__SAS_TOKEN", "sv=1&sig=x")];
+        assert!(
+            uploads_with(azure, &sas)
+                .unwrap_err()
+                .starts_with("storage.az.client_uploads: a SAS token can't sign links")
+        );
+
+        // An emulator's key file, so the machine's own Google credentials aren't read.
+        let file =
+            std::env::temp_dir().join(format!("tachyon-gcs-key-{}.json", std::process::id()));
+        std::fs::write(
+            &file,
+            r#"{"private_key": "unused", "private_key_id": "1", "client_email": "a@b", "disable_oauth": true}"#,
+        )
+        .unwrap();
+        let path = file.to_str().unwrap();
+        let g = uploads_with(
+            "[storage.g]\nadapter = \"gcs\"\nbucket = \"media\"\nendpoint = \"http://127.0.0.1:4443\"\n",
+            &[("TACHYON_STORAGE__G__SERVICE_ACCOUNT_PATH", path)],
+        );
+        std::fs::remove_file(&file).unwrap();
+        assert_eq!(
+            g.unwrap().storages.get("g").unwrap().config().adapter,
+            Adapter::Gcs {
+                bucket: "media".into(),
+                endpoint: Some("http://127.0.0.1:4443".into()),
+            }
+        );
+
+        for (section, key) in [
+            (
+                "adapter = \"azure\"\ncontainer = \"m\"\naccount = \"a\"",
+                "access_key",
+            ),
+            (
+                "adapter = \"azure\"\ncontainer = \"m\"\naccount = \"a\"",
+                "sas_token",
+            ),
+            ("adapter = \"gcs\"\nbucket = \"m\"", "service_account_path"),
+        ] {
+            let err = at(&format!("[storage.x]\n{section}\n{key} = \"in-the-file\"")).unwrap_err();
+            assert_eq!(
+                err,
+                format!(
+                    "storage.x.{key} can't be in the config file; set TACHYON_STORAGE__X__{} in the environment instead",
+                    key.to_ascii_uppercase()
+                )
+            );
+            assert!(!err.contains("in-the-file"), "the secret isn't echoed");
+        }
     }
 
     #[test]

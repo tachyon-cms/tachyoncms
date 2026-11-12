@@ -1576,7 +1576,7 @@ async fn upload_instructions_in(
         "request": {
             "url": url.as_str(),
             "method": "PUT",
-            "headers": {"content-type": mime},
+            "headers": storage.put_headers(&mime),
         },
         "file": {"filename": file.filename, "mimeType": mime, "filesize": ask.filesize},
     })))

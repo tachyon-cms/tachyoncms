@@ -1870,3 +1870,39 @@ async fn an_upload_gone_mid_claim_is_unclaimable(pool: PgPool) {
     let gone = call(&app, "POST", "/api/media", json!({"file": file})).await;
     assert_eq!(refusal(&gone), refusal(&made_up));
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn azure_instructions_carry_blob_type(pool: PgPool) {
+    let d = dirs();
+    let mut c = StorageConfig::local(&d.bucket);
+    c.adapter = tachyon_media::storage::Adapter::Azure {
+        container: "media".into(),
+        account: "acct".into(),
+        endpoint: None,
+    };
+    c.client_uploads = true;
+    // An account key signs offline: any base64 will do here.
+    let azure = Storage::open_with("azure", &c, |k| {
+        (k == "access_key").then(|| "dGFjaHlvbi10ZXN0LWtleQ==".to_owned())
+    })
+    .unwrap();
+    let mut o = options(&d, 0);
+    let mut all = o.uploads.storages.0.clone();
+    all.insert("azure".into(), Arc::new(azure));
+    o.uploads.storages = Arc::new(Storages(all));
+    let app = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    let res = send(&app, "POST", "/api/setup", Some(&body.to_string())).await;
+    assert_eq!(res.status, 201, "setup: {}", res.json);
+    let app = signed_in(app, ADMIN).await;
+    collection(&app, "images", json!({"upload": {"storage": "azure"}})).await;
+    let res = instructions(&app, "images", "a.png", "image/png", 10).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        res.json["request"]["headers"],
+        json!({"content-type": "image/png", "x-ms-blob-type": "BlockBlob"})
+    );
+    let url = Url::parse(res.json["request"]["url"].as_str().unwrap()).unwrap();
+    assert_eq!(url.host_str(), Some("acct.blob.core.windows.net"));
+    assert!(url.path().starts_with("/media/_staging/"), "{url}");
+}

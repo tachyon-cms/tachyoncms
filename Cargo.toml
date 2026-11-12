@@ -33,7 +33,7 @@ jpeg-encoder = "0.7.1"
 quick-xml = "0.42.0"
 webp = { version = "0.3.1", default-features = false }
 multer = "3.1.0"
-object_store = { version = "0.14.2", features = ["aws"] }
+object_store = { version = "0.14.2", features = ["aws", "azure", "gcp"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 sha1 = "0.11.0"

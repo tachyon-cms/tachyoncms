@@ -10,7 +10,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
+use object_store::azure::MicrosoftAzureBuilder;
 use object_store::buffered::BufWriter;
+use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as Key;
 use object_store::signer::{HeaderValue, Method, SignedUrlOptions, Signer};
@@ -39,6 +41,8 @@ pub enum Adapter {
     },
     Gcs {
         bucket: String,
+        /// Another base URL than Google's, for an emulator.
+        endpoint: Option<String>,
     },
 }
 
@@ -88,7 +92,7 @@ pub enum StorageError {
     Store(#[from] object_store::Error),
     #[error(transparent)]
     Io(#[from] std::io::Error),
-    /// This storage can't make signed URLs: it's local.
+    /// This storage can't make signed URLs: it's local, or its credentials can't sign.
     #[error("storage `{0}` can't sign URLs")]
     Unsigned(String),
 }
@@ -121,11 +125,28 @@ pub fn credential_var(storage: &str, key: &str) -> String {
 
 impl Storage {
     /// Opens storage `name`. A local root is created if missing and canonicalised. Bucket
-    /// credentials come only from `TACHYON_STORAGE__<NAME>__ACCESS_KEY_ID`,
-    /// `..._SECRET_ACCESS_KEY` and, for temporary ones, `..._SESSION_TOKEN`. Without them an
-    /// AWS bucket falls back to the machine's own (an instance role); a bucket with an
-    /// `endpoint` (R2, MinIO) has none, so there they're required.
+    /// credentials come only from the environment, `TACHYON_STORAGE__<NAME>__` followed by:
+    /// - S3: `ACCESS_KEY_ID`, `SECRET_ACCESS_KEY` and, for temporary ones, `SESSION_TOKEN`;
+    /// - Azure: `ACCESS_KEY` (the account key) or `SAS_TOKEN`;
+    /// - Google: `SERVICE_ACCOUNT_PATH`, a key file.
+    ///
+    /// Without them the machine's own are used (an instance role, a managed identity). A
+    /// store with an `endpoint` (R2, MinIO, an emulator) has none, so there they're required.
+    /// Signing (`client_uploads`, `signed_downloads`) needs credentials that sign here, with
+    /// no request to the cloud: S3 keys or a role, an Azure account key, a Google key file.
     pub fn open(name: &str, c: &StorageConfig) -> Result<Storage, String> {
+        Self::open_with(name, c, |key| std::env::var(credential_var(name, key)).ok())
+    }
+
+    /// `open`, with `var` giving each credential (`access_key_id`, `access_key`, ...) in
+    /// place of the environment: how a test opens a bucket without touching the process's
+    /// environment. No setting reaches it.
+    #[doc(hidden)]
+    pub fn open_with(
+        name: &str,
+        c: &StorageConfig,
+        var: impl Fn(&str) -> Option<String>,
+    ) -> Result<Storage, String> {
         if let Some(prefix) = &c.prefix {
             check_prefix(prefix).map_err(|e| format!("storage.{name}.prefix: {e}"))?;
             // Another storage on the bucket would sweep this one's files as strays.
@@ -135,7 +156,10 @@ impl Storage {
                 ));
             }
         }
-        let (store, signer): (Arc<dyn ObjectStore>, Option<Arc<dyn Signer>>) = match &c.adapter {
+        // `Err(why)`: the credentials can't sign, so `client_uploads` and `signed_downloads`
+        // are refused at startup rather than failing on each request.
+        type Opened = (Arc<dyn ObjectStore>, Result<Arc<dyn Signer>, String>);
+        let (store, signer): Opened = match &c.adapter {
             Adapter::Local { root } => {
                 std::fs::create_dir_all(root).map_err(|e| {
                     format!("storage.{name}.root: can't create {}: {e}", root.display())
@@ -144,7 +168,7 @@ impl Storage {
                     .map_err(|e| format!("storage.{name}.root: {e}"))?
                     // Each file's directory goes once its last object does.
                     .with_automatic_cleanup(true);
-                (Arc::new(store), None)
+                (Arc::new(store), Err(String::new()))
             }
             Adapter::S3 {
                 bucket,
@@ -161,7 +185,6 @@ impl Storage {
                 if let Some(region) = region {
                     b = b.with_region(region);
                 }
-                let var = |key: &str| std::env::var(credential_var(name, key)).ok();
                 let (id, secret) = (var("access_key_id"), var("secret_access_key"));
                 // Only AWS itself has an instance role to fall back on; elsewhere a missing
                 // key would surface as a metadata-service timeout on every request.
@@ -182,16 +205,96 @@ impl Storage {
                     b = b.with_token(token);
                 }
                 let s3 = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
-                (s3.clone(), Some(s3))
+                (s3.clone(), Ok(s3))
             }
-            Adapter::Azure { .. } | Adapter::Gcs { .. } => {
-                return Err(format!(
-                    "storage.{name}: this build has no Azure or Google Cloud Storage support"
-                ));
+            Adapter::Azure {
+                container,
+                account,
+                endpoint,
+            } => {
+                let mut b = MicrosoftAzureBuilder::new()
+                    .with_account(account)
+                    .with_container_name(container);
+                if let Some(endpoint) = endpoint {
+                    // Azurite, the emulator, serves plain http.
+                    b = b
+                        .with_endpoint(endpoint.clone())
+                        .with_allow_http(endpoint.starts_with("http://"));
+                }
+                let (key_var, sas_var) = (
+                    credential_var(name, "access_key"),
+                    credential_var(name, "sas_token"),
+                );
+                let signs = match (var("access_key"), var("sas_token")) {
+                    (Some(_), Some(_)) => {
+                        return Err(format!(
+                            "storage.{name}: set one of {key_var} and {sas_var}, not both"
+                        ));
+                    }
+                    (Some(key), None) => {
+                        b = b.with_access_key(key);
+                        Ok(())
+                    }
+                    (None, Some(sas)) => {
+                        b = b.with_config(object_store::azure::AzureConfigKey::SasKey, sas);
+                        Err(format!(
+                            "a SAS token can't sign links of its own; set the account key in {key_var} instead"
+                        ))
+                    }
+                    // Without a key the machine's own identity is used, which could only sign
+                    // through a request to Azure that may be refused long after startup.
+                    (None, None) if endpoint.is_none() => Err(format!(
+                        "the machine's own Azure identity can't sign links here; set the account key in {key_var}"
+                    )),
+                    (None, None) => {
+                        return Err(format!(
+                            "storage.{name}: set {key_var} or {sas_var} in the environment; an account with an endpoint needs one"
+                        ));
+                    }
+                };
+                // Before the build, which may read the machine's own credentials.
+                check_signing(name, c, signs.as_ref().err())?;
+                let az = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
+                (az.clone(), signs.map(|()| az as Arc<dyn Signer>))
+            }
+            Adapter::Gcs { bucket, endpoint } => {
+                let mut b = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
+                if let Some(endpoint) = endpoint {
+                    // fake-gcs-server, the emulator, serves plain http.
+                    b = b.with_base_url(endpoint).with_client_options(
+                        object_store::ClientOptions::new()
+                            .with_allow_http(endpoint.starts_with("http://")),
+                    );
+                }
+                let path_var = credential_var(name, "service_account_path");
+                let signs = match var("service_account_path") {
+                    Some(path) => {
+                        let signs = gcs_key_signs(&path)
+                            .map_err(|e| format!("storage.{name}: {path_var}: {e}"))?;
+                        b = b.with_service_account_path(path);
+                        signs.then_some(()).ok_or_else(|| format!(
+                            "the key file in {path_var} sets disable_oauth, so it has no key to sign with"
+                        ))
+                    }
+                    None if endpoint.is_some() => {
+                        return Err(format!(
+                            "storage.{name}: set {path_var} in the environment; a bucket with an endpoint needs its key file"
+                        ));
+                    }
+                    // The machine's own account signs only through Google's IAM API, and only
+                    // when granted that too: a key file signs by itself.
+                    None => Err(format!(
+                        "the machine's own Google account can't sign links here; set a service account key file's path in {path_var}"
+                    )),
+                };
+                // Before the build, which may read the machine's own credentials.
+                check_signing(name, c, signs.as_ref().err())?;
+                let gcs = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
+                (gcs.clone(), signs.map(|()| gcs as Arc<dyn Signer>))
             }
         };
-        check_signing(name, c)?;
-        Ok(Self::with_store(name, store, signer, c.clone()))
+        check_signing(name, c, signer.as_ref().err())?;
+        Ok(Self::with_store(name, store, signer.ok(), c.clone()))
     }
 
     /// `self` signing URLs with `s`: how a test stands a local store in for a bucket. No
@@ -225,7 +328,7 @@ impl Storage {
         &self.config
     }
 
-    /// Signs bucket URLs; `None` for local storage.
+    /// Signs bucket URLs; `None` for local storage and credentials that can't sign.
     pub fn signer(&self) -> Option<&Arc<dyn Signer>> {
         self.signer.as_ref()
     }
@@ -277,6 +380,13 @@ impl Storage {
         let signer = self.signer_or_refuse()?;
         let mime = HeaderValue::from_str(mime)
             .map_err(|_| StorageError::BadKey(format!("`{mime}` isn't a content type")))?;
+        // A SAS signs no headers, so Azure can't hold the client to the type; the server's
+        // check of the bytes after the put is what does.
+        if matches!(self.config.adapter, Adapter::Azure { .. }) {
+            return Ok(signer
+                .signed_url(Method::PUT, &self.key(key)?, expires)
+                .await?);
+        }
         let options = SignedUrlOptions::default().with_signed_header(
             object_store::signer::HeaderName::from_static("content-type"),
             mime,
@@ -292,6 +402,17 @@ impl Storage {
         Ok(signer
             .signed_url(Method::GET, &self.key(key)?, expires)
             .await?)
+    }
+
+    /// The headers a client sends with its `PUT` to a `presign_put` URL for type `mime`.
+    pub fn put_headers(&self, mime: &str) -> serde_json::Map<String, serde_json::Value> {
+        let mut headers = serde_json::Map::new();
+        headers.insert("content-type".into(), mime.into());
+        // Azure's Put Blob refuses a request that doesn't say which kind of blob it makes.
+        if matches!(self.config.adapter, Adapter::Azure { .. }) {
+            headers.insert("x-ms-blob-type".into(), "BlockBlob".into());
+        }
+        headers
     }
 
     /// `key` under this storage's prefix, refused if it could leave it.
@@ -397,10 +518,19 @@ impl Storage {
 /// The longest a signed link may last: what S3 itself allows.
 pub const MAX_SIGNED: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Signing needs a bucket: a local storage that's told to sign is a mistake to catch at
-/// startup, as is a link meant to outlast what a bucket signs.
-fn check_signing(name: &str, c: &StorageConfig) -> Result<(), String> {
+/// Signing needs a bucket whose credentials sign: a storage told to sign without them is a
+/// mistake to catch at startup (`unsigned` says why), as is a link meant to outlast what a
+/// bucket signs.
+fn check_signing(name: &str, c: &StorageConfig, unsigned: Option<&String>) -> Result<(), String> {
     let local = matches!(c.adapter, Adapter::Local { .. });
+    if let Some(why) = unsigned.filter(|_| !local) {
+        if c.client_uploads {
+            return Err(format!("storage.{name}.client_uploads: {why}"));
+        }
+        if matches!(c.signed_downloads, SignedDownloads::On { .. }) {
+            return Err(format!("storage.{name}.signed_downloads: {why}"));
+        }
+    }
     if local && c.client_uploads {
         return Err(format!(
             "storage.{name}.client_uploads: local storage can't take uploads straight from clients; use a bucket"
@@ -419,6 +549,15 @@ fn check_signing(name: &str, c: &StorageConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// Whether the service account key file at `path` can sign: one that sets `disable_oauth`
+/// (an emulator's) is used without its key. Its other fields are the store's to check.
+fn gcs_key_signs(path: &str) -> Result<bool, String> {
+    let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {path}: {e}"))?;
+    let key: serde_json::Value =
+        serde_json::from_str(&text).map_err(|e| format!("{path} isn't a key file: {e}"))?;
+    Ok(key.get("disable_oauth") != Some(&serde_json::Value::Bool(true)))
 }
 
 /// `t` in whole seconds since the epoch, as object times are compared.

@@ -44,3 +44,20 @@ timeout = "10m"                 # how long one upload request may take; under 1h
 # client_uploads = false                      # clients put files here themselves (buckets only)
 # signed_downloads = false                    # or true, or { mime_types = ["application/pdf"], expires_in = "2h" }
 #                                             # (buckets only; a link lasts 7 days at most)
+
+# An Azure blob container. Set the account key in TACHYON_STORAGE__AZURE__ACCESS_KEY, or a
+# SAS token in ..._SAS_TOKEN; with neither, the server uses its managed identity. Only the
+# account key can sign links, so client_uploads and signed_downloads need it. For Azurite,
+# set endpoint to the account's URL, like "http://127.0.0.1:10000/devstoreaccount1".
+# [storage.azure]
+# adapter = "azure"
+# account = "mystorageaccount"
+# container = "media"
+
+# A Google Cloud Storage bucket. Point TACHYON_STORAGE__GCS__SERVICE_ACCOUNT_PATH at a
+# service account key file; without one the server uses its own Google credentials. Only
+# a key file can sign links, so client_uploads and signed_downloads need one. For
+# fake-gcs-server, set endpoint, like "http://127.0.0.1:4443".
+# [storage.gcs]
+# adapter = "gcs"
+# bucket = "media"

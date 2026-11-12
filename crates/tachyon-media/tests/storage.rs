@@ -2,7 +2,10 @@ use std::path::{Path, PathBuf};
 
 use std::time::Duration;
 
-use tachyon_media::storage::{Adapter, SignedDownloads, Storage, StorageConfig, object_key};
+use serde_json::json;
+use tachyon_media::storage::{
+    Adapter, STAGING, SignedDownloads, Storage, StorageConfig, object_key, staging_key,
+};
 use uuid::Uuid;
 
 /// A path in a fresh directory under the system's temp dir, removed on drop.
@@ -254,31 +257,401 @@ async fn s3_round_trip() {
     assert!(!storage.is_local());
     round_trip(&storage).await;
 
-    // A client's put through a signed URL, which holds it to the type signed, and a
-    // signed read of it.
-    let key = object_key(None, "images", Uuid::now_v7(), "a.png").unwrap();
+    client_put_round_trip(&storage, true).await;
+}
+
+/// A client's put through a signed URL to a staging key, with the headers its instructions
+/// carry; the sweeper's one-level listing of it; a signed read of it. With `type_signed`, a
+/// put of another type is refused by the bucket too.
+async fn client_put_round_trip(storage: &Storage, type_signed: bool) {
+    let key = staging_key();
     let ten = Duration::from_secs(600);
     let put = storage.presign_put(&key, "image/png", ten).await.unwrap();
     let client = reqwest::Client::new();
-    let wrong = client
-        .put(put.clone())
-        .header("content-type", "text/html")
-        .body("<p>")
-        .send()
-        .await
-        .unwrap();
-    assert!(!wrong.status().is_success(), "another type is refused");
-    let done = client
-        .put(put)
-        .header("content-type", "image/png")
-        .body("0123456789")
-        .send()
-        .await
-        .unwrap();
+    let send = |mime: &str, body: &'static str| {
+        let mut req = client.put(put.clone());
+        for (name, value) in storage.put_headers(mime) {
+            req = req.header(name, value.as_str().unwrap());
+        }
+        req.body(body).send()
+    };
+    if type_signed {
+        let wrong = send("text/html", "<p>").await.unwrap();
+        assert!(!wrong.status().is_success(), "another type is refused");
+    }
+    let done = send("image/png", "0123456789").await.unwrap();
     assert!(done.status().is_success(), "{}", done.status());
     assert_eq!(storage.head(&key).await.unwrap().size, 10);
+
+    // Only the staging level itself is a sweeper's: nothing nested under it.
+    let nested = format!("{STAGING}/{}/a.png", Uuid::new_v4());
+    storage
+        .put_file(&nested, &source(b"x"), "image/png")
+        .await
+        .unwrap();
+    let soon = std::time::SystemTime::now() + Duration::from_secs(60);
+    let listed = storage.staging_before(soon).await.unwrap();
+    assert!(listed.contains(&key), "{listed:?}");
+    assert!(!listed.contains(&nested), "{listed:?}");
+    let earlier = std::time::SystemTime::now() - Duration::from_secs(3600);
+    assert!(
+        !storage
+            .staging_before(earlier)
+            .await
+            .unwrap()
+            .contains(&key)
+    );
+
     let get = storage.presign_get(&key, ten).await.unwrap();
     let got = client.get(get).send().await.unwrap();
     assert_eq!(&got.bytes().await.unwrap()[..], b"0123456789");
-    storage.delete(&key).await.unwrap();
+    for k in [&key, &nested] {
+        storage.delete(k).await.unwrap();
+        assert!(storage.head(k).await.unwrap_err().is_not_found(), "{k}");
+    }
+}
+
+/// Opens `c` with `vars` as its credentials (`access_key` and so on), leaving the process
+/// environment alone.
+fn open(name: &str, c: &StorageConfig, vars: &[(&str, &str)]) -> Result<Storage, String> {
+    Storage::open_with(name, c, |key| {
+        vars.iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| (*v).to_owned())
+    })
+}
+
+fn azure(endpoint: Option<&str>) -> StorageConfig {
+    StorageConfig {
+        adapter: Adapter::Azure {
+            container: "media".into(),
+            account: "acct".into(),
+            endpoint: endpoint.map(Into::into),
+        },
+        ..StorageConfig::local("unused")
+    }
+}
+
+fn gcs(endpoint: Option<&str>) -> StorageConfig {
+    StorageConfig {
+        adapter: Adapter::Gcs {
+            bucket: "media".into(),
+            endpoint: endpoint.map(Into::into),
+        },
+        ..StorageConfig::local("unused")
+    }
+}
+
+/// `c` with client uploads and signed downloads on.
+fn signing(mut c: StorageConfig) -> StorageConfig {
+    c.client_uploads = true;
+    c.signed_downloads = SignedDownloads::On {
+        mime_types: Vec::new(),
+        expires_in: Duration::from_secs(60),
+    };
+    c
+}
+
+/// An Azure account key: any base64 will do, as nothing checks it offline.
+const AZURE_KEY: &str = "dGFjaHlvbi10ZXN0LWtleQ==";
+
+fn query(url: &url::Url, name: &str) -> Option<String> {
+    url.query_pairs()
+        .find(|(k, _)| k == name)
+        .map(|(_, v)| v.into_owned())
+}
+
+#[tokio::test]
+async fn azure_instructions_carry_blob_type() {
+    let az = open("az", &signing(azure(None)), &[("access_key", AZURE_KEY)]).unwrap();
+    assert!(!az.is_local());
+    assert!(az.takes_client_uploads());
+    assert_eq!(
+        serde_json::Value::Object(az.put_headers("image/png")),
+        json!({"content-type": "image/png", "x-ms-blob-type": "BlockBlob"})
+    );
+    let key = staging_key();
+    let put = az
+        .presign_put(&key, "image/png", Duration::from_secs(900))
+        .await
+        .unwrap();
+    assert_eq!(put.scheme(), "https");
+    assert_eq!(put.host_str(), Some("acct.blob.core.windows.net"));
+    assert_eq!(put.path(), format!("/media/{key}"));
+    assert_eq!(query(&put, "sp").as_deref(), Some("w"));
+    assert_eq!(query(&put, "sr").as_deref(), Some("b"));
+    assert!(query(&put, "sig").is_some());
+    let get = az.presign_get(&key, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(query(&get, "sp").as_deref(), Some("r"));
+    assert_eq!(get.path(), format!("/media/{key}"));
+
+    // Only Azure needs the blob type.
+    let s3 = StorageConfig {
+        adapter: Adapter::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            region: Some("us-east-1".into()),
+        },
+        ..StorageConfig::local("unused")
+    };
+    let dir = temp_root();
+    let key_file = emulator_key(&dir);
+    let g = open("g", &gcs(None), &[("service_account_path", &key_file)]).unwrap();
+    for other in [open("s3", &s3, &[]).unwrap(), g] {
+        assert_eq!(
+            serde_json::Value::Object(other.put_headers("image/png")),
+            json!({"content-type": "image/png"})
+        );
+    }
+}
+
+#[tokio::test]
+async fn azure_links_point_at_the_configured_endpoint() {
+    let azurite = "http://127.0.0.1:10000/devstoreaccount1";
+    let mut c = signing(azure(Some(azurite)));
+    if let Adapter::Azure { account, .. } = &mut c.adapter {
+        *account = "devstoreaccount1".into();
+    }
+    let az = open("az", &c, &[("access_key", AZURE_KEY)]).unwrap();
+    let key = staging_key();
+    let put = az
+        .presign_put(&key, "image/png", Duration::from_secs(60))
+        .await
+        .unwrap();
+    assert_eq!(
+        put.as_str().split('?').next().unwrap(),
+        format!("{azurite}/media/{key}")
+    );
+    let sovereign = "https://acct.blob.core.chinacloudapi.cn";
+    let az = open(
+        "az",
+        &signing(azure(Some(sovereign))),
+        &[("access_key", AZURE_KEY)],
+    )
+    .unwrap();
+    let get = az.presign_get(&key, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(
+        get.as_str().split('?').next().unwrap(),
+        format!("{sovereign}/media/{key}")
+    );
+}
+
+#[test]
+fn signing_needs_a_key_that_signs() {
+    let uploads = |mut c: StorageConfig| {
+        c.client_uploads = true;
+        c
+    };
+    let downloads = |mut c: StorageConfig| {
+        c.signed_downloads = SignedDownloads::On {
+            mime_types: Vec::new(),
+            expires_in: Duration::from_secs(60),
+        };
+        c
+    };
+    let refused = |c: &StorageConfig, name: &str, vars: &[(&str, &str)], key: &str, var: &str| {
+        let err = open(name, c, vars).unwrap_err();
+        assert!(err.starts_with(&format!("storage.{name}.{key}: ")), "{err}");
+        assert!(err.contains(var), "{err}");
+        assert!(
+            !err.contains("not-a-secret"),
+            "the secret isn't echoed: {err}"
+        );
+    };
+    let sas = [("sas_token", "sv=2022-11-02&sig=not-a-secret")];
+    for (set, key) in [
+        (
+            uploads as fn(StorageConfig) -> StorageConfig,
+            "client_uploads",
+        ),
+        (downloads, "signed_downloads"),
+    ] {
+        // A SAS token can't make another, and the machine's own identity signs only
+        // through a request to Azure: both need the account key.
+        refused(
+            &set(azure(None)),
+            "az",
+            &sas,
+            key,
+            "TACHYON_STORAGE__AZ__ACCESS_KEY",
+        );
+        refused(
+            &set(azure(None)),
+            "az",
+            &[],
+            key,
+            "TACHYON_STORAGE__AZ__ACCESS_KEY",
+        );
+        // Google signs for the machine only through its IAM API: a key file is needed.
+        refused(
+            &set(gcs(None)),
+            "g",
+            &[],
+            key,
+            "TACHYON_STORAGE__G__SERVICE_ACCOUNT_PATH",
+        );
+    }
+    // Without signing, each still opens.
+    assert!(open("az", &azure(None), &sas).is_ok());
+    assert!(open("az", &azure(None), &[]).is_ok());
+
+    let both = open("az", &azure(None), &[("access_key", AZURE_KEY), sas[0]]).unwrap_err();
+    assert_eq!(
+        both,
+        "storage.az: set one of TACHYON_STORAGE__AZ__ACCESS_KEY and TACHYON_STORAGE__AZ__SAS_TOKEN, not both"
+    );
+    // An emulator has no identity to fall back on.
+    assert_eq!(
+        open("az", &azure(Some("http://127.0.0.1:10000/acct")), &[]).unwrap_err(),
+        "storage.az: set TACHYON_STORAGE__AZ__ACCESS_KEY or TACHYON_STORAGE__AZ__SAS_TOKEN in the environment; an account with an endpoint needs one"
+    );
+    assert_eq!(
+        open("g", &gcs(Some("http://127.0.0.1:4443")), &[]).unwrap_err(),
+        "storage.g: set TACHYON_STORAGE__G__SERVICE_ACCOUNT_PATH in the environment; a bucket with an endpoint needs its key file"
+    );
+    assert!(
+        open("az", &azure(None), &[("access_key", "not base64!")])
+            .unwrap_err()
+            .starts_with("storage.az: "),
+    );
+
+    // A key file that turns OAuth off (an emulator's) has no key to sign with.
+    let dir = temp_root();
+    let key_file = emulator_key(&dir);
+    let path = key_file.as_str();
+    assert!(open("g", &gcs(None), &[("service_account_path", path)]).is_ok());
+    refused(
+        &uploads(gcs(None)),
+        "g",
+        &[("service_account_path", path)],
+        "client_uploads",
+        "disable_oauth",
+    );
+    let missing = open(
+        "g",
+        &gcs(None),
+        &[("service_account_path", "/nowhere/key.json")],
+    )
+    .unwrap_err();
+    assert!(missing.starts_with("storage.g: "), "{missing}");
+}
+
+/// A key file as an emulator takes one: OAuth off, so its key is never read. Without one
+/// a Google storage reads the machine's own credentials, which no test can count on.
+fn emulator_key(dir: &Path) -> String {
+    let file = dir.join("emulator-key.json");
+    let key = json!({"private_key": "unused", "private_key_id": "1", "client_email": "a@b", "disable_oauth": true});
+    std::fs::write(&file, key.to_string()).unwrap();
+    file.to_str().unwrap().to_owned()
+}
+
+/// A service account key file over a fresh RSA key, made by `openssl`.
+fn service_account(dir: &Path) -> PathBuf {
+    let out = std::process::Command::new("openssl")
+        .args([
+            "genpkey",
+            "-algorithm",
+            "RSA",
+            "-pkeyopt",
+            "rsa_keygen_bits:2048",
+        ])
+        .output()
+        .expect("openssl makes the test's RSA key");
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let file = dir.join("service-account.json");
+    std::fs::write(
+        &file,
+        json!({
+            "private_key": String::from_utf8(out.stdout).unwrap(),
+            "private_key_id": "test",
+            "client_email": "cms@tachyon-test.iam.gserviceaccount.com",
+        })
+        .to_string(),
+    )
+    .unwrap();
+    file
+}
+
+#[tokio::test]
+async fn gcs_signs_with_its_service_account() {
+    let dir = temp_root();
+    let file = service_account(&dir);
+    let vars = [("service_account_path", file.to_str().unwrap())];
+    let g = open("g", &signing(gcs(None)), &vars).unwrap();
+    assert!(g.takes_client_uploads());
+    let key = staging_key();
+    let put = g
+        .presign_put(&key, "image/png", Duration::from_secs(900))
+        .await
+        .unwrap();
+    assert_eq!(
+        put.as_str().split('?').next().unwrap(),
+        format!("https://storage.googleapis.com/media/{key}")
+    );
+    assert_eq!(
+        query(&put, "X-Goog-SignedHeaders").as_deref(),
+        Some("content-type;host"),
+        "the type is signed"
+    );
+    assert!(query(&put, "X-Goog-Signature").is_some());
+    let get = g.presign_get(&key, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(query(&get, "X-Goog-SignedHeaders").as_deref(), Some("host"));
+
+    let emulator = "http://127.0.0.1:4443";
+    let g = open("g", &signing(gcs(Some(emulator))), &vars).unwrap();
+    let get = g.presign_get(&key, Duration::from_secs(60)).await.unwrap();
+    assert_eq!(
+        get.as_str().split('?').next().unwrap(),
+        format!("{emulator}/media/{key}")
+    );
+}
+
+/// Against Azurite: `TACHYON_TEST_AZURITE=http://127.0.0.1:10000/devstoreaccount1`, a
+/// container named by `TACHYON_TEST_AZURE_CONTAINER` (default `tachyon`), the account named
+/// by `TACHYON_TEST_AZURE_ACCOUNT` (default `devstoreaccount1`), its key in
+/// `TACHYON_STORAGE__AZTEST__ACCESS_KEY`.
+#[tokio::test]
+#[ignore = "needs TACHYON_TEST_AZURITE (Azurite)"]
+async fn azure_round_trip() {
+    let endpoint = std::env::var("TACHYON_TEST_AZURITE").expect("TACHYON_TEST_AZURITE");
+    let var = |k: &str, default: &str| std::env::var(k).unwrap_or_else(|_| default.into());
+    let c = StorageConfig {
+        adapter: Adapter::Azure {
+            container: var("TACHYON_TEST_AZURE_CONTAINER", "tachyon"),
+            account: var("TACHYON_TEST_AZURE_ACCOUNT", "devstoreaccount1"),
+            endpoint: Some(endpoint),
+        },
+        prefix: Some("tests".into()),
+        ..signing(StorageConfig::local("unused"))
+    };
+    let storage = Storage::open("aztest", &c).unwrap();
+    round_trip(&storage).await;
+    // A SAS signs no headers, so the type isn't held to: the server's check after the
+    // put is what holds it.
+    client_put_round_trip(&storage, false).await;
+}
+
+/// Against fake-gcs-server: `TACHYON_TEST_GCS_ENDPOINT=http://127.0.0.1:4443`, a bucket
+/// named by `TACHYON_TEST_GCS_BUCKET` (default `tachyon`), and a service account key file
+/// (any RSA key) at `TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH`.
+#[tokio::test]
+#[ignore = "needs TACHYON_TEST_GCS_ENDPOINT (fake-gcs-server)"]
+async fn gcs_round_trip() {
+    let endpoint = std::env::var("TACHYON_TEST_GCS_ENDPOINT").expect("TACHYON_TEST_GCS_ENDPOINT");
+    let c = StorageConfig {
+        adapter: Adapter::Gcs {
+            bucket: std::env::var("TACHYON_TEST_GCS_BUCKET").unwrap_or_else(|_| "tachyon".into()),
+            endpoint: Some(endpoint),
+        },
+        prefix: Some("tests".into()),
+        ..signing(StorageConfig::local("unused"))
+    };
+    let storage = Storage::open("gcstest", &c).unwrap();
+    round_trip(&storage).await;
+    // The emulator checks no signature, so only a real bucket refuses another type.
+    client_put_round_trip(&storage, false).await;
 }
