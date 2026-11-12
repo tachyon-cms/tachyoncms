@@ -771,13 +771,14 @@ const META_KEEP: [&[u8; 4]; 8] = [
 /// `data` with nothing but what its picture is made of, each byte where it was so every
 /// offset still holds: `ftyp`; `meta`'s header and the bodies of its `META_KEEP` children
 /// (the headers of the others); the bytes, in `mdat` or `idat`, of the primary item, its
-/// alpha, its thumbnails that decode as AV1 within `thumbnail_cap` pixels (none at 0), and
+/// alpha, one thumbnail (the first AV1 picture no larger than it that fits
+/// `thumbnail_budget` pixels and decodes; none at 0), and
 /// with `keep_metadata` the Exif and XMP items and whatever else describes the picture;
 /// and the headers of the top-level boxes these sit in. Every other byte is zeroed, other items' included, and the
 /// file ends after the furthest kept one, the box holding that end shortened to it. `None`
 /// when that end can't be known: no `ftyp`, `meta` or primary item, an item kept that
 /// can't be located, or an end inside a box the walk can't reach.
-pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_cap: u64) -> Option<Vec<u8>> {
+pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Option<Vec<u8>> {
     // The top-level boxes: (start, header length, end, type, whether its size is "to the
     // end"), up to one that overruns the file.
     let mut top = Vec::new();
@@ -832,8 +833,8 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_cap: u64) -> Opti
             .and_then(|(_, r)| r.clone())
     };
     // Only what a reader takes as a picture, whatever `iref` calls the rest: the primary;
-    // its alpha, as avif-parse picks it; each thumbnail of it that is an AV1 picture
-    // decoding within `thumbnail_cap`; and with `keep_metadata` what describes it.
+    // its alpha, as avif-parse picks it; one thumbnail of it (below); and with
+    // `keep_metadata` what describes it.
     let refs = references(data, &inner);
     let mut items = vec![primary];
     let alpha = refs
@@ -842,15 +843,35 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_cap: u64) -> Opti
         .map(|(_, from, _)| *from)
         .find(|&id| is_alpha(data, &inner, id));
     items.extend(alpha);
+    let bytes_of = |id: u64| -> Option<Vec<u8>> {
+        let ranges = ranges_of(id)?;
+        Some(
+            ranges
+                .iter()
+                .flat_map(|&(s, e)| data[s..e].iter().copied())
+                .collect(),
+        )
+    };
+    // One thumbnail is decoded at most, from one budget: the first that's no larger than the
+    // picture and fits what's left. Every other is zeroed without decoding.
+    let primary_pixels = bytes_of(primary)
+        .and_then(|b| decode_bound(&b).ok())
+        .map_or(0, |(w, h)| u64::from(w) * u64::from(h));
+    let mut tried = false;
     for (kind, from, to) in &refs {
         match kind {
-            b"thmb" if *from != primary && to.contains(&primary) => {
-                let bytes: Option<Vec<u8>> = ranges_of(*from).map(|r| {
-                    r.iter()
-                        .flat_map(|&(s, e)| data[s..e].iter().copied())
-                        .collect()
-                });
-                if bytes.is_some_and(|b| is_picture(data, &inner, *from, &b, thumbnail_cap)) {
+            b"thmb" if !tried && *from != primary && to.contains(&primary) => {
+                let Some(bytes) = bytes_of(*from) else {
+                    continue;
+                };
+                let Some(pixels) = thumbnail_pixels(data, &inner, *from, &bytes) else {
+                    continue;
+                };
+                if pixels > primary_pixels || pixels > thumbnail_budget {
+                    continue;
+                }
+                tried = true;
+                if decodes(&bytes, pixels) {
                     items.push(*from);
                 }
             }
@@ -931,22 +952,25 @@ fn item_kind(data: &[u8], inner: &[Box4], item: u64) -> Option<[u8; 4]> {
         })
 }
 
-/// Whether item `item`, holding `bytes`, is an AV1 picture: typed `av01`, with an `av1C`
-/// property, and decoding on its own within `cap` pixels.
-fn is_picture(data: &[u8], inner: &[Box4], item: u64, bytes: &[u8], cap: u64) -> bool {
+/// The pixels item `item`, holding `bytes`, would decode to, when it's an AV1 picture by
+/// its headers: typed `av01`, with an `av1C` property, its sequence and frame headers read.
+/// Nothing is decoded.
+fn thumbnail_pixels(data: &[u8], inner: &[Box4], item: u64, bytes: &[u8]) -> Option<u64> {
     let typed = item_kind(data, inner, item) == Some(*b"av01");
     let configured =
         item_properties(data, inner, item).is_some_and(|p| p.iter().any(|b| &b.kind == b"av1C"));
-    let fits = decode_bound(bytes).is_ok_and(|(w, h)| u64::from(w) * u64::from(h) <= cap);
-    typed
-        && configured
-        && fits
-        && guarded(|| {
-            let limit = u32::try_from(cap).unwrap_or(u32::MAX).max(1);
-            avif_decode::decode_av1_item_limited(bytes, limit)
-                .map_err(|_| ImageError::Corrupt("this thumbnail doesn't decode".into()))
-        })
-        .is_ok()
+    let (w, h) = decode_bound(bytes).ok()?;
+    (typed && configured).then_some(u64::from(w) * u64::from(h))
+}
+
+/// Whether AV1 `bytes` decode on their own, refused past `pixels`.
+fn decodes(bytes: &[u8], pixels: u64) -> bool {
+    guarded(|| {
+        let limit = u32::try_from(pixels).unwrap_or(u32::MAX).max(1);
+        avif_decode::decode_av1_item_limited(bytes, limit)
+            .map_err(|_| ImageError::Corrupt("this thumbnail doesn't decode".into()))
+    })
+    .is_ok()
 }
 
 /// The item references in `iref`: (type, from, to), each read within its box.

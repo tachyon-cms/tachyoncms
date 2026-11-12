@@ -695,7 +695,12 @@ fn process_unguarded(
         },
         InputFormat::Bmp => Own::cut(bmp_end(&bytes)),
         InputFormat::Ico => Own::replace(ico::repack(&bytes, &ico::walk(&bytes)?, u.with_metadata)),
-        InputFormat::Avif => Own::replace(avif::keep(&bytes, u.with_metadata, cap)),
+        // Thumbnails get what the cap leaves after the picture, all frames counted.
+        InputFormat::Avif => Own::replace(avif::keep(
+            &bytes,
+            u.with_metadata,
+            cap.saturating_sub(probe.pixels),
+        )),
         // Only the bytes its IFDs reach, each where it was; gaps zeroed.
         InputFormat::Tiff if u.with_metadata => match tiff_regions(&bytes) {
             Ok(regions) => Own::Replace(zeroed_but(&bytes, &regions)),
@@ -2590,6 +2595,75 @@ mod tests {
         let mut b = avif_insert(a.to_vec(), ipma.1, &copied.unwrap(), &[meta, iprp, ipma.0]);
         b[body + 4..body + 8].copy_from_slice(&(count + 1).to_be_bytes());
         b
+    }
+
+    /// Thumbnails share one budget, what the cap leaves after the picture: at most one is
+    /// decoded, the first that's an AV1 picture no larger than the primary and fitting what's
+    /// left; every other is zeroed undecoded.
+    #[test]
+    fn thumbnails_share_one_budget() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let want = pixels_of(&avif);
+        let (_, off, len) = crate::fixtures::avif_extents(&avif)[0];
+        let primary_bytes = avif[off..off + len].to_vec();
+        let thumbnail = |a: &[u8], id: u16| {
+            avif_with_ref(
+                &avif_with_properties_of(
+                    &avif_with_item(a, id, b"av01", None, &primary_bytes, false),
+                    id,
+                    1,
+                ),
+                b"thmb",
+                id,
+                1,
+            )
+        };
+        // Twenty, every other one pointing at the bytes of the one before it.
+        let mut many = avif.clone();
+        for id in 80..100u16 {
+            many = thumbnail(&many, id);
+            if id % 2 == 1 {
+                let extents = crate::fixtures::avif_extents(&many);
+                let (_, before, _) = *extents.iter().find(|e| e.0 == u32::from(id - 1)).unwrap();
+                let index = extents.iter().position(|e| e.0 == u32::from(id)).unwrap();
+                many = crate::fixtures::avif_set_extent(many, index, before as u32, len as u32);
+            }
+        }
+        let copies = |k: &[u8]| k.windows(len).filter(|w| *w == &primary_bytes[..]).count();
+        let limited = |pixels: u64| {
+            upload(serde_json::json!({
+                "constructorOptions": {"limitInputPixels": pixels}
+            }))
+        };
+        // 200 leaves 136 after the 64-pixel picture: room for one 8×8 thumbnail.
+        let started = std::time::Instant::now();
+        let kept = stored(&run(&many, &limited(200)).unwrap());
+        assert!(started.elapsed().as_secs() < 10, "{:?}", started.elapsed());
+        assert_eq!(copies(&kept), 2, "the picture and one thumbnail");
+        assert_eq!(pixels_of(&kept), want);
+        // 100 leaves 36: no thumbnail fits, so it's zeroed, and the file is still stored.
+        let one = thumbnail(&avif, 98);
+        let kept = stored(&run(&one, &limited(100)).unwrap());
+        assert_eq!(copies(&kept), 1, "the picture alone");
+        assert_eq!(pixels_of(&kept), want);
+        assert_eq!(copies(&stored(&run(&one, &limited(200)).unwrap())), 2);
+        // A "thumbnail" larger than the picture isn't one, whatever the budget.
+        let big = encoded(&gradient(16, 16), Codec::Avif);
+        let (_, boff, blen) = crate::fixtures::avif_extents(&big)[0];
+        let big_bytes = &big[boff..boff + blen];
+        let larger = avif_with_ref(
+            &avif_with_properties_of(
+                &avif_with_item(&avif, 98, b"av01", None, big_bytes, false),
+                98,
+                1,
+            ),
+            b"thmb",
+            98,
+            1,
+        );
+        let kept = stored(&run(&larger, &upload(serde_json::json!({}))).unwrap());
+        assert!(!has(&kept, big_bytes), "the larger one stayed");
+        assert_eq!(pixels_of(&kept), want);
     }
 
     /// Items an AVIF holds beside its picture: an HTML page in `idat` goes, and so does
