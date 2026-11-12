@@ -4,7 +4,7 @@
 
 mod common;
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::Duration;
@@ -172,11 +172,15 @@ async fn fetch(app: &Router, uri: &str) -> Raw {
 }
 
 async fn fetch_as(app: &Router, method: &str, uri: &str) -> Raw {
-    let req = Request::builder()
-        .method(method)
-        .uri(uri)
-        .body(Body::empty())
-        .unwrap();
+    fetch_with(app, method, uri, &[]).await
+}
+
+async fn fetch_with(app: &Router, method: &str, uri: &str, headers: &[(&str, &str)]) -> Raw {
+    let mut req = Request::builder().method(method).uri(uri);
+    for (k, v) in headers {
+        req = req.header(*k, *v);
+    }
+    let req = req.body(Body::empty()).unwrap();
     let res = app.clone().oneshot(req).await.unwrap();
     let (status, headers) = (res.status(), res.headers().clone());
     let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
@@ -367,6 +371,18 @@ async fn fixture_corpus(pool: PgPool) {
                     _ => (w, h),
                 };
                 assert_eq!((made.width(), made.height()), pixels, "{at}: as stored");
+                // Turned the way orientation 6 says, a quarter clockwise: the source's
+                // top-left corner is now the top right.
+                if name == "turned.jpg" && !keeps {
+                    let source = image::load_from_memory(&bytes).unwrap().to_rgb8();
+                    let want = image::imageops::rotate90(&source);
+                    let got = made.to_rgb8();
+                    for (x, y) in [(1, 1), (w - 2, 1), (1, h - 2), (w - 2, h - 2)] {
+                        let (a, b) = (want.get_pixel(x, y).0, got.get_pixel(x, y).0);
+                        let off = a.iter().zip(b).map(|(a, b)| a.abs_diff(b)).max().unwrap();
+                        assert!(off < 40, "{at}: ({x}, {y}) is {b:?}, turned it's {a:?}");
+                    }
+                }
             }
             assert_eq!(
                 exif_in(&kept).is_some(),
@@ -433,15 +449,18 @@ async fn fixture_corpus(pool: PgPool) {
 }
 
 /// What a caller learns from an answer: everything but the request's own ID.
-fn seen_as(raw: &Raw) -> (u16, [String; 5], Value) {
-    let headers = [
-        "content-type",
-        "location",
-        "cache-control",
-        "content-security-policy",
-        "x-content-type-options",
-    ]
-    .map(|h| raw.header(h).to_owned());
+fn seen_as(raw: &Raw) -> (u16, BTreeMap<String, String>, Value) {
+    let headers = raw
+        .headers
+        .iter()
+        .filter(|(k, _)| !matches!(k.as_str(), "date" | "x-request-id"))
+        .map(|(k, v)| {
+            (
+                k.to_string(),
+                String::from_utf8_lossy(v.as_bytes()).into_owned(),
+            )
+        })
+        .collect();
     let mut body = serde_json::from_slice(&raw.body)
         .unwrap_or_else(|_| Value::String(format!("{:?}", raw.body)));
     if let Some(o) = body.as_object_mut() {
@@ -489,11 +508,15 @@ struct Site {
     /// Every name `ghost`'s file is stored under: the original, its size, its formats.
     ghost_names: Vec<String>,
     ghost_file: Uuid,
+    priv_doc: String,
     priv_file: Uuid,
     post: String,
     hush: String,
     below: String,
     open: String,
+    /// The versions of `ghost`, and the version of `post` whose draft links it.
+    ghost_versions: Vec<String>,
+    post_draft_version: String,
 }
 
 const HUSH: &str = "Hush Folder";
@@ -515,6 +538,8 @@ async fn uploads_site(pool: &PgPool, d: &Dirs) -> Site {
             {"name": "title", "type": "text"},
             {"name": "cover", "type": "upload", "relationTo": "media"},
             {"name": "file", "type": "upload", "relationTo": "downloads"},
+            {"name": "hero", "type": "upload", "relationTo": "media",
+             "filterOptions": {"alt": {"equals": "Nothing"}}},
             {"name": "body", "type": "richText", "relationTo": ["media", "downloads"],
              "upload": {"collections": {"media": {}, "downloads": {}}}}
         ]}),
@@ -641,13 +666,32 @@ async fn uploads_site(pool: &PgPool, d: &Dirs) -> Site {
     // The original, its thumb, and the thumb's WebP and AVIF copies.
     assert_eq!(ghost_names.len(), 4, "{ghost_names:?}");
     assert!(ghost_names.iter().all(|n| n.starts_with("ghostfile")));
+    let versions = |path: String| {
+        let admin = admin.clone();
+        async move {
+            let list = ok(&admin, "GET", &path, None).await;
+            list["docs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(id_of)
+                .collect::<Vec<_>>()
+        }
+    };
+    let ghost_versions = versions(format!("/api/media/{ghost}/versions")).await;
+    assert!(!ghost_versions.is_empty());
+    // Newest first: the draft linking `ghost`.
+    let post_draft_version = versions(format!("/api/posts/{post}/versions")).await[0].clone();
     Site {
+        ghost_versions,
+        post_draft_version,
         admin,
         seen,
         ghost,
         ghost_names,
         ghost_file,
         priv_file: file_of(pool, &private).await,
+        priv_doc: private.clone(),
         post,
         hush,
         below,
@@ -697,6 +741,27 @@ fn probes(s: &Site, viewer: bool) -> Vec<(String, String, String)> {
         }
     }
     let g = &s.ghost;
+    let post = &s.post;
+    let mut by_version = Vec::new();
+    for v in &s.ghost_versions {
+        by_version.push((
+            format!("/api/media/{g}/versions/{v}"),
+            format!("/api/media/{g}/versions/{missing}"),
+        ));
+    }
+    let v = &s.post_draft_version;
+    by_version.push((
+        format!("/api/posts/{post}/versions/{v}"),
+        format!("/api/posts/{post}/versions/{missing}"),
+    ));
+    for (hit, miss) in by_version {
+        out.push(get(hit.clone(), miss.clone()));
+        out.push((
+            "POST".to_owned(),
+            format!("{hit}/restore"),
+            format!("{miss}/restore"),
+        ));
+    }
     for tail in [
         "/references",
         "/versions",
@@ -918,7 +983,10 @@ async fn uploads_never_leak(pool: PgPool) {
         assert!(text_of(&raw).contains(word), "{url}: {}", text_of(&raw));
     }
     for (_, hit, miss) in probes(&s, true) {
-        if hit.contains("moveContentsTo") || hit.contains("/schedule") {
+        if ["moveContentsTo", "/schedule", "/restore"]
+            .iter()
+            .any(|w| hit.contains(w))
+        {
             continue;
         }
         let drafts = hit.contains("draft=true");
@@ -954,6 +1022,7 @@ async fn uploads_never_leak(pool: PgPool) {
                 text_of(&raw)
             );
         }
+        let now = httpdate::fmt_http_date(std::time::SystemTime::now());
         for (method, hit, miss) in probes(&s, viewer) {
             let (a, b) = (
                 fetch_as(app, &method, &hit).await,
@@ -961,6 +1030,62 @@ async fn uploads_never_leak(pool: PgPool) {
             );
             assert_eq!(seen_as(&a), seen_as(&b), "{who}: {method} {hit}");
             assert_eq!(leaks(&words, &text_of(&a)), None, "{who}: {hit}");
+            // The file route answers HEAD, ranges and conditions only for what it finds.
+            if !hit.contains("/file/") {
+                continue;
+            }
+            let asks: [(&str, &[(&str, &str)]); 4] = [
+                ("HEAD", &[]),
+                ("GET", &[("range", "bytes=0-0")]),
+                ("GET", &[("if-none-match", "*")]),
+                ("GET", &[("if-modified-since", &now)]),
+            ];
+            for (method, headers) in asks {
+                let (a, b) = (
+                    fetch_with(app, method, &hit, headers).await,
+                    fetch_with(app, method, &miss, headers).await,
+                );
+                assert_eq!(
+                    seen_as(&a),
+                    seen_as(&b),
+                    "{who}: {method} {headers:?} {hit}"
+                );
+            }
+        }
+        // Linking what they can't read is refused as linking what isn't there, through an
+        // upload field, a filtered one (the hidden file matches no filter either) and an
+        // upload node.
+        let missing = Uuid::now_v7().to_string();
+        let node = |to: &str, id: &str| {
+            json!({"type": "doc", "content": [
+                {"type": "upload", "attrs": {"relationTo": to, "value": id}}]})
+        };
+        let links = |id: &str, private: &str| {
+            [
+                json!({"title": "t", "cover": id}),
+                json!({"title": "t", "hero": id}),
+                json!({"title": "t", "body": node("media", id)}),
+                json!({"title": "t", "file": private}),
+                json!({"title": "t", "body": node("downloads", private)}),
+            ]
+        };
+        for (hit, miss) in links(&s.ghost, &s.priv_doc)
+            .into_iter()
+            .zip(links(&missing, &missing))
+        {
+            let (a, b) = (
+                call(app, "POST", "/api/posts", Some(hit.clone())).await,
+                call(app, "POST", "/api/posts", Some(miss)).await,
+            );
+            assert!(a.status.is_client_error(), "{who}: {hit}: {}", a.json);
+            let scrubbed = |r: &Res| {
+                let mut v = r.json.clone();
+                if let Some(o) = v.as_object_mut() {
+                    o.remove("requestId");
+                }
+                (r.status, no_ids(&v.to_string()))
+            };
+            assert_eq!(scrubbed(&a), scrubbed(&b), "{who}: {hit}");
         }
         if viewer {
             words.pop();
@@ -1067,7 +1192,10 @@ async fn uploads_never_leak(pool: PgPool) {
             fetch(app, "/api/media/file/seenfile.png?draft=true").await,
         );
         let mut plain_seen = seen_as(&plain);
-        plain_seen.1[2] = draft.header("cache-control").to_owned();
+        plain_seen.1.insert(
+            "cache-control".into(),
+            draft.header("cache-control").to_owned(),
+        );
         assert_eq!(plain_seen, seen_as(&draft), "{who}");
         // A file is signed for whoever may read it, and only them.
         if *who == "other author" {

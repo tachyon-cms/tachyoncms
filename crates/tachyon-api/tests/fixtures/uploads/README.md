@@ -1,7 +1,8 @@
 # Upload fixtures
 
-Small files for `tests/uploads_leaks.rs` (`fixture_corpus`). Each one is made by an
-encoder other than ours, so the tests read what real tools write. All are under 2 KB.
+Small files for `tests/uploads_leaks.rs` (`fixture_corpus`). Each binary one is made
+by an encoder other than ours, so the tests read what real tools write; the SVGs are
+written by hand. All are under 2 KB.
 The EXIF is written by hand with made-up values: no real place or camera is in them.
 
 `make.py` makes the binary files again. It needs ffmpeg, gif2webp (libwebp) and, for

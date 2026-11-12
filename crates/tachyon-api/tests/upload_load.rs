@@ -183,8 +183,9 @@ async fn many_large_uploads_stay_bounded(pool: PgPool) {
         "spool peak {spool} bytes, bound {spool_bound}"
     );
     // Two decodes at a time, each at most 50 MP with its working copies, and the bodies
-    // streamed to disk rather than held: under 1 GB above where it started. (Measured: about
-    // 240 MB on an M-series Mac.)
-    assert!(grew < 1_000 * MB, "RSS grew {} MB", grew / MB);
+    // streamed to disk rather than held: under 640 MB above where it started, 2.5 times
+    // the most measured (164 to 242 MB on an M-series Mac). Holding all eight bodies would
+    // add about 200 MB more.
+    assert!(grew < 640 * MB, "RSS grew {} MB", grew / MB);
     assert_eq!(bytes_in(&temp), 0, "the spool is empty after");
 }
