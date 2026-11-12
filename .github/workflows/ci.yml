@@ -58,3 +58,55 @@ jobs:
       # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
       - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo test --workspace
+
+  # The storage adapters against emulators of each service, over plain http. Started with
+  # `docker run`, not as services: a service can't be given a command, and MinIO and
+  # fake-gcs-server need one.
+  storage:
+    runs-on: ubuntu-latest
+    env:
+      TACHYON_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      TACHYON_STORAGE__S3TEST__ACCESS_KEY_ID: tachyon
+      TACHYON_STORAGE__S3TEST__SECRET_ACCESS_KEY: tachyon-secret
+      TACHYON_TEST_AZURITE: http://127.0.0.1:10000/devstoreaccount1
+      # Azurite's own well-known development key, not a secret.
+      TACHYON_STORAGE__AZTEST__ACCESS_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+      TACHYON_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+      TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH: ${{ github.workspace }}/service-account.json
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Start MinIO, Azurite and fake-gcs-server
+        run: |
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=tachyon -e MINIO_ROOT_PASSWORD=tachyon-secret \
+            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite:3.34.0 \
+            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+          docker run -d --name gcs -p 4443:4443 \
+            fsouza/fake-gcs-server:1.52.2 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443
+      - name: Wait for them, and make a bucket in each
+        run: |
+          up() { for _ in $(seq 1 60); do curl -s -o /dev/null "$1" && return 0; sleep 1; done; docker ps -a; return 1; }
+          up http://127.0.0.1:9000/minio/health/live
+          up http://127.0.0.1:10000/devstoreaccount1
+          up http://127.0.0.1:4443/storage/v1/b
+          docker run --rm --network host \
+            -e MC_HOST_local=http://tachyon:tachyon-secret@127.0.0.1:9000 \
+            minio/mc:RELEASE.2025-04-16T18-13-26Z mb local/tachyon
+          az storage container create --name tachyon --connection-string \
+            "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$TACHYON_STORAGE__AZTEST__ACCESS_KEY;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          curl -sf -X POST -H 'content-type: application/json' -d '{"name": "tachyon"}' \
+            http://127.0.0.1:4443/storage/v1/b
+          # Any RSA key: the emulator checks no signature.
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out key.pem
+          python3 -c 'import json; print(json.dumps({"private_key": open("key.pem").read(), "private_key_id": "test", "client_email": "cms@tachyon-test.iam.gserviceaccount.com"}))' \
+            > "$TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH"
+      - run: cargo test -p tachyon-media --test storage -- --ignored --exact s3_round_trip azure_round_trip gcs_round_trip

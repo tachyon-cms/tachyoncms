@@ -56,6 +56,9 @@ async fn round_trip(storage: &Storage) {
     assert_eq!(&whole.bytes().await.unwrap()[..], b"0123456789");
     storage.copy(&key, &copy).await.unwrap();
     assert_eq!(storage.head(&copy).await.unwrap().size, 10);
+    // Whole when it returns: Azure's is streamed through here, not left to the service.
+    let copied = storage.get_range(&copy, None).await.unwrap();
+    assert_eq!(&copied.bytes().await.unwrap()[..], b"0123456789");
     for k in [&key, &copy] {
         storage.delete(k).await.unwrap();
         assert!(storage.head(k).await.is_err(), "{k} deleted");
@@ -649,6 +652,51 @@ async fn azure_round_trip() {
     // A SAS signs no headers, so the type isn't held to: the server's check after the
     // put is what holds it.
     client_put_round_trip(&storage, false).await;
+    leased_staging_deletes(&storage).await;
+}
+
+/// A client's upload link lets it lease and snapshot its staging blob, and a plain delete
+/// is refused for either: the staging delete breaks the lease and takes the snapshots.
+async fn leased_staging_deletes(storage: &Storage) {
+    let key = staging_key();
+    let put = storage
+        .presign_put(&key, "image/png", Duration::from_secs(600))
+        .await
+        .unwrap();
+    let client = reqwest::Client::new();
+    let mut req = client.put(put.clone());
+    for (name, value) in storage.put_headers("image/png") {
+        req = req.header(name, value.as_str().unwrap());
+    }
+    let done = req.body("x").send().await.unwrap();
+    assert!(done.status().is_success(), "{}", done.status());
+    let with = |comp: &str| {
+        let mut url = put.clone();
+        url.query_pairs_mut().append_pair("comp", comp);
+        url
+    };
+    let lease = client
+        .put(with("lease"))
+        .header("x-ms-lease-action", "acquire")
+        .header("x-ms-lease-duration", "-1")
+        .header("content-length", "0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(lease.status(), 201, "{}", lease.text().await.unwrap());
+    let snapshot = client
+        .put(with("snapshot"))
+        .header("content-length", "0")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(snapshot.status(), 201, "{}", snapshot.text().await.unwrap());
+    assert!(
+        storage.delete(&key).await.is_err(),
+        "a plain delete is refused"
+    );
+    storage.delete_staging(&key).await.unwrap();
+    assert!(storage.head(&key).await.unwrap_err().is_not_found());
 }
 
 /// Against fake-gcs-server: `TACHYON_TEST_GCS_ENDPOINT=http://127.0.0.1:4443`, a bucket
