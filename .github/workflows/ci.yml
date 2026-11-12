@@ -103,7 +103,17 @@ jobs:
           up -fsS http://127.0.0.1:9000/minio/health/live
           up -sS http://127.0.0.1:10000/devstoreaccount1
           up -fsS http://127.0.0.1:4443/storage/v1/b
-          for _ in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:9000/minio/health/ready && break; sleep 1; done
+          up -fsS http://127.0.0.1:9000/minio/health/ready
+          # Bitnami's entrypoint makes the bucket on a first start, then starts the server
+          # again: wait until the bucket itself answers (403, unsigned) three times running.
+          seen=0
+          for _ in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/tachyon || true)
+            if [ "$code" = 403 ]; then seen=$((seen + 1)); else seen=0; fi
+            [ "$seen" -ge 3 ] && break
+            sleep 1
+          done
+          [ "$seen" -ge 3 ] || { docker logs minio; exit 1; }
           az storage container create --name tachyon --connection-string \
             "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$TACHYON_STORAGE__AZTEST__ACCESS_KEY;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
           curl -fsS -X POST -H 'content-type: application/json' -d '{"name": "tachyon"}' \
@@ -115,7 +125,8 @@ jobs:
       # Every ignored test in the file, and exactly three: a renamed or skipped round trip
       # fails the job instead of passing it with nothing run.
       - name: Round trips
+        # `shell: bash` runs with pipefail, so a failing test fails the pipe below.
+        shell: bash
         run: |
-          # The step's shell runs with pipefail, so a failing test fails here.
           cargo test -p tachyon-media --test storage -- --ignored 2>&1 | tee "$RUNNER_TEMP/storage.log"
           grep -q "test result: ok. 3 passed; 0 failed" "$RUNNER_TEMP/storage.log"
