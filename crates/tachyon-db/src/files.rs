@@ -1161,3 +1161,185 @@ pub async fn key_in_use_in(
     .await?;
     Ok(names.iter().any(|n| n.iter().any(|n| n == name)))
 }
+
+/// The job that makes every live file's sizes in a collection again, after a schema change
+/// to what they're made with. Its payload is `{"after": file id | null}`, the batch going on
+/// from that file; its dedupe key `regenerate_sizes:<collection id>`, so a newer change's walk
+/// replaces an older one, from the start.
+pub const REGENERATE: &str = "regenerate_sizes";
+
+/// The batch of `collection_id`'s walk after file `after`, or its first.
+pub fn regenerate_job(collection_id: Uuid, after: Option<Uuid>) -> NewJob<'static> {
+    NewJob {
+        kind: REGENERATE,
+        document_id: None,
+        collection_id: Some(collection_id),
+        payload: json!({ "after": after }),
+        run_at: OffsetDateTime::now_utc(),
+        dedupe_key: Some(format!("{REGENERATE}:{collection_id}")),
+        created_by: None,
+        key_id: None,
+        max_attempts: None,
+    }
+}
+
+/// Up to `limit` live files of `collection_id` after file `after` (from the first without
+/// one), in ID order: each one's ID and type.
+pub async fn live_after(
+    pool: &PgPool,
+    collection_id: Uuid,
+    after: Option<Uuid>,
+    limit: i64,
+) -> Result<Vec<(Uuid, String)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT id, mime_type FROM files
+           WHERE tenant_id = $1 AND collection_id = $2 AND state = 'live'
+             AND ($3::uuid IS NULL OR id > $3)
+           ORDER BY id LIMIT $4"#,
+        DEFAULT_TENANT,
+        collection_id,
+        after,
+        limit,
+    )
+    .fetch_all(pool)
+    .await?;
+    Ok(rows.into_iter().map(|r| (r.id, r.mime_type)).collect())
+}
+
+/// The focal point file `id`'s sizes centre on: the one of the document copy holding it,
+/// its draft's before its published copy's (the newer edit, and what a publish takes), then
+/// the newest version's holding it; 50/50 where none sets one.
+pub async fn focal_of(pool: &PgPool, id: Uuid) -> Result<(f32, f32), DbError> {
+    let row = sqlx::query!(
+        r#"SELECT x, y FROM (
+               SELECT 0 AS rank, id, draft->'focalX' AS x, draft->'focalY' AS y
+               FROM documents WHERE tenant_id = $1 AND draft_file = $2
+               UNION ALL
+               SELECT 1, id, published->'focalX', published->'focalY'
+               FROM documents WHERE tenant_id = $1 AND published_file = $2
+               UNION ALL
+               SELECT 2, id, data->'focalX', data->'focalY'
+               FROM versions WHERE tenant_id = $1 AND file_id = $2
+           ) holders
+           ORDER BY rank, id DESC LIMIT 1"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_optional(pool)
+    .await?;
+    let of = |v: Option<Value>| v.and_then(|v| v.as_f64()).map_or(50.0, |v| v as f32);
+    Ok(row.map_or((50.0, 50.0), |r| (of(r.x), of(r.y))))
+}
+
+/// Drops from file `id` the sizes not named in `keep`, and every name that neither its
+/// original nor a size it keeps is stored under; returns those names, whose objects are
+/// then no longer served. Call it under `lock_for_size_in`, once each kept size is written.
+pub async fn drop_stale_sizes_in(
+    tx: &mut PgConnection,
+    id: Uuid,
+    keep: &[&str],
+) -> Result<Vec<String>, DbError> {
+    let row = sqlx::query!(
+        r#"SELECT filename, names, sizes AS "sizes: Json<Map<String, Value>>"
+           FROM files WHERE tenant_id = $1 AND id = $2"#,
+        DEFAULT_TENANT,
+        id,
+    )
+    .fetch_one(&mut *tx)
+    .await?;
+    let mut sizes = row.sizes.0;
+    sizes.retain(|name, _| keep.contains(&name.as_str()));
+    let mut used = HashSet::from([row.filename.as_str()]);
+    for entry in sizes.values() {
+        let formats = entry.get("formats").and_then(Value::as_object);
+        for e in std::iter::once(entry).chain(formats.into_iter().flat_map(Map::values)) {
+            used.extend(e.get("filename").and_then(Value::as_str));
+        }
+    }
+    let (kept, stale): (Vec<String>, Vec<String>) = row
+        .names
+        .into_iter()
+        .partition(|n| used.contains(n.as_str()));
+    let sizes = Value::Object(sizes);
+    sqlx::query!(
+        "UPDATE files SET sizes = $3, names = $4 WHERE tenant_id = $1 AND id = $2",
+        DEFAULT_TENANT,
+        id,
+        &sizes,
+        &kept,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(stale)
+}
+
+/// How many documents of `collection_id`, trashed ones included, hold a file: in either
+/// copy, or in one of their versions.
+pub async fn holding_documents(
+    conn: &mut PgConnection,
+    collection_id: Uuid,
+) -> Result<i64, DbError> {
+    Ok(sqlx::query_scalar!(
+        r#"SELECT count(*) AS "n!" FROM documents d
+           WHERE d.tenant_id = $1 AND d.collection_id = $2
+             AND (d.published_file IS NOT NULL OR d.draft_file IS NOT NULL
+                  OR EXISTS (SELECT 1 FROM versions v
+                             WHERE v.document_id = d.id AND v.file_id IS NOT NULL))"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_one(&mut *conn)
+    .await?)
+}
+
+/// Takes every file of `collection_id` from whatever holds it, both copies of each document
+/// (trashed ones too) and every version, and releases each; for a collection that stops
+/// holding files. Its pending files turn `gone` too, so nothing can take them, keeping the
+/// cleanup each was reserved with: due once an upload that may still be storing it is done
+/// (and a client's staging object keeps the sweep its issue queued).
+pub async fn drop_collection_in(tx: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
+    // Documents, then versions, then files: the order every write locks them in.
+    let copies = sqlx::query!(
+        r#"WITH old AS (SELECT id, published_file, draft_file FROM documents
+                        WHERE tenant_id = $1 AND collection_id = $2
+                          AND (published_file IS NOT NULL OR draft_file IS NOT NULL)
+                        ORDER BY id FOR NO KEY UPDATE)
+           UPDATE documents d SET published_file = NULL, draft_file = NULL FROM old
+           WHERE d.id = old.id
+           RETURNING old.published_file, old.draft_file"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let versions = sqlx::query_scalar!(
+        r#"WITH old AS (SELECT id, file_id FROM versions
+                        WHERE tenant_id = $1 AND collection_id = $2 AND file_id IS NOT NULL
+                        ORDER BY id FOR UPDATE)
+           UPDATE versions v SET file_id = NULL FROM old
+           WHERE v.id = old.id
+           RETURNING old.file_id"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    let mut held: Vec<Uuid> = copies
+        .into_iter()
+        .flat_map(|c| [c.published_file, c.draft_file])
+        .chain(versions)
+        .flatten()
+        .collect();
+    held.sort();
+    held.dedup();
+    release_in(&mut *tx, &held).await?;
+    sqlx::query!(
+        "UPDATE files SET state = 'gone', released_at = now()
+         WHERE tenant_id = $1 AND collection_id = $2 AND state = 'pending'",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(())
+}

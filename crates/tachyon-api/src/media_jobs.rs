@@ -46,18 +46,78 @@ pub(crate) async fn queue_sizes(
     if picture::size_format(&f.mime_type).is_none() {
         return Ok(None);
     }
-    let job = NewJob {
+    jobs::enqueue(tx, &size_job(c.id, file, false))
+        .await
+        .map(Some)
+}
+
+/// The size job of `file`, in collection `collection`; one that `regenerate`s makes every
+/// size again, not only those the file doesn't have yet, and drops those its collection
+/// no longer has.
+fn size_job(collection: Uuid, file: Uuid, regenerate: bool) -> NewJob<'static> {
+    let payload = match regenerate {
+        true => json!({ "file": file, "regenerate": true }),
+        false => json!({ "file": file }),
+    };
+    NewJob {
         kind: IMAGE_SIZES,
         document_id: None,
-        collection_id: Some(c.id),
-        payload: json!({ "file": file }),
+        collection_id: Some(collection),
+        payload,
         run_at: OffsetDateTime::now_utc(),
         dedupe_key: Some(format!("{IMAGE_SIZES}:{file}")),
         created_by: None,
         key_id: None,
         max_attempts: None,
+    }
+}
+
+/// How many files one batch of a walk (`files::REGENERATE`) gives a size job.
+const REGENERATE_BATCH: i64 = 100;
+
+/// One batch of a collection's walk: queues a size job that makes every size again for each
+/// of its next `REGENERATE_BATCH` live images, completes, then queues the next batch from
+/// the last of them, all in one transaction. A walk a restart cuts off goes on from its
+/// batch; one a newer change replaced (they share a dedupe key) can't complete, and its
+/// jobs go with it. Each size job reads the file and the schema as they are when it runs,
+/// so a file uploaded, cropped or refocused meanwhile, a new file, keeps its own sizes.
+pub(crate) async fn run_regenerate(state: &AppState, job: &Job) -> Result<(), JobError> {
+    let collection = job
+        .collection_id
+        .ok_or_else(|| JobError::Permanent("the job names no collection".into()))?;
+    let after = match job.payload.get("after") {
+        None | Some(Value::Null) => None,
+        Some(v) => Some(
+            v.as_str()
+                .and_then(|s| s.parse::<Uuid>().ok())
+                .ok_or_else(|| JobError::Permanent("the payload's `after` isn't a file".into()))?,
+        ),
     };
-    jobs::enqueue(tx, &job).await.map(Some)
+    let batch = files::live_after(&state.pool, collection, after, REGENERATE_BATCH)
+        .await
+        .map_err(retry)?;
+    let mut tx = state.pool.begin().await.map_err(retry)?;
+    for (file, mime) in &batch {
+        if picture::size_format(mime).is_some() {
+            jobs::enqueue(&mut tx, &size_job(collection, *file, true))
+                .await
+                .map_err(retry)?;
+        }
+    }
+    if !jobs::complete_in(&mut tx, job).await.map_err(retry)? {
+        return Ok(());
+    }
+    // Its own key, now this one's done: a newer walk then replaces it too.
+    if let Some((last, _)) = batch
+        .last()
+        .filter(|_| batch.len() as i64 == REGENERATE_BATCH)
+    {
+        jobs::add(&mut tx, &files::regenerate_job(collection, Some(*last)))
+            .await
+            .map_err(retry)?;
+    }
+    tx.commit().await.map_err(retry)?;
+    Ok(())
 }
 
 fn released() -> JobError {
@@ -96,6 +156,7 @@ static JOB_DECODES: Semaphore = Semaphore::const_new(1);
 pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobError> {
     let id = file_of(job)?;
     let verify = job.payload.get("verify") == Some(&Value::Bool(true));
+    let regenerate = job.payload.get("regenerate") == Some(&Value::Bool(true));
     let file = match files::get(&state.pool, id).await {
         Ok(f) if f.state == "live" => f,
         // Nothing left to verify.
@@ -103,6 +164,10 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
         Ok(_) | Err(DbError::NotFound) => return Err(released()),
         Err(e) => return Err(retry(e)),
     };
+    // The document's, not the row's: without a focal point a focal edit keeps the file, so
+    // only the document knows it once the option's turned on. Read before the lease, which
+    // holds a connection of its own, so a run never waits on a second.
+    let focal = files::focal_of(&state.pool, id).await.map_err(retry)?;
     let leased = keep_leased(state, job, LEASE).await?;
     // Already taken over: the run that took it is the one that counts.
     if leased.lost() {
@@ -120,6 +185,7 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
     for s in &u.image_sizes {
         let entry = file.sizes.get(&s.name).filter(|e| !e.is_null());
         let wanted = match entry {
+            _ if regenerate => true,
             // Those an earlier run made are kept.
             Some(_) if !verify => false,
             None => !verify,
@@ -128,6 +194,17 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
         if wanted {
             todo.push(s);
         }
+    }
+    if todo.is_empty() && regenerate {
+        // No sizes left to make: only those the collection dropped go.
+        drop(leased);
+        let mut tx = state.pool.begin().await.map_err(retry)?;
+        let file = locked(&mut tx, &c, id).await?;
+        forget_stale(&mut tx, storage, &file.key, id, &u.image_sizes).await?;
+        if jobs::complete_in(&mut tx, job).await.map_err(retry)? {
+            tx.commit().await.map_err(retry)?;
+        }
+        return Ok(());
     }
     if todo.is_empty() {
         drop(leased);
@@ -155,7 +232,7 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
         .file;
         open(fetched.path(), cap, u.with_metadata).await?
     };
-    let focal = u.focal_point.then_some((file.focal_x, file.focal_y));
+    let focal = u.focal_point.then_some(focal);
     // Every size is made, into files, before any is stored: the decoded original and its
     // permits are given back before the job waits on storage or the database.
     let mut made = Vec::with_capacity(todo.len());
@@ -186,6 +263,7 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
         lease: Some(leased),
         // A first run always verifies what it, or a run before it, stored.
         verify_after: !verify,
+        regenerate,
     };
     for (i, (size, made)) in todo.iter().zip(&made).enumerate() {
         if write.lease.as_ref().is_some_and(Leased::lost) {
@@ -336,6 +414,8 @@ struct Write<'a> {
     /// Whether the last size queues a verify run: always for a first run, and for a verify
     /// run once it has stored anything.
     verify_after: bool,
+    /// Whether the last size drops what the collection's sizes no longer use.
+    regenerate: bool,
 }
 
 impl Write<'_> {
@@ -396,30 +476,7 @@ impl Write<'_> {
                 self.verify_after = true;
             }
             let mut tx = pool.begin().await.map_err(retry)?;
-            let file = match files::lock_for_size_in(&mut tx, self.c.id, id)
-                .await
-                .map_err(retry)?
-            {
-                SizeLock::Released => return Err(released()),
-                SizeLock::Moved => {
-                    return Err(JobError::Defer(
-                        "a document took the file as its size was written".into(),
-                    ));
-                }
-                SizeLock::Busy => {
-                    return Err(JobError::Defer(
-                        "a write held the file as its size was written".into(),
-                    ));
-                }
-                SizeLock::Live { schema_version, .. }
-                    if schema_version != self.c.schema_version =>
-                {
-                    return Err(JobError::Defer(
-                        "the collection's schema changed; its sizes are made again".into(),
-                    ));
-                }
-                SizeLock::Live { file, .. } => file,
-            };
+            let file = locked(&mut tx, self.c, id).await?;
             // Renamed by a restore since: stored again under the new names.
             if file.filename != self.filename {
                 self.filename = file.filename;
@@ -430,6 +487,9 @@ impl Write<'_> {
                 .await
                 .map_err(retry)?;
             if last {
+                if self.regenerate {
+                    forget_stale(&mut tx, self.storage, &self.key, id, self.sizes).await?;
+                }
                 drop(self.lease.take());
                 if !jobs::complete_in(&mut tx, self.job).await.map_err(retry)? {
                     return Ok(false);
@@ -514,6 +574,55 @@ impl Write<'_> {
         objects.retain(|(n, _, _)| clash(n).is_none());
         (entry, objects)
     }
+}
+
+/// File `id` of `c` locked in `tx` with everything a size written to it changes
+/// (`lock_for_size_in`), as it is now. A run that finds it released fails for good; one
+/// that finds it taken or held, or its collection's schema changed since the run read it,
+/// defers.
+async fn locked(
+    tx: &mut PgConnection,
+    c: &Collection,
+    id: Uuid,
+) -> Result<Box<files::FileRow>, JobError> {
+    match files::lock_for_size_in(tx, c.id, id).await.map_err(retry)? {
+        SizeLock::Released => Err(released()),
+        SizeLock::Moved => Err(JobError::Defer(
+            "a document took the file as its size was written".into(),
+        )),
+        SizeLock::Busy => Err(JobError::Defer(
+            "a write held the file as its size was written".into(),
+        )),
+        SizeLock::Live { schema_version, .. } if schema_version != c.schema_version => Err(
+            JobError::Defer("the collection's schema changed; its sizes are made again".into()),
+        ),
+        SizeLock::Live { file, .. } => Ok(file),
+    }
+}
+
+/// Under file `id`'s lock in `tx`, drops the sizes `sizes` (its collection's) no longer
+/// name, and every name neither its original nor a size it keeps is stored under,
+/// queuing the deletion of those objects (beside `key`) for once `tx` commits. Every copy
+/// and version holding the file has had each kept size written in by then, so nothing
+/// still names them; a cleanup keeps any a size is stored under again meanwhile.
+async fn forget_stale(
+    tx: &mut PgConnection,
+    storage: &Storage,
+    key: &str,
+    id: Uuid,
+    sizes: &[ImageSize],
+) -> Result<(), JobError> {
+    let keep: Vec<&str> = sizes.iter().map(|s| s.name.as_str()).collect();
+    let stale = files::drop_stale_sizes_in(tx, id, &keep)
+        .await
+        .map_err(retry)?;
+    if !stale.is_empty() {
+        let keys: Vec<String> = stale.iter().map(|n| beside(key, n)).collect();
+        files::queue_key_cleanup(tx, storage.name(), &keys, OffsetDateTime::now_utc())
+            .await
+            .map_err(retry)?;
+    }
+    Ok(())
 }
 
 /// `made`'s entry for size `name`, its copies under `formats`, named after `filename`, the

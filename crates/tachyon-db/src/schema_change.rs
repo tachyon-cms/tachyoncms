@@ -52,6 +52,9 @@ pub struct Preview {
     /// Versions the change deletes: those past a lowered `maxVersions`, or every one when
     /// `versions` goes. A version a pending job holds is kept.
     pub pruned: i64,
+    /// Documents holding files, trashed ones and those only a version of holds included,
+    /// when the collection stops holding files: their files are removed.
+    pub holding_files: i64,
     /// For a shared block: the change in each schema that names it, by slug.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub collections: BTreeMap<String, Preview>,
@@ -65,6 +68,8 @@ pub struct ConfirmationScope {
     pub fields: bool,
     /// Old document versions the change deletes.
     pub versions: i64,
+    /// Documents whose files the change removes, as a collection stops holding files.
+    pub files: i64,
 }
 
 impl ConfirmationScope {
@@ -73,6 +78,7 @@ impl ConfirmationScope {
         Self {
             fields: self.fields || other.fields,
             versions: self.versions + other.versions,
+            files: self.files + other.files,
         }
     }
 
@@ -80,11 +86,16 @@ impl ConfirmationScope {
     pub fn what(&self) -> String {
         const FIELDS: &str =
             "This change removes or retypes fields, or leaves documents that won't validate";
-        match (self.fields, self.versions) {
+        let rest = match (self.fields, self.versions) {
             (true, 0) => format!("{FIELDS}."),
             (false, 0) => "This change needs confirmation.".to_owned(),
             (true, n) => format!("{FIELDS}, and deletes {n} old {}.", versions(n)),
             (false, n) => format!("This change deletes {n} old {}.", versions(n)),
+        };
+        match self.files {
+            0 => rest,
+            1 => format!("1 document holds files; they'll be removed. {rest}"),
+            n => format!("{n} documents hold files; they'll be removed. {rest}"),
         }
     }
 }
@@ -100,6 +111,7 @@ impl Preview {
         let mut scope = ConfirmationScope {
             fields: self.diff.is_destructive() || self.invalid > 0,
             versions: 0,
+            files: self.holding_files,
         };
         if self.collections.is_empty() {
             scope.versions = self.pruned;
@@ -370,6 +382,7 @@ impl Preview {
             cleared: 0,
             indexes: IndexChanges::default(),
             pruned: 0,
+            holding_files: 0,
             collections: BTreeMap::new(),
         }
     }
@@ -753,6 +766,16 @@ async fn run_in(
         if drafts == (false, true) {
             seed_drafts(&mut *tx, part.id).await?;
         }
+        if part.old.upload.is_some() && part.new.upload.is_none() {
+            crate::files::drop_collection_in(&mut *tx, part.id).await?;
+        }
+        // Each file's sizes are made again once this commits, with what it saves; without
+        // sizes before or after, there's nothing to make or drop.
+        let remade = |c: &Change| matches!(c, Change::UploadChanged { removed: false, .. });
+        let sized = |s: &CollectionSchema| s.uploads().is_some_and(|u| !u.image_sizes.is_empty());
+        if previews[k].diff.changes.iter().any(remade) && (sized(&part.old) || sized(&part.new)) {
+            crate::jobs::enqueue(&mut *tx, &crate::files::regenerate_job(part.id, None)).await?;
+        }
         if !part.saved {
             // Its fields changed with a shared block, so writes validated against the old
             // ones must retry (see `documents::check_schema`).
@@ -854,7 +877,11 @@ async fn scan(
     if old.versions != new.versions {
         p.pruned = prune(&mut *conn, part.id, kept(new), false).await?;
     }
-    p.needs_confirmation = p.diff.is_destructive() || p.invalid > 0 || p.pruned > 0;
+    if old.upload.is_some() && new.upload.is_none() {
+        p.holding_files = crate::files::holding_documents(&mut *conn, part.id).await?;
+    }
+    p.needs_confirmation =
+        p.diff.is_destructive() || p.invalid > 0 || p.pruned > 0 || p.holding_files > 0;
     Ok(p)
 }
 
@@ -1187,12 +1214,14 @@ mod tests {
         let scope = ConfirmationScope {
             fields: false,
             versions: 340,
+            files: 0,
         };
         assert_eq!(scope.what(), "This change deletes 340 old versions.");
         assert_eq!(
             ConfirmationScope {
                 fields: false,
                 versions: 1,
+                files: 0,
             }
             .what(),
             "This change deletes 1 old version."
@@ -1205,6 +1234,7 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 0,
+                files: 0,
             }
             .what(),
             "This change removes or retypes fields, or leaves documents that won't validate."
@@ -1217,6 +1247,7 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 340,
+                files: 0,
             }
             .what(),
             "This change removes or retypes fields, or leaves documents that won't validate, and deletes 340 old versions."
@@ -1228,16 +1259,19 @@ mod tests {
         let fields = ConfirmationScope {
             fields: true,
             versions: 0,
+            files: 0,
         };
         let versions = ConfirmationScope {
             fields: false,
             versions: 2,
+            files: 0,
         };
         assert_eq!(
             fields.combine(versions),
             ConfirmationScope {
                 fields: true,
                 versions: 2,
+                files: 0,
             }
         );
         assert_eq!(
@@ -1245,7 +1279,28 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 2,
+                files: 0,
             }
         );
+    }
+
+    #[test]
+    fn a_scope_with_files_counts_their_documents_first() {
+        let scope = |files| ConfirmationScope {
+            fields: true,
+            versions: 0,
+            files,
+        };
+        let fields =
+            "This change removes or retypes fields, or leaves documents that won't validate.";
+        assert_eq!(
+            scope(2).what(),
+            format!("2 documents hold files; they'll be removed. {fields}")
+        );
+        assert_eq!(
+            scope(1).what(),
+            format!("1 document holds files; they'll be removed. {fields}")
+        );
+        assert_eq!(scope(1).combine(scope(2)).files, 3);
     }
 }

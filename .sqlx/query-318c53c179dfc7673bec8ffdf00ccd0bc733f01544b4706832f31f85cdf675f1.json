@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH old AS (SELECT id, file_id FROM versions\n                        WHERE tenant_id = $1 AND collection_id = $2 AND file_id IS NOT NULL\n                        ORDER BY id FOR UPDATE)\n           UPDATE versions v SET file_id = NULL FROM old\n           WHERE v.id = old.id\n           RETURNING old.file_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "file_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "318c53c179dfc7673bec8ffdf00ccd0bc733f01544b4706832f31f85cdf675f1"
+}

@@ -52,8 +52,10 @@ pub enum Change {
         drafts: (bool, bool),
         max_versions: (u32, u32),
     },
-    /// An upload collection's files change: its `imageSizes` (the sizes made from each
-    /// file), whether it has a focal point, or it stops holding files (`removed`).
+    /// An upload collection's files change: what its sizes are made with (`sizes`: its
+    /// `imageSizes`, `formatOptions`, `resizeOptions`, `trimOptions`, `withMetadata` or
+    /// `constructorOptions`), whether it has a focal point, or it stops holding files
+    /// (`removed`). Any but the last makes every file's sizes again.
     UploadChanged {
         sizes: bool,
         focal_point: bool,
@@ -184,7 +186,12 @@ fn upload_change(old: Option<&Upload>, new: Option<&Upload>) -> Option<Change> {
     let (sizes, focal_point, removed) = match new {
         None => (!old.image_sizes.is_empty(), old.focal_point, true),
         Some(new) => (
-            old.image_sizes != new.image_sizes,
+            old.image_sizes != new.image_sizes
+                || old.format_options != new.format_options
+                || old.resize_options != new.resize_options
+                || old.trim_options != new.trim_options
+                || old.with_metadata != new.with_metadata
+                || old.constructor_options != new.constructor_options,
             old.focal_point != new.focal_point,
             false,
         ),
@@ -1960,11 +1967,34 @@ mod tests {
                 removed: false
             }]
         );
+        // Every option sizes are made with remakes them.
+        for option in [
+            json!({"formatOptions": {"format": "webp"}}),
+            json!({"resizeOptions": {"width": 100}}),
+            json!({"trimOptions": {"threshold": 10}}),
+            json!({"withMetadata": true}),
+            json!({"constructorOptions": {"limitInputPixels": 1000}}),
+        ] {
+            let mut upload = json!({"imageSizes": [{"name": "thumbnail", "width": 400}]});
+            upload
+                .as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            assert_eq!(
+                changes(&one, &media(upload)),
+                [Change::UploadChanged {
+                    sizes: true,
+                    focal_point: false,
+                    removed: false
+                }],
+                "{option}"
+            );
+        }
         // Other upload options change no stored data.
         let c = changes(
             &one,
             &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
-            "mimeTypes": ["image/*"]})),
+            "mimeTypes": ["image/*"], "staticDir": "pictures"})),
         );
         assert_eq!(c, [Change::CollectionOptionsChanged]);
         // Turning uploads off removes the built-in fields too.

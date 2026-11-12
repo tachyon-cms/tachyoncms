@@ -1,4 +1,7 @@
-//! The jobs that delete stored files, run by a real worker against local storage.
+//! The jobs that delete stored files, run by a real worker against local storage, and
+//! those that make every file's sizes again when its collection's schema changes.
+
+mod common;
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -6,16 +9,20 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
+use axum::Router;
+use common::{ADMIN, PASSWORD, Res, png, send, signed_in, upload};
 use futures_util::StreamExt;
 use futures_util::stream::BoxStream;
+use http_body_util::BodyExt;
 use object_store::local::LocalFileSystem;
 use object_store::path::Path as Key;
 use object_store::{
     CopyOptions, GetOptions, GetResult, ListResult, MultipartUpload, ObjectMeta, ObjectStore,
     PutMultipartOptions, PutOptions, PutPayload, PutResult,
 };
-use serde_json::{Map, json};
+use serde_json::{Map, Value, json};
 use sqlx::PgPool;
+use sqlx::postgres::PgPoolOptions;
 use tachyon_api::{JobsConfig, Options, UploadsConfig};
 use tachyon_core::CollectionSchema;
 use tachyon_db::collections::{self, Collection};
@@ -23,8 +30,10 @@ use tachyon_db::documents::{self, FileChange, Prepared};
 use tachyon_db::files::{self, CLEANUP, CLEANUP_ATTEMPTS, FileRow, NewFile};
 use tachyon_db::jobs::{self, NewJob};
 use tachyon_db::{DbError, DocCopy};
+use tachyon_media::fixtures;
 use tachyon_media::storage::{Storage, StorageConfig, Storages, object_key};
 use time::OffsetDateTime;
+use tower::ServiceExt;
 use uuid::Uuid;
 
 /// Local storage whose deletes fail while `fails` is above 0, counting down.
@@ -292,9 +301,9 @@ async fn cleanup(pool: &PgPool, file: Uuid) -> (Uuid, String, i32) {
     .unwrap()
 }
 
-/// Polls `check` until it holds, for up to 20 s.
+/// Polls `check` until it holds, for up to 90 s: a debug build takes its time over AVIF.
 async fn until<F: AsyncFn() -> bool>(what: &str, check: F) {
-    for _ in 0..400 {
+    for _ in 0..1800 {
         if check().await {
             return;
         }
@@ -902,4 +911,738 @@ async fn a_failing_sweep_still_has_a_next_run(pool: PgPool) {
     })
     .await;
     assert_ne!(queued_sweep(&pool).await, next);
+}
+
+// Regenerating sizes when a schema changes, and removing uploads.
+
+/// A test's spool and store, removed with everything in them when the test is done.
+struct Dirs {
+    spool: PathBuf,
+    store: PathBuf,
+    _base: tempfile::TempDir,
+}
+
+fn dirs() -> Dirs {
+    let base = temp_root().0;
+    let d = Dirs {
+        spool: base.path().join("spool"),
+        store: base.path().join("store"),
+        _base: base,
+    };
+    std::fs::create_dir_all(&d.spool).unwrap();
+    std::fs::create_dir_all(&d.store).unwrap();
+    d
+}
+
+fn api_options(d: &Dirs, workers: usize, inline_rows: Option<i64>) -> Options {
+    let storages = Storages::open(&std::collections::BTreeMap::from([(
+        "default".into(),
+        StorageConfig::local(&d.store),
+    )]))
+    .unwrap();
+    Options {
+        jobs: JobsConfig {
+            workers,
+            ..JobsConfig::default()
+        },
+        uploads: UploadsConfig {
+            temp_dir: d.spool.clone(),
+            storages: Arc::new(storages),
+            ..UploadsConfig::default()
+        },
+        schema_inline_rows: inline_rows,
+        ..Options::default()
+    }
+}
+
+/// The API over `d` with no workers, signed in as its first Admin.
+async fn api(pool: &PgPool, d: &Dirs) -> Router {
+    api_with(pool, d, None).await
+}
+
+async fn api_with(pool: &PgPool, d: &Dirs, inline_rows: Option<i64>) -> Router {
+    let app = tachyon_api::router_with(pool.clone(), api_options(d, 0, inline_rows))
+        .await
+        .unwrap();
+    let setup = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    let res = send(&app, "POST", "/api/setup", Some(&setup.to_string())).await;
+    if res.status != 201 {
+        assert_eq!(res.status, 403, "setup: {}", res.json);
+    }
+    signed_in(app, ADMIN).await
+}
+
+/// A job worker over a pool of its own; closing that pool stops it.
+async fn worker(pool: &PgPool, d: &Dirs) -> PgPool {
+    let own = PgPoolOptions::new()
+        .connect_with((*pool.connect_options()).clone())
+        .await
+        .unwrap();
+    // Its workers run on their own; the router isn't needed.
+    let _ = tachyon_api::router_with(own.clone(), api_options(d, 1, None))
+        .await
+        .unwrap();
+    own
+}
+
+/// Whether any job is due or running, other than the hourly sweep.
+async fn busy(pool: &PgPool) -> bool {
+    sqlx::query_scalar(
+        "SELECT EXISTS (SELECT 1 FROM jobs WHERE kind <> 'file_cleanup_sweep'
+           AND (state = 'running' OR (state = 'queued' AND run_at <= now())))",
+    )
+    .fetch_one(pool)
+    .await
+    .unwrap()
+}
+
+async fn ok(app: &Router, method: &str, uri: &str, body: Option<Value>) -> Value {
+    let res = send(app, method, uri, body.map(|b| b.to_string()).as_deref()).await;
+    assert!(res.status.is_success(), "{method} {uri}: {}", res.json);
+    res.json
+}
+
+fn media(upload: Value, extra: Value) -> Value {
+    let mut schema = json!({
+        "slug": "media", "upload": upload,
+        "fields": [{"name": "alt", "type": "text"}]
+    });
+    schema
+        .as_object_mut()
+        .unwrap()
+        .extend(extra.as_object().unwrap().clone());
+    schema
+}
+
+async fn change(app: &Router, slug: &str, schema: Value, confirm: bool) -> Res {
+    let body = json!({"schema": schema, "confirm": confirm});
+    send(
+        app,
+        "PUT",
+        &format!("/api/admin/collections/{slug}"),
+        Some(&body.to_string()),
+    )
+    .await
+}
+
+/// The status `url` (a full URL) is served with, and its bytes.
+async fn fetch(app: &Router, url: &Value) -> (u16, Vec<u8>) {
+    let url = url::Url::parse(url.as_str().unwrap_or_else(|| panic!("no url: {url}"))).unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(url.path())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, body)
+}
+
+/// The file document `id` holds in its published copy, or else its draft.
+async fn held(pool: &PgPool, id: &Value) -> Uuid {
+    sqlx::query_scalar("SELECT coalesce(published_file, draft_file) FROM documents WHERE id = $1")
+        .bind(id.as_str().unwrap().parse::<Uuid>().unwrap())
+        .fetch_one(pool)
+        .await
+        .unwrap()
+}
+
+async fn count(pool: &PgPool, sql: &'static str) -> i64 {
+    sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn changing_image_sizes_regenerates(pool: PgPool) {
+    let d = dirs();
+    let app = api(&pool, &d).await;
+    let thumb = |w: u32, h: u32| json!({"name": "thumbnail", "width": w, "height": h});
+    let versions = json!({"versions": {"maxVersions": 10}});
+    let schema = media(json!({"imageSizes": [thumb(400, 300)]}), versions.clone());
+    ok(&app, "POST", "/api/admin/collections", Some(schema)).await;
+    let mut ids = Vec::new();
+    for n in 0..3 {
+        let res = upload(
+            &app,
+            "POST",
+            "/api/media",
+            Some(&png(800, 600)),
+            &format!("{n}.png"),
+            None,
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+        ids.push(res.json["id"].clone());
+    }
+    let first = ids[0].as_str().unwrap().to_owned();
+    // A second version of the first, holding the same file.
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/media/{first}"),
+        Some(json!({"alt": "two"})),
+    )
+    .await;
+    let w = worker(&pool, &d).await;
+    until("the first sizes are made", async || !busy(&pool).await).await;
+    w.close().await;
+    let mut old = Vec::new();
+    for id in &ids {
+        let file = files::get(&pool, held(&pool, id).await).await.unwrap();
+        assert_eq!(file.sizes["thumbnail"]["width"], 400, "{:?}", file.sizes);
+        for name in file.names.iter().filter(|n| n.contains("400x300")) {
+            old.push(d.store.join(sibling(&file.key, name)));
+        }
+    }
+    assert_eq!(old.len(), 9, "a png, avif and webp each: {old:?}");
+    assert!(old.iter().all(|p| p.exists()));
+
+    // The thumbnail shrinks and a card is added.
+    let card = json!({"name": "card", "width": 768});
+    let schema = media(json!({"imageSizes": [thumb(300, 200), card]}), versions);
+    let res = change(&app, "media", schema, false).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM jobs WHERE kind = 'regenerate_sizes' AND state = 'queued'"
+        )
+        .await,
+        1
+    );
+    // Until the jobs run, reads show the old sizes.
+    for id in &ids {
+        let doc = ok(
+            &app,
+            "GET",
+            &format!("/api/media/{}", id.as_str().unwrap()),
+            None,
+        )
+        .await;
+        assert_eq!(doc["sizes"]["thumbnail"]["width"], 400, "{doc}");
+        assert!(doc["sizes"]["card"].is_null(), "{doc}");
+    }
+
+    let w = worker(&pool, &d).await;
+    until(
+        "every size is made again and the old ones deleted",
+        async || !busy(&pool).await && old.iter().all(|p| !p.exists()),
+    )
+    .await;
+    w.close().await;
+    for id in &ids {
+        let doc = ok(
+            &app,
+            "GET",
+            &format!("/api/media/{}", id.as_str().unwrap()),
+            None,
+        )
+        .await;
+        let sizes = &doc["sizes"];
+        assert_eq!(
+            (&sizes["thumbnail"]["width"], &sizes["thumbnail"]["height"]),
+            (&json!(300), &json!(200)),
+            "{sizes}"
+        );
+        assert_eq!(sizes["card"]["width"], 768, "{sizes}");
+        for size in ["thumbnail", "card"] {
+            assert_eq!(fetch(&app, &sizes[size]["url"]).await.0, 200, "{sizes}");
+        }
+        let file = files::get(&pool, held(&pool, id).await).await.unwrap();
+        assert!(
+            !file.names.iter().any(|n| n.contains("400x300")),
+            "{:?}",
+            file.names
+        );
+    }
+    // Every version holding a file says what it has now.
+    let stale = count(
+        &pool,
+        "SELECT count(*) FROM versions WHERE data->'sizes'->'thumbnail'->>'width' <> '300'
+           OR data->'sizes'->'card' IS NULL OR data->'sizes'->'card' = 'null'",
+    )
+    .await;
+    assert_eq!(stale, 0);
+    // Restoring the first version serves working sizes.
+    let list = ok(&app, "GET", &format!("/api/media/{first}/versions"), None).await;
+    let docs = list["docs"].as_array().unwrap();
+    let oldest = docs.last().unwrap()["id"].as_str().unwrap();
+    let restored = ok(
+        &app,
+        "POST",
+        &format!("/api/media/{first}/versions/{oldest}/restore"),
+        None,
+    )
+    .await;
+    let restored = match restored.get("doc") {
+        Some(doc) => doc.clone(),
+        None => restored,
+    };
+    for size in ["thumbnail", "card"] {
+        let url = &restored["sizes"][size]["url"];
+        assert_eq!(fetch(&app, url).await.0, 200, "{restored}");
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn regeneration_takes_the_focal_point_from_the_document(pool: PgPool) {
+    let d = dirs();
+    let app = api(&pool, &d).await;
+    let square = json!({"imageSizes": [{"name": "square", "width": 200, "height": 200}]});
+    let drafts = json!({"versions": {"drafts": true, "maxVersions": 10}});
+    let mut off = square.clone();
+    off["focalPoint"] = json!(false);
+    let schema = media(off, drafts.clone());
+    ok(&app, "POST", "/api/admin/collections", Some(schema)).await;
+    let halves = image::RgbImage::from_fn(1000, 500, |x, _| {
+        if x < 500 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
+    });
+    let image = fixtures::encoded(
+        &image::DynamicImage::ImageRgb8(halves),
+        image::ImageFormat::Png,
+    );
+    let res = upload(
+        &app,
+        "POST",
+        "/api/media",
+        Some(&image),
+        "a.png",
+        Some(&json!({"focalX": 90})),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    ok(&app, "POST", &format!("/api/media/{id}/publish"), None).await;
+    // Without a focal point, a focal write keeps the file: both copies hold it, each with
+    // its own focalX, the published copy's on the blue side, the draft's on the red.
+    ok(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        Some(json!({"focalX": 10})),
+    )
+    .await;
+    let (published, draft): (Option<Uuid>, Option<Uuid>) =
+        sqlx::query_as("SELECT published_file, draft_file FROM documents WHERE id = $1")
+            .bind(id.parse::<Uuid>().unwrap())
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(published, draft, "one file for both copies");
+
+    let res = change(&app, "media", media(square, drafts), false).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let w = worker(&pool, &d).await;
+    until("the sizes are made again", async || {
+        !busy(&pool).await
+            && count(
+                &pool,
+                "SELECT count(*) FROM jobs WHERE kind = 'regenerate_sizes' AND state = 'done'",
+            )
+            .await
+                == 1
+    })
+    .await;
+    w.close().await;
+    // The draft's focal point wins: it's the newer edit, and what publishing takes.
+    let draft = ok(&app, "GET", &format!("/api/media/{id}?draft=true"), None).await;
+    assert_eq!(draft["focalX"], 10, "{draft}");
+    let (status, body) = fetch(&app, &draft["sizes"]["square"]["url"]).await;
+    assert_eq!(status, 200, "{draft}");
+    let made = image::load_from_memory(&body).unwrap().to_rgb8();
+    let [r, _, b] = made.get_pixel(100, 100).0;
+    assert!(r > 200 && b < 50, "the centre is red: {r} {b}");
+    let published = ok(&app, "GET", &format!("/api/media/{id}"), None).await;
+    assert_eq!(published["focalX"], 90, "{published}");
+    let entry = |doc: &Value| {
+        let e = &doc["sizes"]["square"];
+        (e["filename"].clone(), e["filesize"].clone())
+    };
+    assert_eq!(
+        entry(&published),
+        entry(&draft),
+        "one file, one set of sizes"
+    );
+}
+
+/// `n` live files of `c`, each held by a document of its own, nothing stored.
+async fn many(pool: &PgPool, c: &Collection, n: usize) -> Vec<Uuid> {
+    let mut ids = Vec::new();
+    for i in 0..n {
+        let name = format!("{i}.png");
+        let f = NewFile {
+            collection_id: c.id,
+            storage: "default",
+            filename: &name,
+            scope: "",
+            mime_type: "image/png",
+            filesize: 3,
+            width: Some(4),
+            height: Some(3),
+            focal: (50.0, 50.0),
+            blurhash: None,
+            issued_to: None,
+            document: None,
+        };
+        let file = files::reserve(pool, &f, |id, name| {
+            object_key(None, "images", id, name).map_err(|e| e.to_string())
+        })
+        .await
+        .unwrap();
+        holding(pool, c, file.id).await;
+        ids.push(file.id);
+    }
+    ids.sort();
+    ids
+}
+
+/// `c`'s schema with a `thumb` size `width` wide.
+fn sized(c: &Collection, width: u32) -> CollectionSchema {
+    let mut schema = c.schema.0.clone();
+    let mut upload = schema.upload.clone().unwrap();
+    upload.image_sizes =
+        vec![serde_json::from_value(json!({"name": "thumb", "width": width})).unwrap()];
+    schema.upload = Some(upload);
+    schema
+}
+
+async fn apply(pool: &PgPool, schema: &CollectionSchema) {
+    tachyon_db::schema_change::apply(
+        pool,
+        "images",
+        schema,
+        &tachyon_core::diff::Renames::new(),
+        true,
+    )
+    .await
+    .unwrap();
+}
+
+/// The walks of `c`: each batch's `after` and state, oldest first.
+async fn walks(pool: &PgPool, c: &Collection) -> Vec<(Option<Uuid>, String)> {
+    sqlx::query_as(
+        "SELECT (payload->>'after')::uuid, state FROM jobs
+         WHERE kind = 'regenerate_sizes' AND collection_id = $1 ORDER BY id",
+    )
+    .bind(c.id)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+/// The files of `c` given a size job to make every size again since `since`.
+async fn regenerated(pool: &PgPool, since: OffsetDateTime) -> Vec<Uuid> {
+    sqlx::query_scalar(
+        "SELECT DISTINCT (payload->>'file')::uuid FROM jobs
+         WHERE kind = 'image_sizes' AND payload->>'regenerate' = 'true' AND created_at >= $1
+         ORDER BY 1",
+    )
+    .bind(since)
+    .fetch_all(pool)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn regeneration_walks_every_batch(pool: PgPool) {
+    let c = seed_with(
+        &pool,
+        json!({"upload": {"imageSizes": [{"name": "thumb", "width": 10}]}}),
+    )
+    .await;
+    let ids = many(&pool, &c, 250).await;
+    let since = OffsetDateTime::now_utc();
+    apply(&pool, &sized(&c, 20)).await;
+    let (store, _root) = storage(0);
+    let _app = serve(&pool, store).await;
+    until("the walk is done", async || {
+        walks(&pool, &c)
+            .await
+            .iter()
+            .filter(|(_, s)| s == "done")
+            .count()
+            == 3
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    let w = walks(&pool, &c).await;
+    assert_eq!(
+        w,
+        [
+            (None, "done".into()),
+            (Some(ids[99]), "done".into()),
+            (Some(ids[199]), "done".into()),
+        ],
+        "three batches, each from where the last stopped, and no fourth"
+    );
+    let keyed: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'regenerate_sizes'
+         AND dedupe_key = 'regenerate_sizes:' || $1::text",
+    )
+    .bind(c.id)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(keyed, 3, "every batch can be replaced by a newer walk");
+    assert_eq!(regenerated(&pool, since).await, ids);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_change_mid_walk_starts_it_again(pool: PgPool) {
+    let c = seed_with(
+        &pool,
+        json!({"upload": {"imageSizes": [{"name": "thumb", "width": 10}]}}),
+    )
+    .await;
+    let ids = many(&pool, &c, 150).await;
+    apply(&pool, &sized(&c, 20)).await;
+    // As if its first batch had run: the walk goes on from the 100th file.
+    sqlx::query(
+        "UPDATE jobs SET payload = jsonb_build_object('after', $2::text)
+         WHERE kind = 'regenerate_sizes' AND collection_id = $1",
+    )
+    .bind(c.id)
+    .bind(ids[99].to_string())
+    .execute(&pool)
+    .await
+    .unwrap();
+    let since = OffsetDateTime::now_utc();
+    let c = collections::get_by_slug(&pool, "images").await.unwrap();
+    apply(&pool, &sized(&c, 30)).await;
+    assert_eq!(
+        walks(&pool, &c).await,
+        [(Some(ids[99]), "cancelled".into()), (None, "queued".into()),],
+        "the newer walk replaces the older, from the start"
+    );
+    let (store, _root) = storage(0);
+    let _app = serve(&pool, store).await;
+    until("the new walk is done", async || {
+        walks(&pool, &c)
+            .await
+            .iter()
+            .filter(|(_, s)| s == "done")
+            .count()
+            == 2
+    })
+    .await;
+    assert_eq!(
+        regenerated(&pool, since).await,
+        ids,
+        "every file, the first 100 too"
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn other_upload_options_dont_regenerate(pool: PgPool) {
+    let c = seed_with(
+        &pool,
+        json!({"upload": {"imageSizes": [{"name": "thumb", "width": 10}]}}),
+    )
+    .await;
+    many(&pool, &c, 1).await;
+    let mut schema = c.schema.0.clone();
+    let mut upload = schema.upload.clone().unwrap();
+    upload.mime_types = vec!["image/*".into()];
+    upload.static_dir = Some("pictures".into());
+    schema.upload = Some(upload);
+    apply(&pool, &schema).await;
+    assert_eq!(walks(&pool, &c).await, []);
+    // Without sizes before or after, an option sizes are made with remakes nothing.
+    let mut schema = collections::get_by_slug(&pool, "images")
+        .await
+        .unwrap()
+        .schema
+        .0;
+    let mut upload = schema.upload.clone().unwrap();
+    upload.image_sizes = Vec::new();
+    schema.upload = Some(upload.clone());
+    apply(&pool, &schema).await;
+    let dropped = walks(&pool, &c).await.len();
+    assert_eq!(dropped, 1, "dropping the sizes walks, to delete them");
+    upload.with_metadata = true;
+    schema.upload = Some(upload);
+    apply(&pool, &schema).await;
+    assert_eq!(walks(&pool, &c).await.len(), dropped);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn removing_upload_needs_confirm(pool: PgPool) {
+    let d = dirs();
+    let app = api(&pool, &d).await;
+    let versions = json!({"versions": {"maxVersions": 10}});
+    let schema = media(json!(true), versions);
+    ok(&app, "POST", "/api/admin/collections", Some(schema)).await;
+    let posts = json!({"slug": "posts", "fields": [
+        {"name": "title", "type": "text"},
+        {"name": "cover", "type": "upload", "relationTo": "media"}]});
+    ok(&app, "POST", "/api/admin/collections", Some(posts)).await;
+    let a = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "a.png", None).await;
+    assert_eq!(a.status, 201, "{}", a.json);
+    let b = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "b.png", None).await;
+    assert_eq!(b.status, 201, "{}", b.json);
+    let (a, b) = (a.json["id"].clone(), b.json["id"].clone());
+    let (a_id, b_id) = (a.as_str().unwrap(), b.as_str().unwrap());
+    let first_b = held(&pool, &b).await;
+    // B's first file is now held only by a version of B.
+    let res = upload(
+        &app,
+        "PATCH",
+        &format!("/api/media/{b_id}"),
+        Some(&png(5, 3)),
+        "c.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // A is in the trash.
+    ok(&app, "DELETE", &format!("/api/media/{a_id}"), None).await;
+    let held_files: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM files ORDER BY id")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(held_files.len(), 3);
+    assert!(held_files.contains(&first_b));
+    // An upload under way.
+    let c = collections::get_by_slug(&pool, "media").await.unwrap();
+    let pending = files::reserve(
+        &pool,
+        &NewFile {
+            collection_id: c.id,
+            storage: "default",
+            filename: "d.png",
+            scope: "",
+            mime_type: "image/png",
+            filesize: 3,
+            width: Some(4),
+            height: Some(3),
+            focal: (50.0, 50.0),
+            blurhash: None,
+            issued_to: None,
+            document: None,
+        },
+        |id, name| object_key(None, "media", id, name).map_err(|e| e.to_string()),
+    )
+    .await
+    .unwrap();
+
+    // Upload fields point at media: no confirm passes that.
+    let off = json!({"slug": "media", "versions": {"maxVersions": 10},
+                     "fields": [{"name": "alt", "type": "text"}]});
+    let referrer = "media can't stop holding files while these upload fields point at it: posts.cover; change them first";
+    for confirm in [false, true] {
+        let res = change(&app, "media", off.clone(), confirm).await;
+        assert_eq!(res.status, 409, "{}", res.json);
+        assert_eq!(res.json["detail"], referrer, "{}", res.json);
+    }
+    let posts = json!({"slug": "posts", "fields": [{"name": "title", "type": "text"}]});
+    let res = change(&app, "posts", posts, true).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+
+    // Without confirm: a 409 counting the documents holding files, trashed and
+    // version-only ones too, and nothing changes.
+    let res = change(&app, "media", off.clone(), false).await;
+    assert_eq!(res.status, 409, "{}", res.json);
+    assert_eq!(
+        res.json["detail"],
+        "2 documents hold files; they'll be removed. This change removes or retypes fields, \
+         or leaves documents that won't validate. Send it again with \"confirm\": true to go ahead.",
+        "{}",
+        res.json
+    );
+    assert_eq!(res.json["preview"]["holdingFiles"], 2, "{}", res.json);
+    let stored = ok(&app, "GET", "/api/admin/collections/media", None).await;
+    assert_eq!(stored["schema"]["upload"], true, "{stored}");
+    assert_eq!(
+        count(&pool, "SELECT count(*) FROM files WHERE state = 'live'").await,
+        3
+    );
+
+    // With it: every file reference goes, and every file is released.
+    let res = change(&app, "media", off, true).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM documents
+             WHERE published_file IS NOT NULL OR draft_file IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM versions WHERE file_id IS NOT NULL"
+        )
+        .await,
+        0
+    );
+    assert!(count(&pool, "SELECT count(*) FROM versions").await >= 3);
+    for id in held_files.iter().chain([&pending.id]) {
+        let row = files::get(&pool, *id).await.unwrap();
+        assert_eq!(row.state, "gone", "{id}");
+        let n: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs WHERE kind = 'file_cleanup' AND state = 'queued'
+             AND payload->>'file' = $1",
+        )
+        .bind(id.to_string())
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(n, 1, "one cleanup for {id}");
+    }
+    // The pending file's cleanup keeps its grace: an upload still storing it may land.
+    let (pending_job, _, _) = cleanup(&pool, pending.id).await;
+    let at = jobs::status(&pool, pending_job)
+        .await
+        .unwrap()
+        .unwrap()
+        .run_at;
+    assert!(at > OffsetDateTime::now_utc() + time::Duration::minutes(50));
+    let doc = ok(&app, "GET", &format!("/api/media/{b_id}"), None).await;
+    assert!(doc.get("filename").is_none(), "{doc}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn removing_upload_from_a_big_collection_runs_as_a_job(pool: PgPool) {
+    let d = dirs();
+    let app = api_with(&pool, &d, Some(0)).await;
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(media(json!(true), json!({}))),
+    )
+    .await;
+    let res = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "a.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let file = files::get(&pool, held(&pool, &res.json["id"]).await)
+        .await
+        .unwrap();
+    let object = d.store.join(&file.key);
+    assert!(object.exists());
+    let off = json!({"slug": "media", "fields": [{"name": "alt", "type": "text"}]});
+    let res = change(&app, "media", off, true).await;
+    assert_eq!(res.status, 202, "{}", res.json);
+    let w = worker(&pool, &d).await;
+    until("the file is cleaned up", async || {
+        !row_exists(&pool, file.id).await && !object.exists()
+    })
+    .await;
+    w.close().await;
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM documents WHERE published_file IS NOT NULL"
+        )
+        .await,
+        0
+    );
 }
