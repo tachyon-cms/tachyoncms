@@ -2214,3 +2214,63 @@ async fn a_wait_answers_with_what_is_made_when_a_walk_takes_its_job(pool: PgPool
     assert_eq!(res.status, 201, "{}", res.json);
     assert!(res.json["sizes"]["thumb"].is_null(), "{}", res.json);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_walk_that_cant_be_requeued_doesnt_stop_the_cleanups(pool: PgPool) {
+    // Storage stays down, so the requeued cleanup can only fail and wait again.
+    let (storage, _root) = storage(usize::MAX);
+    let c = seed(&pool).await;
+    let a = stored(&pool, &c, &storage, "a.png").await;
+    let b = stored(&pool, &c, &storage, "b.png").await;
+    let doc = holding(&pool, &c, a.id).await;
+    set_file(&pool, &c, doc, b.id).await;
+    let failed_cleanup = cleanup(&pool, a.id).await.0;
+    fail_for_good(&pool, failed_cleanup).await;
+    // A walk running under a key, and a failed one under it that sorts after it, as a
+    // server whose clock runs ahead would make.
+    let walked = Uuid::now_v7();
+    let mut conn = pool.acquire().await.unwrap();
+    let running = jobs::add(&mut conn, &files::regenerate_job(walked, None))
+        .await
+        .unwrap();
+    drop(conn);
+    sqlx::query(
+        "UPDATE jobs SET state = 'running', locked_until = now() + interval '1 hour' WHERE id = $1",
+    )
+    .bind(running)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let stale = Uuid::now_v7();
+    sqlx::query(
+        "INSERT INTO jobs (id, tenant_id, kind, collection_id, payload, run_at, state,
+                           dedupe_key, attempts, max_attempts, finished_at)
+         SELECT $1, tenant_id, kind, collection_id, payload, now(), 'failed', dedupe_key, 20, 20,
+                now()
+         FROM jobs WHERE id = $2",
+    )
+    .bind(stale)
+    .bind(running)
+    .execute(&pool)
+    .await
+    .unwrap();
+    // Another collection's failed walk, its latest: the clash above mustn't keep it back.
+    let lone = failed_walk(&pool, Uuid::now_v7()).await;
+    let _app = serve(&pool, storage).await;
+    sweep_now(&pool).await;
+    until("the other walk runs again", async || {
+        job_state(&pool, lone).await.0 != "failed"
+    })
+    .await;
+    until("the failed cleanup is queued again", async || {
+        let (state, attempts) = job_state(&pool, failed_cleanup).await;
+        state == "queued" && attempts <= 1
+    })
+    .await;
+    assert_eq!(
+        job_state(&pool, stale).await.0,
+        "failed",
+        "its key has a walk going"
+    );
+    assert_eq!(job_state(&pool, running).await.0, "running");
+}

@@ -1186,7 +1186,8 @@ pub fn regenerate_job(collection_id: Uuid, after: Option<Uuid>) -> NewJob<'stati
 }
 
 /// Queues again, with fresh attempts, each failed walk that's still its collection's
-/// latest: no newer walk, pending or finished, has its key. It goes on from its batch.
+/// latest: no newer walk, pending or finished, has its key, nor is one pending under it
+/// (newer or not: job ids come from each server's clock). It goes on from its batch.
 /// Returns how many.
 pub async fn requeue_walks_in(tx: &mut PgConnection) -> Result<u64, DbError> {
     let done = sqlx::query!(
@@ -1194,11 +1195,14 @@ pub async fn requeue_walks_in(tx: &mut PgConnection) -> Result<u64, DbError> {
                finished_at = NULL, result = NULL
            WHERE id IN (
                SELECT id FROM (
-                   SELECT DISTINCT ON (dedupe_key) id, state FROM jobs
+                   SELECT DISTINCT ON (dedupe_key) id, state, dedupe_key FROM jobs
                    WHERE tenant_id = $1 AND kind = $2
-                   ORDER BY dedupe_key, id DESC
+                   ORDER BY dedupe_key, created_at DESC, id DESC
                ) latest
-               WHERE state = 'failed')"#,
+               WHERE state = 'failed'
+                 AND NOT EXISTS (SELECT 1 FROM jobs o
+                                 WHERE o.tenant_id = $1 AND o.dedupe_key = latest.dedupe_key
+                                   AND o.state IN ('queued', 'running')))"#,
         DEFAULT_TENANT,
         REGENERATE,
     )
@@ -1207,14 +1211,29 @@ pub async fn requeue_walks_in(tx: &mut PgConnection) -> Result<u64, DbError> {
     Ok(done.rows_affected())
 }
 
-/// Up to `limit` live files of `collection_id` after file `after` (from the first without
-/// one), in ID order: each one's ID and type.
-pub async fn live_after(
-    pool: &PgPool,
+/// One batch of `collection_id`'s walk, in `tx`: up to `limit` of its live files after file
+/// `after` (from the first without one), in ID order, each given the job `job_for` makes
+/// from its ID and type (none for a file it skips), all queued in one statement
+/// (`jobs::enqueue_all`). Returns the batch's files. The collection is taken `FOR KEY SHARE`
+/// first, so a schema change under way, a removal of its files say, is waited out and its
+/// outcome read: the lock order a removal takes too.
+pub async fn regenerate_batch_in(
+    tx: &mut PgConnection,
     collection_id: Uuid,
     after: Option<Uuid>,
     limit: i64,
-) -> Result<Vec<(Uuid, String)>, DbError> {
+    job_for: impl Fn(Uuid, &str) -> Option<NewJob<'static>>,
+) -> Result<Vec<Uuid>, DbError> {
+    let here = sqlx::query_scalar!(
+        "SELECT id FROM collections WHERE tenant_id = $1 AND id = $2 FOR KEY SHARE",
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_optional(&mut *tx)
+    .await?;
+    if here.is_none() {
+        return Ok(Vec::new());
+    }
     let rows = sqlx::query!(
         r#"SELECT id, mime_type FROM files
            WHERE tenant_id = $1 AND collection_id = $2 AND state = 'live'
@@ -1225,9 +1244,14 @@ pub async fn live_after(
         after,
         limit,
     )
-    .fetch_all(pool)
+    .fetch_all(&mut *tx)
     .await?;
-    Ok(rows.into_iter().map(|r| (r.id, r.mime_type)).collect())
+    let queued: Vec<NewJob<'static>> = rows
+        .iter()
+        .filter_map(|r| job_for(r.id, &r.mime_type))
+        .collect();
+    jobs::enqueue_all(&mut *tx, &queued).await?;
+    Ok(rows.into_iter().map(|r| r.id).collect())
 }
 
 /// The focal point file `id`'s sizes centre on: the one of the document copy holding it,

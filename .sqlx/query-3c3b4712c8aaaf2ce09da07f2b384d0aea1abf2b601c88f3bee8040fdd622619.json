@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET state = 'queued', attempts = 0, run_at = now(), locked_until = NULL,\n               finished_at = NULL, result = NULL\n           WHERE id IN (\n               SELECT id FROM (\n                   SELECT DISTINCT ON (dedupe_key) id, state, dedupe_key FROM jobs\n                   WHERE tenant_id = $1 AND kind = $2\n                   ORDER BY dedupe_key, created_at DESC, id DESC\n               ) latest\n               WHERE state = 'failed'\n                 AND NOT EXISTS (SELECT 1 FROM jobs o\n                                 WHERE o.tenant_id = $1 AND o.dedupe_key = latest.dedupe_key\n                                   AND o.state IN ('queued', 'running')))",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3c3b4712c8aaaf2ce09da07f2b384d0aea1abf2b601c88f3bee8040fdd622619"
+}

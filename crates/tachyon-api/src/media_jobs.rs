@@ -93,23 +93,23 @@ pub(crate) async fn run_regenerate(state: &AppState, job: &Job) -> Result<(), Jo
                 .ok_or_else(|| JobError::Permanent("the payload's `after` isn't a file".into()))?,
         ),
     };
-    let batch = files::live_after(&state.pool, collection, after, REGENERATE_BATCH)
-        .await
-        .map_err(retry)?;
     let mut tx = state.pool.begin().await.map_err(retry)?;
-    let sized: Vec<NewJob<'static>> = batch
-        .iter()
-        .filter(|(_, mime)| picture::size_format(mime).is_some())
-        .map(|(file, _)| size_job(collection, *file, true))
-        .collect();
     // One statement for the batch, not a savepoint per file. A size job queued for one of
     // these files meanwhile (only a restore or a first run does) fails it, and it retries.
-    jobs::enqueue_all(&mut tx, &sized).await.map_err(retry)?;
+    let batch = files::regenerate_batch_in(
+        &mut tx,
+        collection,
+        after,
+        REGENERATE_BATCH,
+        |file, mime| picture::size_format(mime).map(|_| size_job(collection, file, true)),
+    )
+    .await
+    .map_err(retry)?;
     if !jobs::complete_in(&mut tx, job).await.map_err(retry)? {
         return Ok(());
     }
     // Its own key, now this one's done: a newer walk then replaces it too.
-    if let Some((last, _)) = batch
+    if let Some(last) = batch
         .last()
         .filter(|_| batch.len() as i64 == REGENERATE_BATCH)
     {
@@ -916,20 +916,29 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
     let names: Vec<String> = state.media.storages.0.keys().cloned().collect();
     // This run is done whatever happens now, and the next one is queued: a failure is only
     // logged, and the next run tries again.
+    // Walks in a transaction of their own, so one that can't be queued again never takes
+    // the cleanups with it.
+    let walks = async {
+        let mut tx = state.pool.begin().await?;
+        let n = files::requeue_walks_in(&mut tx).await?;
+        tx.commit().await?;
+        Ok::<_, DbError>(n)
+    };
+    match walks.await {
+        Ok(0) => {}
+        Ok(walks) => tracing::info!(walks, "queued failed size walks again"),
+        Err(error) => {
+            tracing::error!(%error, "couldn't queue failed size walks again; the next sweep tries in an hour");
+        }
+    }
     let requeued = async {
         let mut tx = state.pool.begin().await?;
         let n = files::requeue_cleanups_in(&mut tx, &names).await?;
-        let walks = files::requeue_walks_in(&mut tx).await?;
         tx.commit().await?;
-        Ok::<_, DbError>((n, walks))
+        Ok::<_, DbError>(n)
     };
     let n = match requeued.await {
-        Ok((n, walks)) => {
-            if walks > 0 {
-                tracing::info!(walks, "queued failed size walks again");
-            }
-            n
-        }
+        Ok(n) => n,
         Err(error) => {
             tracing::error!(%error, "couldn't queue failed file cleanups again; the next sweep tries in an hour");
             return Ok(());

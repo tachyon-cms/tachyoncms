@@ -1235,3 +1235,68 @@ async fn a_newer_walk_cancels_a_batch_that_was_committing(pool: PgPool) {
         "one walk goes on, the newer, from the start"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_walk_batch_waits_out_a_removal(pool: PgPool) {
+    let c = seed(&pool).await;
+    for i in 0..3 {
+        let f = reserve(&pool, &c, &format!("{i}.png"), "", None).await;
+        draft_with(&pool, &c, f.id).await;
+    }
+    let off: CollectionSchema = serde_json::from_value(json!({
+        "slug": "images",
+        "versions": {"drafts": true, "maxVersions": 10},
+        "fields": [{"name": "alt", "type": "text"}]
+    }))
+    .unwrap();
+    // The removal, done but not yet committed.
+    let mut removal = pool.begin().await.unwrap();
+    tachyon_db::schema_change::apply_in(
+        &mut removal,
+        "images",
+        &off,
+        &tachyon_core::diff::Renames::new(),
+        true,
+    )
+    .await
+    .unwrap();
+    // A batch of the walk starts meanwhile, on its own connection.
+    let batch = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut tx = pool.begin().await.unwrap();
+            let files = files::regenerate_batch_in(&mut tx, c.id, None, 100, |file, _| {
+                Some(tachyon_db::jobs::NewJob {
+                    kind: "image_sizes",
+                    document_id: None,
+                    collection_id: Some(c.id),
+                    payload: json!({"file": file, "regenerate": true}),
+                    run_at: time::OffsetDateTime::now_utc(),
+                    dedupe_key: Some(format!("image_sizes:{file}")),
+                    created_by: None,
+                    key_id: None,
+                    max_attempts: None,
+                })
+            })
+            .await
+            .unwrap();
+            tx.commit().await.unwrap();
+            files.len()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    assert!(!batch.is_finished(), "the batch waits for the removal");
+    removal.commit().await.unwrap();
+    assert_eq!(
+        batch.await.unwrap(),
+        0,
+        "it sees the files as the removal left them"
+    );
+    let left: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = 'image_sizes' AND state <> 'cancelled'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(left, 0, "no size job for a collection that holds no files");
+}
