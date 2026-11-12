@@ -2423,6 +2423,211 @@ mod tests {
         crate::fixtures::avif_set_extent(a, index, offset, TAIL.len() as u32)
     }
 
+    /// The `meta` child of `a` of type `kind`: (meta's start, the child's start, its end).
+    fn meta_child(a: &[u8], kind: &[u8; 4]) -> Option<(usize, usize, usize)> {
+        let (meta, end, _) = child_boxes(a, 0, a.len())
+            .into_iter()
+            .find(|b| &b.2 == b"meta")?;
+        let child = child_boxes(a, meta + 12, end)
+            .into_iter()
+            .find(|b| &b.2 == kind)?;
+        Some((meta, child.0, child.1))
+    }
+
+    /// `a` with its `iloc` rewritten as version 1, which can say where an item is
+    /// constructed from (4-byte offsets and lengths, no base, no index).
+    fn avif_iloc_v1(a: Vec<u8>) -> Vec<u8> {
+        let (meta, iloc, end) = meta_child(&a, b"iloc").unwrap();
+        let body = iloc + 8;
+        if a[body] == 1 {
+            return a;
+        }
+        assert_eq!((a[body], a[body + 4], a[body + 5]), (0, 0x44, 0));
+        let u16_at = |i: usize| u16::from_be_bytes([a[i], a[i + 1]]);
+        let count = u16_at(body + 6);
+        let mut out = vec![1, 0, 0, 0, 0x44, 0];
+        out.extend_from_slice(&count.to_be_bytes());
+        let mut i = body + 8;
+        for _ in 0..count {
+            out.extend_from_slice(&a[i..i + 2]);
+            out.extend_from_slice(&[0, 0]);
+            out.extend_from_slice(&a[i + 2..i + 4]);
+            let n = usize::from(u16_at(i + 4));
+            out.extend_from_slice(&a[i + 4..i + 6 + 8 * n]);
+            i += 6 + 8 * n;
+        }
+        let boxed = isobmff_box(b"iloc", &out, false);
+        let grow = boxed.len() - (end - iloc);
+        let old: Vec<_> = crate::fixtures::avif_extents(&a);
+        let mut b = a.clone();
+        b.splice(iloc..end, boxed);
+        let size = u32::from_be_bytes(b[meta..meta + 4].try_into().unwrap()) + grow as u32;
+        b[meta..meta + 4].copy_from_slice(&size.to_be_bytes());
+        for (k, (_, off, len)) in old.into_iter().enumerate() {
+            if off >= end {
+                b = crate::fixtures::avif_set_extent(b, k, (off + grow) as u32, len as u32);
+            }
+        }
+        b
+    }
+
+    /// `a` with one more item: `id`, of type `kind` (with `content`, its content type, for
+    /// `mime`), holding `data` in `mdat`, or in `idat` (construction method 1) when
+    /// `in_idat`.
+    fn avif_with_item(
+        a: &[u8],
+        id: u16,
+        kind: &[u8; 4],
+        content: Option<&str>,
+        data: &[u8],
+        in_idat: bool,
+    ) -> Vec<u8> {
+        let mut a = if in_idat {
+            avif_iloc_v1(a.to_vec())
+        } else {
+            a.to_vec()
+        };
+        let (meta, iloc, iloc_end) = meta_child(&a, b"iloc").unwrap();
+        let body = iloc + 8;
+        let version = a[body];
+        let mut entry = id.to_be_bytes().to_vec();
+        if version >= 1 {
+            entry.extend_from_slice(&[0, u8::from(in_idat)]);
+        }
+        entry.extend_from_slice(&[0, 0, 0, 1]);
+        entry.extend_from_slice(&[0; 8]);
+        a = avif_insert(a, iloc_end, &entry, &[meta, iloc]);
+        let count = u16::from_be_bytes([a[body + 6], a[body + 7]]) + 1;
+        a[body + 6..body + 8].copy_from_slice(&count.to_be_bytes());
+        let (meta, iinf, iinf_end) = meta_child(&a, b"iinf").unwrap();
+        let mut infe = vec![2, 0, 0, 0];
+        infe.extend_from_slice(&id.to_be_bytes());
+        infe.extend_from_slice(&[0, 0]);
+        infe.extend_from_slice(kind);
+        infe.extend_from_slice(b"item\0");
+        if let Some(c) = content {
+            infe.extend_from_slice(c.as_bytes());
+            infe.push(0);
+        }
+        a = avif_insert(
+            a,
+            iinf_end,
+            &isobmff_box(b"infe", &infe, false),
+            &[meta, iinf],
+        );
+        assert_eq!(a[iinf + 8], 0, "iinf version 0");
+        let count = u16::from_be_bytes([a[iinf + 12], a[iinf + 13]]) + 1;
+        a[iinf + 12..iinf + 14].copy_from_slice(&count.to_be_bytes());
+        let offset = if in_idat {
+            let (meta, _, _) = meta_child(&a, b"iinf").unwrap();
+            let end = child_boxes(&a, 0, a.len())
+                .into_iter()
+                .find(|b| &b.2 == b"meta")
+                .unwrap()
+                .1;
+            a = avif_insert(a, end, &isobmff_box(b"idat", data, false), &[meta]);
+            0
+        } else {
+            let (mdat, _, kind) = *child_boxes(&a, 0, a.len()).last().unwrap();
+            assert_eq!(&kind, b"mdat");
+            let offset = a.len() as u32;
+            a.extend_from_slice(data);
+            let size =
+                u32::from_be_bytes(a[mdat..mdat + 4].try_into().unwrap()) + data.len() as u32;
+            a[mdat..mdat + 4].copy_from_slice(&size.to_be_bytes());
+            offset
+        };
+        let index = crate::fixtures::avif_extents(&a)
+            .iter()
+            .position(|e| e.0 == u32::from(id))
+            .unwrap();
+        crate::fixtures::avif_set_extent(a, index, offset, data.len() as u32)
+    }
+
+    /// `a` with a reference of type `kind` from item `from` to item `to`.
+    fn avif_with_ref(a: &[u8], kind: &[u8; 4], from: u16, to: u16) -> Vec<u8> {
+        let mut r = from.to_be_bytes().to_vec();
+        r.extend_from_slice(&1u16.to_be_bytes());
+        r.extend_from_slice(&to.to_be_bytes());
+        let reference = isobmff_box(kind, &r, false);
+        match meta_child(a, b"iref") {
+            Some((meta, iref, end)) => avif_insert(a.to_vec(), end, &reference, &[meta, iref]),
+            None => {
+                let (meta, end, _) = child_boxes(a, 0, a.len())
+                    .into_iter()
+                    .find(|b| &b.2 == b"meta")
+                    .unwrap();
+                let iref = isobmff_box(b"iref", &[&[0, 0, 0, 0][..], &reference].concat(), false);
+                avif_insert(a.to_vec(), end, &iref, &[meta])
+            }
+        }
+    }
+
+    /// Items an AVIF holds beside its picture: an HTML page in `idat` goes; its alpha, a
+    /// thumbnail of it, and (with `withMetadata`) any metadata describing it stay.
+    #[test]
+    fn an_avif_keeps_only_what_belongs_to_its_picture() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let want = pixels_of(&avif);
+        let in_idat = avif_with_item(&avif, 99, b"mime", Some("text/html"), TAIL, true);
+        let rgba = DynamicImage::ImageRgba8(::image::RgbaImage::from_fn(8, 8, |x, y| {
+            ::image::Rgba([x as u8 * 30, y as u8 * 30, 90, (x * y * 4) as u8])
+        }));
+        let transparent = encoded(&rgba, Codec::Avif);
+        let thumb_bytes = b"THUMBNAIL-AV1-BYTES";
+        let thumbed = avif_with_ref(
+            &avif_with_item(&avif, 98, b"av01", None, thumb_bytes, false),
+            b"thmb",
+            98,
+            1,
+        );
+        let manifest = b"C2PA-MANIFEST-BYTES";
+        let described = avif_with_ref(
+            &avif_with_item(
+                &avif,
+                97,
+                b"mime",
+                Some("application/c2pa"),
+                manifest,
+                false,
+            ),
+            b"cdsc",
+            97,
+            1,
+        );
+        for (how, u) in settings() {
+            let at = |name: &str| format!("{name}, {how}");
+            let kept = |bytes: &[u8]| {
+                let out = run(bytes, &u).unwrap_or_else(|e| panic!("{how}: {e}"));
+                stored(&out)
+            };
+            let k = kept(&in_idat);
+            assert!(!has(&k, b"<html>"), "{}: the page stayed", at("idat item"));
+            assert_eq!(pixels_of(&k), want, "{}", at("idat item"));
+            let k = kept(&transparent);
+            assert_eq!(
+                pixels_of(&k),
+                pixels_of(&transparent),
+                "{}: alpha",
+                at("rgba")
+            );
+            let k = kept(&thumbed);
+            assert!(has(&k, thumb_bytes), "{}: the thumbnail went", at("thmb"));
+            assert_eq!(pixels_of(&k), want, "{}", at("thmb"));
+            let k = kept(&described);
+            assert_eq!(has(&k, manifest), u.with_metadata, "{}", at("cdsc"));
+            assert_eq!(pixels_of(&k), want, "{}", at("cdsc"));
+        }
+        // The alpha is a picture of its own: zeroed, the pixels would differ.
+        assert_ne!(
+            pixels_of(&transparent),
+            pixels_of(&encoded(
+                &DynamicImage::ImageRgb8(rgba.to_rgb8()),
+                Codec::Avif
+            ))
+        );
+    }
+
     /// What's inside an AVIF's `meta` and among its items is kept only where it's the
     /// picture's; a TIFF's gaps go; an extent of length 0 ends with its box.
     #[test]

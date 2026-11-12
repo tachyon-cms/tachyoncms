@@ -753,15 +753,17 @@ fn orientation_of(ops: &[Op]) -> u8 {
 }
 
 /// The `meta` children whose bodies an AVIF's picture is read from: the rest (`free`,
-/// `skip`, anything unknown) keep only their headers.
-const META_KEEP: [&[u8; 4]; 9] = [
-    b"hdlr", b"pitm", b"iloc", b"iinf", b"iref", b"iprp", b"idat", b"dinf", b"grpl",
+/// `skip`, anything unknown) keep only their headers. `idat` keeps only the items kept
+/// from it, as `mdat` does.
+const META_KEEP: [&[u8; 4]; 8] = [
+    b"hdlr", b"pitm", b"iloc", b"iinf", b"iref", b"iprp", b"dinf", b"grpl",
 ];
 
 /// `data` with nothing but what its picture is made of, each byte where it was so every
 /// offset still holds: `ftyp`; `meta`'s header and the bodies of its `META_KEEP` children
-/// (the headers of the others); the bytes of the primary item, the tiles it's made of and
-/// its alpha (and the Exif and XMP items with `keep_metadata`); and the headers of the
+/// (the headers of the others); the bytes, in `mdat` or `idat`, of the primary item, its
+/// thumbnails, the tiles they're made of and their alpha (and with `keep_metadata` the
+/// Exif and XMP items and whatever else describes the picture); and the headers of the
 /// top-level boxes these sit in. Every other byte is zeroed, other items' included, and the
 /// file ends after the furthest kept one, the box holding that end shortened to it. `None`
 /// when that end can't be known: no `ftyp`, `meta` or primary item, an item kept that
@@ -807,11 +809,21 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
         let wide = if *data.get(b.body)? == 0 { 2 } else { 4 };
         read(data, &mut (b.body + 4), wide, b.end)
     })?;
-    let mut items = vec![primary];
-    for (kind, from, to) in references(data, &inner) {
-        match &kind {
-            b"dimg" if from == primary => items.extend(to),
-            b"auxl" if to.contains(&primary) => items.push(from),
+    // The picture, and its thumbnails; then what each is made of (tiles, alpha); and with
+    // `keep_metadata` whatever describes the picture.
+    let refs = references(data, &inner);
+    let mut pictures = vec![primary];
+    for (kind, from, to) in &refs {
+        if kind == b"thmb" && to.contains(&primary) {
+            pictures.push(*from);
+        }
+    }
+    let mut items = pictures.clone();
+    for (kind, from, to) in &refs {
+        match kind {
+            b"dimg" if pictures.contains(from) => items.extend(to),
+            b"auxl" if to.iter().any(|t| pictures.contains(t)) => items.push(*from),
+            b"cdsc" if keep_metadata && to.contains(&primary) => items.push(*from),
             _ => {}
         }
     }
