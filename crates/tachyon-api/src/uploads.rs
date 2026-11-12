@@ -249,7 +249,11 @@ async fn checked_claim(
     }
     let spool = download(storage, staging, &state.media.temp_dir, &row.filename, cap)
         .await
-        .map_err(unread)?
+        .map_err(|e| match e.is_not_found() {
+            // Swept between its `head` and its download: gone, like any other.
+            true => unclaimed(),
+            false => unread(e),
+        })?
         .ok_or_else(too_big)?;
     let mut checked = check_and_process(state, u, spool).await?;
     checked.source = match checked.source {

@@ -1586,27 +1586,287 @@ async fn stray_staging_objects_are_swept(pool: PgPool) {
     // Objects in the staging area that no file knows: one long finished, one just put.
     let old = d.bucket.join(format!("_staging/{}", Uuid::new_v4()));
     let fresh = d.bucket.join(format!("_staging/{}", Uuid::new_v4()));
-    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
-    std::fs::write(&old, b"slow").unwrap();
-    std::fs::write(&fresh, b"new").unwrap();
-    let three_hours = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
-    std::fs::File::options()
-        .write(true)
-        .open(&old)
-        .unwrap()
-        .set_modified(three_hours)
-        .unwrap();
-    // The hourly sweep runs now.
-    sqlx::query(
-        "UPDATE jobs SET run_at = now() WHERE kind = 'file_cleanup_sweep' AND state = 'queued'",
-    )
-    .execute(&pool)
-    .await
-    .unwrap();
+    // And old ones that aren't a staging key's shape, which it leaves alone.
+    let nested = d
+        .bucket
+        .join(format!("_staging/media/{}/a.png", Uuid::now_v7()));
+    let named = d.bucket.join("_staging/not-a-uuid");
+    for (path, bytes) in [
+        (&old, "slow"),
+        (&fresh, "new"),
+        (&nested, "png"),
+        (&named, "x"),
+    ] {
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+    for path in [&old, &nested, &named] {
+        age(path);
+    }
+    sweep_now(&pool).await;
     let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
         .await
         .unwrap();
     until("the stray object is deleted", async || !old.exists()).await;
     assert!(fresh.exists());
+    assert!(nested.exists() && named.exists());
     drop(app);
+}
+
+/// `path` written three hours ago.
+fn age(path: &Path) {
+    let three_hours = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(path)
+        .unwrap()
+        .set_modified(three_hours)
+        .unwrap();
+}
+
+/// The hourly cleanup sweep, due now.
+async fn sweep_now(pool: &PgPool) {
+    let moved = sqlx::query(
+        "UPDATE jobs SET run_at = now() WHERE kind = 'file_cleanup_sweep' AND state = 'queued'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_sweep_run_stops_at_its_cap(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let dir = d.bucket.join("_staging");
+    std::fs::create_dir_all(&dir).unwrap();
+    // Two of the test's storages, `bucket` and `plain`, share this directory: one run
+    // sweeps it twice, 1,000 each.
+    for _ in 0..2005 {
+        let path = dir.join(Uuid::new_v4().to_string());
+        std::fs::write(&path, b"x").unwrap();
+        age(&path);
+    }
+    let left = || std::fs::read_dir(&dir).unwrap().count();
+    sweep_now(&pool).await;
+    let worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    // A run takes 1,000 a storage; the next hour's takes the rest.
+    until("a run is done", async || left() == 5).await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    assert_eq!(left(), 5);
+    sweep_now(&pool).await;
+    until("the next run is done", async || left() == 0).await;
+    drop((worker, app));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_static_dir_cant_be_the_staging_area(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    for dir in ["_staging", "_staging/media"] {
+        let schema = json!({"slug": "media", "upload": {"storage": "plain", "staticDir": dir},
+                            "fields": [{"name": "alt", "type": "text"}]});
+        let res = call(&app, "POST", "/api/admin/collections", schema).await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], "upload.staticDir", "{dir}");
+    }
+    // Beside it is fine.
+    let schema = json!({"slug": "media", "upload": {"storage": "plain", "staticDir": "media/_staging"},
+                        "fields": [{"name": "alt", "type": "text"}]});
+    ok(&app, "POST", "/api/admin/collections", schema).await;
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn replacements_in_two_scopes_keep_one_claimable(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "media",
+        json!({"upload": {"storage": "bucket", "filenameCompoundIndex": ["alt"]}}),
+    )
+    .await;
+    let alt = json!({"alt": "x"});
+    let res = upload(
+        &app,
+        "POST",
+        "/api/media",
+        Some(&png(1, 1)),
+        "a.png",
+        Some(&alt),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    let ask = |alt: &str, size: usize| {
+        json!({"filename": "a.png", "mimeType": "image/png", "filesize": size,
+               "id": id, "data": {"alt": alt}})
+    };
+    let (x, y) = (png(3, 3), png(7, 7));
+    let for_x = call(
+        &app,
+        "POST",
+        "/api/media/upload-instructions",
+        ask("x", x.len()),
+    )
+    .await;
+    put_to(&d.bucket, &for_x.json, &x);
+    let for_y = call(
+        &app,
+        "POST",
+        "/api/media/upload-instructions",
+        ask("y", y.len()),
+    )
+    .await;
+    let file = put_to(&d.bucket, &for_y.json, &y);
+    let body = json!({"file": file, "alt": "y"});
+    let doc = ok(&app, "PATCH", &format!("/api/media/{id}"), body).await;
+    assert_eq!(doc["width"], 7);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_claimed_upload_isnt_swept_from_under_its_claim(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let res = instructions(&app, "media", "a.png", "image/png", 70).await;
+    put_to(&d.bucket, &res.json, &png(1, 1));
+    let staging = signed_key(res.json["request"]["url"].as_str().unwrap());
+    // A claim is under way: taken, not yet live.
+    let (c, user): (Uuid, Uuid) =
+        sqlx::query_as("SELECT collection_id, issued_to FROM files WHERE staging_key = $1")
+            .bind(&staging)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    let mut tx = pool.begin().await.unwrap();
+    let claimed = files::claim_pending(&mut tx, c, "a.png", user, None, None)
+        .await
+        .unwrap();
+    assert!(claimed.is_some());
+    tx.commit().await.unwrap();
+    // Its key's sweep comes due meanwhile, and leaves it to the claim.
+    let moved =
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = $1 AND payload->'keys' ? $2")
+            .bind(CLEANUP)
+            .bind(&staging)
+            .execute(&pool)
+            .await
+            .unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    until("the sweep is done", async || {
+        sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE payload->'keys' ? $1")
+            .bind(&staging)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+            == "done"
+    })
+    .await;
+    assert!(d.bucket.join(&staging).exists());
+}
+
+/// A bucket whose staging objects vanish when read: `head` finds them, the download doesn't.
+#[derive(Debug)]
+struct Vanishing(LocalFileSystem);
+
+impl std::fmt::Display for Vanishing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Vanishing({})", self.0)
+    }
+}
+
+type Listing =
+    futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>;
+type Keys = futures_util::stream::BoxStream<'static, object_store::Result<Key>>;
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Vanishing {
+    async fn put_opts(
+        &self,
+        location: &Key,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.0.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Key,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.0.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Key,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        if !options.head && location.as_ref().starts_with("_staging/") {
+            return Err(object_store::Error::NotFound {
+                path: location.to_string(),
+                source: "swept".into(),
+            });
+        }
+        self.0.get_opts(location, options).await
+    }
+
+    fn delete_stream(&self, locations: Keys) -> Keys {
+        self.0.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Key>) -> Listing {
+        self.0.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.0.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.0.copy_opts(from, to, options).await
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn an_upload_gone_mid_claim_is_unclaimable(pool: PgPool) {
+    let d = dirs();
+    let mut c = StorageConfig::local(&d.bucket);
+    c.client_uploads = true;
+    let store = Vanishing(LocalFileSystem::new_with_prefix(&d.bucket).unwrap());
+    let vanishing = Storage::with_store("vanishing", Arc::new(store), None, c)
+        .with_signer(Arc::new(FakeSigner));
+    let mut o = options(&d, 0);
+    let mut all: HashMap<String, Arc<Storage>> = o.uploads.storages.0.clone();
+    all.insert("vanishing".into(), Arc::new(vanishing));
+    o.uploads.storages = Arc::new(Storages(all));
+    let app = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    let res = send(&app, "POST", "/api/setup", Some(&body.to_string())).await;
+    assert_eq!(res.status, 201);
+    let app = signed_in(app, ADMIN).await;
+    collection(&app, "media", json!({"upload": {"storage": "vanishing"}})).await;
+    let made_up = json!({"file": {"filename": "nope.png"}});
+    let made_up = call(&app, "POST", "/api/media", made_up).await;
+    let res = instructions(&app, "media", "a.png", "image/png", 70).await;
+    let file = put_to(&d.bucket, &res.json, &png(1, 1));
+    let gone = call(&app, "POST", "/api/media", json!({"file": file})).await;
+    assert_eq!(refusal(&gone), refusal(&made_up));
 }

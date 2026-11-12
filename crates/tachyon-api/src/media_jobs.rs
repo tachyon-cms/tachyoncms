@@ -703,6 +703,7 @@ pub(crate) async fn run_cleanup(state: &AppState, job: &Job) -> Result<(), JobEr
             .as_str()
             .ok_or_else(|| JobError::Permanent("the payload names no storage".into()))?;
         let storage = storage(state, name)?;
+        let staging = job.payload.get("staging").is_some();
         for key in &keys {
             // The file is locked from the check until the delete is done, and a size is
             // only stored under that lock, so one can't be stored here in between.
@@ -710,6 +711,15 @@ pub(crate) async fn run_cleanup(state: &AppState, job: &Job) -> Result<(), JobEr
             if files::key_in_use_in(&mut tx, name, key)
                 .await
                 .map_err(retry)?
+            {
+                continue;
+            }
+            // A claim under way reads what the client put, then deletes it itself; the row
+            // is locked as the claim locks it, so it can't start or end in between.
+            if staging
+                && files::staging_in_claim_in(&mut tx, name, key)
+                    .await
+                    .map_err(retry)?
             {
                 continue;
             }
@@ -815,9 +825,16 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
 const STAGING_KEPT: std::time::Duration =
     std::time::Duration::from_secs(files::PENDING_GRACE.as_secs() + 3600);
 
+/// The most staging objects one sweep run deletes in a storage; the next run, an hour on,
+/// goes on from there.
+pub(crate) const STAGING_PER_RUN: usize = 1000;
+/// How many staging keys are looked up at once.
+const STAGING_BATCH: usize = 500;
+
 /// Deletes from each storage's staging area what no pending file waits on and was written
 /// before `STAGING_KEPT` ago: a `PUT` that landed after its key's own sweep, or one a
-/// client never claimed. Failures are logged; the next run tries again.
+/// client never claimed. Only keys of a staging key's own shape, at the area's top level,
+/// at most `STAGING_PER_RUN` a run. Failures are logged; the next run tries again.
 async fn sweep_staging(state: &AppState) {
     let before = std::time::SystemTime::now() - STAGING_KEPT;
     for (name, storage) in &state.media.storages.0 {
@@ -825,25 +842,29 @@ async fn sweep_staging(state: &AppState) {
         if !storage.takes_client_uploads() {
             continue;
         }
-        let staging = tachyon_media::storage::STAGING;
-        let keys = match storage.written_before(staging, before).await {
+        let mut keys = match storage.staging_before(before).await {
             Ok(keys) => keys,
             Err(error) => {
                 tracing::error!(%error, storage = %name, "couldn't list the staging area; the next sweep tries in an hour");
                 continue;
             }
         };
-        for key in keys {
-            match files::staging_claimed(&state.pool, name, &key).await {
-                Ok(false) => {}
-                Ok(true) => continue,
+        if keys.len() > STAGING_PER_RUN {
+            tracing::info!(storage = %name, left = keys.len() - STAGING_PER_RUN, "the staging area has more strays than one sweep takes; the next sweep goes on");
+            keys.truncate(STAGING_PER_RUN);
+        }
+        for batch in keys.chunks(STAGING_BATCH) {
+            let claimed = match files::staging_claimed(&state.pool, name, batch).await {
+                Ok(claimed) => claimed,
                 Err(error) => {
-                    tracing::error!(%error, %key, "couldn't check a staging object; the next sweep tries again");
+                    tracing::error!(%error, storage = %name, "couldn't check staging objects; the next sweep tries again");
                     continue;
                 }
-            }
-            if let Err(error) = storage.delete(&key).await {
-                tracing::error!(%error, %key, "couldn't delete a stray staging object; the next sweep tries again");
+            };
+            for key in batch.iter().filter(|k| !claimed.contains(*k)) {
+                if let Err(error) = storage.delete(key).await {
+                    tracing::error!(%error, %key, "couldn't delete a stray staging object; the next sweep tries again");
+                }
             }
         }
     }

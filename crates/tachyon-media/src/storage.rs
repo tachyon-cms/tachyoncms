@@ -128,6 +128,12 @@ impl Storage {
     pub fn open(name: &str, c: &StorageConfig) -> Result<Storage, String> {
         if let Some(prefix) = &c.prefix {
             check_prefix(prefix).map_err(|e| format!("storage.{name}.prefix: {e}"))?;
+            // Another storage on the bucket would sweep this one's files as strays.
+            if prefix.rsplit('/').next() == Some(STAGING) {
+                return Err(format!(
+                    "storage.{name}.prefix: `{prefix}` ends in `{STAGING}`, where client uploads wait to be checked; pick another name"
+                ));
+            }
         }
         let (store, signer): (Arc<dyn ObjectStore>, Option<Arc<dyn Signer>>) = match &c.adapter {
             Adapter::Local { root } => {
@@ -338,19 +344,21 @@ impl Storage {
         Ok(self.store.copy(&self.key(from)?, &self.key(to)?).await?)
     }
 
-    /// The keys under directory `dir` (as given to `put_file`, without the prefix) last
-    /// written before `before`.
-    pub async fn written_before(
+    /// The staging keys (`staging_key`'s shape, nothing else) in this storage's staging
+    /// area, last written before `before`. One level only: whatever is nested under it isn't
+    /// a staging key, so isn't for a sweep.
+    pub async fn staging_before(
         &self,
-        dir: &str,
         before: std::time::SystemTime,
     ) -> Result<Vec<String>, StorageError> {
-        use futures_util::TryStreamExt as _;
-        let prefix = self.key(dir)?;
-        let before = epoch_secs(before);
-        let found: Vec<ObjectMeta> = self.store.list(Some(&prefix)).try_collect().await?;
+        let listed = self
+            .store
+            .list_with_delimiter(Some(&self.key(STAGING)?))
+            .await?;
         let strip = self.config.prefix.as_ref().map(|p| format!("{p}/"));
-        Ok(found
+        let before = epoch_secs(before);
+        Ok(listed
+            .objects
             .into_iter()
             .filter(|m| m.last_modified.timestamp() < before)
             .map(|m| {
@@ -361,6 +369,7 @@ impl Storage {
                     .unwrap_or(key)
                     .to_owned()
             })
+            .filter(|k| is_staging_key(k))
             .collect())
     }
 
@@ -485,6 +494,13 @@ pub const STAGING: &str = "_staging";
 /// A new key in `STAGING`: `_staging/{random}`.
 pub fn staging_key() -> String {
     format!("{STAGING}/{}", Uuid::new_v4())
+}
+
+/// Whether `key` is exactly what `staging_key` makes: `_staging/` and a UUID, nothing after.
+pub fn is_staging_key(key: &str) -> bool {
+    key.strip_prefix(STAGING)
+        .and_then(|rest| rest.strip_prefix('/'))
+        .is_some_and(|id| !id.contains('/') && Uuid::try_parse(id).is_ok())
 }
 
 /// Every open storage by name. There's always a `default`.

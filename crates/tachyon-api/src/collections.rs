@@ -126,6 +126,18 @@ pub fn check_upload(limits: &UploadLimits, schema: &CollectionSchema) -> Result<
     {
         return refuse("upload.staticDir", message);
     }
+    // Client uploads wait there, and are swept from there.
+    if let Some(dir) = &u.static_dir
+        && dir.split('/').next() == Some(tachyon_media::storage::STAGING)
+    {
+        return refuse(
+            "upload.staticDir",
+            format!(
+                "`{dir}` begins with `{}`, where client uploads wait to be checked; pick another name",
+                tachyon_media::storage::STAGING
+            ),
+        );
+    }
     let limit = u
         .constructor_options
         .as_ref()

@@ -244,8 +244,8 @@ pub enum Issued {
 /// claim's grace is over, whatever happens to the file. That sweep is what's counted,
 /// while the URL works, so a file given up or cleaned up early still counts. Its name is
 /// numbered against the client's other waiting files in every scope, so a claim by name
-/// finds one. A file issued earlier for the same document under the same name, not yet
-/// claimed, is given up: only the newest can be claimed.
+/// finds one. A file issued earlier for the same document under the same name, in any
+/// scope, not yet claimed, is given up: only the newest can be claimed.
 pub async fn issue(
     pool: &PgPool,
     f: &NewFile<'_>,
@@ -270,15 +270,14 @@ pub async fn issue(
         r#"SELECT count(*) AS "n!",
                   ceil(extract(epoch FROM min(created_at) + make_interval(secs => $5) - now()))::bigint AS wait
            FROM jobs
-           WHERE tenant_id = $1 AND kind = $6 AND collection_id = $2 AND payload ? 'staging'
-             AND created_by = $3 AND key_id IS NOT DISTINCT FROM $4
+           WHERE tenant_id = $1 AND kind = 'file_cleanup' AND collection_id = $2
+             AND payload ? 'staging' AND created_by = $3 AND key_id IS NOT DISTINCT FROM $4
              AND created_at > now() - make_interval(secs => $5)"#,
         DEFAULT_TENANT,
         f.collection_id,
         user,
         key,
         window,
-        CLEANUP,
     )
     .fetch_one(&mut *tx)
     .await?;
@@ -332,13 +331,12 @@ pub async fn issue(
         let earlier = sqlx::query_scalar!(
             "UPDATE files SET state = 'gone', released_at = now()
              WHERE tenant_id = $1 AND collection_id = $2 AND document_id = $3 AND filename = $4
-               AND scope = $5 AND state = 'pending' AND issued_to IS NOT NULL AND id <> $6
+               AND state = 'pending' AND issued_to IS NOT NULL AND id <> $5
              RETURNING id",
             DEFAULT_TENANT,
             f.collection_id,
             document,
             row.filename,
-            f.scope,
             row.id,
         )
         .fetch_all(&mut *tx)
@@ -351,18 +349,47 @@ pub async fn issue(
     Ok(Issued::Reserved(Box::new(row)))
 }
 
-/// Whether a pending file on `storage` waits on what a client put at `staging`.
-pub async fn staging_claimed(pool: &PgPool, storage: &str, staging: &str) -> Result<bool, DbError> {
+/// Which of `staging` (keys on `storage`) a pending file waits on.
+pub async fn staging_claimed(
+    pool: &PgPool,
+    storage: &str,
+    staging: &[String],
+) -> Result<HashSet<String>, DbError> {
     Ok(sqlx::query_scalar!(
-        r#"SELECT EXISTS (SELECT 1 FROM files
-                          WHERE tenant_id = $1 AND storage = $2 AND staging_key = $3
-                            AND state = 'pending') AS "claimed!""#,
+        r#"SELECT staging_key AS "key!" FROM files
+           WHERE tenant_id = $1 AND storage = $2 AND staging_key = ANY($3)
+             AND state = 'pending'"#,
         DEFAULT_TENANT,
         storage,
         staging,
     )
-    .fetch_one(pool)
-    .await?)
+    .fetch_all(pool)
+    .await?
+    .into_iter()
+    .collect())
+}
+
+/// Whether a claim is under way on what a client put at `staging` on `storage`: its file is
+/// pending and taken. The row is locked as a claim locks it, until `tx` ends, so the answer
+/// holds while the caller acts on it.
+pub async fn staging_in_claim_in(
+    tx: &mut PgConnection,
+    storage: &str,
+    staging: &str,
+) -> Result<bool, DbError> {
+    let rows = sqlx::query!(
+        "SELECT state, issued_to FROM files
+         WHERE tenant_id = $1 AND storage = $2 AND staging_key = $3
+         FOR UPDATE",
+        DEFAULT_TENANT,
+        storage,
+        staging,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    Ok(rows
+        .iter()
+        .any(|r| r.state == "pending" && r.issued_to.is_none()))
 }
 
 /// The key a client puts an issued file at, which only the server reads.

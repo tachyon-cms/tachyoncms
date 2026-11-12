@@ -117,6 +117,20 @@ async fn a_static_dir_goes_before_the_collection() {
 }
 
 #[test]
+fn a_prefix_cant_be_a_staging_area() {
+    let root = temp_root();
+    for bad in ["_staging", "cms/_staging"] {
+        let mut c = StorageConfig::local(&*root);
+        c.prefix = Some(bad.into());
+        let err = Storage::open("disk", &c).unwrap_err();
+        assert!(err.starts_with("storage.disk.prefix: "), "{bad:?}: {err}");
+    }
+    let mut c = StorageConfig::local(&*root);
+    c.prefix = Some("_staging/cms".into());
+    assert!(Storage::open("disk", &c).is_ok());
+}
+
+#[test]
 fn a_bad_prefix_stops_startup() {
     for bad in ["", "/", "a//b", "../x", "x/"] {
         let root = temp_root();

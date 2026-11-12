@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT staging_key AS \"key!\" FROM files\n           WHERE tenant_id = $1 AND storage = $2 AND staging_key = ANY($3)\n             AND state = 'pending'",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "key!",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "staging_key"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "TextArray"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "0dc559a4dd6ad84b2d4ee41ef5f730cf70217c039f5ca3bfda12a7d9f3de7f11"
+}
