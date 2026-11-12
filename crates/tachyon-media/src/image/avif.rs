@@ -2,6 +2,8 @@
 //! sizes its AV1 data can decode to, its rotation and mirroring, and where its EXIF and
 //! XMP items sit, so they can be blanked without touching the picture.
 
+use std::collections::HashMap;
+
 use super::ImageError;
 
 /// What an `ftyp` box says a file is.
@@ -778,7 +780,75 @@ const META_KEEP: [&[u8; 4]; 8] = [
 /// file ends after the furthest kept one, the box holding that end shortened to it. `None`
 /// when that end can't be known: no `ftyp`, `meta` or primary item, an item kept that
 /// can't be located, or an end inside a box the walk can't reach.
-pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Option<Vec<u8>> {
+pub(super) fn keep(
+    data: &[u8],
+    keep_metadata: bool,
+    thumbnail_budget: u64,
+) -> Result<Option<Vec<u8>>, ImageError> {
+    check_counts(data)?;
+    Ok(keep_counted(data, keep_metadata, thumbnail_budget))
+}
+
+/// The most items an AVIF may list (in `iinf`, `iloc` or `ipma`), and the most item
+/// references its `iref` may hold: a picture needs a handful, and every item is work.
+const MAX_ITEMS: u64 = 4096;
+
+/// Refuses an AVIF listing more than `MAX_ITEMS` items or references, from the counts its
+/// boxes declare, before anything walks them.
+pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
+    let too_many = || {
+        Err(ImageError::Corrupt(format!(
+            "this AVIF lists more than {MAX_ITEMS} items"
+        )))
+    };
+    let top = boxes(data, 0, data.len());
+    let Some(meta) = find(&top, b"meta") else {
+        return Ok(());
+    };
+    let inner = boxes(data, meta.body + 4, meta.end);
+    let version = |b: &Box4| data.get(b.body).copied().unwrap_or(0);
+    let count = |b: &Box4, at: usize, wide: usize| read(data, &mut (b.body + at), wide, b.end);
+    if let Some(b) = find(&inner, b"iinf") {
+        let wide = if version(&b) == 0 { 2 } else { 4 };
+        if count(&b, 4, wide).is_some_and(|n| n > MAX_ITEMS) {
+            return too_many();
+        }
+    }
+    if let Some(b) = find(&inner, b"iloc") {
+        let wide = if version(&b) < 2 { 2 } else { 4 };
+        if count(&b, 6, wide).is_some_and(|n| n > MAX_ITEMS) {
+            return too_many();
+        }
+    }
+    if let Some(b) = find(&inner, b"iprp") {
+        let props = boxes(data, b.body, b.end);
+        if let Some(ipma) = find(&props, b"ipma")
+            && count(&ipma, 4, 4).is_some_and(|n| n > MAX_ITEMS)
+        {
+            return too_many();
+        }
+    }
+    if let Some(b) = find(&inner, b"iref") {
+        let wide = if version(&b) == 0 { 2 } else { 4 };
+        let mut total = 0u64;
+        let (mut at, end) = (b.body + 4, b.end.min(data.len()));
+        while let Some(h) = data.get(at..at + 8).filter(|_| at + 8 <= end) {
+            let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+            let n = read(data, &mut (at + 8 + wide), 2, end).unwrap_or(0);
+            total += 1 + n;
+            if total > MAX_ITEMS {
+                return too_many();
+            }
+            if size < 8 {
+                break;
+            }
+            at += size;
+        }
+    }
+    Ok(())
+}
+
+fn keep_counted(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Option<Vec<u8>> {
     // The top-level boxes: (start, header length, end, type, whether its size is "to the
     // end"), up to one that overruns the file.
     let mut top = Vec::new();
@@ -825,13 +895,15 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> O
             .find(|b| b.0 <= at && at < b.2 && !b.4)
             .map(|b| b.2)
     };
-    let located = locations(data, &inner, &[], Some(&box_end)).ok()?;
-    let ranges_of = |id: u64| {
-        located
-            .iter()
-            .find(|(i, _)| *i == id)
-            .and_then(|(_, r)| r.clone())
-    };
+    // Each item's ranges, type and property kinds, read once.
+    let located: HashMap<u64, Option<Vec<(usize, usize)>>> =
+        locations(data, &inner, &[], Some(&box_end))
+            .ok()?
+            .into_iter()
+            .collect();
+    let ranges_of = |id: u64| located.get(&id).cloned().flatten();
+    let kinds = item_kinds(data, &inner);
+    let props = property_kinds(data, &inner);
     // Only what a reader takes as a picture, whatever `iref` calls the rest: the primary;
     // its alpha, as avif-parse picks it; one thumbnail of it (below); and with
     // `keep_metadata` what describes it.
@@ -841,40 +913,58 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> O
         .iter()
         .filter(|(kind, from, to)| kind == b"auxl" && *from != primary && to.contains(&primary))
         .map(|(_, from, _)| *from)
-        .find(|&id| is_alpha(data, &inner, id));
+        .find(|id| {
+            props
+                .get(id)
+                .is_some_and(|p| p.iter().any(|b| is_alpha(data, b)))
+        });
     items.extend(alpha);
-    let bytes_of = |id: u64| -> Option<Vec<u8>> {
-        let ranges = ranges_of(id)?;
-        Some(
-            ranges
-                .iter()
-                .flat_map(|&(s, e)| data[s..e].iter().copied())
-                .collect(),
-        )
+    // An item's bytes, borrowed: only an item in one extent has them in one piece.
+    let slice_of = |id: u64| match ranges_of(id)?.as_slice() {
+        [(s, e)] => data.get(*s..*e),
+        _ => None,
     };
-    // One thumbnail is decoded at most, from one budget: the first that's no larger than the
-    // picture and fits what's left. Every other is zeroed without decoding.
-    let primary_pixels = bytes_of(primary)
+    // One thumbnail is decoded at most, from one budget: of the first `THUMBNAIL_LOOKS`
+    // thumbnails of the picture, the first that's an AV1 picture by its headers, held in
+    // one extent, no larger than the picture and fitting what's left. Every other is
+    // zeroed without a look. With no budget there's nothing to look for.
+    let primary_pixels = ranges_of(primary)
+        .map(|r| {
+            r.iter()
+                .flat_map(|&(s, e)| data[s..e].iter().copied())
+                .collect::<Vec<_>>()
+        })
         .and_then(|b| decode_bound(&b).ok())
         .map_or(0, |(w, h)| u64::from(w) * u64::from(h));
-    let mut tried = false;
+    let candidates = refs
+        .iter()
+        .filter(|(kind, from, to)| kind == b"thmb" && *from != primary && to.contains(&primary))
+        .map(|(_, from, _)| *from)
+        .take(if thumbnail_budget == 0 {
+            0
+        } else {
+            THUMBNAIL_LOOKS
+        });
+    for id in candidates {
+        let Some(bytes) = slice_of(id) else { continue };
+        let typed = kinds.get(&id) == Some(b"av01");
+        let configured = props
+            .get(&id)
+            .is_some_and(|p| p.iter().any(|b| &b.kind == b"av1C"));
+        let Ok((w, h)) = decode_bound(bytes) else {
+            continue;
+        };
+        let pixels = u64::from(w) * u64::from(h);
+        if !typed || !configured || pixels > primary_pixels || pixels > thumbnail_budget {
+            continue;
+        }
+        if decodes(bytes, pixels) {
+            items.push(id);
+        }
+        break;
+    }
     for (kind, from, to) in &refs {
         match kind {
-            b"thmb" if !tried && *from != primary && to.contains(&primary) => {
-                let Some(bytes) = bytes_of(*from) else {
-                    continue;
-                };
-                let Some(pixels) = thumbnail_pixels(data, &inner, *from, &bytes) else {
-                    continue;
-                };
-                if pixels > primary_pixels || pixels > thumbnail_budget {
-                    continue;
-                }
-                tried = true;
-                if decodes(&bytes, pixels) {
-                    items.push(*from);
-                }
-            }
             b"cdsc" if keep_metadata && to.contains(&primary) => items.push(*from),
             _ => {}
         }
@@ -915,32 +1005,35 @@ pub(super) fn keep(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> O
     reached.then_some(out)
 }
 
+/// How many thumbnails of the picture are looked at, at most.
+const THUMBNAIL_LOOKS: usize = 4;
+
 /// The `auxC` type avif-parse takes an alpha plane by.
 const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 
-/// Whether `item` carries the alpha `auxC` property, as avif-parse requires of the alpha
-/// item it decodes.
-fn is_alpha(data: &[u8], inner: &[Box4], item: u64) -> bool {
-    item_properties(data, inner, item)
-        .unwrap_or_default()
-        .iter()
-        .filter(|b| &b.kind == b"auxC")
-        .any(|b| {
-            // A full box: version and flags, then the type, ending in a zero.
-            let urn = data.get(b.body + 4..b.end).unwrap_or_default();
-            let urn = urn.split(|&c| c == 0).next().unwrap_or_default();
-            urn.split(|&c| c == b'?').next() == Some(ALPHA_URN)
-        })
+/// Whether property box `b` is the alpha `auxC`, as avif-parse requires of the alpha item
+/// it decodes.
+fn is_alpha(data: &[u8], b: &Box4) -> bool {
+    // A full box: version and flags, then the type, ending in a zero.
+    let urn = data.get(b.body + 4..b.end).unwrap_or_default();
+    let urn = urn.split(|&c| c == 0).next().unwrap_or_default();
+    &b.kind == b"auxC" && urn.split(|&c| c == b'?').next() == Some(ALPHA_URN)
 }
 
-/// The type `iinf` gives `item`.
-fn item_kind(data: &[u8], inner: &[Box4], item: u64) -> Option<[u8; 4]> {
-    let iinf = find(inner, b"iinf")?;
-    let count_bytes = if *data.get(iinf.body)? == 0 { 2 } else { 4 };
+/// Every item's type, as `iinf` gives it, in one pass.
+fn item_kinds(data: &[u8], inner: &[Box4]) -> HashMap<u64, [u8; 4]> {
+    let Some(iinf) = find(inner, b"iinf") else {
+        return HashMap::new();
+    };
+    let count_bytes = if data.get(iinf.body) == Some(&0) {
+        2
+    } else {
+        4
+    };
     boxes(data, iinf.body + 4 + count_bytes, iinf.end)
         .into_iter()
         .filter(|b| &b.kind == b"infe")
-        .find_map(|infe| {
+        .filter_map(|infe| {
             let version = *data.get(infe.body)?;
             if version < 2 {
                 return None;
@@ -948,19 +1041,56 @@ fn item_kind(data: &[u8], inner: &[Box4], item: u64) -> Option<[u8; 4]> {
             let mut at = infe.body + 4;
             let id = read(data, &mut at, if version == 2 { 2 } else { 4 }, infe.end)?;
             let kind = data.get(at + 2..at + 6).filter(|_| at + 6 <= infe.end)?;
-            (id == item).then(|| kind.try_into().ok()).flatten()
+            Some((id, kind.try_into().ok()?))
         })
+        .collect()
 }
 
-/// The pixels item `item`, holding `bytes`, would decode to, when it's an AV1 picture by
-/// its headers: typed `av01`, with an `av1C` property, its sequence and frame headers read.
-/// Nothing is decoded.
-fn thumbnail_pixels(data: &[u8], inner: &[Box4], item: u64, bytes: &[u8]) -> Option<u64> {
-    let typed = item_kind(data, inner, item) == Some(*b"av01");
-    let configured =
-        item_properties(data, inner, item).is_some_and(|p| p.iter().any(|b| &b.kind == b"av1C"));
-    let (w, h) = decode_bound(bytes).ok()?;
-    (typed && configured).then_some(u64::from(w) * u64::from(h))
+/// Every item's associated property boxes, as `ipma` gives them, in one pass.
+fn property_kinds(data: &[u8], inner: &[Box4]) -> HashMap<u64, Vec<Box4>> {
+    let mut out = HashMap::new();
+    let Some(iprp) = find(inner, b"iprp") else {
+        return out;
+    };
+    let props = boxes(data, iprp.body, iprp.end);
+    let (Some(ipco), Some(ipma)) = (find(&props, b"ipco"), find(&props, b"ipma")) else {
+        return out;
+    };
+    let list = boxes(data, ipco.body, ipco.end);
+    let end = ipma.end;
+    let (Some(&version), Some(&flags)) = (data.get(ipma.body), data.get(ipma.body + 3)) else {
+        return out;
+    };
+    let wide_index = flags & 1 == 1;
+    let mut at = ipma.body + 4;
+    let Some(entries) = read(data, &mut at, 4, end) else {
+        return out;
+    };
+    for _ in 0..entries {
+        let entry = (|| {
+            let id = read(data, &mut at, if version < 1 { 2 } else { 4 }, end)?;
+            let n = read(data, &mut at, 1, end)?;
+            let mut found = Vec::new();
+            for _ in 0..n {
+                let index = if wide_index {
+                    read(data, &mut at, 2, end)? & 0x7FFF
+                } else {
+                    read(data, &mut at, 1, end)? & 0x7F
+                };
+                if let Some(b) = usize::try_from(index)
+                    .ok()
+                    .and_then(|i| i.checked_sub(1))
+                    .and_then(|i| list.get(i))
+                {
+                    found.push(*b);
+                }
+            }
+            Some((id, found))
+        })();
+        let Some((id, found)) = entry else { break };
+        out.insert(id, found);
+    }
+    out
 }
 
 /// Whether AV1 `bytes` decode on their own, refused past `pixels`.

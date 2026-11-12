@@ -270,7 +270,7 @@ fn probe_unguarded(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
             let mut bytes = read()?;
             // Read as it will be kept: only its own boxes and items (`process_original`
             // keeps the same, or refuses a file whose end can't be known).
-            if let Some(kept) = avif::keep(&bytes, true, 0) {
+            if let Some(kept) = avif::keep(&bytes, true, 0)? {
                 bytes = kept;
             }
             let parsed = avif::parse(&bytes)?;
@@ -700,7 +700,7 @@ fn process_unguarded(
             &bytes,
             u.with_metadata,
             cap.saturating_sub(probe.pixels),
-        )),
+        )?),
         // Only the bytes its IFDs reach, each where it was; gaps zeroed.
         InputFormat::Tiff if u.with_metadata => match tiff_regions(&bytes) {
             Ok(regions) => Own::Replace(zeroed_but(&bytes, &regions)),
@@ -2597,6 +2597,126 @@ mod tests {
         b
     }
 
+    /// `avif` with `n` more items, ids 2 up, each typed `av01` with no properties and one
+    /// extent: `shared` appended once to `mdat` when given (every item pointing at it), else
+    /// the primary's own bytes. The first `thumbs` are thumbnails of the primary. Every box
+    /// is written whole, so making many items stays linear.
+    fn avif_many_items(avif: &[u8], n: u32, shared: Option<&[u8]>, thumbs: u32) -> Vec<u8> {
+        let top = child_boxes(avif, 0, avif.len());
+        let (meta, meta_end, _) = *top.iter().find(|b| &b.2 == b"meta").unwrap();
+        let (mdat, mdat_end, _) = *top.iter().find(|b| &b.2 == b"mdat").unwrap();
+        assert_eq!(mdat_end, avif.len(), "mdat last");
+        let children = child_boxes(avif, meta + 12, meta_end);
+        let (iloc, iloc_end, _) = *children.iter().find(|b| &b.2 == b"iloc").unwrap();
+        let (iinf, iinf_end, _) = *children.iter().find(|b| &b.2 == b"iinf").unwrap();
+        let body = iloc + 8;
+        assert_eq!((avif[body], avif[body + 4], avif[body + 5]), (0, 0x44, 0));
+        assert_eq!(avif[iinf + 8], 0, "iinf version 0");
+        let old_count = u16::from_be_bytes([avif[body + 6], avif[body + 7]]);
+        let (_, primary_off, primary_len) = crate::fixtures::avif_extents(avif)[0];
+        let infe = |id: u16| {
+            let mut b = vec![2, 0, 0, 0];
+            b.extend_from_slice(&id.to_be_bytes());
+            b.extend_from_slice(&[0, 0]);
+            b.extend_from_slice(b"av01\0");
+            isobmff_box(b"infe", &b, false)
+        };
+        let entry = |id: u16, off: u32, len: u32| {
+            let mut e = id.to_be_bytes().to_vec();
+            e.extend_from_slice(&[0, 0, 0, 1]);
+            e.extend_from_slice(&off.to_be_bytes());
+            e.extend_from_slice(&len.to_be_bytes());
+            e
+        };
+        let ids = || (0..n).map(|i| u16::try_from(i + 2).unwrap());
+        // Sizes first, so offsets can be known as the boxes are written.
+        let iloc_len = (iloc_end - iloc) + 14 * n as usize;
+        let iinf_len = (iinf_end - iinf) + infe(2).len() * n as usize;
+        let mut refs = Vec::new();
+        for id in ids().take(thumbs as usize) {
+            refs.extend(isobmff_box(
+                b"thmb",
+                &[&id.to_be_bytes()[..], &[0, 1, 0, 1]].concat(),
+                false,
+            ));
+        }
+        let iref = isobmff_box(b"iref", &[&[0, 0, 0, 0][..], &refs].concat(), false);
+        let grow = (iloc_len - (iloc_end - iloc)) + (iinf_len - (iinf_end - iinf)) + iref.len();
+        let moved = |off: usize| (off + grow) as u32;
+        let (off, len) = match shared {
+            Some(d) => (moved(avif.len()), d.len() as u32),
+            None => (moved(primary_off), primary_len as u32),
+        };
+        let mut iloc_body = avif[body..body + 6].to_vec();
+        iloc_body.extend_from_slice(&(old_count as u32 + n).to_be_bytes()[2..]);
+        let mut first = avif[body + 8..iloc_end].to_vec();
+        // The primary's one extent offset, moved along with mdat.
+        let at = first.len() - 8;
+        first[at..at + 4].copy_from_slice(&moved(primary_off).to_be_bytes());
+        iloc_body.extend(first);
+        for id in ids() {
+            iloc_body.extend(entry(id, off, len));
+        }
+        let mut iinf_body = avif[iinf + 8..iinf + 12].to_vec();
+        let old_infes = u16::from_be_bytes([avif[iinf + 12], avif[iinf + 13]]);
+        iinf_body.extend_from_slice(&(old_infes as u32 + n).to_be_bytes()[2..]);
+        iinf_body.extend_from_slice(&avif[iinf + 14..iinf_end]);
+        for id in ids() {
+            iinf_body.extend(infe(id));
+        }
+        let mut meta_body = avif[meta + 8..meta + 12].to_vec();
+        for &(start, end, kind) in &children {
+            match &kind {
+                b"iloc" => meta_body.extend(isobmff_box(b"iloc", &iloc_body, false)),
+                b"iinf" => meta_body.extend(isobmff_box(b"iinf", &iinf_body, false)),
+                _ => meta_body.extend_from_slice(&avif[start..end]),
+            }
+        }
+        meta_body.extend(iref);
+        let mut out = avif[..meta].to_vec();
+        out.extend(isobmff_box(b"meta", &meta_body, false));
+        out.extend_from_slice(&avif[meta_end..mdat]);
+        let mut mdat_body = avif[mdat + 8..mdat_end].to_vec();
+        if let Some(d) = shared {
+            mdat_body.extend_from_slice(d);
+        }
+        out.extend(isobmff_box(b"mdat", &mdat_body, false));
+        assert_eq!(out.len(), avif.len() + grow + shared.map_or(0, <[u8]>::len));
+        out
+    }
+
+    /// An AVIF listing more items than any picture needs is refused before any of them is
+    /// looked at; one with thousands, a hundred of them thumbnails sharing one large extent,
+    /// is kept clean in well under a second.
+    #[test]
+    fn many_items_cost_little() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let want = pixels_of(&avif);
+        let flood = avif_many_items(&avif, 60_000, None, 0);
+        for (how, u) in settings() {
+            let started = std::time::Instant::now();
+            let res = run(&flood, &u);
+            assert!(matches!(res, Err(ImageError::Corrupt(_))), "{how}: {res:?}");
+            assert!(
+                started.elapsed().as_millis() < 1000,
+                "{how}: {:?}",
+                started.elapsed()
+            );
+        }
+        let payload: Vec<u8> = TAIL.iter().copied().cycle().take(1_000_000).collect();
+        let crowd = avif_many_items(&avif, 4_000, Some(&payload), 100);
+        for (how, u) in settings() {
+            let started = std::time::Instant::now();
+            let out = run(&crowd, &u).unwrap_or_else(|e| panic!("{how}: {e}"));
+            let took = started.elapsed();
+            let kept = stored(&out);
+            assert!(!has(&kept, b"<html>"), "{how}: the payload stayed");
+            assert_eq!(pixels_of(&kept), want, "{how}");
+            assert!(took.as_millis() < 1000, "{how}: {took:?}");
+            println!("4,000 items, 100 thumbnails on 1 MB, {how}: {took:?}");
+        }
+    }
+
     /// Thumbnails share one budget, what the cap leaves after the picture: at most one is
     /// decoded, the first that's an AV1 picture no larger than the primary and fitting what's
     /// left; every other is zeroed undecoded.
@@ -2647,6 +2767,21 @@ mod tests {
         assert_eq!(copies(&kept), 1, "the picture alone");
         assert_eq!(pixels_of(&kept), want);
         assert_eq!(copies(&stored(&run(&one, &limited(200)).unwrap())), 2);
+        // Only the first four thumbnails are looked at: four that aren't pictures, then a
+        // real one, and the real one is zeroed unexamined.
+        let mut fifth = avif.clone();
+        for id in 90..94u16 {
+            fifth = avif_with_ref(
+                &avif_with_item(&fifth, id, b"mime", Some("text/html"), TAIL, false),
+                b"thmb",
+                id,
+                1,
+            );
+        }
+        let fifth = thumbnail(&fifth, 98);
+        let kept = stored(&run(&fifth, &upload(serde_json::json!({}))).unwrap());
+        assert_eq!(copies(&kept), 1, "the fifth thumbnail was looked at");
+        assert!(!has(&kept, b"<html>"));
         // A "thumbnail" larger than the picture isn't one, whatever the budget.
         let big = encoded(&gradient(16, 16), Codec::Avif);
         let (_, boff, blen) = crate::fixtures::avif_extents(&big)[0];
@@ -2874,7 +3009,7 @@ mod tests {
 
         let avif = encoded(&gradient(8, 8), Codec::Avif);
         assert_eq!(
-            avif::keep(&tailed(avif.clone()), true, 50_000_000),
+            avif::keep(&tailed(avif.clone()), true, 50_000_000).unwrap(),
             Some(avif.clone())
         );
         let boxes = top_boxes(&avif);
@@ -2882,12 +3017,12 @@ mod tests {
         let mut to_eof = tailed(avif.clone());
         to_eof[mdat..mdat + 4].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(
-            avif::keep(&to_eof, true, 50_000_000),
+            avif::keep(&to_eof, true, 50_000_000).unwrap(),
             Some(avif.clone()),
             "size 0: shortened to its items"
         );
         assert_eq!(
-            avif::keep(&avif[..avif.len() - 1], true, 50_000_000),
+            avif::keep(&avif[..avif.len() - 1], true, 50_000_000).unwrap(),
             None,
             "an item past the end"
         );
@@ -2896,7 +3031,11 @@ mod tests {
             .filter(|(s, _, _)| &avif[s + 4..s + 8] != b"meta")
             .flat_map(|&(s, _, e)| avif[s..e].to_vec())
             .collect();
-        assert_eq!(avif::keep(&no_meta, true, 50_000_000), None, "no meta");
+        assert_eq!(
+            avif::keep(&no_meta, true, 50_000_000).unwrap(),
+            None,
+            "no meta"
+        );
 
         let tiff = tiff_with(true, 1);
         assert_eq!(tiff_end(&tailed(tiff.clone())), Ok(tiff.len()));
