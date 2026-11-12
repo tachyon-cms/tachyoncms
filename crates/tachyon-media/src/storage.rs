@@ -10,7 +10,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use object_store::aws::AmazonS3Builder;
-use object_store::azure::MicrosoftAzureBuilder;
+use object_store::azure::{AzureConfigKey, MicrosoftAzureBuilder};
 use object_store::buffered::BufWriter;
 use object_store::gcp::GoogleCloudStorageBuilder;
 use object_store::local::LocalFileSystem;
@@ -109,12 +109,24 @@ impl StorageError {
 }
 
 /// An open `[storage.<name>]`.
-#[derive(Debug)]
 pub struct Storage {
     name: String,
     store: Arc<dyn ObjectStore>,
     signer: Option<Arc<dyn Signer>>,
     config: StorageConfig,
+    /// For the requests the store makes no call for (an Azure staging key's delete).
+    http: reqwest::Client,
+}
+
+/// The store and signer hold the credentials, and some print them: only what's set here.
+impl std::fmt::Debug for Storage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Storage")
+            .field("name", &self.name)
+            .field("config", &self.config)
+            .field("signs", &self.signer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 /// The environment variable a storage's credential comes from, such as
@@ -139,18 +151,20 @@ impl Storage {
     /// Signing (`client_uploads`, `signed_downloads`) needs credentials that sign here, with
     /// no request to the cloud: S3 keys or a role, an Azure account key, a Google key file.
     pub fn open(name: &str, c: &StorageConfig) -> Result<Storage, String> {
-        Self::open_with(name, c, |key| std::env::var(credential_var(name, key)).ok())
+        Self::open_with(name, c, |var| std::env::var(var).ok())
     }
 
-    /// `open`, with `var` giving each credential (`access_key_id`, `access_key`, ...) in
-    /// place of the environment: how a test opens a bucket without touching the process's
-    /// environment. No setting reaches it.
+    /// `open`, with `var` reading each environment variable it needs (a credential such as
+    /// `TACHYON_STORAGE__AZ__ACCESS_KEY`, or an Azure identity's `AZURE_CLIENT_ID`) in place
+    /// of the process's environment: how a test opens a bucket without touching it. No
+    /// setting reaches it.
     #[doc(hidden)]
     pub fn open_with(
         name: &str,
         c: &StorageConfig,
         var: impl Fn(&str) -> Option<String>,
     ) -> Result<Storage, String> {
+        let cred = |key: &str| var(&credential_var(name, key));
         if let Some(prefix) = &c.prefix {
             check_prefix(prefix).map_err(|e| format!("storage.{name}.prefix: {e}"))?;
             // Another storage on the bucket would sweep this one's files as strays.
@@ -160,16 +174,13 @@ impl Storage {
                 ));
             }
         }
-        // `Err(why)`: the credentials can't sign, so `client_uploads` and `signed_downloads`
-        // are refused at startup rather than failing on each request.
-        type Opened = (Arc<dyn ObjectStore>, Result<Arc<dyn Signer>, String>);
-        if c.sign_with_identity && matches!(c.adapter, Adapter::Local { .. } | Adapter::S3 { .. }) {
-            return Err(format!(
-                "storage.{name}.sign_with_identity: only an Azure or Google storage signs through the machine's own identity"
-            ));
-        }
-        let (store, signer): Opened = match &c.adapter {
+        // Whether the credentials sign, and why not: an `Err` refuses `client_uploads` and
+        // `signed_downloads` at startup rather than failing each request. Checked in each
+        // arm before its build, which may read the machine's own credentials.
+        let (store, signer): (Arc<dyn ObjectStore>, Option<Arc<dyn Signer>>) = match &c.adapter {
             Adapter::Local { root } => {
+                no_identity(name, c)?;
+                check_signing_config(name, c, Err("local storage can't sign links; use a bucket"))?;
                 std::fs::create_dir_all(root).map_err(|e| {
                     format!("storage.{name}.root: can't create {}: {e}", root.display())
                 })?;
@@ -177,24 +188,27 @@ impl Storage {
                     .map_err(|e| format!("storage.{name}.root: {e}"))?
                     // Each file's directory goes once its last object does.
                     .with_automatic_cleanup(true);
-                (Arc::new(store), Err(String::new()))
+                (Arc::new(store), None)
             }
             Adapter::S3 {
                 bucket,
                 endpoint,
                 region,
             } => {
+                no_identity(name, c)?;
+                check_signing_config(name, c, Ok(()))?;
                 let mut b = AmazonS3Builder::new().with_bucket_name(bucket);
-                if let Some(endpoint) = endpoint {
+                if let Some(raw) = endpoint {
                     // MinIO and similar often run on plain http inside a private network.
+                    let url = endpoint_url(name, raw)?;
                     b = b
-                        .with_endpoint(endpoint)
-                        .with_allow_http(endpoint.starts_with("http://"));
+                        .with_allow_http(url.scheme() == "http")
+                        .with_endpoint(trimmed(&url));
                 }
                 if let Some(region) = region {
                     b = b.with_region(region);
                 }
-                let (id, secret) = (var("access_key_id"), var("secret_access_key"));
+                let (id, secret) = (cred("access_key_id"), cred("secret_access_key"));
                 // Only AWS itself has an instance role to fall back on; elsewhere a missing
                 // key would surface as a metadata-service timeout on every request.
                 if endpoint.is_some() && (id.is_none() || secret.is_none()) {
@@ -210,31 +224,53 @@ impl Storage {
                 if let Some(secret) = secret {
                     b = b.with_secret_access_key(secret);
                 }
-                if let Some(token) = var("session_token") {
+                if let Some(token) = cred("session_token") {
                     b = b.with_token(token);
                 }
                 let s3 = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
-                (s3.clone(), Ok(s3))
+                (s3.clone(), Some(s3))
             }
             Adapter::Azure {
                 container,
                 account,
                 endpoint,
             } => {
+                if account.len() < 3
+                    || account.len() > 24
+                    || !account
+                        .bytes()
+                        .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit())
+                {
+                    return Err(format!(
+                        "storage.{name}.account: an Azure storage account's name is 3 to 24 lowercase letters and digits"
+                    ));
+                }
                 let mut b = MicrosoftAzureBuilder::new()
                     .with_account(account)
                     .with_container_name(container);
-                if let Some(endpoint) = endpoint {
+                let endpoint = endpoint
+                    .as_deref()
+                    .map(|raw| endpoint_url(name, raw))
+                    .transpose()?;
+                if let Some(url) = &endpoint {
+                    // Azure signs a resource named after its host's account (the emulator's is
+                    // in its path), so on another https host every signed link would be refused.
+                    let own = url.host_str().is_some_and(|h| h.contains(account.as_str()));
+                    if url.scheme() == "https" && !own && signs_anything(c) {
+                        return Err(format!(
+                            "storage.{name}.endpoint: signed links need the account's own host, like https://{account}.blob.core.windows.net, or an emulator's http endpoint"
+                        ));
+                    }
                     // Azurite, the emulator, serves plain http.
                     b = b
-                        .with_endpoint(endpoint.clone())
-                        .with_allow_http(endpoint.starts_with("http://"));
+                        .with_endpoint(trimmed(url))
+                        .with_allow_http(url.scheme() == "http");
                 }
                 let (key_var, sas_var) = (
                     credential_var(name, "access_key"),
                     credential_var(name, "sas_token"),
                 );
-                let signs = match (var("access_key"), var("sas_token")) {
+                let signs = match (cred("access_key"), cred("sas_token")) {
                     (Some(_), Some(_)) => {
                         return Err(format!(
                             "storage.{name}: set one of {key_var} and {sas_var}, not both"
@@ -245,67 +281,104 @@ impl Storage {
                         Ok(())
                     }
                     (None, Some(sas)) => {
-                        b = b.with_config(object_store::azure::AzureConfigKey::SasKey, sas);
+                        b = b.with_config(AzureConfigKey::SasKey, sas);
                         Err(format!(
                             "a SAS token can't sign links of its own; set the account key in {key_var} instead"
                         ))
                     }
-                    // Without a key the machine's own identity is used, which signs only through
-                    // a request to Azure: allowed when asked for, and tried at startup.
-                    (None, None) if endpoint.is_none() && c.sign_with_identity => Ok(()),
-                    (None, None) if endpoint.is_none() => Err(format!(
-                        "the machine's own Azure identity signs links only through a request to Azure; set the account key in {key_var}, or sign_with_identity = true to sign that way (its role needs generateUserDelegationKey)"
-                    )),
-                    (None, None) => {
+                    (None, None) if endpoint.is_some() => {
                         return Err(format!(
                             "storage.{name}: set {key_var} or {sas_var} in the environment; an account with an endpoint needs one"
                         ));
                     }
+                    // Without a key the machine's own identity is used, which signs only through
+                    // a request to Azure: allowed when asked for, and tried at startup.
+                    (None, None) => {
+                        b = azure_identity(b, &var);
+                        match c.sign_with_identity {
+                            true => Ok(()),
+                            false => Err(format!(
+                                "the machine's own Azure identity signs links only through a request to Azure; set the account key in {key_var}, or sign_with_identity = true to sign that way (its role needs generateUserDelegationKey)"
+                            )),
+                        }
+                    }
                 };
-                // Before the build, which may read the machine's own credentials.
-                check_signing_config(name, c, signs.as_ref().err())?;
+                check_signing_config(name, c, signs.as_ref().map(|_| ()).map_err(String::as_str))?;
                 let az = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
-                (az.clone(), signs.map(|()| az as Arc<dyn Signer>))
+                (az.clone(), signs.ok().map(|()| az as Arc<dyn Signer>))
             }
             Adapter::Gcs { bucket, endpoint } => {
-                let mut b = GoogleCloudStorageBuilder::new().with_bucket_name(bucket);
-                if let Some(endpoint) = endpoint {
+                let endpoint = endpoint
+                    .as_deref()
+                    .map(|raw| endpoint_url(name, raw))
+                    .transpose()?;
+                // Google signs for its own host only, whatever host the link points at.
+                if let Some(url) = &endpoint
+                    && url.scheme() == "https"
+                    && url.host_str() != Some("storage.googleapis.com")
+                    && signs_anything(c)
+                {
+                    return Err(format!(
+                        "storage.{name}.endpoint: signed links need Google's own host, https://storage.googleapis.com, or an emulator's http endpoint"
+                    ));
+                }
+                // Always set, so a key file's own `gcs_base_url` can't send requests elsewhere.
+                let base = endpoint
+                    .as_ref()
+                    .map_or_else(|| GCS_BASE.to_owned(), trimmed);
+                let mut b = GoogleCloudStorageBuilder::new()
+                    .with_bucket_name(bucket)
+                    .with_base_url(&base);
+                if let Some(url) = &endpoint {
                     // fake-gcs-server, the emulator, serves plain http.
-                    b = b.with_base_url(endpoint).with_client_options(
-                        object_store::ClientOptions::new()
-                            .with_allow_http(endpoint.starts_with("http://")),
+                    b = b.with_client_options(
+                        object_store::ClientOptions::new().with_allow_http(url.scheme() == "http"),
                     );
                 }
                 let path_var = credential_var(name, "service_account_path");
-                let signs = match var("service_account_path") {
+                let signs = match cred("service_account_path") {
                     Some(path) => {
-                        let signs = gcs_key_signs(&path)
+                        let key = gcs_key_file(&path)
                             .map_err(|e| format!("storage.{name}: {path_var}: {e}"))?;
+                        if key
+                            .base_url
+                            .is_some_and(|u| u.trim_end_matches('/') != base)
+                        {
+                            return Err(format!(
+                                "storage.{name}: the key file in {path_var} names a gcs_base_url other than this storage's endpoint; set endpoint to it, or take it out of the file"
+                            ));
+                        }
+                        if key.disable_oauth && endpoint.is_none() {
+                            return Err(format!(
+                                "storage.{name}: the key file in {path_var} sets disable_oauth, which is for an emulator; set endpoint to the emulator's address"
+                            ));
+                        }
                         b = b.with_service_account_path(path);
-                        signs.then_some(()).ok_or_else(|| format!(
-                            "the key file in {path_var} sets disable_oauth, so it has no key to sign with"
-                        ))
+                        match key.disable_oauth {
+                            false => Ok(()),
+                            true => Err(format!(
+                                "the key file in {path_var} sets disable_oauth, so it has no key to sign with"
+                            )),
+                        }
                     }
                     None if endpoint.is_some() => {
                         return Err(format!(
                             "storage.{name}: set {path_var} in the environment; a bucket with an endpoint needs its key file"
                         ));
                     }
-                    // The machine's own account signs only through Google's IAM API, and only
-                    // when granted that too: allowed when asked for, and tried at startup.
+                    // The machine's own credentials may sign only through Google's IAM API, and
+                    // only when granted that too: allowed when asked for, and tried at startup.
                     None if c.sign_with_identity => Ok(()),
                     None => Err(format!(
-                        "the machine's own Google account signs links only through Google's IAM API; set a service account key file's path in {path_var}, or sign_with_identity = true to sign that way (it needs iam.serviceAccounts.signBlob)"
+                        "the machine's own Google credentials may sign links only through Google's IAM API; set a service account key file's path in {path_var}, or sign_with_identity = true to sign that way (it needs iam.serviceAccounts.signBlob)"
                     )),
                 };
-                // Before the build, which may read the machine's own credentials.
-                check_signing_config(name, c, signs.as_ref().err())?;
+                check_signing_config(name, c, signs.as_ref().map(|_| ()).map_err(String::as_str))?;
                 let gcs = Arc::new(b.build().map_err(|e| format!("storage.{name}: {e}"))?);
-                (gcs.clone(), signs.map(|()| gcs as Arc<dyn Signer>))
+                (gcs.clone(), signs.ok().map(|()| gcs as Arc<dyn Signer>))
             }
         };
-        check_signing_config(name, c, signer.as_ref().err())?;
-        Ok(Self::with_store(name, store, signer.ok(), c.clone()))
+        Ok(Self::with_store(name, store, signer, c.clone()))
     }
 
     /// `self` signing URLs with `s`: how a test stands a local store in for a bucket. No
@@ -328,6 +401,12 @@ impl Storage {
             store,
             signer,
             config,
+            http: reqwest::Client::builder()
+                .no_proxy()
+                .redirect(reqwest::redirect::Policy::none())
+                .timeout(Duration::from_secs(30))
+                .build()
+                .expect("an HTTP client without a proxy or TLS options builds"),
         }
     }
 
@@ -384,9 +463,11 @@ impl Storage {
             Adapter::Azure { .. } => {
                 "Microsoft.Storage/storageAccounts/blobServices/generateUserDelegationKey/action on the storage account, as the Storage Blob Delegator role does"
             }
-            _ => {
+            Adapter::Gcs { .. } => {
                 "iam.serviceAccounts.signBlob on itself, as the Service Account Token Creator role does"
             }
+            // No identity of theirs signs; `open` refuses the setting for them.
+            Adapter::Local { .. } | Adapter::S3 { .. } => return Ok(()),
         };
         let probe = format!("{STAGING}/signing-check");
         match self.presign_get(&probe, Duration::from_secs(60)).await {
@@ -556,7 +637,87 @@ impl Storage {
                     .to_owned()
             })
             .filter(|k| is_staging_key(k))
-            .collect())
+            .collect::<Vec<_>>())
+        .map(|mut keys| {
+            // In one order whatever the store lists in, as buckets list.
+            keys.sort_unstable();
+            keys
+        })
+    }
+
+    /// Deletes staging key `key`, however a client left it. On Azure the upload link's write
+    /// permission also lets a client lease or snapshot the blob, either of which a plain
+    /// delete is refused for: so any lease is broken first, and snapshots go with it.
+    pub async fn delete_staging(&self, key: &str) -> Result<(), StorageError> {
+        if !matches!(self.config.adapter, Adapter::Azure { .. }) || self.signer.is_none() {
+            return self.delete(key).await;
+        }
+        let failed = |source: String| {
+            StorageError::Store(object_store::Error::Generic {
+                store: "MicrosoftAzure",
+                source: source.into(),
+            })
+        };
+        let [lease, delete] = self.staging_delete_requests(key).await?;
+        for (request, step) in [(lease, "break the lease on"), (delete, "delete")] {
+            let res = self
+                .http
+                .execute(request)
+                .await
+                .map_err(|e| failed(format!("can't {step} `{key}`: {}", e.without_url())))?;
+            match res.status().as_u16() {
+                200..=299 => {}
+                404 => return Ok(()),
+                // A blob with no lease has none to break.
+                409 if step.starts_with("break") => {}
+                status => {
+                    return Err(failed(format!(
+                        "can't {step} `{key}`: Azure answered {status}"
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// The two requests `delete_staging` sends on Azure, each signed for `key` alone and
+    /// for a minute: a lease break taking effect at once, then a delete with snapshots.
+    #[doc(hidden)]
+    pub async fn staging_delete_requests(
+        &self,
+        key: &str,
+    ) -> Result<[reqwest::Request; 2], StorageError> {
+        if !matches!(self.config.adapter, Adapter::Azure { .. }) {
+            return Err(StorageError::BadKey(format!(
+                "storage `{}` isn't Azure's; its staging keys delete as any key does",
+                self.name
+            )));
+        }
+        let signer = self.signer_or_refuse()?;
+        let path = self.key(key)?;
+        let minute = Duration::from_secs(60);
+        // A SAS's `w` covers Lease Blob; the operation itself goes outside the signature.
+        let mut lease = signer.signed_url(Method::PUT, &path, minute).await?;
+        lease.query_pairs_mut().append_pair("comp", "lease");
+        let delete = signer.signed_url(Method::DELETE, &path, minute).await?;
+        let build = |r: reqwest::RequestBuilder| {
+            r.build()
+                .map_err(|e| StorageError::BadKey(format!("can't build a request: {e}")))
+        };
+        Ok([
+            build(
+                self.http
+                    .put(lease)
+                    .header("x-ms-lease-action", "break")
+                    .header("x-ms-lease-break-period", "0")
+                    .header("content-length", "0"),
+            )?,
+            build(
+                self.http
+                    .delete(delete)
+                    .header("x-ms-delete-snapshots", "include"),
+            )?,
+        ])
     }
 
     /// Deletes `key`. One that isn't there is already deleted.
@@ -583,16 +744,15 @@ impl Storage {
 /// The longest a signed link may last: what S3 itself allows.
 pub const MAX_SIGNED: Duration = Duration::from_secs(7 * 24 * 3600);
 
-/// Signing needs a bucket whose credentials sign: a storage told to sign without them is a
-/// mistake to catch at startup (`unsigned` says why), as is a link meant to outlast what a
-/// bucket signs.
+/// Signing needs credentials that sign: a storage told to sign without them is a mistake
+/// to catch at startup (`signs` says why not), as is a link meant to outlast what a bucket
+/// signs, or what an Azure identity signs without a call to Azure each time.
 fn check_signing_config(
     name: &str,
     c: &StorageConfig,
-    unsigned: Option<&String>,
+    signs: Result<(), &str>,
 ) -> Result<(), String> {
-    let local = matches!(c.adapter, Adapter::Local { .. });
-    if let Some(why) = unsigned.filter(|_| !local) {
+    if let Err(why) = signs {
         if c.client_uploads {
             return Err(format!("storage.{name}.client_uploads: {why}"));
         }
@@ -600,33 +760,120 @@ fn check_signing_config(
             return Err(format!("storage.{name}.signed_downloads: {why}"));
         }
     }
-    if local && c.client_uploads {
-        return Err(format!(
-            "storage.{name}.client_uploads: local storage can't take uploads straight from clients; use a bucket"
-        ));
-    }
     if let SignedDownloads::On { expires_in, .. } = &c.signed_downloads {
-        if local {
-            return Err(format!(
-                "storage.{name}.signed_downloads: local storage can't sign links; use a bucket"
-            ));
-        }
         if *expires_in > MAX_SIGNED || expires_in.is_zero() {
             return Err(format!(
                 "storage.{name}.signed_downloads.expires_in: a link lasts between a second and 7 days"
+            ));
+        }
+        // object_store keeps an Azure identity's delegation key only for links this short;
+        // past it, every link would be a call to Azure, which Azure throttles.
+        if c.sign_with_identity
+            && matches!(c.adapter, Adapter::Azure { .. })
+            && *expires_in > IDENTITY_SIGNED
+        {
+            return Err(format!(
+                "storage.{name}.signed_downloads.expires_in: a link signed through the machine's Azure identity lasts 2 h at most, as a longer one costs a call to Azure each time; shorten it, or sign with the account key"
             ));
         }
     }
     Ok(())
 }
 
-/// Whether the service account key file at `path` can sign: one that sets `disable_oauth`
-/// (an emulator's) is used without its key. Its other fields are the store's to check.
-fn gcs_key_signs(path: &str) -> Result<bool, String> {
+/// The longest link an Azure identity signs without asking Azure for a key each time.
+pub const IDENTITY_SIGNED: Duration = Duration::from_secs(2 * 3600);
+
+/// `sign_with_identity` on a local or S3 storage, which have no such identity, is a mistake.
+fn no_identity(name: &str, c: &StorageConfig) -> Result<(), String> {
+    match c.sign_with_identity {
+        true => Err(format!(
+            "storage.{name}.sign_with_identity: only an Azure or Google storage signs through the machine's own identity"
+        )),
+        false => Ok(()),
+    }
+}
+
+/// Whether `c` signs anything: client uploads or signed downloads.
+fn signs_anything(c: &StorageConfig) -> bool {
+    c.client_uploads || matches!(c.signed_downloads, SignedDownloads::On { .. })
+}
+
+/// Where Google Cloud Storage is reached when no `endpoint` says otherwise.
+const GCS_BASE: &str = "https://storage.googleapis.com";
+
+/// A store's `endpoint`: an http or https URL carrying no user, password, query or
+/// fragment. Nothing of it is echoed, as a user or password in it would be a secret.
+fn endpoint_url(name: &str, raw: &str) -> Result<Url, String> {
+    let bad = |why: &str| Err(format!("storage.{name}.endpoint: {why}"));
+    let Ok(url) = Url::parse(raw) else {
+        return bad("isn't a URL; give a full address, like https://host:port");
+    };
+    if !matches!(url.scheme(), "http" | "https") || url.host_str().is_none() {
+        return bad("has to be an http:// or https:// address with a host");
+    }
+    if !url.username().is_empty() || url.password().is_some() {
+        return bad("can't carry a user or password; credentials come only from the environment");
+    }
+    if url.query().is_some() || url.fragment().is_some() {
+        return bad("can't carry a query or a fragment, which would go into every link");
+    }
+    Ok(url)
+}
+
+/// `url` as a store takes it: without a trailing `/`.
+fn trimmed(url: &Url) -> String {
+    url.as_str().trim_end_matches('/').to_owned()
+}
+
+/// The environment variables of an Azure identity: a user-assigned managed identity
+/// (`AZURE_CLIENT_ID`, `AZURE_OBJECT_ID`, `AZURE_MSI_RESOURCE_ID`, `IDENTITY_ENDPOINT`) or
+/// workload identity, as AKS sets it (`AZURE_CLIENT_ID`, `AZURE_TENANT_ID`,
+/// `AZURE_FEDERATED_TOKEN_FILE`, `AZURE_AUTHORITY_HOST`). Unlike the builder's `from_env`,
+/// nothing else: no key, token, endpoint or emulator switch, which would sign as another
+/// credential or move the links' host.
+fn azure_identity(
+    mut b: MicrosoftAzureBuilder,
+    var: &impl Fn(&str) -> Option<String>,
+) -> MicrosoftAzureBuilder {
+    for name in [
+        "AZURE_CLIENT_ID",
+        "AZURE_TENANT_ID",
+        "AZURE_FEDERATED_TOKEN_FILE",
+        "AZURE_AUTHORITY_HOST",
+        "AZURE_OBJECT_ID",
+        "AZURE_MSI_RESOURCE_ID",
+        "AZURE_MSI_ENDPOINT",
+    ] {
+        if let (Some(value), Ok(key)) = (var(name), name.to_ascii_lowercase().parse()) {
+            b = b.with_config(key, value);
+        }
+    }
+    if let Some(endpoint) = var("IDENTITY_ENDPOINT") {
+        b = b.with_msi_endpoint(endpoint);
+    }
+    b
+}
+
+/// What of a service account key file the storage checks itself.
+struct GcsKeyFile {
+    /// An emulator's: the key is never read, so nothing is signed with it.
+    disable_oauth: bool,
+    /// Where the file would send every request in place of Google.
+    base_url: Option<String>,
+}
+
+/// Reads the key file at `path`. Its other fields are the store's to check.
+fn gcs_key_file(path: &str) -> Result<GcsKeyFile, String> {
     let text = std::fs::read_to_string(path).map_err(|e| format!("can't read {path}: {e}"))?;
     let key: serde_json::Value =
         serde_json::from_str(&text).map_err(|e| format!("{path} isn't a key file: {e}"))?;
-    Ok(key.get("disable_oauth") != Some(&serde_json::Value::Bool(true)))
+    Ok(GcsKeyFile {
+        disable_oauth: key.get("disable_oauth") == Some(&serde_json::Value::Bool(true)),
+        base_url: key
+            .get("gcs_base_url")
+            .and_then(|u| u.as_str())
+            .map(str::to_owned),
+    })
 }
 
 /// `t` in whole seconds since the epoch, as object times are compared.
@@ -755,6 +1002,47 @@ impl Default for Storages {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn an_azure_identity_takes_only_identity_variables() {
+        let env = [
+            ("AZURE_CLIENT_ID", "client"),
+            ("AZURE_TENANT_ID", "tenant"),
+            ("AZURE_FEDERATED_TOKEN_FILE", "/var/run/secrets/token"),
+            ("IDENTITY_ENDPOINT", "http://169.254.169.254/msi"),
+            // What `from_env` would also take: another credential, another host.
+            ("AZURE_STORAGE_ACCOUNT_KEY", "a2V5"),
+            ("AZURE_STORAGE_SAS_TOKEN", "sig=x"),
+            ("AZURE_STORAGE_USE_EMULATOR", "true"),
+            ("AZURE_STORAGE_ENDPOINT", "https://evil.example"),
+        ];
+        let var = |name: &str| {
+            env.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).to_owned())
+        };
+        let b = azure_identity(MicrosoftAzureBuilder::new(), &var);
+        let got = |key: AzureConfigKey| b.get_config_value(&key);
+        // Workload identity, as AKS sets it, resolves from these three.
+        assert_eq!(got(AzureConfigKey::ClientId).as_deref(), Some("client"));
+        assert_eq!(got(AzureConfigKey::AuthorityId).as_deref(), Some("tenant"));
+        assert_eq!(
+            got(AzureConfigKey::FederatedTokenFile).as_deref(),
+            Some("/var/run/secrets/token")
+        );
+        assert_eq!(
+            got(AzureConfigKey::MsiEndpoint).as_deref(),
+            Some("http://169.254.169.254/msi")
+        );
+        for other in [
+            AzureConfigKey::AccessKey,
+            AzureConfigKey::SasKey,
+            AzureConfigKey::Endpoint,
+        ] {
+            assert_eq!(got(other), None, "{other:?}");
+        }
+        assert_eq!(got(AzureConfigKey::UseEmulator).as_deref(), Some("false"));
+    }
 
     #[test]
     fn keys_are_plain_segments() {

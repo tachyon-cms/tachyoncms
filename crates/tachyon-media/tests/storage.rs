@@ -312,13 +312,22 @@ async fn client_put_round_trip(storage: &Storage, type_signed: bool) {
     }
 }
 
-/// Opens `c` with `vars` as its credentials (`access_key` and so on), leaving the process
-/// environment alone.
+/// Opens `c` with `vars` as its environment, leaving the process's alone: a lowercase name
+/// is the storage's own credential (`access_key` is `TACHYON_STORAGE__<NAME>__ACCESS_KEY`),
+/// anything else a variable by its full name (`AZURE_CLIENT_ID`).
 fn open(name: &str, c: &StorageConfig, vars: &[(&str, &str)]) -> Result<Storage, String> {
-    Storage::open_with(name, c, |key| {
-        vars.iter()
-            .find(|(k, _)| *k == key)
-            .map(|(_, v)| (*v).to_owned())
+    let vars: Vec<(String, String)> = vars
+        .iter()
+        .map(|(k, v)| {
+            let k = match k.chars().any(|c| c.is_ascii_uppercase()) {
+                true => (*k).to_owned(),
+                false => tachyon_media::storage::credential_var(name, k),
+            };
+            (k, (*v).to_owned())
+        })
+        .collect();
+    Storage::open_with(name, c, |var| {
+        vars.iter().find(|(k, _)| k == var).map(|(_, v)| v.clone())
     })
 }
 
@@ -397,7 +406,12 @@ async fn azure_instructions_carry_blob_type() {
     };
     let dir = temp_root();
     let key_file = emulator_key(&dir);
-    let g = open("g", &gcs(None), &[("service_account_path", &key_file)]).unwrap();
+    let g = open(
+        "g",
+        &gcs(Some("http://127.0.0.1:4443")),
+        &[("service_account_path", &key_file)],
+    )
+    .unwrap();
     for other in [open("s3", &s3, &[]).unwrap(), g] {
         assert_eq!(
             serde_json::Value::Object(other.put_headers("image/png")),
@@ -520,9 +534,10 @@ fn signing_needs_a_key_that_signs() {
     let dir = temp_root();
     let key_file = emulator_key(&dir);
     let path = key_file.as_str();
-    assert!(open("g", &gcs(None), &[("service_account_path", path)]).is_ok());
+    let emulator = Some("http://127.0.0.1:4443");
+    assert!(open("g", &gcs(emulator), &[("service_account_path", path)]).is_ok());
     refused(
-        &uploads(gcs(None)),
+        &uploads(gcs(emulator)),
         "g",
         &[("service_account_path", path)],
         "client_uploads",
@@ -874,4 +889,445 @@ async fn azure_copies_by_streaming() {
     };
     let s3 = Storage::with_store("s3", store, None, s3);
     assert!(s3.copy(&from, &to).await.is_err());
+}
+
+/// `c` with `endpoint` as its adapter's endpoint.
+fn at_endpoint(mut c: StorageConfig, url: &str) -> StorageConfig {
+    match &mut c.adapter {
+        Adapter::Azure { endpoint, .. }
+        | Adapter::Gcs { endpoint, .. }
+        | Adapter::S3 { endpoint, .. } => *endpoint = Some(url.to_owned()),
+        Adapter::Local { .. } => unreachable!(),
+    }
+    c
+}
+
+/// A storage, its config, its environment, and the start of its startup error.
+type Refused<'a> = (&'a str, StorageConfig, &'a [(&'a str, &'a str)], &'a str);
+
+#[tokio::test]
+async fn endpoints_and_accounts_are_checked() {
+    let dir = temp_root();
+    let gcs_key = service_account(&dir);
+    let gcs_key = gcs_key.to_str().unwrap();
+    let key = [("access_key", AZURE_KEY)];
+    let gcs_vars = [("service_account_path", gcs_key)];
+    let s3 = StorageConfig {
+        adapter: Adapter::S3 {
+            bucket: "b".into(),
+            endpoint: None,
+            region: Some("auto".into()),
+        },
+        ..StorageConfig::local("unused")
+    };
+    let s3_keys = [("access_key_id", "id"), ("secret_access_key", "secret")];
+    let named = |account: &str| {
+        let mut c = azure(None);
+        if let Adapter::Azure { account: a, .. } = &mut c.adapter {
+            *a = account.into();
+        }
+        c
+    };
+    // (storage, config, its env, the start of the startup error)
+    let refused: Vec<Refused> = vec![
+        ("az", named("evil.example#"), &key, "storage.az.account: "),
+        ("az", named("ab"), &key, "storage.az.account: "),
+        ("az", named("Acct"), &key, "storage.az.account: "),
+        ("az", named(&"a".repeat(25)), &key, "storage.az.account: "),
+        (
+            "az",
+            at_endpoint(
+                azure(None),
+                "https://user:hunter2@acct.blob.core.windows.net",
+            ),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        (
+            "az",
+            at_endpoint(azure(None), "https://acct.blob.core.windows.net/?foo=bar"),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        (
+            "az",
+            at_endpoint(azure(None), "https://acct.blob.core.windows.net/#top"),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        (
+            "az",
+            at_endpoint(azure(None), "ftp://acct.blob.core.windows.net"),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        (
+            "az",
+            at_endpoint(azure(None), "acct.blob.core.windows.net"),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        // Azure signs a custom domain's links for a resource it doesn't serve.
+        (
+            "az",
+            signing(at_endpoint(azure(None), "https://media.example.com")),
+            &key,
+            "storage.az.endpoint: ",
+        ),
+        (
+            "g",
+            signing(at_endpoint(gcs(None), "https://gcs.example.com")),
+            &gcs_vars,
+            "storage.g.endpoint: ",
+        ),
+        (
+            "s3",
+            at_endpoint(s3.clone(), "https://user:pw@acct.r2.cloudflarestorage.com"),
+            &s3_keys,
+            "storage.s3.endpoint: ",
+        ),
+        (
+            "s3",
+            at_endpoint(s3.clone(), "https://acct.r2.cloudflarestorage.com/?x=1"),
+            &s3_keys,
+            "storage.s3.endpoint: ",
+        ),
+    ];
+    for (name, c, vars, start) in refused {
+        let err = open(name, &c, vars).unwrap_err();
+        assert!(err.starts_with(start), "{c:?}: {err}");
+        assert!(
+            !err.contains("hunter2") && !err.contains(":pw@"),
+            "nothing secret is echoed: {err}"
+        );
+    }
+
+    assert!(open("az", &named("acct2024"), &key).is_ok());
+    // Without signing, a custom domain is only a host to reach.
+    assert!(
+        open(
+            "az",
+            &at_endpoint(azure(None), "https://media.example.com"),
+            &key
+        )
+        .is_ok()
+    );
+    // A trailing slash and the scheme's case don't change the links.
+    let link = |c: StorageConfig| async move {
+        let storage = open("az", &c, &key).unwrap();
+        let url = storage
+            .presign_get("_staging/x", Duration::from_secs(60))
+            .await
+            .unwrap();
+        url.as_str().split('?').next().unwrap().to_owned()
+    };
+    assert_eq!(
+        link(signing(at_endpoint(
+            azure(None),
+            "https://acct.blob.core.windows.net/"
+        )))
+        .await,
+        "https://acct.blob.core.windows.net/media/_staging/x"
+    );
+    let mut azurite = signing(at_endpoint(
+        azure(None),
+        "HTTP://127.0.0.1:10000/devstoreaccount1/",
+    ));
+    if let Adapter::Azure { account, .. } = &mut azurite.adapter {
+        *account = "devstoreaccount1".into();
+    }
+    assert_eq!(
+        link(azurite).await,
+        "http://127.0.0.1:10000/devstoreaccount1/media/_staging/x"
+    );
+}
+
+#[test]
+fn a_key_files_base_url_must_be_the_configured_one() {
+    let dir = temp_root();
+    let file = dir.join("key.json");
+    let with_base = |base: &str| {
+        let key = json!({"private_key": "unused", "private_key_id": "1", "client_email": "a@b",
+                         "disable_oauth": true, "gcs_base_url": base});
+        std::fs::write(&file, key.to_string()).unwrap();
+        file.to_str().unwrap().to_owned()
+    };
+    let emulator = "http://127.0.0.1:4443";
+    let path = with_base("https://evil.example");
+    for c in [gcs(None), gcs(Some(emulator))] {
+        let err = open("g", &c, &[("service_account_path", &path)]).unwrap_err();
+        assert!(err.starts_with("storage.g: "), "{err}");
+        assert!(err.contains("gcs_base_url"), "{err}");
+    }
+    let path = with_base("http://127.0.0.1:4443/");
+    assert!(
+        open(
+            "g",
+            &gcs(Some(emulator)),
+            &[("service_account_path", &path)]
+        )
+        .is_ok()
+    );
+    // An emulator's key file, with no emulator to send it to, would send Google no token.
+    let path = emulator_key(&dir);
+    let err = open("g", &gcs(None), &[("service_account_path", &path)]).unwrap_err();
+    assert!(err.contains("disable_oauth"), "{err}");
+}
+
+#[test]
+fn debug_shows_no_secret() {
+    let sas = "sv=2022-11-02&sp=rw&sig=c2VjcmV0LXNpZ25hdHVyZQ%3D%3D";
+    for (c, vars, secrets) in [
+        (
+            signing(azure(None)),
+            &[("access_key", AZURE_KEY)][..],
+            vec![AZURE_KEY.to_owned(), format!("{:?}", b"tachyon-test-key")],
+        ),
+        (
+            azure(None),
+            &[("sas_token", sas)][..],
+            vec![
+                "c2VjcmV0LXNpZ25hdHVyZQ".to_owned(),
+                "secret-signature".to_owned(),
+            ],
+        ),
+    ] {
+        let storage = open("az", &c, vars).unwrap();
+        let all = tachyon_media::storage::Storages(std::collections::HashMap::from([(
+            "az".to_owned(),
+            Arc::new(storage),
+        )]));
+        let shown = format!("{all:?} {all:#?}");
+        assert!(shown.contains("az"), "{shown}");
+        for secret in &secrets {
+            assert!(!shown.contains(secret.as_str()), "{secret} in {shown}");
+        }
+        // The bytes as a list, as a derived Debug of the key would show them.
+        assert!(!shown.contains("116, 97, 99"), "{shown}");
+    }
+}
+
+#[test]
+fn identity_links_last_two_hours_at_most_on_azure() {
+    let lasting = |hours: u64| {
+        let mut c = with_identity(azure(None));
+        c.signed_downloads = SignedDownloads::On {
+            mime_types: Vec::new(),
+            expires_in: Duration::from_secs(hours * 3600),
+        };
+        c
+    };
+    assert!(open("az", &lasting(2), &[]).is_ok());
+    let err = open("az", &lasting(3), &[]).unwrap_err();
+    assert!(
+        err.starts_with("storage.az.signed_downloads.expires_in: "),
+        "{err}"
+    );
+    assert!(err.contains("2 h"), "{err}");
+    // A key signs links of any length up to the 7 days every bucket allows.
+    let mut keyed = lasting(48);
+    keyed.sign_with_identity = false;
+    assert!(open("az", &keyed, &[("access_key", AZURE_KEY)]).is_ok());
+}
+
+#[tokio::test]
+async fn azure_staging_deletes_break_leases_and_snapshots() {
+    let az = open("az", &signing(azure(None)), &[("access_key", AZURE_KEY)]).unwrap();
+    let key = staging_key();
+    let [lease, delete] = az.staging_delete_requests(&key).await.unwrap();
+    for (req, method, sp) in [(&lease, "PUT", "w"), (&delete, "DELETE", "d")] {
+        assert_eq!(req.method().as_str(), method);
+        let url = req.url();
+        assert_eq!(url.host_str(), Some("acct.blob.core.windows.net"));
+        // One blob, for a minute.
+        assert_eq!(url.path(), format!("/media/{key}"));
+        assert_eq!(query(url, "sr").as_deref(), Some("b"));
+        assert_eq!(query(url, "sp").as_deref(), Some(sp));
+        assert!(query(url, "sig").is_some());
+        let lasts =
+            chrono_secs(&query(url, "se").unwrap()) - chrono_secs(&query(url, "st").unwrap());
+        assert!(lasts <= 300, "{lasts} s");
+    }
+    assert_eq!(query(lease.url(), "comp").as_deref(), Some("lease"));
+    assert_eq!(lease.headers()["x-ms-lease-action"], "break");
+    assert_eq!(lease.headers()["x-ms-lease-break-period"], "0");
+    assert_eq!(lease.headers()["content-length"], "0");
+    assert_eq!(query(delete.url(), "comp"), None);
+    assert_eq!(delete.headers()["x-ms-delete-snapshots"], "include");
+    // Anywhere else a staging key deletes as any key does.
+    let dir = temp_root();
+    let disk = Storage::open("disk", &StorageConfig::local(&*dir)).unwrap();
+    assert!(disk.staging_delete_requests(&key).await.is_err());
+    disk.put_file(&key, &source(b"x"), "image/png")
+        .await
+        .unwrap();
+    disk.delete_staging(&key).await.unwrap();
+    assert!(disk.head(&key).await.unwrap_err().is_not_found());
+}
+
+/// Seconds since the epoch of an Azure SAS time, `2026-11-11T18:00:00Z`.
+fn chrono_secs(t: &str) -> i64 {
+    let (date, time) = t.trim_end_matches('Z').split_once('T').unwrap();
+    let d: Vec<i64> = date.split('-').map(|p| p.parse().unwrap()).collect();
+    let h: Vec<i64> = time.split(':').map(|p| p.parse().unwrap()).collect();
+    // Only differences are taken, within a day or two, so whole days since a fixed point do.
+    ((d[0] * 372 + d[1] * 31 + d[2]) * 86_400) + h[0] * 3600 + h[1] * 60 + h[2]
+}
+
+/// A store whose puts fail, as a bucket that goes down mid-copy does, and with `cut_reads`
+/// whose reads fail after their first chunk; it notes each multipart upload's abort.
+#[derive(Debug)]
+struct FailingPuts {
+    inner: object_store::memory::InMemory,
+    aborted: Arc<std::sync::atomic::AtomicBool>,
+    cut_reads: bool,
+}
+
+impl std::fmt::Display for FailingPuts {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "FailingPuts")
+    }
+}
+
+fn down() -> object_store::Error {
+    object_store::Error::Generic {
+        store: "test",
+        source: "the bucket is down".into(),
+    }
+}
+
+#[derive(Debug)]
+struct FailingUpload(Arc<std::sync::atomic::AtomicBool>);
+
+#[async_trait::async_trait]
+impl object_store::MultipartUpload for FailingUpload {
+    fn put_part(&mut self, _: object_store::PutPayload) -> object_store::UploadPart {
+        Box::pin(async { Err(down()) })
+    }
+
+    async fn complete(&mut self) -> object_store::Result<object_store::PutResult> {
+        Err(down())
+    }
+
+    async fn abort(&mut self) -> object_store::Result<()> {
+        self.0.store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for FailingPuts {
+    async fn put_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: object_store::PutPayload,
+        _: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        Err(down())
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        Ok(Box::new(FailingUpload(self.aborted.clone())))
+    }
+
+    async fn get_opts(
+        &self,
+        location: &object_store::path::Path,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        use futures_util::StreamExt;
+        let mut got = self.inner.get_opts(location, options).await?;
+        if self.cut_reads {
+            let empty =
+                object_store::GetResultPayload::Stream(futures_util::stream::empty().boxed());
+            if let object_store::GetResultPayload::Stream(chunks) =
+                std::mem::replace(&mut got.payload, empty)
+            {
+                let cut = chunks
+                    .take(1)
+                    .chain(futures_util::stream::once(async { Err(down()) }));
+                got.payload = object_store::GetResultPayload::Stream(cut.boxed());
+            }
+        }
+        Ok(got)
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<
+            'static,
+            object_store::Result<object_store::path::Path>,
+        >,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::path::Path>>
+    {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&object_store::path::Path>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        _: &object_store::path::Path,
+        _: &object_store::path::Path,
+        _: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        Err(down())
+    }
+}
+
+#[tokio::test]
+async fn a_failed_streamed_copy_leaves_nothing() {
+    // Puts that fail, then a read that fails part way.
+    for cut_reads in [false, true] {
+        failed_copy(cut_reads).await;
+    }
+}
+
+async fn failed_copy(cut_reads: bool) {
+    use object_store::ObjectStoreExt;
+    let aborted = Arc::new(std::sync::atomic::AtomicBool::new(false));
+    let store = Arc::new(FailingPuts {
+        inner: object_store::memory::InMemory::new(),
+        aborted: aborted.clone(),
+        cut_reads,
+    });
+    let id = Uuid::now_v7();
+    let (from, to) = (
+        object_key(None, "images", id, "a.png").unwrap(),
+        object_key(None, "images", id, "a-1.png").unwrap(),
+    );
+    // Past one part, so the copy goes multipart.
+    let bytes: Vec<u8> = (0..12_000_000u32).map(|i| (i % 251) as u8).collect();
+    store
+        .inner
+        .put(&from.as_str().into(), bytes.into())
+        .await
+        .unwrap();
+    let az = Storage::with_store("az", store.clone(), None, azure(None));
+    assert!(az.copy(&from, &to).await.is_err());
+    assert!(
+        aborted.load(std::sync::atomic::Ordering::SeqCst),
+        "the multipart upload is aborted ({cut_reads})"
+    );
+    assert!(
+        az.head(&to).await.unwrap_err().is_not_found(),
+        "no partial copy"
+    );
 }

@@ -142,6 +142,14 @@ pub async fn router(pool: PgPool) -> Result<Router, StartError> {
 /// `pool` closes: dropping the router doesn't stop them, and a second router on the same pool
 /// starts as many again.
 pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, StartError> {
+    // A storage that signs through the machine's identity signs once now, so a missing
+    // grant stops startup instead of failing each request.
+    options
+        .uploads
+        .storages
+        .check_signing()
+        .await
+        .map_err(StartError::Config)?;
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
     tachyon_db::auth::ensure_users_collection(&pool).await?;

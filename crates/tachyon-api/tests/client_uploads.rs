@@ -1883,7 +1883,7 @@ async fn azure_instructions_carry_blob_type(pool: PgPool) {
     c.client_uploads = true;
     // An account key signs offline: any base64 will do here.
     let azure = Storage::open_with("azure", &c, |k| {
-        (k == "access_key").then(|| "dGFjaHlvbi10ZXN0LWtleQ==".to_owned())
+        (k == "TACHYON_STORAGE__AZURE__ACCESS_KEY").then(|| "dGFjaHlvbi10ZXN0LWtleQ==".to_owned())
     })
     .unwrap();
     let mut o = options(&d, 0);
@@ -1992,4 +1992,194 @@ async fn a_signing_failure_is_unavailable(pool: PgPool) {
     let url = res.json["docs"][0]["url"].as_str().unwrap();
     assert!(url.ends_with("/api/images/file/m.png"), "{url}");
     assert!(!url.contains("media.tachyoncms.com"), "{url}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn identity_signing_is_checked_before_serving(pool: PgPool) {
+    let d = dirs();
+    let mut c = StorageConfig::local(&d.bucket);
+    c.adapter = tachyon_media::storage::Adapter::Azure {
+        container: "media".into(),
+        account: "acct".into(),
+        endpoint: None,
+    };
+    c.client_uploads = true;
+    c.sign_with_identity = true;
+    let store = LocalFileSystem::new_with_prefix(&d.bucket).unwrap();
+    // The identity's role lacks the grant: its one signature at startup is refused.
+    let identity =
+        Storage::with_store("identity", Arc::new(store), None, c).with_signer(Arc::new(Revoked));
+    let mut o = options(&d, 0);
+    let mut all = o.uploads.storages.0.clone();
+    all.insert("identity".into(), Arc::new(identity));
+    o.uploads.storages = Arc::new(Storages(all));
+    let err = tachyon_api::router_with(pool.clone(), o)
+        .await
+        .expect_err("startup stops")
+        .to_string();
+    assert!(
+        err.contains("storage.identity.sign_with_identity: "),
+        "{err}"
+    );
+    assert!(err.contains("generateUserDelegationKey"), "{err}");
+}
+
+/// Local storage whose deletes of `stuck` keys always fail, as a leased blob's do.
+#[derive(Debug)]
+struct Stuck {
+    inner: Arc<LocalFileSystem>,
+    stuck: Arc<std::collections::HashSet<String>>,
+}
+
+impl std::fmt::Display for Stuck {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Stuck")
+    }
+}
+
+#[async_trait::async_trait]
+impl object_store::ObjectStore for Stuck {
+    async fn put_opts(
+        &self,
+        location: &Key,
+        payload: object_store::PutPayload,
+        opts: object_store::PutOptions,
+    ) -> object_store::Result<object_store::PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Key,
+        opts: object_store::PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn object_store::MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Key,
+        options: object_store::GetOptions,
+    ) -> object_store::Result<object_store::GetResult> {
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: futures_util::stream::BoxStream<'static, object_store::Result<Key>>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<Key>> {
+        use futures_util::StreamExt;
+        let (inner, stuck) = (self.inner.clone(), self.stuck.clone());
+        locations
+            .then(move |location| {
+                let (inner, stuck) = (inner.clone(), stuck.clone());
+                async move {
+                    let location = location?;
+                    if stuck.contains(location.as_ref()) {
+                        return Err(object_store::Error::Generic {
+                            store: "stuck",
+                            source: "there is an active lease on the blob".into(),
+                        });
+                    }
+                    object_store::ObjectStoreExt::delete(&*inner, &location).await?;
+                    Ok(location)
+                }
+            })
+            .boxed()
+    }
+
+    fn list(
+        &self,
+        prefix: Option<&Key>,
+    ) -> futures_util::stream::BoxStream<'static, object_store::Result<object_store::ObjectMeta>>
+    {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(
+        &self,
+        prefix: Option<&Key>,
+    ) -> object_store::Result<object_store::ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        options: object_store::CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
+/// The most strays a sweep run tries in a storage (`media_jobs::STAGING_PER_RUN`).
+const PER_RUN: usize = 1000;
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn undeletable_strays_dont_starve_the_sweep(pool: PgPool) {
+    let d = dirs();
+    let root = d.bucket.parent().unwrap().join("stuck");
+    let dir = root.join("_staging");
+    std::fs::create_dir_all(&dir).unwrap();
+    // A full run's worth of strays that can't be deleted, all listed before one that can.
+    let mut stuck = std::collections::HashSet::new();
+    for _ in 0..PER_RUN {
+        let key = format!("_staging/{}", Uuid::new_v4());
+        assert!(key.as_str() < "_staging/ffffffff");
+        let path = root.join(&key);
+        std::fs::write(&path, b"x").unwrap();
+        age(&path);
+        stuck.insert(key);
+    }
+    let last = dir.join("ffffffff-ffff-4fff-bfff-ffffffffffff");
+    std::fs::write(&last, b"x").unwrap();
+    age(&last);
+    let store: Arc<dyn object_store::ObjectStore> = Arc::new(Stuck {
+        inner: Arc::new(LocalFileSystem::new_with_prefix(&root).unwrap()),
+        stuck: Arc::new(stuck),
+    });
+    let mut c = StorageConfig::local(&root);
+    c.client_uploads = true;
+    let with_stuck = |workers| {
+        let stuck = Storage::with_store("stuck", store.clone(), None, c.clone())
+            .with_signer(Arc::new(FakeSigner));
+        let mut o = options(&d, workers);
+        let mut all = o.uploads.storages.0.clone();
+        all.insert("stuck".into(), Arc::new(stuck));
+        o.uploads.storages = Arc::new(Storages(all));
+        o
+    };
+    let app = tachyon_api::router_with(pool.clone(), with_stuck(0))
+        .await
+        .unwrap();
+    let _worker = tachyon_api::router_with(pool.clone(), with_stuck(1))
+        .await
+        .unwrap();
+    let next_queued = async || {
+        sqlx::query_scalar::<_, i64>(
+            "SELECT count(*) FROM jobs WHERE kind = 'file_cleanup_sweep' AND state = 'queued'
+             AND run_at > now() + interval '30 minutes'",
+        )
+        .fetch_one(&pool)
+        .await
+        .unwrap()
+            == 1
+    };
+    // Each run takes 1,000 of the 1,001 from a different start: the one that can go is
+    // missed by a run only one time in 1,001.
+    for _ in 0..5 {
+        sweep_now(&pool).await;
+        until("the run is done", next_queued).await;
+        if !last.exists() {
+            break;
+        }
+    }
+    assert!(!last.exists(), "the deletable stray is swept");
+    assert_eq!(
+        std::fs::read_dir(&dir).unwrap().count(),
+        PER_RUN,
+        "the stuck ones stay, logged"
+    );
+    drop(app);
 }

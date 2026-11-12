@@ -725,7 +725,13 @@ pub(crate) async fn run_cleanup(state: &AppState, job: &Job) -> Result<(), JobEr
             }
             // Bounded, so a stalled store can't hold the file's row from the writes that
             // wait on it.
-            tokio::time::timeout(DELETE_TIMEOUT, storage.delete(key))
+            let delete = async {
+                match staging {
+                    true => storage.delete_staging(key).await,
+                    false => storage.delete(key).await,
+                }
+            };
+            tokio::time::timeout(DELETE_TIMEOUT, delete)
                 .await
                 .map_err(|_| JobError::Retry(format!("deleting `{key}` took too long")))?
                 .map_err(retry)?;
@@ -825,8 +831,8 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
 const STAGING_KEPT: std::time::Duration =
     std::time::Duration::from_secs(files::PENDING_GRACE.as_secs() + 3600);
 
-/// The most staging objects one sweep run deletes in a storage; the next run, an hour on,
-/// goes on from there.
+/// The most staging objects one sweep run tries to delete in a storage, from a different
+/// place in the listing each run.
 pub(crate) const STAGING_PER_RUN: usize = 1000;
 /// How many staging keys are looked up at once.
 const STAGING_BATCH: usize = 500;
@@ -834,7 +840,8 @@ const STAGING_BATCH: usize = 500;
 /// Deletes from each storage's staging area what no pending file waits on and was written
 /// before `STAGING_KEPT` ago: a `PUT` that landed after its key's own sweep, or one a
 /// client never claimed. Only keys of a staging key's own shape, at the area's top level,
-/// at most `STAGING_PER_RUN` a run. Failures are logged; the next run tries again.
+/// at most `STAGING_PER_RUN` a run. Failures are logged and passed over; a later run,
+/// starting elsewhere, tries again.
 async fn sweep_staging(state: &AppState) {
     let before = std::time::SystemTime::now() - STAGING_KEPT;
     for (name, storage) in &state.media.storages.0 {
@@ -851,6 +858,10 @@ async fn sweep_staging(state: &AppState) {
         };
         if keys.len() > STAGING_PER_RUN {
             tracing::info!(storage = %name, left = keys.len() - STAGING_PER_RUN, "the staging area has more strays than one sweep takes; the next sweep goes on");
+            // From another place in the listing each run, so strays that can't be deleted
+            // can't hold the first places and keep the rest from ever being tried.
+            let start = (Uuid::new_v4().as_u128() % keys.len() as u128) as usize;
+            keys.rotate_left(start);
             keys.truncate(STAGING_PER_RUN);
         }
         for batch in keys.chunks(STAGING_BATCH) {
@@ -862,7 +873,7 @@ async fn sweep_staging(state: &AppState) {
                 }
             };
             for key in batch.iter().filter(|k| !claimed.contains(*k)) {
-                if let Err(error) = storage.delete(key).await {
+                if let Err(error) = storage.delete_staging(key).await {
                     tracing::error!(%error, %key, "couldn't delete a stray staging object; the next sweep tries again");
                 }
             }

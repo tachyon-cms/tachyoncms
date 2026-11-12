@@ -204,7 +204,7 @@ async fn claimed(
         (Ok(storage), Ok(Some(staging))) => {
             let checked = checked_claim(state, u, storage, &staging, row, limit).await;
             // The sweep queued at issue is there should this fail, or the client put again.
-            if let Err(error) = storage.delete(&staging).await {
+            if let Err(error) = storage.delete_staging(&staging).await {
                 tracing::warn!(%error, %staging, "couldn't delete a client's upload; it's swept when its URL runs out");
             }
             checked
