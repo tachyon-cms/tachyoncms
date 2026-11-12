@@ -60,8 +60,8 @@ jobs:
       - run: cargo test --workspace
 
   # The storage adapters against emulators of each service, over plain http. Started with
-  # `docker run`, not as services: a service can't be given a command, and MinIO and
-  # fake-gcs-server need one.
+  # `docker run`, not as services: a service can't be given a command, and Azurite and
+  # fake-gcs-server need one. Images are pinned by digest, their tags beside them.
   storage:
     runs-on: ubuntu-latest
     env:
@@ -72,7 +72,8 @@ jobs:
       # Azurite's own well-known development key, not a secret.
       TACHYON_STORAGE__AZTEST__ACCESS_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
       TACHYON_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
-      TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH: ${{ github.workspace }}/service-account.json
+      # Under the runner's temp directory, out of the checkout and the cache.
+      TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH: ${{ runner.temp }}/service-account.json
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
@@ -83,30 +84,38 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y nasm
       - name: Start MinIO, Azurite and fake-gcs-server
         run: |
+          # MinIO's own images are no longer published; Bitnami's frozen build makes the
+          # bucket itself.
           docker run -d --name minio -p 9000:9000 \
             -e MINIO_ROOT_USER=tachyon -e MINIO_ROOT_PASSWORD=tachyon-secret \
-            minio/minio:RELEASE.2025-04-22T22-12-26Z server /data
+            -e MINIO_DEFAULT_BUCKETS=tachyon \
+            bitnamilegacy/minio@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20 # 2025.7.23-debian-12-r5
           docker run -d --name azurite -p 10000:10000 \
-            mcr.microsoft.com/azure-storage/azurite:3.34.0 \
-            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck
+            mcr.microsoft.com/azure-storage/azurite@sha256:0a47e12e3693483cef5c71f35468b91d751611f172d2f97414e9c69113b106d9 \
+            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck # 3.34.0
           docker run -d --name gcs -p 4443:4443 \
-            fsouza/fake-gcs-server:1.52.2 \
-            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443
+            fsouza/fake-gcs-server@sha256:d47b4cf8b87006cab8fbbecfa5f06a2a3c5722e464abddc0d107729663d40ec4 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443 # 1.52.2
       - name: Wait for them, and make a bucket in each
         run: |
-          up() { for _ in $(seq 1 60); do curl -s -o /dev/null "$1" && return 0; sleep 1; done; docker ps -a; return 1; }
-          up http://127.0.0.1:9000/minio/health/live
-          up http://127.0.0.1:10000/devstoreaccount1
-          up http://127.0.0.1:4443/storage/v1/b
-          docker run --rm --network host \
-            -e MC_HOST_local=http://tachyon:tachyon-secret@127.0.0.1:9000 \
-            minio/mc:RELEASE.2025-04-16T18-13-26Z mb local/tachyon
+          # `curl -f` for the two with a health answer; Azurite's root answers 400 when up.
+          up() { for _ in $(seq 1 60); do curl $1 -o /dev/null "$2" && return 0; sleep 1; done; docker ps -a; docker logs minio; return 1; }
+          up -fsS http://127.0.0.1:9000/minio/health/live
+          up -sS http://127.0.0.1:10000/devstoreaccount1
+          up -fsS http://127.0.0.1:4443/storage/v1/b
+          for _ in $(seq 1 60); do curl -fsS -o /dev/null http://127.0.0.1:9000/minio/health/ready && break; sleep 1; done
           az storage container create --name tachyon --connection-string \
             "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$TACHYON_STORAGE__AZTEST__ACCESS_KEY;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
-          curl -sf -X POST -H 'content-type: application/json' -d '{"name": "tachyon"}' \
+          curl -fsS -X POST -H 'content-type: application/json' -d '{"name": "tachyon"}' \
             http://127.0.0.1:4443/storage/v1/b
           # Any RSA key: the emulator checks no signature.
-          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out key.pem
-          python3 -c 'import json; print(json.dumps({"private_key": open("key.pem").read(), "private_key_id": "test", "client_email": "cms@tachyon-test.iam.gserviceaccount.com"}))' \
-            > "$TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH"
-      - run: cargo test -p tachyon-media --test storage -- --ignored --exact s3_round_trip azure_round_trip gcs_round_trip
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RUNNER_TEMP/key.pem"
+          python3 -c 'import json, sys; print(json.dumps({"private_key": open(sys.argv[1]).read(), "private_key_id": "test", "client_email": "cms@tachyon-test.iam.gserviceaccount.com"}))' \
+            "$RUNNER_TEMP/key.pem" > "$TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH"
+      # Every ignored test in the file, and exactly three: a renamed or skipped round trip
+      # fails the job instead of passing it with nothing run.
+      - name: Round trips
+        run: |
+          # The step's shell runs with pipefail, so a failing test fails here.
+          cargo test -p tachyon-media --test storage -- --ignored 2>&1 | tee "$RUNNER_TEMP/storage.log"
+          grep -q "test result: ok. 3 passed; 0 failed" "$RUNNER_TEMP/storage.log"
