@@ -58,7 +58,7 @@ tower-http = { version = "0.7.1", features = ["catch-panic"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
-uuid = { version = "1.28.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

@@ -279,7 +279,13 @@ pub async fn create(
     access.writes(&c, &body, Action::Create, None)?;
     // Decoded only once the write is allowed.
     let checked = match (&c.schema.upload, file) {
-        (Some(u), Some(file)) => Some((u, file.checked(&state, &access, &c, u, None).await?)),
+        (Some(u), Some(file)) => {
+            let values = body.as_object().cloned().unwrap_or_default();
+            Some((
+                u,
+                file.checked(&state, &access, &c, u, None, &values).await?,
+            ))
+        }
         _ => None,
     };
     // A file a client put in storage, claimed above, is given up if the write is refused.
@@ -557,7 +563,11 @@ pub async fn update(
     // would arrive, and goes the same way from here.
     let checked = match (&c.schema.upload, file, &edit) {
         (Some(u), Some(file), _) => {
-            Some((u, file.checked(&state, &access, &c, u, Some(id)).await?))
+            // What the document will hold, for the scope its file is claimed in.
+            let mut values = stored.clone();
+            values.extend(patch.as_object().cloned().unwrap_or_default());
+            let at = Some(id);
+            Some((u, file.checked(&state, &access, &c, u, at, &values).await?))
         }
         (Some(u), None, Some(e)) => edited(&state, &c, u, id, copy, e, deadline.limit.as_ref())
             .await?

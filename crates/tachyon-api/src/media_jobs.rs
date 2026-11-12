@@ -6,7 +6,6 @@ use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use futures_util::StreamExt;
 use serde_json::{Map, Value, json};
 use sqlx::{PgConnection, PgPool};
 use tachyon_core::uploads::{ImageFormat, ImageSize, rename_sizes, suffixed_size_filename};
@@ -15,10 +14,8 @@ use tachyon_db::collections::Collection;
 use tachyon_db::files::{self, Renamed, SizeLock};
 use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_media::image::{self as picture, ImageError, Made, Original, SizeOut};
-use tachyon_media::storage::{Storage, StorageError};
-use tempfile::NamedTempFile;
+use tachyon_media::storage::Storage;
 use time::OffsetDateTime;
-use tokio::io::AsyncWriteExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use uuid::Uuid;
 
@@ -138,9 +135,24 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
     }
     let cap = picture::cap(&u, state.media.max_pixels);
     let original = {
-        let fetched = fetch(storage, &file.key, &state.media.temp_dir)
-            .await
-            .map_err(retry)?;
+        // No bigger than the row says it is: what was stored is what was checked.
+        let size = u64::try_from(file.filesize).unwrap_or_default();
+        let fetched = crate::uploads::download(
+            storage,
+            &file.key,
+            &state.media.temp_dir,
+            &file.filename,
+            size,
+        )
+        .await
+        .map_err(retry)?
+        .ok_or_else(|| {
+            JobError::Permanent(format!(
+                "the stored original of `{}` is bigger than the {size} bytes it was",
+                file.id
+            ))
+        })?
+        .file;
         open(fetched.path(), cap, u.with_metadata).await?
     };
     let focal = u.focal_point.then_some((file.focal_x, file.focal_y));
@@ -219,23 +231,6 @@ fn file_of(job: &Job) -> Result<Uuid, JobError> {
         .and_then(Value::as_str)
         .and_then(|s| s.parse().ok())
         .ok_or_else(|| JobError::Permanent("the payload names no file".into()))
-}
-
-/// The object at `key`, copied into a new file in `dir` that's deleted when it drops.
-pub(crate) async fn fetch(
-    storage: &Storage,
-    key: &str,
-    dir: &Path,
-) -> Result<NamedTempFile, StorageError> {
-    let got = storage.get_range(key, None).await?;
-    let file = NamedTempFile::new_in(dir)?;
-    let mut out = tokio::fs::File::from_std(file.reopen()?);
-    let mut chunks = got.into_stream();
-    while let Some(chunk) = chunks.next().await {
-        out.write_all(&chunk?).await?;
-    }
-    out.flush().await?;
-    Ok(file)
 }
 
 /// An original decoded for its sizes, holding a `DECODES` permit for as long as any of

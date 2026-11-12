@@ -96,8 +96,11 @@ async fn serve_file(
             ))
         })?;
     // Served from the bucket through a short-lived link, once the caller is known to be
-    // allowed it; never stored, as the link is theirs.
-    if let Some(expires) = storage.signs(&found.mime) {
+    // allowed it; never stored, as the link is theirs. What the route sandboxes (call 7)
+    // isn't: the bucket's answer would carry no sandbox, so it streams from here instead.
+    if !sandboxed(&found.mime)
+        && let Some(expires) = storage.signs(&found.mime)
+    {
         let url = storage
             .presign_get(&found.key, expires)
             .await

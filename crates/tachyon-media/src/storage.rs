@@ -444,6 +444,18 @@ pub fn object_key(
     Ok(key)
 }
 
+/// Where a client puts a file before the server checks it:
+/// `{staticDir}/{collection}/staging/{random}`. A file's own keys are `{collection}/{file
+/// id}/…`, so no file is ever stored, served or linked to under it.
+pub fn staging_key(static_dir: Option<&str>, collection: &str) -> Result<String, StorageError> {
+    let key = match static_dir {
+        Some(dir) => format!("{dir}/{collection}/staging/{}", Uuid::new_v4()),
+        None => format!("{collection}/staging/{}", Uuid::new_v4()),
+    };
+    checked(&key)?;
+    Ok(key)
+}
+
 /// Every open storage by name. There's always a `default`.
 #[derive(Debug)]
 pub struct Storages(pub HashMap<String, Arc<Storage>>);

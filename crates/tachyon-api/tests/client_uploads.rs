@@ -95,15 +95,17 @@ fn dirs() -> Dirs {
 }
 
 /// A bucket over the local directory `root`, taking client uploads and signing downloads
-/// of `signed` types (all with an empty list).
-fn bucket(name: &str, root: &Path, signed: Vec<String>) -> Arc<Storage> {
+/// of `signed` types (all with an empty list; none with `None`).
+fn bucket(name: &str, root: &Path, signed: Option<Vec<String>>) -> Arc<Storage> {
     let mut c = StorageConfig::local(root);
     c.client_uploads = true;
     c.public_url = Some(Url::parse("https://media.tachyoncms.com").unwrap());
-    c.signed_downloads = SignedDownloads::On {
-        mime_types: signed,
-        expires_in: Duration::from_secs(600),
-    };
+    if let Some(signed) = signed {
+        c.signed_downloads = SignedDownloads::On {
+            mime_types: signed,
+            expires_in: Duration::from_secs(600),
+        };
+    }
     let store = LocalFileSystem::new_with_prefix(root).unwrap();
     Arc::new(Storage::with_store(name, Arc::new(store), None, c).with_signer(Arc::new(FakeSigner)))
 }
@@ -112,11 +114,16 @@ fn options(d: &Dirs, workers: usize) -> Options {
     let local = Storage::open("default", &StorageConfig::local(&d.root)).unwrap();
     let storages = Storages(HashMap::from([
         ("default".into(), Arc::new(local)),
-        ("bucket".into(), bucket("bucket", &d.bucket, Vec::new())),
+        (
+            "bucket".into(),
+            bucket("bucket", &d.bucket, Some(Vec::new())),
+        ),
         (
             "pdfs".into(),
-            bucket("pdfs", &d.pdfs, vec!["application/pdf".into()]),
+            bucket("pdfs", &d.pdfs, Some(vec!["application/pdf".into()])),
         ),
+        // Its files stream through the route, so what it serves can be read back.
+        ("plain".into(), bucket("plain", &d.bucket, None)),
     ]));
     Options {
         jobs: JobsConfig {
@@ -253,6 +260,7 @@ fn refusal(res: &Res) -> Value {
 struct Raw {
     status: u16,
     headers: axum::http::HeaderMap,
+    body: Vec<u8>,
 }
 
 impl Raw {
@@ -272,8 +280,12 @@ async fn fetch(app: &Router, method: &str, uri: &str) -> Raw {
         .unwrap();
     let status = res.status().as_u16();
     let headers = res.headers().clone();
-    let _ = res.into_body().collect().await.unwrap();
-    Raw { status, headers }
+    let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    Raw {
+        status,
+        headers,
+        body,
+    }
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -306,7 +318,10 @@ async fn instructions_shape_and_rights(pool: PgPool) {
             "file": {"filename": "a b.png", "mimeType": "image/png", "filesize": 10}
         })
     );
-    assert_eq!(signed_key(&url), *key);
+    // The client puts to a staging key of its own, never to the file's.
+    let staging = signed_key(&url);
+    assert!(staging.starts_with("media/staging/"), "{staging}");
+    assert_ne!(staging, *key);
     assert_eq!(query(&url, "method").as_deref(), Some("PUT"));
     assert_eq!(query(&url, "expires").as_deref(), Some("900"));
     assert_eq!(query(&url, "content-type").as_deref(), Some("image/png"));
@@ -389,7 +404,13 @@ async fn client_upload_creates_a_document(pool: PgPool) {
     let rows = file_states(&pool, "media").await;
     assert_eq!(rows.len(), 1);
     assert_eq!(rows[0].1, "live");
+    // The server wrote the file itself, from what it checked; the staging object is gone.
     assert!(d.bucket.join(&rows[0].2).exists());
+    assert!(
+        !d.bucket
+            .join(signed_key(res.json["request"]["url"].as_str().unwrap()))
+            .exists()
+    );
     // No cleanup is left waiting for it.
     let queued: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM jobs WHERE kind = $1 AND state = 'queued' AND payload->>'file' = $2",
@@ -418,21 +439,23 @@ async fn client_upload_is_verified_after_put(pool: PgPool) {
     )
     .await;
     // Given up before the answer: its row is gone and its cleanup is due, so a crash now
-    // couldn't leave the object behind.
+    // couldn't leave anything behind, and what the client put is deleted already.
     let gone = async |instructions: &Value| {
-        let key = signed_key(instructions["request"]["url"].as_str().unwrap());
+        let name = instructions["file"]["filename"].as_str().unwrap();
         let (state, due): (String, bool) = sqlx::query_as(
             "SELECT f.state, EXISTS (SELECT 1 FROM jobs j WHERE j.kind = $2 AND j.state = 'queued'
                                      AND j.payload->>'file' = f.id::text AND j.run_at <= now())
-             FROM files f WHERE f.key = $1",
+             FROM files f WHERE f.filename = $1",
         )
-        .bind(&key)
+        .bind(name)
         .bind(CLEANUP)
         .fetch_one(&pool)
         .await
         .unwrap();
-        assert_eq!((state.as_str(), due), ("gone", true), "{key}");
-        key
+        assert_eq!((state.as_str(), due), ("gone", true), "{name}");
+        let staging = signed_key(instructions["request"]["url"].as_str().unwrap());
+        assert!(!d.bucket.join(&staging).exists(), "{name}: staging deleted");
+        staging
     };
     let mut keys = Vec::new();
 
@@ -597,7 +620,8 @@ async fn outstanding_instructions_are_capped(pool: PgPool) {
         .unwrap()
         .parse()
         .unwrap();
-    assert!((3500..=3600).contains(&wait), "{wait}");
+    // The oldest one's PUT URL runs out within 15 minutes.
+    assert!((850..=900).contains(&wait), "{wait}");
     // Another collection counts on its own.
     assert_eq!(
         instructions(&app, "other", "x.png", "image/png", 10)
@@ -605,10 +629,10 @@ async fn outstanding_instructions_are_capped(pool: PgPool) {
             .status,
         200
     );
-    // One past its grace no longer counts, nor one given up.
+    // One whose PUT URL has run out no longer counts.
     sqlx::query(
-        "UPDATE files SET created_at = now() - interval '2 hours'
-         WHERE filename = '0.png'",
+        "UPDATE jobs SET created_at = now() - interval '16 minutes'
+         WHERE payload->'keys' ? (SELECT staging_key FROM files WHERE filename = '0.png')",
     )
     .execute(&pool)
     .await
@@ -625,6 +649,7 @@ async fn outstanding_instructions_are_capped(pool: PgPool) {
             .status,
         429
     );
+    // One given up still counts while its URL works: the client could still put to it.
     sqlx::query("UPDATE files SET state = 'gone' WHERE filename = '1.png'")
         .execute(&pool)
         .await
@@ -633,7 +658,7 @@ async fn outstanding_instructions_are_capped(pool: PgPool) {
         instructions(&app, "media", "y.png", "image/png", 10)
             .await
             .status,
-        200
+        429
     );
 }
 
@@ -644,7 +669,8 @@ async fn an_unclaimed_upload_is_cleaned_up(pool: PgPool) {
     collection(&app, "media", json!({})).await;
     let res = instructions(&app, "media", "a.png", "image/png", 10).await;
     put_to(&d.bucket, &res.json, &png(1, 1));
-    let (id, _, key) = file_states(&pool, "media").await.remove(0);
+    let (id, _, _) = file_states(&pool, "media").await.remove(0);
+    let key = signed_key(res.json["request"]["url"].as_str().unwrap());
     assert!(d.bucket.join(&key).exists());
     // The grace runs out (no clock to move: the reserve and its cleanup are moved back).
     sqlx::query("UPDATE files SET created_at = now() - interval '2 hours' WHERE id = $1")
@@ -652,20 +678,21 @@ async fn an_unclaimed_upload_is_cleaned_up(pool: PgPool) {
         .execute(&pool)
         .await
         .unwrap();
-    sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = $1 AND payload->>'file' = $2")
+    // Both its cleanups: the reserve's, and its staging key's, due once the URL is spent.
+    let moved = sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = $1 AND state = 'queued'")
         .bind(CLEANUP)
-        .bind(id.to_string())
         .execute(&pool)
         .await
         .unwrap();
+    assert_eq!(moved.rows_affected(), 2);
     let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
         .await
         .unwrap();
-    until("the reserve is deleted", async || {
-        files::get(&pool, id).await.is_err()
-    })
+    until(
+        "the reserve and the staging object are deleted",
+        async || files::get(&pool, id).await.is_err() && !d.bucket.join(&key).exists(),
+    )
     .await;
-    assert!(!d.bucket.join(&key).exists());
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -692,16 +719,12 @@ async fn client_uploads_replace_and_save_drafts(pool: PgPool) {
     assert_eq!(rows[0].1, "live");
     assert!(rows[0].2.ends_with("/a.webp"), "{}", rows[0].2);
     assert!(d.bucket.join(&rows[0].2).exists());
-    // The object the client put, under its old name, goes.
-    let first = rows[0].2.replace("a.webp", "a.png");
-    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
-        .await
-        .unwrap();
-    let root = d.bucket.clone();
-    until("the client's object is deleted", async || {
-        !root.join(&first).exists()
-    })
-    .await;
+    // The object the client put, at its staging key, goes.
+    assert!(
+        !d.bucket
+            .join(signed_key(res.json["request"]["url"].as_str().unwrap()))
+            .exists()
+    );
 
     // A replacement, to the draft, the same way.
     let image = png(2, 2);
@@ -874,9 +897,6 @@ async fn a_replacement_keeps_its_name(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["file"]["filename"], "a.png");
     let file = put_to(&d.bucket, &res.json, &image);
-    // While that one waits, it holds the name, even for its own document.
-    let res = replacing(&app, "media", a, "a.png", size).await;
-    assert_eq!(res.json["file"]["filename"], "a-2.png");
 
     // Only a PATCH of that document takes it.
     let made_up = call(
@@ -981,4 +1001,478 @@ async fn instructions_name_files_in_their_scope(pool: PgPool) {
         .await;
         assert_eq!(doc["filename"], name, "{alt}");
     }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn new_replacement_instructions_retire_the_last(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let image = png(1, 1);
+    let size = image.len() as u64;
+    let res = instructions(&app, "media", "a.png", "image/png", size).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let doc = ok(&app, "POST", "/api/media", json!({"file": file})).await;
+    let id = doc["id"].as_str().unwrap();
+    let first = replacing(&app, "media", id, "a.png", size).await;
+    put_to(&d.bucket, &first.json, &png(3, 3));
+    let second = replacing(&app, "media", id, "a.png", size).await;
+    assert_eq!(second.json["file"]["filename"], "a.png");
+    // The first is given up, its staging key left for the sweep at its URL's expiry: only
+    // the second can be claimed, and what was put for the first isn't it.
+    let res = call(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        json!({"file": first.json["file"]}),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(res.json["errors"][0]["path"], "file");
+    let swept: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = $1 AND state = 'queued'
+         AND payload->'keys' ? $2 AND run_at > now() + interval '15 minutes'",
+    )
+    .bind(CLEANUP)
+    .bind(signed_key(first.json["request"]["url"].as_str().unwrap()))
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(swept, 1);
+    let second = replacing(&app, "media", id, "a.png", size).await;
+    let file = put_to(&d.bucket, &second.json, &png(5, 5));
+    let doc = ok(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        json!({"file": file}),
+    )
+    .await;
+    assert_eq!(
+        (doc["filename"].clone(), doc["width"].clone()),
+        (json!("a.png"), json!(5))
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn replacement_instructions_dont_rename_edits(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let res = upload(&app, "POST", "/api/media", Some(&png(4, 4)), "a.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    let asked = replacing(&app, "media", &id, "a.png", 70).await;
+    assert_eq!(asked.json["file"]["filename"], "a.png");
+    // Never put: the document's own edits keep its name meanwhile.
+    let doc = ok(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        json!({"focalX": 10}),
+    )
+    .await;
+    assert_eq!(doc["filename"], "a.png");
+    let res = upload(
+        &app,
+        "PATCH",
+        &format!("/api/media/{id}"),
+        Some(&png(2, 2)),
+        "a.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(res.json["filename"], "a.png");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_client_cant_overwrite_the_checked_file(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "media",
+        json!({"access": {"read": true},
+               "upload": {"storage": "plain", "mimeTypes": ["image/*"], "filesizeLimit": 1000}}),
+    )
+    .await;
+    let image = png(2, 2);
+    let res = instructions(&app, "media", "a.png", "image/png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let doc = ok(&app, "POST", "/api/media", json!({"file": file})).await;
+    let served = fetch(&app, "GET", "/api/media/file/a.png").await;
+    assert_eq!(served.status, 200);
+    let checked = served.body.clone();
+    // The PUT URL still works for its 15 minutes; what it reaches isn't the file.
+    let html = format!(
+        "<!doctype html><script>alert(1)</script>{}",
+        "x".repeat(5000)
+    );
+    put_to(&d.bucket, &res.json, html.as_bytes());
+    let served = fetch(&app, "GET", "/api/media/file/a.png").await;
+    assert_eq!(served.status, 200);
+    assert_eq!(served.body, checked);
+    assert_eq!(served.header("content-type"), "image/png");
+    assert_eq!(served.body.len() as u64, doc["filesize"].as_u64().unwrap());
+    let (_, _, key) = file_states(&pool, "media").await.remove(0);
+    assert_ne!(
+        key,
+        signed_key(res.json["request"]["url"].as_str().unwrap())
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_stored_file_carries_its_sniffed_type(pool: PgPool) {
+    use object_store::{Attribute, ObjectStore, ObjectStoreExt, PutOptions, memory::InMemory};
+    let d = dirs();
+    // A store that keeps content types, as a bucket does.
+    let memory = Arc::new(InMemory::new());
+    let mut c = StorageConfig::local(&d.bucket);
+    c.adapter = tachyon_media::storage::Adapter::S3 {
+        bucket: "b".into(),
+        endpoint: None,
+        region: None,
+    };
+    c.client_uploads = true;
+    let typed =
+        Storage::with_store("typed", memory.clone(), None, c).with_signer(Arc::new(FakeSigner));
+    let mut o = options(&d, 0);
+    let mut all = HashMap::new();
+    for (k, v) in &o.uploads.storages.0 {
+        all.insert(k.clone(), v.clone());
+    }
+    all.insert("typed".into(), Arc::new(typed));
+    o.uploads.storages = Arc::new(Storages(all));
+    let app = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    assert_eq!(
+        send(&app, "POST", "/api/setup", Some(&body.to_string()))
+            .await
+            .status,
+        201
+    );
+    let app = signed_in(app, ADMIN).await;
+    collection(
+        &app,
+        "papers",
+        json!({"upload": {"storage": "typed", "mimeTypes": ["application/pdf", "text/plain"]}}),
+    )
+    .await;
+    // Claimed as text, put as text, but the bytes are a PDF.
+    let pdf = b"%PDF-1.4\n%\xe2\xe3\xcf\xd3\n1 0 obj\n<<>>\nendobj\ntrailer\n<<>>\n%%EOF\n";
+    let res = instructions(&app, "papers", "a.txt", "text/plain", pdf.len() as u64).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let staging = Key::from(signed_key(res.json["request"]["url"].as_str().unwrap()));
+    let mut put = PutOptions::default();
+    put.attributes
+        .insert(Attribute::ContentType, "text/plain".into());
+    memory
+        .put_opts(&staging, pdf.to_vec().into(), put)
+        .await
+        .unwrap();
+    let doc = ok(
+        &app,
+        "POST",
+        "/api/papers",
+        json!({"file": res.json["file"]}),
+    )
+    .await;
+    assert_eq!(doc["mimeType"], "application/pdf");
+    let (_, _, key) = file_states(&pool, "papers").await.remove(0);
+    let got = memory.get(&Key::from(key)).await.unwrap();
+    assert_eq!(
+        got.attributes
+            .get(&Attribute::ContentType)
+            .map(|v| v.as_ref()),
+        Some("application/pdf")
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn giving_up_doesnt_escape_the_cap(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    for i in 0..100 {
+        let res = instructions(&app, "media", "a.png", "image/png", 10).await;
+        assert_eq!(res.status, 200, "{i}: {}", res.json);
+        // Never put: the claim gives it up at once.
+        let res = call(
+            &app,
+            "POST",
+            "/api/media",
+            json!({"file": res.json["file"]}),
+        )
+        .await;
+        assert_eq!(res.status, 422, "{i}: {}", res.json);
+    }
+    assert_problem(
+        &instructions(&app, "media", "a.png", "image/png", 10).await,
+        429,
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_cap_holds_under_concurrency(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let asks = (0..120).map(|i| {
+        let app = app.clone();
+        async move {
+            instructions(&app, "media", &format!("{i}.png"), "image/png", 10)
+                .await
+                .status
+        }
+    });
+    let statuses = futures_util::future::join_all(asks).await;
+    let issued = statuses.iter().filter(|s| s.as_u16() == 200).count();
+    let refused = statuses.iter().filter(|s| s.as_u16() == 429).count();
+    assert_eq!((issued, refused), (100, 20), "{statuses:?}");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_put_after_giving_up_is_swept(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let res = instructions(&app, "media", "a.png", "image/png", 10).await;
+    let given = call(
+        &app,
+        "POST",
+        "/api/media",
+        json!({"file": res.json["file"]}),
+    )
+    .await;
+    assert_problem(&given, 422);
+    // The URL still works: the client puts anyway, after the give-up's own cleanup.
+    let staging = signed_key(res.json["request"]["url"].as_str().unwrap());
+    put_to(&d.bucket, &res.json, &png(1, 1));
+    // The sweep due at the URL's expiry takes it.
+    let moved =
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = $1 AND payload->'keys' ? $2")
+            .bind(CLEANUP)
+            .bind(&staging)
+            .execute(&pool)
+            .await
+            .unwrap();
+    assert_eq!(moved.rows_affected(), 1);
+    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    let root = d.bucket.clone();
+    until("the late object is deleted", async || {
+        !root.join(&staging).exists()
+    })
+    .await;
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn claims_are_matched_in_their_scope(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "media",
+        json!({"upload": {"storage": "bucket", "filenameCompoundIndex": ["alt"]}}),
+    )
+    .await;
+    let ask = |alt: &str, size: usize| json!({"filename": "a.png", "mimeType": "image/png", "filesize": size, "data": {"alt": alt}});
+    // Two scopes, one name: each create takes its own scope's bytes.
+    let (x, y) = (png(3, 3), png(7, 7));
+    let for_x = call(
+        &app,
+        "POST",
+        "/api/media/upload-instructions",
+        ask("x", x.len()),
+    )
+    .await;
+    let for_y = call(
+        &app,
+        "POST",
+        "/api/media/upload-instructions",
+        ask("y", y.len()),
+    )
+    .await;
+    assert_eq!(for_x.json["file"]["filename"], "a.png");
+    assert_eq!(for_y.json["file"]["filename"], "a.png");
+    let fx = put_to(&d.bucket, &for_x.json, &x);
+    let fy = put_to(&d.bucket, &for_y.json, &y);
+    let doc = ok(&app, "POST", "/api/media", json!({"file": fy, "alt": "y"})).await;
+    assert_eq!(doc["width"], 7);
+    let doc = ok(&app, "POST", "/api/media", json!({"file": fx, "alt": "x"})).await;
+    assert_eq!(doc["width"], 3);
+
+    // A replacement waiting for one document doesn't stand in the way of a create in
+    // another scope under the same name.
+    let id = doc["id"].as_str().unwrap();
+    let body = json!({"filename": "b.png", "mimeType": "image/png", "filesize": 70, "id": id});
+    let replace = call(&app, "POST", "/api/media/upload-instructions", body).await;
+    assert_eq!(replace.json["file"]["filename"], "b.png");
+    let mut create = ask("z", x.len());
+    create["filename"] = "b.png".into();
+    let create = call(&app, "POST", "/api/media/upload-instructions", create).await;
+    assert_eq!(create.json["file"]["filename"], "b.png");
+    let file = put_to(&d.bucket, &create.json, &x);
+    let res = call(
+        &app,
+        "POST",
+        "/api/media",
+        json!({"file": file, "alt": "z"}),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn rights_come_before_the_body(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let anon = router(&pool, &d).await;
+    for (uri, body) in [
+        ("/api/media/upload-instructions", "{\"nope\": 1}"),
+        ("/api/media/upload-instructions", "not json"),
+        ("/api/upload-instructions", "{\"nope\": 1}"),
+        ("/api/upload-instructions", "not json"),
+    ] {
+        let res = send(&anon, "POST", uri, Some(body)).await;
+        assert_problem(&res, 401);
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn refusals_after_the_claim_give_it_up(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    // Authors may not write a file's width: a field rule on what the file sets.
+    collection(
+        &app,
+        "media",
+        json!({"fields": [{"name": "alt", "type": "text"},
+                          {"name": "width", "type": "number",
+                           "access": {"create": {"role": ["admin"]}, "update": {"role": ["admin"]}}}]}),
+    )
+    .await;
+    let amy = as_role(&pool, &d, "amy@example.com", "author").await;
+    let image = png(2, 2);
+    let state = async |res: &Res| -> String {
+        sqlx::query_scalar("SELECT state FROM files WHERE staging_key = $1")
+            .bind(signed_key(res.json["request"]["url"].as_str().unwrap()))
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+    };
+    let res = instructions(&amy, "media", "a.png", "image/png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let refused = call(&amy, "POST", "/api/media", json!({"file": file})).await;
+    assert_problem(&refused, 403);
+    assert_eq!(state(&res).await, "gone");
+
+    // A 409: the collection's fields change while the update is between its read and write.
+    let res = instructions(&app, "media", "b.png", "image/png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let doc = ok(&app, "POST", "/api/media", json!({"file": file})).await;
+    let id: Uuid = doc["id"].as_str().unwrap().parse().unwrap();
+    let res = replacing(&app, "media", &id.to_string(), "b.png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &png(3, 3));
+    let pause = tachyon_api::pause_next_update(id);
+    let patch = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            call(
+                &app,
+                "PATCH",
+                &format!("/api/media/{id}"),
+                json!({"file": file}),
+            )
+            .await
+        })
+    };
+    pause.reached().await;
+    let schema = json!({"slug": "media", "upload": {"storage": "bucket"},
+                        "fields": [{"name": "alt", "type": "text"}, {"name": "extra", "type": "text"}]});
+    ok(
+        &app,
+        "PUT",
+        "/api/admin/collections/media",
+        json!({"schema": schema}),
+    )
+    .await;
+    pause.resume();
+    let patched = patch.await.unwrap();
+    assert_problem(&patched, 409);
+    assert_eq!(state(&res).await, "gone");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn signed_storages_keep_the_route_s_rules(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "kept",
+        json!({"access": {"read": true}, "versions": {"maxVersions": 10}}),
+    )
+    .await;
+    collection(
+        &app,
+        "hidden",
+        json!({"access": {"read": true},
+               "fields": [{"name": "filename", "type": "text",
+                           "access": {"read": {"role": ["admin", "editor"]}}}]}),
+    )
+    .await;
+    collection(&app, "art", json!({"access": {"read": true}})).await;
+    let viewer = as_role(&pool, &d, "viewer@example.com", "viewer").await;
+    let anon = router(&pool, &d).await;
+    let not_found = |res: &Raw, what: &str| {
+        assert_eq!(res.status, 404, "{what}");
+        assert_eq!(res.header("location"), "", "{what}");
+    };
+
+    // A file only a version holds is served to nobody, signed or not.
+    let res = upload(&app, "POST", "/api/kept", Some(&png(1, 1)), "old.png", None).await;
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    let res = upload(
+        &app,
+        "PATCH",
+        &format!("/api/kept/{id}"),
+        Some(&png(2, 2)),
+        "new.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        fetch(&app, "GET", "/api/kept/file/new.png").await.status,
+        302
+    );
+    not_found(
+        &fetch(&app, "GET", "/api/kept/file/old.png").await,
+        "version only",
+    );
+
+    // A hidden `filename` hides the file.
+    upload(&app, "POST", "/api/hidden", Some(&png(1, 1)), "h.png", None).await;
+    not_found(
+        &fetch(&viewer, "GET", "/api/hidden/file/h.png").await,
+        "hidden field",
+    );
+    assert_eq!(
+        fetch(&app, "GET", "/api/hidden/file/h.png").await.status,
+        302
+    );
+
+    // What the route sandboxes streams through it, sandboxed; the rest is signed.
+    let svg = br#"<svg xmlns="http://www.w3.org/2000/svg" width="1" height="1"><rect width="1" height="1"/></svg>"#;
+    let res = upload(&app, "POST", "/api/art", Some(svg), "a.svg", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let res = fetch(&anon, "GET", "/api/art/file/a.svg").await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("content-type"), "image/svg+xml");
+    assert_eq!(res.header("content-security-policy"), "sandbox");
+    upload(&app, "POST", "/api/art", Some(&png(1, 1)), "a.png", None).await;
+    assert_eq!(fetch(&anon, "GET", "/api/art/file/a.png").await.status, 302);
 }

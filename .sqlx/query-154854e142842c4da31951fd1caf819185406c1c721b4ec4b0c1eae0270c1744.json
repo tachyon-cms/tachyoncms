@@ -1,0 +1,33 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE files SET state = 'gone', released_at = now()\n             WHERE tenant_id = $1 AND collection_id = $2 AND document_id = $3 AND filename = $4\n               AND scope = $5 AND state = 'pending' AND issued_to IS NOT NULL AND id <> $6\n             RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "154854e142842c4da31951fd1caf819185406c1c721b4ec4b0c1eae0270c1744"
+}

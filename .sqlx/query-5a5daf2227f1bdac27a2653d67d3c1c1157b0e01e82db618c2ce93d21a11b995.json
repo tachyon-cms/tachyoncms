@@ -1,0 +1,35 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT count(*) AS \"n!\",\n                  ceil(extract(epoch FROM min(created_at) + make_interval(secs => $5) - now()))::bigint AS wait\n           FROM jobs\n           WHERE tenant_id = $1 AND kind = $6 AND collection_id = $2 AND payload ? 'staging'\n             AND created_by = $3 AND key_id IS NOT DISTINCT FROM $4\n             AND created_at + make_interval(secs => $5) > now()",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "n!",
+        "type_info": "Int8",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 1,
+        "name": "wait",
+        "type_info": "Int8",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Float8",
+        "Text"
+      ]
+    },
+    "nullable": [
+      null,
+      null
+    ]
+  },
+  "hash": "5a5daf2227f1bdac27a2653d67d3c1c1157b0e01e82db618c2ce93d21a11b995"
+}
