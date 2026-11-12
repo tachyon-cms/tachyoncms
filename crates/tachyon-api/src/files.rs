@@ -123,9 +123,25 @@ async fn serve_file(
     };
 
     let mut out = HeaderMap::new();
-    let etag = format!("\"{}-{}\"", found.file.id, encoded(&name, etag_char));
+    // The object as stored now: a size made again under the same name is new bytes, so a
+    // cache asking with the old ETag or date gets them.
+    let meta = storage.head(&found.key).await.map_err(failed)?;
+    let size = meta.size;
+    let etag = format!(
+        "\"{}-{}-{}\"",
+        found.file.id,
+        encoded(&name, etag_char),
+        version(meta.e_tag.as_deref(), meta.last_modified.into(), size)
+    );
+    // An original's key is written once (a new file is a new row); a size's object can be
+    // made again under its name, so its own write time counts.
+    let made = SystemTime::from(found.file.created_at);
+    let stored = match found.key == found.file.key {
+        true => made,
+        false => made.max(meta.last_modified.into()),
+    };
     // Whole seconds, as the header has them, so `If-Modified-Since` compares like for like.
-    let modified = httpdate::fmt_http_date(SystemTime::from(found.file.created_at));
+    let modified = httpdate::fmt_http_date(stored);
     let at_second = httpdate::parse_http_date(&modified).ok();
     let disposition = format!(
         "inline; filename=\"{}\"; filename*=UTF-8''{}",
@@ -172,7 +188,6 @@ async fn serve_file(
     if fresh(&headers, &etag, at_second) {
         return Ok(answer(StatusCode::NOT_MODIFIED, out, Body::empty()));
     }
-    let size = storage.head(&found.key).await.map_err(failed)?.size;
     let wanted = match method {
         // A `HEAD` answers as the whole file's `GET` would.
         // An `If-Range` naming another copy wants the whole of this one (RFC 9110 13.1.5).
@@ -316,6 +331,22 @@ fn beside(key: &str, name: &str) -> String {
         Some((dir, _)) => format!("{dir}/{name}"),
         None => name.to_owned(),
     }
+}
+
+/// A short token for the stored object's version: its store's own ETag where it has one,
+/// else when it was written and how big it is.
+fn version(e_tag: Option<&str>, written: SystemTime, size: u64) -> String {
+    use sha2::Digest;
+    let of = match e_tag {
+        Some(tag) => tag.to_owned(),
+        None => {
+            let at = written
+                .duration_since(SystemTime::UNIX_EPOCH)
+                .unwrap_or_default();
+            format!("{}-{size}", at.as_nanos())
+        }
+    };
+    hex::encode(&sha2::Sha256::digest(of.as_bytes())[..8])
 }
 
 /// Whether the client's copy is still good: `If-None-Match` names this `etag` (or `*`),

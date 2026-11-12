@@ -1454,6 +1454,26 @@ async fn other_upload_options_dont_regenerate(pool: PgPool) {
     schema.upload = Some(upload);
     apply(&pool, &schema).await;
     assert_eq!(walks(&pool, &c).await, []);
+    // Options that shape only the original at upload, or how strictly it's decoded then:
+    // sizes are made from the stored original, so nothing they make changes.
+    let c = collections::get_by_slug(&pool, "images").await.unwrap();
+    for option in [
+        json!({"formatOptions": {"format": "webp"}}),
+        json!({"resizeOptions": {"width": 100}}),
+        json!({"trimOptions": {"threshold": 10}}),
+        json!({"constructorOptions": {"failOn": "none"}}),
+    ] {
+        let mut upload = serde_json::to_value(c.schema.upload.clone().unwrap()).unwrap();
+        upload
+            .as_object_mut()
+            .unwrap()
+            .extend(option.as_object().unwrap().clone());
+        let mut schema = c.schema.0.clone();
+        schema.upload = Some(serde_json::from_value(upload).unwrap());
+        apply(&pool, &schema).await;
+        assert_eq!(walks(&pool, &c).await, [], "{option}");
+        apply(&pool, &c.schema.0).await;
+    }
     // Without sizes before or after, an option sizes are made with remakes nothing.
     let mut schema = collections::get_by_slug(&pool, "images")
         .await
@@ -1645,4 +1665,130 @@ async fn removing_upload_from_a_big_collection_runs_as_a_job(pool: PgPool) {
         .await,
         0
     );
+}
+
+/// `url` (a full URL) fetched, `If-None-Match` sent when there's a `tag`: its status, its
+/// ETag and its bytes.
+async fn fetch_tagged(app: &Router, url: &Value, tag: Option<&str>) -> (u16, String, Vec<u8>) {
+    let url = url::Url::parse(url.as_str().unwrap_or_else(|| panic!("no url: {url}"))).unwrap();
+    let mut req = axum::http::Request::get(url.path());
+    if let Some(tag) = tag {
+        req = req.header("if-none-match", tag);
+    }
+    let res = app
+        .clone()
+        .oneshot(req.body(axum::body::Body::empty()).unwrap())
+        .await
+        .unwrap();
+    let status = res.status().as_u16();
+    let etag = res
+        .headers()
+        .get("etag")
+        .map(|v| v.to_str().unwrap().to_owned())
+        .unwrap_or_default();
+    let body = res.into_body().collect().await.unwrap().to_bytes().to_vec();
+    (status, etag, body)
+}
+
+/// The `Last-Modified` `url` (a full URL) is served with.
+async fn last_modified(app: &Router, url: &Value) -> String {
+    let url = url::Url::parse(url.as_str().unwrap()).unwrap();
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(url.path())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    res.headers()["last-modified"].to_str().unwrap().to_owned()
+}
+
+/// The red, green and blue of the centre of PNG `bytes`.
+fn centre(bytes: &[u8]) -> [u8; 3] {
+    let img = image::load_from_memory(bytes).unwrap().to_rgb8();
+    img.get_pixel(img.width() / 2, img.height() / 2).0
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_remade_under_its_name_gets_a_new_etag(pool: PgPool) {
+    let d = dirs();
+    let app = api(&pool, &d).await;
+    let square = |position: &str| {
+        json!({"imageSizes": [{"name": "square", "width": 200, "height": 200,
+                               "position": position}]})
+    };
+    let schema = media(square("left"), json!({}));
+    ok(&app, "POST", "/api/admin/collections", Some(schema)).await;
+    let halves = image::RgbImage::from_fn(1000, 500, |x, _| {
+        if x < 500 {
+            image::Rgb([255, 0, 0])
+        } else {
+            image::Rgb([0, 0, 255])
+        }
+    });
+    let image = fixtures::encoded(
+        &image::DynamicImage::ImageRgb8(halves),
+        image::ImageFormat::Png,
+    );
+    let res = upload(&app, "POST", "/api/media", Some(&image), "a.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let id = res.json["id"].as_str().unwrap().to_owned();
+    let w = worker(&pool, &d).await;
+    until("the sizes are made", async || !busy(&pool).await).await;
+    w.close().await;
+    let before = ok(&app, "GET", &format!("/api/media/{id}"), None).await;
+    let url = before["sizes"]["square"]["url"].clone();
+    let (status, old_tag, old_bytes) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(centre(&old_bytes)[0], 255, "cut from the left: red");
+    let old_date = last_modified(&app, &url).await;
+    // `Last-Modified` has whole seconds: the remade size's must be a later one.
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+
+    let res = change(&app, "media", media(square("right"), json!({})), false).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let w = worker(&pool, &d).await;
+    until("the size is made again", async || {
+        !busy(&pool).await
+            && count(
+                &pool,
+                "SELECT count(*) FROM jobs WHERE kind = 'regenerate_sizes' AND state = 'done'",
+            )
+            .await
+                == 1
+    })
+    .await;
+    w.close().await;
+    let after = ok(&app, "GET", &format!("/api/media/{id}"), None).await;
+    assert_eq!(
+        after["sizes"]["square"]["url"], url,
+        "the same name: {after}"
+    );
+
+    let (status, new_tag, new_bytes) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    assert_eq!(centre(&new_bytes)[2], 255, "cut from the right: blue");
+    assert_ne!(new_tag, old_tag, "new bytes, a new ETag");
+    // A cache holding the old bytes asks with their ETag, and gets the new ones.
+    let (status, tag, bytes) = fetch_tagged(&app, &url, Some(&old_tag)).await;
+    assert_eq!((status, tag.as_str()), (200, new_tag.as_str()));
+    assert_eq!(bytes, new_bytes);
+    // So does one that only kept the date.
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(url::Url::parse(url.as_str().unwrap()).unwrap().path())
+                .header("if-modified-since", &old_date)
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 200);
+    assert_ne!(last_modified(&app, &url).await, old_date);
+    // One holding the new bytes is told they're still good.
+    let (status, _, bytes) = fetch_tagged(&app, &url, Some(&new_tag)).await;
+    assert_eq!((status, bytes.len()), (304, 0));
 }

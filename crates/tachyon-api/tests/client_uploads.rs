@@ -2183,3 +2183,75 @@ async fn undeletable_strays_dont_starve_the_sweep(pool: PgPool) {
     );
     drop(app);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn removing_upload_stops_client_uploads(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    // A collection that never held files, for the refusals to be compared with.
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        json!({"slug": "notes", "fields": [{"name": "alt", "type": "text"}]}),
+    )
+    .await;
+    let image = png(3, 2);
+    let res = instructions(&app, "media", "a.png", "image/png", image.len() as u64).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let a = put_to(&d.bucket, &res.json, &image);
+    ok(&app, "POST", "/api/media", json!({"file": a})).await;
+    // Issued and put, never claimed.
+    let res = instructions(&app, "media", "b.png", "image/png", image.len() as u64).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let b = put_to(&d.bucket, &res.json, &image);
+    // Served (the bucket signs downloads, so through a redirect).
+    assert_eq!(
+        fetch(&app, "GET", "/api/media/file/a.png").await.status,
+        302
+    );
+
+    let off = json!({"confirm": true,
+        "schema": {"slug": "media", "fields": [{"name": "alt", "type": "text"}]}});
+    let res = call(&app, "PUT", "/api/admin/collections/media", off).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert!(
+        file_states(&pool, "media")
+            .await
+            .iter()
+            .all(|(_, state, _)| state == "gone")
+    );
+
+    // Upload instructions: refused as on a collection that never held files.
+    let refused = instructions(&app, "media", "c.png", "image/png", 10).await;
+    let never = instructions(&app, "notes", "c.png", "image/png", 10).await;
+    assert_eq!(refused.status, never.status, "{}", refused.json);
+    assert!(refused.status.is_client_error(), "{}", refused.json);
+    let named = |r: &Res, slug: &str| {
+        refusal(r)
+            .to_string()
+            .replace(&format!("`{slug}`"), "`<slug>`")
+    };
+    assert_eq!(named(&refused, "media"), named(&never, "notes"));
+    // The former files: 404, as a name that was never there.
+    let gone = fetch(&app, "GET", "/api/media/file/a.png").await;
+    let missing = fetch(&app, "GET", "/api/media/file/never.png").await;
+    let problem = |r: &Raw| {
+        let mut v: Value = serde_json::from_slice(&r.body).unwrap();
+        v.as_object_mut().unwrap().remove("requestId");
+        v
+    };
+    assert_eq!((gone.status, problem(&gone)), (404, problem(&missing)));
+    // Claiming what was issued before: the standard 422 at `file`.
+    let claim = call(&app, "POST", "/api/media", json!({"file": b})).await;
+    assert_problem(&claim, 422);
+    assert_eq!(claim.json["errors"][0]["path"], "file", "{}", claim.json);
+    let elsewhere = call(&app, "POST", "/api/notes", json!({"file": b})).await;
+    assert_eq!(refusal(&claim), refusal(&elsewhere));
+    assert_eq!(
+        file_states(&pool, "media").await.len(),
+        2,
+        "nothing new was reserved"
+    );
+}

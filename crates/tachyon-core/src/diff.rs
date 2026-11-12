@@ -53,9 +53,10 @@ pub enum Change {
         max_versions: (u32, u32),
     },
     /// An upload collection's files change: what its sizes are made with (`sizes`: its
-    /// `imageSizes`, `formatOptions`, `resizeOptions`, `trimOptions`, `withMetadata` or
-    /// `constructorOptions`), whether it has a focal point, or it stops holding files
-    /// (`removed`). Any but the last makes every file's sizes again.
+    /// `imageSizes`, `withMetadata` or `constructorOptions.limitInputPixels`), whether it
+    /// has a focal point, or it stops holding files (`removed`). Any but the last makes
+    /// every file's sizes again. Options that only shape the original at upload don't:
+    /// sizes are made from the original as stored.
     UploadChanged {
         sizes: bool,
         focal_point: bool,
@@ -187,11 +188,8 @@ fn upload_change(old: Option<&Upload>, new: Option<&Upload>) -> Option<Change> {
         None => (!old.image_sizes.is_empty(), old.focal_point, true),
         Some(new) => (
             old.image_sizes != new.image_sizes
-                || old.format_options != new.format_options
-                || old.resize_options != new.resize_options
-                || old.trim_options != new.trim_options
                 || old.with_metadata != new.with_metadata
-                || old.constructor_options != new.constructor_options,
+                || pixel_limit(old) != pixel_limit(new),
             old.focal_point != new.focal_point,
             false,
         ),
@@ -201,6 +199,14 @@ fn upload_change(old: Option<&Upload>, new: Option<&Upload>) -> Option<Change> {
         focal_point,
         removed,
     })
+}
+
+/// `constructorOptions.limitInputPixels`, the one constructor option a size is made with
+/// (its decode cap); `failOn` only judges an upload.
+fn pixel_limit(u: &Upload) -> Option<u64> {
+    u.constructor_options
+        .as_ref()
+        .and_then(|c| c.limit_input_pixels)
 }
 
 fn compare(
@@ -1969,9 +1975,6 @@ mod tests {
         );
         // Every option sizes are made with remakes them.
         for option in [
-            json!({"formatOptions": {"format": "webp"}}),
-            json!({"resizeOptions": {"width": 100}}),
-            json!({"trimOptions": {"threshold": 10}}),
             json!({"withMetadata": true}),
             json!({"constructorOptions": {"limitInputPixels": 1000}}),
         ] {
@@ -1990,13 +1993,26 @@ mod tests {
                 "{option}"
             );
         }
-        // Other upload options change no stored data.
-        let c = changes(
-            &one,
-            &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
-            "mimeTypes": ["image/*"], "staticDir": "pictures"})),
-        );
-        assert_eq!(c, [Change::CollectionOptionsChanged]);
+        // Other upload options change no stored data. Those shaping the original at upload
+        // change no size either: sizes are made from the original as stored.
+        for option in [
+            json!({"mimeTypes": ["image/*"], "staticDir": "pictures"}),
+            json!({"formatOptions": {"format": "webp"}}),
+            json!({"resizeOptions": {"width": 100}}),
+            json!({"trimOptions": {"threshold": 10}}),
+            json!({"constructorOptions": {"failOn": "none"}}),
+        ] {
+            let mut upload = json!({"imageSizes": [{"name": "thumbnail", "width": 400}]});
+            upload
+                .as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            assert_eq!(
+                changes(&one, &media(upload)),
+                [Change::CollectionOptionsChanged],
+                "{option}"
+            );
+        }
         // Turning uploads off removes the built-in fields too.
         let off = media(Value::Bool(false));
         let d = diff(&one, &off, &Renames::new()).unwrap();

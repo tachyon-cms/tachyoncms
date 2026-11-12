@@ -255,7 +255,12 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert_eq!(res.header("content-type"), "image/png");
     assert_eq!(res.header("x-content-type-options"), "nosniff");
     assert_eq!(res.header("content-length"), bytes.len().to_string());
-    assert_eq!(res.header("etag"), format!("\"{file}-cat.png\""));
+    assert!(
+        res.header("etag")
+            .starts_with(&format!("\"{file}-cat.png-")),
+        "{}",
+        res.header("etag")
+    );
     // Revalidated each time: a deleted document's name can come back as other bytes.
     assert_eq!(res.header("cache-control"), "public, no-cache");
     assert_eq!(
@@ -383,7 +388,13 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert_eq!(small.status, 200, "{}", small.json());
     assert_eq!(small.body, png(10, 5));
     assert_eq!(small.header("content-type"), "image/png");
-    assert_eq!(small.header("etag"), format!("\"{file}-cat-10x5.png\""));
+    assert!(
+        small
+            .header("etag")
+            .starts_with(&format!("\"{file}-cat-10x5.png-")),
+        "{}",
+        small.header("etag")
+    );
     let webp = fetch(&anon, "/api/images/file/cat-10x5.webp").await;
     assert_eq!(webp.status, 200);
     assert_eq!(webp.header("content-type"), "image/webp");
@@ -413,7 +424,12 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     let res = fetch(&anon, "/api/images/file/cat-10x5.png").await;
     assert_eq!(res.status, 200);
     assert_eq!(res.body, twin_bytes);
-    assert_eq!(res.header("etag"), format!("\"{twin_file}-cat-10x5.png\""));
+    assert!(
+        res.header("etag")
+            .starts_with(&format!("\"{twin_file}-cat-10x5.png-")),
+        "{}",
+        res.header("etag")
+    );
 
     for missing in ["/api/images/file/nope.png", "/api/nowhere/file/cat.png"] {
         assert_eq!(fetch(&anon, missing).await.status, 404, "{missing}");
@@ -872,7 +888,11 @@ async fn urls_are_filled_on_every_read(pool: PgPool) {
         let file = held(&pool, &doc["id"], "published_file").await.unwrap();
         let res = fetch(&anon, &path_of(&doc["url"])).await;
         assert_eq!(res.status, 200);
-        assert_eq!(res.header("etag"), format!("\"{file}-x.png\""));
+        assert!(
+            res.header("etag").starts_with(&format!("\"{file}-x.png-")),
+            "{}",
+            res.header("etag")
+        );
     }
     assert_eq!(
         fetch(
@@ -1327,7 +1347,11 @@ async fn a_published_file_wins_over_an_older_draft_of_the_same_name(pool: PgPool
     // What's published comes first, whichever file is older.
     let res = fetch(&editor, "/api/images/file/a.png").await;
     assert_eq!(res.status, 200);
-    assert_eq!(res.header("etag"), format!("\"{b}-a.png\""));
+    assert!(
+        res.header("etag").starts_with(&format!("\"{b}-a.png-")),
+        "{}",
+        res.header("etag")
+    );
     assert_eq!(res.header("cache-control"), "public, no-cache");
     assert_eq!(
         res.body,
