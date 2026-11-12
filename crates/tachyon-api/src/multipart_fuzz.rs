@@ -196,6 +196,7 @@ async fn multipart_fuzz() {
         std::env::temp_dir().join(format!("tachyon-multipart-fuzz-{}", uuid::Uuid::now_v7()));
     std::fs::create_dir_all(&temp).unwrap();
     let mut r = Rng(0x7AC4_1E55_0B0D_1E5D);
+    let started = std::time::Instant::now();
     let (mut json, mut files, mut bad, mut big) = (0, 0, 0, 0);
     for case in 0..5_000 {
         let (kind, bytes, expected) = body(&mut r);
@@ -245,6 +246,9 @@ async fn multipart_fuzz() {
         }
         assert!(is_empty(&temp), "case {case} left a spool file");
     }
+    // Seconds, not minutes, in a debug build on CI (W1-R35).
+    let took = started.elapsed();
+    assert!(took.as_secs() < 10, "the fuzz took {took:?}");
     // Every outcome is reached often enough to mean something.
     for (what, n) in [("json", json), ("file", files), ("400", bad), ("413", big)] {
         assert!(n >= 50, "only {n} cases came out {what}");

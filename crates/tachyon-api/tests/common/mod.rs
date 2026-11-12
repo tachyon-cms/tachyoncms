@@ -1,5 +1,7 @@
 #![allow(dead_code)] // each test binary uses a different subset of these helpers
 
+pub mod fixtures;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};

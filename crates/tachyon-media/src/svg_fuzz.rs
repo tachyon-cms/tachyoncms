@@ -331,6 +331,7 @@ fn check(input: &str, out: &[u8]) {
 #[test]
 fn svg_sanitiser_fuzz() {
     let mut rng = Rng(0x5eed_5a17_0bad_c0de);
+    let started = std::time::Instant::now();
     let (mut kept, mut refused) = (0, 0);
     for _ in 0..20_000 {
         let input = document(&mut rng);
@@ -350,4 +351,7 @@ fn svg_sanitiser_fuzz() {
     // Roots other than `svg`, duplicate attributes and cut-off documents are refused by
     // design; enough of the rest are kept that the checks above see real output.
     assert!(kept > 8_000, "only {kept} kept, {refused} refused");
+    // Seconds, not minutes, in a debug build on CI (W1-R35).
+    let took = started.elapsed();
+    assert!(took.as_secs() < 10, "the fuzz took {took:?}");
 }
