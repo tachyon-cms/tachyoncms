@@ -1,6 +1,6 @@
 //! An icon's directory and the chunks of its PNG entries, walked within fixed bounds; its
-//! entries decoded from exactly their declared bytes; and the icon rebuilt with those
-//! PNGs' metadata chunks gone and every entry kept.
+//! entries decoded from exactly their declared bytes; and the icon laid out afresh, each
+//! entry cut at its own end, with those PNGs' metadata chunks gone unless kept.
 //!
 //! image's own icon decoder isn't used: it reads a PNG entry from its offset to the end of
 //! the file with no limits, so what follows an entry's declared size reaches it.
@@ -63,8 +63,6 @@ impl Entry {
 /// An icon, walked.
 pub(super) struct Icon {
     pub entries: Vec<Entry>,
-    /// Whether any PNG entry carries a chunk outside `PNG_KEEP`.
-    pub metadata: bool,
 }
 
 /// Walks the icon `bytes`. Each distinct image is walked once however many entries point
@@ -87,7 +85,6 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Icon, ImageError> {
     }
     let mut budget = MAX_CHUNKS;
     let mut entries: Vec<Entry> = Vec::with_capacity(count);
-    let mut metadata = false;
     for e in 0..count {
         let dir: [u8; 16] = bytes
             .get(6 + 16 * e..22 + 16 * e)
@@ -122,7 +119,6 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Icon, ImageError> {
                         "an icon's PNG carries compressed metadata".into(),
                     ));
                 }
-                metadata |= !PNG_KEEP.contains(&kind);
             }
             Some(chunks)
         } else {
@@ -152,15 +148,15 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Icon, ImageError> {
             height,
         });
     }
-    Ok(Icon { entries, metadata })
+    Ok(Icon { entries })
 }
 
-/// The icon `bytes` rebuilt with its PNG entries' chunks outside `PNG_KEEP` gone, every
-/// entry kept, or `None` when there's nothing to take out.
-pub(super) fn strip(bytes: &[u8], icon: &Icon) -> Option<Vec<u8>> {
-    if !icon.metadata {
-        return None;
-    }
+/// The icon `bytes` laid out afresh: the directory, then each distinct image once, end to
+/// end, so nothing sits between or after them. A PNG entry ends at its `IEND` (every chunk
+/// kept with `keep_metadata`, else only `PNG_KEEP`) and a bitmap at the end of its mask,
+/// whatever size the directory gives. `None` when an entry's end can't be found: a PNG
+/// with no `IEND`, a bitmap shorter than its own header says.
+pub(super) fn repack(bytes: &[u8], icon: &Icon, keep_metadata: bool) -> Option<Vec<u8>> {
     let header = bytes.get(..6)?;
     let mut images: Vec<((usize, usize), Vec<u8>)> = Vec::new();
     for e in &icon.entries {
@@ -170,15 +166,16 @@ pub(super) fn strip(bytes: &[u8], icon: &Icon) -> Option<Vec<u8>> {
         let data = bytes.get(e.start..e.end)?;
         let image = match &e.chunks {
             Some(chunks) => {
+                super::png_end(data)?;
                 let mut out = data.get(..8)?.to_vec();
                 for (kind, s, end) in chunks {
-                    if PNG_KEEP.contains(&kind) {
+                    if keep_metadata || PNG_KEEP.contains(&kind) {
                         out.extend_from_slice(data.get(*s..*end)?);
                     }
                 }
                 out
             }
-            None => data.to_vec(),
+            None => data.get(..bitmap_len(data)?)?.to_vec(),
         };
         images.push(((e.start, e.end), image));
     }
@@ -205,7 +202,47 @@ pub(super) fn strip(bytes: &[u8], icon: &Icon) -> Option<Vec<u8>> {
     Some(out)
 }
 
+/// How long a bitmap entry is by its own header: header, palette, pixels and AND mask, as
+/// `decode_bitmap` reads them; all of `data` when it ends inside the mask (the mask may be
+/// short), and `None` when it ends before the pixels do or the header can't be read.
+fn bitmap_len(data: &[u8]) -> Option<usize> {
+    let u32_at = |i: usize| {
+        data.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    };
+    let header = u32_at(0)? as usize;
+    let w = (u32_at(4)? as i32).unsigned_abs() as usize;
+    let h = (u32_at(8)? as i32).unsigned_abs() as usize / 2;
+    let bits = usize::from(u16::from_le_bytes(data.get(14..16)?.try_into().ok()?));
+    let bit_fields = u32_at(16)? == 3 && bits == 32;
+    let header = if bit_fields { header.max(52) } else { header };
+    let colours = match bits {
+        1 | 4 | 8 => match u32_at(32)? as usize {
+            0 => 1 << bits,
+            used => used.min(1 << bits),
+        },
+        _ => 0,
+    };
+    let pixels_end = header.checked_add(4 * colours)?.checked_add(
+        (w.checked_mul(bits)?)
+            .div_ceil(32)
+            .checked_mul(4)?
+            .checked_mul(h)?,
+    )?;
+    let end = pixels_end.checked_add(w.div_ceil(32).checked_mul(4)?.checked_mul(h)?)?;
+    (pixels_end <= data.len()).then_some(end.min(data.len()))
+}
+
 impl Icon {
+    /// Whether any PNG entry carries a chunk outside `PNG_KEEP`.
+    #[cfg(test)]
+    pub fn has_metadata(&self) -> bool {
+        self.entries
+            .iter()
+            .flat_map(|e| e.chunks.iter().flatten())
+            .any(|(kind, _, _)| !PNG_KEEP.contains(&kind))
+    }
+
     /// The entry shown as the icon: the largest.
     pub fn largest(&self) -> Option<&Entry> {
         self.entries

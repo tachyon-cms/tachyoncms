@@ -449,7 +449,7 @@ pub(super) fn meta(data: &[u8]) -> Result<Meta, ImageError> {
     });
     let (wanted, seen_all) = metadata_items(data, &inner)?;
     m.unresolved |= !seen_all;
-    let located = locations(data, &inner, &wanted)?;
+    let located = locations(data, &inner, &wanted, false)?;
     for (id, exif) in wanted {
         match located.iter().find(|(i, _)| *i == id) {
             Some((_, Some(ranges))) => m.items.push(Item {
@@ -527,22 +527,26 @@ type Located = (u64, Option<Vec<(usize, usize)>>);
 
 /// The file ranges `iloc` gives each of `wanted`, from one pass over it: `None` for an
 /// item whose ranges can't be found (construction method 2, no `idat`, out of range).
+/// With `all`, every item's, an extent running to the end of the file (length 0) counts as
+/// not found, and so does an `iloc` that can't be read through (an item `(0, None)`).
 fn locations(
     data: &[u8],
     inner: &[Box4],
     wanted: &[(u64, bool)],
+    all: bool,
 ) -> Result<Vec<Located>, ImageError> {
     let mut out = Vec::new();
-    if wanted.is_empty() {
+    let unread = || if all { vec![(0, None)] } else { Vec::new() };
+    if wanted.is_empty() && !all {
         return Ok(out);
     }
     let Some(iloc) = find(inner, b"iloc") else {
-        return Ok(out);
+        return Ok(unread());
     };
     let idat = find(inner, b"idat").map(|b| b.body as u64);
     let end = iloc.end;
     let mut at = iloc.body;
-    let cut = || Ok(Vec::new());
+    let cut = || Ok(unread());
     let Some(version) = read(data, &mut at, 1, end) else {
         return cut();
     };
@@ -577,6 +581,7 @@ fn locations(
             Some((id, method, base, n))
         })();
         let Some((id, method, base, n)) = item else {
+            out.extend(unread());
             break;
         };
         total += n;
@@ -606,6 +611,9 @@ fn locations(
             let range = origin.and_then(|o| {
                 let start = usize::try_from(o.checked_add(base)?.checked_add(off)?).ok()?;
                 let stop = if len == 0 {
+                    if all {
+                        return None;
+                    }
                     data.len()
                 } else {
                     start.checked_add(usize::try_from(len).ok()?)?
@@ -617,7 +625,7 @@ fn locations(
                 _ => ranges = None,
             }
         }
-        if wanted.iter().any(|(w, _)| *w == id) {
+        if all || wanted.iter().any(|(w, _)| *w == id) {
             out.push((id, ranges));
         }
     }
@@ -729,6 +737,68 @@ fn orientation_of(ops: &[Op]) -> u8 {
             candidate == done
         })
         .unwrap_or(1)
+}
+
+/// `data` with nothing but what an AVIF is made of: its `ftyp` and `meta` boxes, the
+/// bytes `iloc` places its items in, and the headers of the top-level boxes they sit in,
+/// each where it was so every offset still holds. Every other byte (a `free` or unknown
+/// box's, an `mdat`'s past its items) is zeroed, and the file ends after the furthest of
+/// them, the box holding that end shortened to it. `None` when that end can't be known: no
+/// `ftyp` or `meta`, an item that can't be located or runs to the end of the file, or an
+/// end inside a box the walk can't reach.
+pub(super) fn keep(data: &[u8]) -> Option<Vec<u8>> {
+    // The top-level boxes: (start, header length, end), up to one that overruns the file.
+    let mut top = Vec::new();
+    let mut i = 0;
+    while let Some(h) = data.get(i..i + 8) {
+        let (size, header) = match u32::from_be_bytes([h[0], h[1], h[2], h[3]]) {
+            0 => ((data.len() - i) as u64, 8),
+            1 => (
+                u64::from_be_bytes(data.get(i + 8..i + 16)?.try_into().ok()?),
+                16,
+            ),
+            n => (u64::from(n), 8),
+        };
+        let end = usize::try_from(size).ok().and_then(|s| i.checked_add(s));
+        match end {
+            Some(end) if size >= header as u64 && end <= data.len() => {
+                top.push((i, header, end, [h[4], h[5], h[6], h[7]]));
+                i = end;
+            }
+            _ => break,
+        }
+    }
+    let whole = |kind: &[u8; 4]| top.iter().find(|b| &b.3 == kind).map(|b| (b.0, b.2));
+    let (ftyp, meta) = (whole(b"ftyp")?, whole(b"meta")?);
+    // `meta` is a full box: its children follow a version and flags.
+    let (_, header, _, _) = *top.iter().find(|b| &b.3 == b"meta")?;
+    let inner = boxes(data, meta.0 + header + 4, meta.1);
+    let mut kept = vec![ftyp, meta];
+    for (_, ranges) in locations(data, &inner, &[], true).ok()? {
+        kept.extend(ranges?);
+    }
+    let cut = kept.iter().map(|r| r.1).max()?;
+    let mut out = vec![0u8; cut];
+    for &(s, e) in &kept {
+        out[s..e].copy_from_slice(&data[s..e]);
+    }
+    let mut reached = false;
+    for &(start, header, end, _) in top.iter().filter(|b| b.0 < cut) {
+        if start + header > cut {
+            return None;
+        }
+        out[start..start + header].copy_from_slice(&data[start..start + header]);
+        if end >= cut {
+            reached = true;
+            let size = (cut - start) as u64;
+            if header == 16 {
+                out[start + 8..start + 16].copy_from_slice(&size.to_be_bytes());
+            } else {
+                out[start..start + 4].copy_from_slice(&u32::try_from(size).ok()?.to_be_bytes());
+            }
+        }
+    }
+    reached.then_some(out)
 }
 
 /// `data` with the EXIF and XMP items blanked, or `None` when it has none. The caller

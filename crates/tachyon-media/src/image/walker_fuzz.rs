@@ -134,10 +134,15 @@ fn ico_walker_fuzz() {
     ])];
     fuzz("ico", 0x2468_ace0_1357_9bdf, &seeds, 4_000, |input| {
         if let Ok(icon) = ico::walk(input)
-            && let Some(stripped) = ico::strip(input, &icon)
+            && let Some(stripped) = ico::repack(input, &icon, false)
         {
-            let again = ico::walk(&stripped).expect("stripped output walks");
-            assert!(!again.metadata, "metadata survived");
+            let again = ico::walk(&stripped).expect("repacked output walks");
+            assert!(!again.has_metadata(), "metadata survived");
+            // Packed already: a second repack changes nothing.
+            assert_eq!(
+                ico::repack(&stripped, &again, false),
+                Some(stripped.clone())
+            );
         }
     });
 }
@@ -227,7 +232,7 @@ fn icon_sizes_fuzz() {
     }
     each("icon sizes", cases, |input| {
         if let Ok(icon) = ico::walk(input) {
-            let _ = ico::strip(input, &icon);
+            let _ = ico::repack(input, &icon, true);
         }
         let _ = probe_bytes(input);
     });
