@@ -650,7 +650,7 @@ fn process_unguarded(
         .constructor_options
         .as_ref()
         .is_none_or(|c| c.fail_on != FailOn::None);
-    let bytes = std::fs::read(input).map_err(internal)?;
+    let mut bytes = std::fs::read(input).map_err(internal)?;
     let walked_jpeg = match probe.format {
         InputFormat::Jpeg => Some(jpeg::walk(&bytes)?),
         _ => None,
@@ -659,6 +659,17 @@ fn process_unguarded(
         InputFormat::Gif => Some(gif::walk(&bytes, !u.with_metadata)?),
         _ => None,
     };
+    // What follows the format's own end (a ZIP, a page, a vendor trailer) isn't metadata
+    // and isn't the picture: it goes, whatever `withMetadata` keeps.
+    let uploaded = bytes.len();
+    let end = match probe.format {
+        InputFormat::Jpeg => walked_jpeg.as_ref().map_or(uploaded, |j| j.end),
+        InputFormat::Gif => walked_gif.as_ref().map_or(uploaded, |g| g.end),
+        InputFormat::Png => png_end(&bytes),
+        InputFormat::Webp => webp_end(&bytes),
+        _ => uploaded,
+    };
+    bytes.truncate(end);
     let ends = walked_jpeg.as_ref().map(|j| j.ends);
     if strict && (ends == Some(false) || walked_gif.as_ref().is_some_and(|g| !g.ends)) {
         return Err(ImageError::Truncated);
@@ -717,6 +728,7 @@ fn process_unguarded(
     );
     let (path, filesize) = match stripped {
         Some(b) => write_new(out_dir, &b)?,
+        None if bytes.len() < uploaded => write_new(out_dir, &bytes)?,
         None => (input.to_path_buf(), bytes.len() as u64),
     };
     Ok(Processed {
@@ -875,6 +887,28 @@ fn transform_and_encode(
         filesize,
         blurhash: hash,
     })
+}
+
+/// Where a PNG ends: just past its `IEND` chunk, or the end of `bytes` without one.
+fn png_end(bytes: &[u8]) -> usize {
+    let mut i = 8;
+    while let Some(h) = bytes.get(i..i + 8) {
+        let len = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
+        let next = i.saturating_add(12).saturating_add(len);
+        if &h[4..] == b"IEND" {
+            return next.min(bytes.len());
+        }
+        i = next;
+    }
+    bytes.len()
+}
+
+/// Where a WebP ends: where its RIFF header says, or the end of `bytes` if that's sooner.
+fn webp_end(bytes: &[u8]) -> usize {
+    bytes
+        .get(4..8)
+        .map(|l| u32::from_le_bytes([l[0], l[1], l[2], l[3]]) as usize)
+        .map_or(bytes.len(), |len| len.saturating_add(8).min(bytes.len()))
 }
 
 /// A new file in `dir` holding `bytes`, and its size. Nothing is left behind on failure.
@@ -1496,6 +1530,33 @@ mod tests {
         let out = run(&jpeg, &upload(serde_json::json!({}))).unwrap();
         let bytes = std::fs::read(&out.path).unwrap();
         assert!(!bytes.windows(4).any(|w| w == b"Exif"));
+    }
+
+    #[test]
+    fn what_follows_the_end_marker_is_dropped() {
+        let tail = b"<html><script>alert(1)</script></html>PK\x05\x06";
+        for (codec, end) in [
+            (Codec::Png, &b"IEND\xAE\x42\x60\x82"[..]),
+            (Codec::Jpeg, &[0xFF, 0xD9][..]),
+            (Codec::Gif, &[0x3B][..]),
+            (Codec::WebP, &[][..]),
+        ] {
+            let clean = encoded(&gradient(8, 8), codec);
+            let mut with_tail = clean.clone();
+            with_tail.extend_from_slice(tail);
+            for meta in [false, true] {
+                let u = upload(serde_json::json!({"withMetadata": meta}));
+                let out = run(&with_tail, &u).unwrap();
+                let kept = stored(&out);
+                assert!(!has(&kept, b"<html>"), "{codec:?} {meta}: the tail stayed");
+                assert!(kept.ends_with(end), "{codec:?} {meta}");
+                assert_eq!(out.filesize, kept.len() as u64, "{codec:?} {meta}");
+                if meta {
+                    // Nothing else changes: the file is as uploaded, up to its end.
+                    assert_eq!(kept, clean, "{codec:?}");
+                }
+            }
+        }
     }
 
     #[test]

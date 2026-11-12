@@ -385,11 +385,12 @@ async fn fixture_corpus(pool: PgPool) {
                         assert!(text.contains(r##"<use href="#r"/>"##), "{at}: {text}");
                     }
                 }
-                // What follows the PNG goes with the metadata; kept, it's still served as
-                // the PNG it starts with, never sniffed as anything else.
+                // What follows the PNG isn't metadata: it goes whatever withMetadata
+                // keeps, and the file ends where the PNG does.
                 "png-html.png" | "png-zip.png" => {
-                    assert_eq!(holds(&kept, tail), keeps, "{at}");
-                    assert_eq!(holds(&kept, b"PK\x05\x06"), keeps && name == "png-zip.png");
+                    assert!(!holds(&kept, tail), "{at}");
+                    assert!(!holds(&kept, b"PK\x05\x06"), "{at}");
+                    assert!(kept.ends_with(b"IEND\xAE\x42\x60\x82"), "{at}");
                 }
                 _ => {}
             }

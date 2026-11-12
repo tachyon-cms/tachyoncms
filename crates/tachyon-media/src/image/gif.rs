@@ -21,6 +21,8 @@ pub(super) struct Walked {
     /// Whether the trailer was reached; a file that stops after a whole frame is still
     /// read, as browsers read it.
     pub ends: bool,
+    /// Where the GIF ends: just past its trailer, or the end of the bytes without one.
+    pub end: usize,
     /// An ICC profile (`ICCRGBG1012`) and XMP packet (`XMP DataXMP`) the file carries.
     pub icc: Option<Vec<u8>>,
     pub xmp: Option<Vec<u8>>,
@@ -60,6 +62,7 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
         }
     };
     let (mut frames, mut pixels, mut ends) = (0u32, 0u64, false);
+    let mut end = bytes.len();
     let (mut icc, mut xmp) = (None, None);
     // The graphic control block for the next image: only the last one counts, and it's
     // written just before that image, so repeating them carries nothing.
@@ -149,6 +152,7 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
             0x3B => {
                 keep(&mut out, start, i + 1);
                 ends = true;
+                end = i + 1;
                 break;
             }
             b => {
@@ -171,6 +175,7 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
         pixels,
         stripped: out,
         ends,
+        end,
         icc,
         xmp,
     })

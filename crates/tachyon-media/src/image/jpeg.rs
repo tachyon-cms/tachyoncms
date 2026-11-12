@@ -3,10 +3,12 @@
 
 use super::ImageError;
 
-/// A JPEG without its metadata, and whether its end-of-image marker was found.
+/// A JPEG without its metadata, whether its end-of-image marker was found, and where the
+/// JPEG ends: just past that marker, or the end of the bytes without one.
 pub(super) struct Walked {
     pub stripped: Vec<u8>,
     pub ends: bool,
+    pub end: usize,
 }
 
 /// Walks `bytes`, keeping every segment decoding needs (JFIF, an ICC profile, Adobe's
@@ -28,6 +30,7 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
             return Ok(Walked {
                 stripped: out,
                 ends: false,
+                end: bytes.len(),
             });
         };
         match marker {
@@ -36,6 +39,7 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
                 return Ok(Walked {
                     stripped: out,
                     ends: true,
+                    end: i + 2,
                 });
             }
             0x01 | 0xD0..=0xD7 => {
@@ -49,6 +53,7 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
             return Ok(Walked {
                 stripped: out,
                 ends: false,
+                end: bytes.len(),
             });
         };
         let len = usize::from(u16::from_be_bytes([len[0], len[1]]));
@@ -62,6 +67,7 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
             return Ok(Walked {
                 stripped: out,
                 ends: false,
+                end: bytes.len(),
             });
         };
         let body = &segment[4.min(segment.len())..];

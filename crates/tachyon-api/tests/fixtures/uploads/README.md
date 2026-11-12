@@ -27,4 +27,8 @@ Made on the spot by `tests/common/fixtures.rs`, so they aren't committed:
   frames add up to 51 million pixels, one million over the cap.
 - **Polyglots**: a PNG followed by an HTML page, and a PNG followed by a ZIP archive
   holding `index.html`. Both are stored and served as `image/png` with `nosniff`. What
-  follows the PNG is dropped with the metadata, and kept only with `withMetadata`.
+  follows the PNG's `IEND` isn't metadata, so it's dropped, with `withMetadata` or not.
+
+The WebP header bomb claims 10000×10000, not 16384×16384: the image crate reads a 16384
+header as 0×0, and the upload is refused as a broken file rather than by the pixel cap.
+That fails closed too, but wouldn't test the cap.
