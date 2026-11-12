@@ -270,7 +270,7 @@ fn probe_unguarded(path: &Path, head: &[u8]) -> Result<Probe, ImageError> {
             let mut bytes = read()?;
             // Read as it will be kept: only its own boxes and items (`process_original`
             // keeps the same, or refuses a file whose end can't be known).
-            if let Some(kept) = avif::keep(&bytes) {
+            if let Some(kept) = avif::keep(&bytes, true) {
                 bytes = kept;
             }
             let parsed = avif::parse(&bytes)?;
@@ -695,9 +695,10 @@ fn process_unguarded(
         },
         InputFormat::Bmp => Own::cut(bmp_end(&bytes)),
         InputFormat::Ico => Own::replace(ico::repack(&bytes, &ico::walk(&bytes)?, u.with_metadata)),
-        InputFormat::Avif => Own::replace(avif::keep(&bytes)),
-        InputFormat::Tiff if u.with_metadata => match tiff_extent(&bytes) {
-            Ok(end) => Own::Cut(end),
+        InputFormat::Avif => Own::replace(avif::keep(&bytes, u.with_metadata)),
+        // Only the bytes its IFDs reach, each where it was; gaps zeroed.
+        InputFormat::Tiff if u.with_metadata => match tiff_regions(&bytes) {
+            Ok(regions) => Own::Replace(zeroed_but(&bytes, &regions)),
             Err(TiffEnd::Odd) => {
                 odd_tiff = true;
                 Own::Cut(uploaded)
@@ -946,6 +947,16 @@ fn transform_and_encode(
     })
 }
 
+/// `bytes` up to the furthest of `regions`, every byte outside them zeroed.
+fn zeroed_but(bytes: &[u8], regions: &[(usize, usize)]) -> Vec<u8> {
+    let end = regions.iter().map(|r| r.1).max().unwrap_or(0);
+    let mut out = vec![0u8; end];
+    for &(s, e) in regions {
+        out[s..e].copy_from_slice(&bytes[s..e]);
+    }
+    out
+}
+
 /// What of an original is its own: all of it up to an end, a rebuilt copy, or nothing
 /// known (no end, or one that lies).
 enum Own {
@@ -976,10 +987,10 @@ enum TiffEnd {
 const TIFF_MAX_IFDS: usize = 64;
 const TIFF_MAX_ENTRIES: usize = 4096;
 
-/// Where a classic TIFF ends: after the last byte reached from its header, over the IFD
-/// chain and its SubIFD, Exif, GPS and Interop IFDs, every value stored out of line, and the
+/// The byte ranges a classic TIFF is made of, from its header: the header, the IFD chain
+/// and its SubIFD, Exif, GPS and Interop IFDs, every value stored out of line, and the
 /// strips, tiles, JPEG stream and free blocks the offset/byte-count pairs give.
-fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
+fn tiff_regions(bytes: &[u8]) -> Result<Vec<(usize, usize)>, TiffEnd> {
     use TiffEnd::{Lies, Odd};
     let big = match bytes.get(..4).ok_or(Lies)? {
         b"MM\0*" => true,
@@ -991,10 +1002,10 @@ fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
     let u16_at = |at: usize| read_u16(bytes, at, big).ok_or(Lies);
     let u32_at = |at: usize| read_u32(bytes, at, big).ok_or(Lies);
     let fits = |start: usize, n: usize| match start.checked_add(n) {
-        Some(e) if e <= len => Ok(e),
+        Some(e) if e <= len => Ok((start, e)),
         _ => Err(Lies),
     };
-    let mut end = 8;
+    let mut regions = vec![(0, 8)];
     let mut todo = vec![u32_at(4)? as usize];
     let (mut seen, mut entries) = (Vec::new(), 0usize);
     while let Some(ifd) = todo.pop() {
@@ -1013,7 +1024,7 @@ fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
         if entries > TIFF_MAX_ENTRIES {
             return Err(Lies);
         }
-        end = end.max(fits(ifd, 2 + 12 * n + 4)?);
+        regions.push(fits(ifd, 2 + 12 * n + 4)?);
         todo.push(u32_at(ifd + 2 + 12 * n)? as usize);
         // Each entry's values: (tag, the values as numbers when they're offsets or sizes).
         let mut values: Vec<(u16, Vec<usize>)> = Vec::new();
@@ -1030,7 +1041,7 @@ fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
             let total = size.checked_mul(count).ok_or(Lies)?;
             let from = if total > 4 {
                 let from = u32_at(at + 8)? as usize;
-                end = end.max(fits(from, total)?);
+                regions.push(fits(from, total)?);
                 from
             } else {
                 at + 8
@@ -1055,7 +1066,7 @@ fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
             match (get(offsets), get(counts)) {
                 (Some(o), Some(c)) if o.len() == c.len() => {
                     for (&o, &c) in o.iter().zip(c) {
-                        end = end.max(fits(o, c)?);
+                        regions.push(fits(o, c)?);
                     }
                 }
                 (None, None) => {}
@@ -1063,7 +1074,7 @@ fn tiff_extent(bytes: &[u8]) -> Result<usize, TiffEnd> {
             }
         }
     }
-    Ok(end)
+    Ok(regions)
 }
 
 /// Where a PNG ends: just past an `IEND` chunk of length 0, every chunk before it whole.
@@ -2039,7 +2050,10 @@ mod tests {
             b[2..6].copy_from_slice(&60u32.to_le_bytes());
             b
         };
-        let lying: [(&str, Vec<u8>); 12] = [
+        let small = encoded(&gradient(4, 4), Codec::Png);
+        let two_entries = ico_of(&[small[..small.len() - 12].to_vec(), png.clone()]);
+        let lying: [(&str, Vec<u8>); 13] = [
+            ("ico with a smaller entry without IEND", two_entries),
             (
                 "ico PNG entry without IEND",
                 ico_around(&tailed(png[..png.len() - 12].to_vec())),
@@ -2127,24 +2141,51 @@ mod tests {
         Out(Vec<u8>),
     }
 
-    /// Writes an IFD of `entries` at the end of `out` (little-endian), its values after it,
-    /// pointing on to `next`; returns where it starts.
-    fn put_ifd(out: &mut Vec<u8>, entries: Vec<(u16, u16, u32, TiffValue)>, next: u32) -> u32 {
+    /// Writes an IFD of `entries` at the end of `out`, in `big`-endian order or little, its
+    /// values after it, pointing on to `next`; returns where it starts.
+    fn put_ifd(
+        out: &mut Vec<u8>,
+        big: bool,
+        entries: Vec<(u16, u16, u32, TiffValue)>,
+        next: u32,
+    ) -> u32 {
+        let u16b = |v: u16| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let u32b = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
         if out.len() % 2 == 1 {
             out.push(0);
         }
         let at = out.len();
         let mut values_at = at + 2 + 12 * entries.len() + 4;
         let mut values = Vec::new();
-        out.extend_from_slice(&(entries.len() as u16).to_le_bytes());
+        out.extend_from_slice(&u16b(entries.len() as u16));
         for (tag, kind, count, v) in entries {
-            out.extend_from_slice(&tag.to_le_bytes());
-            out.extend_from_slice(&kind.to_le_bytes());
-            out.extend_from_slice(&count.to_le_bytes());
+            out.extend_from_slice(&u16b(tag));
+            out.extend_from_slice(&u16b(kind));
+            out.extend_from_slice(&u32b(count));
             match v {
-                TiffValue::In(x) => out.extend_from_slice(&x.to_le_bytes()),
+                // A short sits at the start of the field; bytes are in file order.
+                TiffValue::In(x) if kind == 3 => {
+                    out.extend_from_slice(&u16b(x as u16));
+                    out.extend_from_slice(&[0, 0]);
+                }
+                TiffValue::In(x) if matches!(kind, 1 | 2 | 7) => {
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                TiffValue::In(x) => out.extend_from_slice(&u32b(x)),
                 TiffValue::Out(b) => {
-                    out.extend_from_slice(&(values_at as u32).to_le_bytes());
+                    out.extend_from_slice(&u32b(values_at as u32));
                     values_at += b.len() + b.len() % 2;
                     values.extend_from_slice(&b);
                     if b.len() % 2 == 1 {
@@ -2153,7 +2194,7 @@ mod tests {
                 }
             }
         }
-        out.extend_from_slice(&next.to_le_bytes());
+        out.extend_from_slice(&u32b(next));
         out.extend_from_slice(&values);
         at as u32
     }
@@ -2173,18 +2214,33 @@ mod tests {
         ]
     }
 
-    /// A TIFF with an Exif IFD and a GPS IFD (each with a value out of line), or of two
-    /// pages, made by hand.
+    /// A little-endian TIFF with an Exif IFD and a GPS IFD (each with a value out of line),
+    /// or of two pages, made by hand.
     fn tiff_with(gps: bool, pages: usize) -> Vec<u8> {
+        tiff_in(false, gps, pages)
+    }
+
+    fn tiff_in(big: bool, gps: bool, pages: usize) -> Vec<u8> {
         use TiffValue::{In, Out};
-        let mut out = b"II*\0\0\0\0\0".to_vec();
+        let u32b = |v: u32| {
+            if big {
+                v.to_be_bytes()
+            } else {
+                v.to_le_bytes()
+            }
+        };
+        let mut out = if big {
+            b"MM\0*\0\0\0\0".to_vec()
+        } else {
+            b"II*\0\0\0\0\0".to_vec()
+        };
         let first = out.len() as u32;
         out.extend_from_slice(&[10, 80, 160, 240]);
-        let second = out.len() as u32;
-        out.extend_from_slice(&[240, 160, 80, 10]);
         let mut next = 0;
         if pages == 2 {
-            next = put_ifd(&mut out, page(second), 0);
+            let second = out.len() as u32;
+            out.extend_from_slice(&[240, 160, 80, 10]);
+            next = put_ifd(&mut out, big, page(second), 0);
         }
         let mut ifd0 = page(first);
         if gps {
@@ -2193,36 +2249,237 @@ mod tests {
             ifd0.push((34665, 4, 1, In(0)));
             ifd0.push((34853, 4, 1, In(0)));
         }
-        let at = put_ifd(&mut out, ifd0, next);
-        out[4..8].copy_from_slice(&at.to_le_bytes());
+        let at = put_ifd(&mut out, big, ifd0, next);
+        out[4..8].copy_from_slice(&u32b(at));
         if gps {
             let exif = put_ifd(
                 &mut out,
+                big,
                 vec![(36867, 2, 20, Out(b"2001:02:03 04:05:06\0".to_vec()))],
                 0,
             );
             let rational: Vec<u8> = [1u32, 1, 2, 1, 3, 1]
                 .iter()
-                .flat_map(|v| v.to_le_bytes())
+                .flat_map(|&v| u32b(v))
                 .collect();
             let gps = put_ifd(
                 &mut out,
+                big,
                 vec![(1, 2, 2, In(u32::from(b'N'))), (2, 5, 3, Out(rational))],
                 0,
             );
             let at = at as usize;
-            let n = usize::from(u16::from_le_bytes([out[at], out[at + 1]]));
+            let n = usize::from(read_u16(&out, at, big).unwrap());
             for e in 0..n {
                 let entry = at + 2 + 12 * e;
-                let value = match u16::from_le_bytes([out[entry], out[entry + 1]]) {
+                let value = match read_u16(&out, entry, big).unwrap() {
                     34665 => exif,
                     34853 => gps,
                     _ => continue,
                 };
-                out[entry + 8..entry + 12].copy_from_slice(&value.to_le_bytes());
+                out[entry + 8..entry + 12].copy_from_slice(&u32b(value));
             }
         }
         out
+    }
+
+    /// `tiff` with its IFD0 copied to the end, past `payload`, and the header pointing at
+    /// the copy: the old IFD0 and the payload are reached by nothing.
+    fn tiff_moved_ifd0(mut tiff: Vec<u8>, payload: &[u8]) -> Vec<u8> {
+        let ifd0 = u32::from_le_bytes(tiff[4..8].try_into().unwrap()) as usize;
+        let n = usize::from(u16::from_le_bytes([tiff[ifd0], tiff[ifd0 + 1]]));
+        let copy = tiff[ifd0..ifd0 + 2 + 12 * n + 4].to_vec();
+        tiff.extend_from_slice(payload);
+        if tiff.len() % 2 == 1 {
+            tiff.push(0);
+        }
+        let at = tiff.len() as u32;
+        tiff.extend_from_slice(&copy);
+        tiff[4..8].copy_from_slice(&at.to_le_bytes());
+        tiff
+    }
+
+    /// The pixels `bytes` decodes to, as RGBA.
+    fn pixels_of(bytes: &[u8]) -> Vec<u8> {
+        let d = dir();
+        let input = file(&d, bytes);
+        let p = probe(&input, &bytes[..bytes.len().min(8192)]).unwrap();
+        decode(bytes, &p, 50_000_000, false, false).unwrap().frames[0]
+            .image
+            .to_rgba8()
+            .into_raw()
+    }
+
+    /// The boxes directly inside `data[from..to]` with 32-bit sizes: (start, end, type).
+    fn child_boxes(data: &[u8], from: usize, to: usize) -> Vec<(usize, usize, [u8; 4])> {
+        let mut out = Vec::new();
+        let mut i = from;
+        while i + 8 <= to {
+            let size = u32::from_be_bytes(data[i..i + 4].try_into().unwrap()) as usize;
+            out.push((i, i + size, data[i + 4..i + 8].try_into().unwrap()));
+            i += size;
+        }
+        out
+    }
+
+    /// `avif` with `bytes` put at `at`, the boxes starting at `parents` grown to hold them,
+    /// and every `iloc` extent at or past `at` moved along.
+    fn avif_insert(mut a: Vec<u8>, at: usize, bytes: &[u8], parents: &[usize]) -> Vec<u8> {
+        a.splice(at..at, bytes.iter().copied());
+        for &p in parents {
+            let size = u32::from_be_bytes(a[p..p + 4].try_into().unwrap()) + bytes.len() as u32;
+            a[p..p + 4].copy_from_slice(&size.to_be_bytes());
+        }
+        for (i, (_, off, len)) in crate::fixtures::avif_extents(&a).into_iter().enumerate() {
+            if off >= at {
+                let moved = (off + bytes.len()) as u32;
+                a = crate::fixtures::avif_set_extent(a, i, moved, len as u32);
+            }
+        }
+        a
+    }
+
+    /// `avif` with a `free` box holding the tail as the last box inside `meta`.
+    fn avif_free_in_meta(avif: &[u8]) -> Vec<u8> {
+        let (meta, end, _) = child_boxes(avif, 0, avif.len())
+            .into_iter()
+            .find(|b| &b.2 == b"meta")
+            .unwrap();
+        avif_insert(
+            avif.to_vec(),
+            end,
+            &isobmff_box(b"free", TAIL, false),
+            &[meta],
+        )
+    }
+
+    /// `avif` with one more item, item 99: an HTML page, with its own `infe` (`mime`,
+    /// `text/html`) and `iloc` entry, its bytes at the end of `mdat`.
+    fn avif_extra_item(avif: &[u8]) -> Vec<u8> {
+        let find = |a: &[u8], kind: &[u8; 4]| {
+            let (meta, end, _) = child_boxes(a, 0, a.len())
+                .into_iter()
+                .find(|b| &b.2 == b"meta")
+                .unwrap();
+            let child = child_boxes(a, meta + 12, end)
+                .into_iter()
+                .find(|b| &b.2 == kind)
+                .unwrap();
+            (meta, child.0, child.1)
+        };
+        // The iloc entry: one extent, placed below.
+        let (meta, iloc, iloc_end) = find(avif, b"iloc");
+        let body = iloc + 8;
+        let version = avif[body];
+        assert_eq!(
+            (avif[body + 4], avif[body + 5]),
+            (0x44, 0),
+            "4-byte offsets, no base"
+        );
+        let wide = if version < 2 { 2 } else { 4 };
+        let mut entry = 99u32.to_be_bytes()[4 - wide..].to_vec();
+        if version >= 1 {
+            entry.extend_from_slice(&[0, 0]);
+        }
+        entry.extend_from_slice(&[0, 0, 0, 1]);
+        entry.extend_from_slice(&[0; 8]);
+        let mut a = avif_insert(avif.to_vec(), iloc_end, &entry, &[meta, iloc]);
+        let count_at = body + 6;
+        let count = a[count_at..count_at + wide]
+            .iter()
+            .fold(0u32, |v, &b| v << 8 | u32::from(b))
+            + 1;
+        a[count_at..count_at + wide].copy_from_slice(&count.to_be_bytes()[4 - wide..]);
+        // Its infe, version 2.
+        let (meta, iinf, iinf_end) = find(&a, b"iinf");
+        let mut infe = vec![2, 0, 0, 0, 0, 99, 0, 0];
+        infe.extend_from_slice(b"mime");
+        infe.extend_from_slice(b"page\0text/html\0");
+        let a2 = avif_insert(
+            a,
+            iinf_end,
+            &isobmff_box(b"infe", &infe, false),
+            &[meta, iinf],
+        );
+        let mut a = a2;
+        let wide = if a[iinf + 8] == 0 { 2 } else { 4 };
+        let at = iinf + 12;
+        let count = a[at..at + wide]
+            .iter()
+            .fold(0u32, |v, &b| v << 8 | u32::from(b))
+            + 1;
+        a[at..at + wide].copy_from_slice(&count.to_be_bytes()[4 - wide..]);
+        // Its bytes, at the end of mdat, the last box.
+        let (mdat, _, kind) = *child_boxes(&a, 0, a.len()).last().unwrap();
+        assert_eq!(&kind, b"mdat");
+        let offset = a.len() as u32;
+        a.extend_from_slice(TAIL);
+        let size = u32::from_be_bytes(a[mdat..mdat + 4].try_into().unwrap()) + TAIL.len() as u32;
+        a[mdat..mdat + 4].copy_from_slice(&size.to_be_bytes());
+        let index = crate::fixtures::avif_extents(&a)
+            .iter()
+            .position(|e| e.0 == 99)
+            .unwrap();
+        crate::fixtures::avif_set_extent(a, index, offset, TAIL.len() as u32)
+    }
+
+    /// What's inside an AVIF's `meta` and among its items is kept only where it's the
+    /// picture's; a TIFF's gaps go; an extent of length 0 ends with its box.
+    #[test]
+    fn what_no_part_of_the_picture_reaches_goes() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let want = pixels_of(&avif);
+        let extents = crate::fixtures::avif_extents(&avif);
+        assert_eq!(extents.len(), 1, "one item, one extent");
+        let to_box_end = tailed(crate::fixtures::avif_set_extent(
+            avif.clone(),
+            0,
+            extents[0].1 as u32,
+            0,
+        ));
+        for (name, bytes) in [
+            ("avif free box inside meta", avif_free_in_meta(&avif)),
+            ("avif extra item", avif_extra_item(&avif)),
+            ("avif extent of length 0", to_box_end),
+        ] {
+            assert!(
+                probe(&file(&dir(), &bytes), &bytes[..8192.min(bytes.len())]).is_ok(),
+                "{name}"
+            );
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                let out = run(&bytes, &u).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let kept = stored(&out);
+                assert!(!has(&kept, b"<html>"), "{at}: the payload stayed");
+                assert_eq!(pixels_of(&kept), want, "{at}: the picture changed");
+            }
+        }
+
+        // A payload in a gap a moved IFD0 leaves, and the same TIFF big-endian.
+        let tiff = tiff_with(true, 1);
+        let moved = tiff_moved_ifd0(tiff.clone(), TAIL);
+        let big = tiff_in(true, true, 1);
+        for (name, bytes) in [
+            ("tiff gap before IFD0", moved),
+            ("big-endian tiff", tailed(big.clone())),
+        ] {
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                let out = run(&bytes, &u).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let kept = stored(&out);
+                assert!(!has(&kept, b"<html>"), "{at}: the payload stayed");
+                assert_eq!(::image::load_from_memory(&kept).unwrap().width(), 2, "{at}");
+                assert_eq!(has(&kept, b"2001:02:03"), u.with_metadata, "{at}: Exif");
+                if u.with_metadata && name == "big-endian tiff" {
+                    assert_eq!(kept, big, "{at}");
+                }
+            }
+        }
+    }
+
+    /// Where a TIFF's regions end.
+    fn tiff_end(bytes: &[u8]) -> Result<usize, TiffEnd> {
+        tiff_regions(bytes).map(|r| r.iter().map(|x| x.1).max().unwrap())
     }
 
     /// Each end finder, directly: where it says a file ends, and when it says it can't.
@@ -2257,18 +2514,18 @@ mod tests {
         );
 
         let avif = encoded(&gradient(8, 8), Codec::Avif);
-        assert_eq!(avif::keep(&tailed(avif.clone())), Some(avif.clone()));
+        assert_eq!(avif::keep(&tailed(avif.clone()), true), Some(avif.clone()));
         let boxes = top_boxes(&avif);
         let (mdat, _, _) = *boxes.last().unwrap();
         let mut to_eof = tailed(avif.clone());
         to_eof[mdat..mdat + 4].copy_from_slice(&0u32.to_be_bytes());
         assert_eq!(
-            avif::keep(&to_eof),
+            avif::keep(&to_eof, true),
             Some(avif.clone()),
             "size 0: shortened to its items"
         );
         assert_eq!(
-            avif::keep(&avif[..avif.len() - 1]),
+            avif::keep(&avif[..avif.len() - 1], true),
             None,
             "an item past the end"
         );
@@ -2277,25 +2534,21 @@ mod tests {
             .filter(|(s, _, _)| &avif[s + 4..s + 8] != b"meta")
             .flat_map(|&(s, _, e)| avif[s..e].to_vec())
             .collect();
-        assert_eq!(avif::keep(&no_meta), None, "no meta");
+        assert_eq!(avif::keep(&no_meta, true), None, "no meta");
 
         let tiff = tiff_with(true, 1);
-        assert_eq!(tiff_extent(&tailed(tiff.clone())), Ok(tiff.len()));
-        assert_eq!(
-            tiff_extent(b"II+\0\x08\0\0\0"),
-            Err(TiffEnd::Odd),
-            "BigTIFF"
-        );
+        assert_eq!(tiff_end(&tailed(tiff.clone())), Ok(tiff.len()));
+        assert_eq!(tiff_end(b"II+\0\x08\0\0\0"), Err(TiffEnd::Odd), "BigTIFF");
         let mut unknown = tiff.clone();
         let ifd0 = u32::from_le_bytes(unknown[4..8].try_into().unwrap()) as usize;
         unknown[ifd0 + 2 + 2..ifd0 + 2 + 4].copy_from_slice(&99u16.to_le_bytes());
         assert_eq!(
-            tiff_extent(&unknown),
+            tiff_end(&unknown),
             Err(TiffEnd::Odd),
             "a type it doesn't know"
         );
         assert_eq!(
-            tiff_extent(&tiff[..tiff.len() - 1]),
+            tiff_end(&tiff[..tiff.len() - 1]),
             Err(TiffEnd::Lies),
             "a value past the end"
         );

@@ -303,6 +303,7 @@ fn frame_size(s: &SequenceHeader, frame: &[u8]) -> Result<(u32, u32), ImageError
 #[derive(Clone, Copy)]
 struct Box4 {
     kind: [u8; 4],
+    start: usize,
     body: usize,
     end: usize,
 }
@@ -334,7 +335,12 @@ fn walk_boxes(data: &[u8], from: usize, to: usize) -> (Vec<Box4>, bool) {
         if end > to || end < body {
             break;
         }
-        out.push(Box4 { kind, body, end });
+        out.push(Box4 {
+            kind,
+            start: i,
+            body,
+            end,
+        });
         i = end;
     }
     (out, i == to.min(data.len()))
@@ -449,7 +455,7 @@ pub(super) fn meta(data: &[u8]) -> Result<Meta, ImageError> {
     });
     let (wanted, seen_all) = metadata_items(data, &inner)?;
     m.unresolved |= !seen_all;
-    let located = locations(data, &inner, &wanted, false)?;
+    let located = locations(data, &inner, &wanted, None)?;
     for (id, exif) in wanted {
         match located.iter().find(|(i, _)| *i == id) {
             Some((_, Some(ranges))) => m.items.push(Item {
@@ -527,17 +533,24 @@ type Located = (u64, Option<Vec<(usize, usize)>>);
 
 /// The file ranges `iloc` gives each of `wanted`, from one pass over it: `None` for an
 /// item whose ranges can't be found (construction method 2, no `idat`, out of range).
-/// With `all`, every item's, an extent running to the end of the file (length 0) counts as
-/// not found, and so does an `iloc` that can't be read through (an item `(0, None)`).
+/// With `all`, every item's: an extent of length 0 ("to the end of the data") ends where
+/// `all` says the box holding its start does, and an `iloc` that can't be read through is
+/// an item `(0, None)`.
 fn locations(
     data: &[u8],
     inner: &[Box4],
     wanted: &[(u64, bool)],
-    all: bool,
+    all: Option<&dyn Fn(usize) -> Option<usize>>,
 ) -> Result<Vec<Located>, ImageError> {
     let mut out = Vec::new();
-    let unread = || if all { vec![(0, None)] } else { Vec::new() };
-    if wanted.is_empty() && !all {
+    let unread = || {
+        if all.is_some() {
+            vec![(0, None)]
+        } else {
+            Vec::new()
+        }
+    };
+    if wanted.is_empty() && all.is_none() {
         return Ok(out);
     }
     let Some(iloc) = find(inner, b"iloc") else {
@@ -611,10 +624,10 @@ fn locations(
             let range = origin.and_then(|o| {
                 let start = usize::try_from(o.checked_add(base)?.checked_add(off)?).ok()?;
                 let stop = if len == 0 {
-                    if all {
-                        return None;
+                    match all {
+                        Some(box_end) => box_end(start)?,
+                        None => data.len(),
                     }
-                    data.len()
                 } else {
                     start.checked_add(usize::try_from(len).ok()?)?
                 };
@@ -625,7 +638,7 @@ fn locations(
                 _ => ranges = None,
             }
         }
-        if all || wanted.iter().any(|(w, _)| *w == id) {
+        if all.is_some() || wanted.iter().any(|(w, _)| *w == id) {
             out.push((id, ranges));
         }
     }
@@ -739,19 +752,28 @@ fn orientation_of(ops: &[Op]) -> u8 {
         .unwrap_or(1)
 }
 
-/// `data` with nothing but what an AVIF is made of: its `ftyp` and `meta` boxes, the
-/// bytes `iloc` places its items in, and the headers of the top-level boxes they sit in,
-/// each where it was so every offset still holds. Every other byte (a `free` or unknown
-/// box's, an `mdat`'s past its items) is zeroed, and the file ends after the furthest of
-/// them, the box holding that end shortened to it. `None` when that end can't be known: no
-/// `ftyp` or `meta`, an item that can't be located or runs to the end of the file, or an
-/// end inside a box the walk can't reach.
-pub(super) fn keep(data: &[u8]) -> Option<Vec<u8>> {
-    // The top-level boxes: (start, header length, end), up to one that overruns the file.
+/// The `meta` children whose bodies an AVIF's picture is read from: the rest (`free`,
+/// `skip`, anything unknown) keep only their headers.
+const META_KEEP: [&[u8; 4]; 9] = [
+    b"hdlr", b"pitm", b"iloc", b"iinf", b"iref", b"iprp", b"idat", b"dinf", b"grpl",
+];
+
+/// `data` with nothing but what its picture is made of, each byte where it was so every
+/// offset still holds: `ftyp`; `meta`'s header and the bodies of its `META_KEEP` children
+/// (the headers of the others); the bytes of the primary item, the tiles it's made of and
+/// its alpha (and the Exif and XMP items with `keep_metadata`); and the headers of the
+/// top-level boxes these sit in. Every other byte is zeroed, other items' included, and the
+/// file ends after the furthest kept one, the box holding that end shortened to it. `None`
+/// when that end can't be known: no `ftyp`, `meta` or primary item, an item kept that
+/// can't be located, or an end inside a box the walk can't reach.
+pub(super) fn keep(data: &[u8], keep_metadata: bool) -> Option<Vec<u8>> {
+    // The top-level boxes: (start, header length, end, type, whether its size is "to the
+    // end"), up to one that overruns the file.
     let mut top = Vec::new();
     let mut i = 0;
     while let Some(h) = data.get(i..i + 8) {
-        let (size, header) = match u32::from_be_bytes([h[0], h[1], h[2], h[3]]) {
+        let field = u32::from_be_bytes([h[0], h[1], h[2], h[3]]);
+        let (size, header) = match field {
             0 => ((data.len() - i) as u64, 8),
             1 => (
                 u64::from_be_bytes(data.get(i + 8..i + 16)?.try_into().ok()?),
@@ -762,20 +784,56 @@ pub(super) fn keep(data: &[u8]) -> Option<Vec<u8>> {
         let end = usize::try_from(size).ok().and_then(|s| i.checked_add(s));
         match end {
             Some(end) if size >= header as u64 && end <= data.len() => {
-                top.push((i, header, end, [h[4], h[5], h[6], h[7]]));
+                top.push((i, header, end, [h[4], h[5], h[6], h[7]], field == 0));
                 i = end;
             }
             _ => break,
         }
     }
-    let whole = |kind: &[u8; 4]| top.iter().find(|b| &b.3 == kind).map(|b| (b.0, b.2));
-    let (ftyp, meta) = (whole(b"ftyp")?, whole(b"meta")?);
+    let whole = |kind: &[u8; 4]| top.iter().find(|b| &b.3 == kind).copied();
+    let ftyp = whole(b"ftyp")?;
+    let (meta, header, meta_end, _, _) = whole(b"meta")?;
     // `meta` is a full box: its children follow a version and flags.
-    let (_, header, _, _) = *top.iter().find(|b| &b.3 == b"meta")?;
-    let inner = boxes(data, meta.0 + header + 4, meta.1);
-    let mut kept = vec![ftyp, meta];
-    for (_, ranges) in locations(data, &inner, &[], true).ok()? {
-        kept.extend(ranges?);
+    let body = meta + header + 4;
+    let inner = boxes(data, body, meta_end);
+    let mut kept = vec![(ftyp.0, ftyp.2), (meta, body)];
+    for b in &inner {
+        kept.push((b.start, b.body));
+        if META_KEEP.contains(&&b.kind) {
+            kept.push((b.body, b.end));
+        }
+    }
+    let primary = find(&inner, b"pitm").and_then(|b| {
+        let wide = if *data.get(b.body)? == 0 { 2 } else { 4 };
+        read(data, &mut (b.body + 4), wide, b.end)
+    })?;
+    let mut items = vec![primary];
+    for (kind, from, to) in references(data, &inner) {
+        match &kind {
+            b"dimg" if from == primary => items.extend(to),
+            b"auxl" if to.contains(&primary) => items.push(from),
+            _ => {}
+        }
+    }
+    if keep_metadata {
+        items.extend(
+            metadata_items(data, &inner)
+                .ok()?
+                .0
+                .into_iter()
+                .map(|(id, _)| id),
+        );
+    }
+    // An extent of length 0 runs to the end of the box it starts in, when that has one.
+    let box_end = |at: usize| {
+        top.iter()
+            .find(|b| b.0 <= at && at < b.2 && !b.4)
+            .map(|b| b.2)
+    };
+    let located = locations(data, &inner, &[], Some(&box_end)).ok()?;
+    for id in items {
+        let (_, ranges) = located.iter().find(|(i, _)| *i == id)?;
+        kept.extend(ranges.clone()?);
     }
     let cut = kept.iter().map(|r| r.1).max()?;
     let mut out = vec![0u8; cut];
@@ -783,7 +841,7 @@ pub(super) fn keep(data: &[u8]) -> Option<Vec<u8>> {
         out[s..e].copy_from_slice(&data[s..e]);
     }
     let mut reached = false;
-    for &(start, header, end, _) in top.iter().filter(|b| b.0 < cut) {
+    for &(start, header, end, _, _) in top.iter().filter(|b| b.0 < cut) {
         if start + header > cut {
             return None;
         }
@@ -799,6 +857,29 @@ pub(super) fn keep(data: &[u8]) -> Option<Vec<u8>> {
         }
     }
     reached.then_some(out)
+}
+
+/// The item references in `iref`: (type, from, to), each read within its box.
+fn references(data: &[u8], inner: &[Box4]) -> Vec<([u8; 4], u64, Vec<u64>)> {
+    let Some(iref) = find(inner, b"iref") else {
+        return Vec::new();
+    };
+    let Some(&version) = data.get(iref.body) else {
+        return Vec::new();
+    };
+    let wide = if version == 0 { 2 } else { 4 };
+    boxes(data, iref.body + 4, iref.end)
+        .into_iter()
+        .filter_map(|r| {
+            let mut at = r.body;
+            let from = read(data, &mut at, wide, r.end)?;
+            let n = read(data, &mut at, 2, r.end)?;
+            let to = (0..n)
+                .map(|_| read(data, &mut at, wide, r.end))
+                .collect::<Option<Vec<_>>>()?;
+            Some((r.kind, from, to))
+        })
+        .collect()
 }
 
 /// `data` with the EXIF and XMP items blanked, or `None` when it has none. The caller
