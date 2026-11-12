@@ -806,5 +806,45 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
     if n > 0 {
         tracing::info!(cleanups = n, "queued failed file cleanups again");
     }
+    sweep_staging(state).await;
     Ok(())
+}
+
+/// How long an object may sit in a storage's staging area before it's taken for a stray:
+/// past any claim's grace, and an hour more for a slow `PUT` to finish landing.
+const STAGING_KEPT: std::time::Duration =
+    std::time::Duration::from_secs(files::PENDING_GRACE.as_secs() + 3600);
+
+/// Deletes from each storage's staging area what no pending file waits on and was written
+/// before `STAGING_KEPT` ago: a `PUT` that landed after its key's own sweep, or one a
+/// client never claimed. Failures are logged; the next run tries again.
+async fn sweep_staging(state: &AppState) {
+    let before = std::time::SystemTime::now() - STAGING_KEPT;
+    for (name, storage) in &state.media.storages.0 {
+        // Only a storage that takes client uploads has a staging area.
+        if !storage.takes_client_uploads() {
+            continue;
+        }
+        let staging = tachyon_media::storage::STAGING;
+        let keys = match storage.written_before(staging, before).await {
+            Ok(keys) => keys,
+            Err(error) => {
+                tracing::error!(%error, storage = %name, "couldn't list the staging area; the next sweep tries in an hour");
+                continue;
+            }
+        };
+        for key in keys {
+            match files::staging_claimed(&state.pool, name, &key).await {
+                Ok(false) => {}
+                Ok(true) => continue,
+                Err(error) => {
+                    tracing::error!(%error, %key, "couldn't check a staging object; the next sweep tries again");
+                    continue;
+                }
+            }
+            if let Err(error) = storage.delete(&key).await {
+                tracing::error!(%error, %key, "couldn't delete a stray staging object; the next sweep tries again");
+            }
+        }
+    }
 }

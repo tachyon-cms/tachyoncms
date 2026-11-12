@@ -160,7 +160,7 @@ pub async fn reserve(
     key_of: impl Fn(Uuid, &str) -> Result<String, String>,
 ) -> Result<FileRow, DbError> {
     let mut tx = pool.begin().await?;
-    let row = reserve_in(&mut tx, f, key_of).await?;
+    let row = reserve_in(&mut tx, f, &HashSet::new(), key_of).await?;
     tx.commit().await?;
     Ok(row)
 }
@@ -169,6 +169,7 @@ pub async fn reserve(
 async fn reserve_in(
     tx: &mut PgConnection,
     f: &NewFile<'_>,
+    also: &HashSet<String>,
     key_of: impl Fn(Uuid, &str) -> Result<String, String>,
 ) -> Result<FileRow, DbError> {
     let filename = free_name(
@@ -177,7 +178,7 @@ async fn reserve_in(
         f.scope,
         f.filename,
         f.document,
-        &HashSet::new(),
+        also,
         None,
     )
     .await?;
@@ -221,8 +222,8 @@ async fn reserve_in(
 
 /// How long a client's signed `PUT` URL works.
 pub const ISSUED_PUT: Duration = Duration::from_secs(15 * 60);
-/// How long after its URL runs out a staging key is swept: a `PUT` may still be landing.
-const PUT_SKEW: Duration = Duration::from_secs(60);
+/// How long after the claim's grace a staging key is swept, for a claim just made.
+const CLAIM_SKEW: Duration = Duration::from_secs(60);
 
 /// The most files one user and key may be issued in one collection while their `PUT` URLs
 /// still work, whatever became of them since.
@@ -239,11 +240,12 @@ pub enum Issued {
 
 /// `reserve`s `f` for the client it's issued to (`f.issued_to`, which it needs), to put at
 /// `staging` in its storage, unless `ISSUED_CAP` files issued to them in its collection
-/// still have working URLs. Each issue queues the sweep of its staging key for when its
-/// URL has run out, whatever happens to the file: a client may `PUT` until then. That
-/// sweep is what's counted, so a file given up or cleaned up early still counts. A file
-/// issued earlier for the same document under the same name, not yet claimed, is given up:
-/// only the newest can be claimed.
+/// still have working URLs. Each issue queues the sweep of its staging key for when the
+/// claim's grace is over, whatever happens to the file. That sweep is what's counted,
+/// while the URL works, so a file given up or cleaned up early still counts. Its name is
+/// numbered against the client's other waiting files in every scope, so a claim by name
+/// finds one. A file issued earlier for the same document under the same name, not yet
+/// claimed, is given up: only the newest can be claimed.
 pub async fn issue(
     pool: &PgPool,
     f: &NewFile<'_>,
@@ -270,7 +272,7 @@ pub async fn issue(
            FROM jobs
            WHERE tenant_id = $1 AND kind = $6 AND collection_id = $2 AND payload ? 'staging'
              AND created_by = $3 AND key_id IS NOT DISTINCT FROM $4
-             AND created_at + make_interval(secs => $5) > now()"#,
+             AND created_at > now() - make_interval(secs => $5)"#,
         DEFAULT_TENANT,
         f.collection_id,
         user,
@@ -286,7 +288,22 @@ pub async fn issue(
             retry_after: Duration::from_secs(secs.unsigned_abs()),
         });
     }
-    let row = reserve_in(&mut tx, f, key_of).await?;
+    let waiting: HashSet<String> = sqlx::query_scalar!(
+        r#"SELECT filename FROM files
+           WHERE tenant_id = $1 AND collection_id = $2 AND state = 'pending'
+             AND issued_to = $3 AND issued_key IS NOT DISTINCT FROM $4
+             AND (document_id IS DISTINCT FROM $5 OR $5 IS NULL)"#,
+        DEFAULT_TENANT,
+        f.collection_id,
+        user,
+        key,
+        f.document,
+    )
+    .fetch_all(&mut *tx)
+    .await?
+    .into_iter()
+    .collect();
+    let row = reserve_in(&mut tx, f, &waiting, key_of).await?;
     sqlx::query!(
         "UPDATE files SET staging_key = $3 WHERE tenant_id = $1 AND id = $2",
         DEFAULT_TENANT,
@@ -295,7 +312,7 @@ pub async fn issue(
     )
     .execute(&mut *tx)
     .await?;
-    let sweep = time::Duration::try_from(ISSUED_PUT + PUT_SKEW).expect("minutes fit");
+    let sweep = time::Duration::try_from(PENDING_GRACE + CLAIM_SKEW).expect("an hour fits");
     jobs::enqueue(
         &mut tx,
         &NewJob {
@@ -332,6 +349,20 @@ pub async fn issue(
     }
     tx.commit().await?;
     Ok(Issued::Reserved(Box::new(row)))
+}
+
+/// Whether a pending file on `storage` waits on what a client put at `staging`.
+pub async fn staging_claimed(pool: &PgPool, storage: &str, staging: &str) -> Result<bool, DbError> {
+    Ok(sqlx::query_scalar!(
+        r#"SELECT EXISTS (SELECT 1 FROM files
+                          WHERE tenant_id = $1 AND storage = $2 AND staging_key = $3
+                            AND state = 'pending') AS "claimed!""#,
+        DEFAULT_TENANT,
+        storage,
+        staging,
+    )
+    .fetch_one(pool)
+    .await?)
 }
 
 /// The key a client puts an issued file at, which only the server reads.
@@ -924,18 +955,16 @@ pub async fn holders(pool: &PgPool, file: Uuid) -> Result<Vec<(Uuid, DocCopy)>, 
         .collect())
 }
 
-/// Takes the pending file of `collection_id` named `filename` in `scope` that was issued
-/// to `user` with `key` (none for a session), within its grace, for `document`: one issued
+/// Takes the pending file of `collection_id` named `filename` that was issued to `user`
+/// with `key` (none for a session), within its grace, for `document`: one issued
 /// for no document is taken by any write, one issued for a document only by that
 /// document's update. Once taken it's issued to nobody, so no other request can take it:
 /// of two at once, the second waits for the first's row lock and then finds nothing. It
 /// stays pending, for the write that takes it to make live or give up, or for its cleanup.
-#[allow(clippy::too_many_arguments)]
 pub async fn claim_pending(
     tx: &mut PgConnection,
     collection_id: Uuid,
     filename: &str,
-    scope: &str,
     user: Uuid,
     key: Option<Uuid>,
     document: Option<Uuid>,
@@ -948,7 +977,7 @@ pub async fn claim_pending(
            WHERE tenant_id = $1 AND state = 'pending' AND issued_to = $4
              AND id = (SELECT id FROM files
                        WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3
-                         AND scope = $8 AND state = 'pending' AND issued_to = $4
+                         AND state = 'pending' AND issued_to = $4
                          AND issued_key IS NOT DISTINCT FROM $5
                          AND created_at + make_interval(secs => $6) > now()
                          AND (document_id IS NULL OR document_id = $7)
@@ -964,7 +993,6 @@ pub async fn claim_pending(
         key,
         PENDING_GRACE.as_secs_f64(),
         document,
-        scope,
     )
     .fetch_optional(&mut *tx)
     .await?)

@@ -127,8 +127,8 @@ impl Incoming {
 impl Incoming {
     /// The file checked and made what's stored (`check_and_process`), from wherever it
     /// comes: one put in storage by the client is claimed for the caller first, for
-    /// `document` when it's an update's, in the scope `values` (what the document will
-    /// hold) gives it. A refusal after the claim gives that file up.
+    /// `document` when it's an update's. Its name is settled in the write's own scope when
+    /// it's stored. A refusal after the claim gives that file up.
     pub(crate) async fn checked(
         self,
         state: &AppState,
@@ -136,18 +136,10 @@ impl Incoming {
         c: &Collection,
         u: &Upload,
         document: Option<Uuid>,
-        values: &Map<String, Value>,
     ) -> Result<Checked, ApiError> {
         match self {
             Self::Client(f, limit) => {
-                let mut values = values.clone();
-                values.insert("filename".into(), f.filename.clone().into());
-                let scope = scope_of(u, &values);
-                let at = Claim {
-                    document,
-                    scope: &scope,
-                };
-                claimed(state, access, c, u, &f, limit.as_ref(), at).await
+                claimed(state, access, c, u, &f, limit.as_ref(), document).await
             }
             other => {
                 let spool = other.spool(state, u).await?;
@@ -180,14 +172,8 @@ pub(crate) async fn or_give_up<T>(
     result
 }
 
-/// Which issued file a write may claim: one for its document (an update's) or for none,
-/// in its scope.
-struct Claim<'a> {
-    document: Option<Uuid>,
-    scope: &'a str,
-}
-
-/// File `f`, put in storage by the client, claimed for the caller (`at`) and checked as
+/// File `f`, put in storage by the client, claimed for the caller (for `document`, or for
+/// none) and checked as
 /// an upload is: past the limit by its stored size (413), then downloaded and sniffed,
 /// with the time an upload gets. Any refusal from here on gives it up. What the client put
 /// is deleted once the claim is done, either way; the file is only ever written by the
@@ -199,15 +185,14 @@ async fn claimed(
     u: &Upload,
     f: &ClientFile,
     limit: Option<&crate::Limit>,
-    at: Claim<'_>,
+    document: Option<Uuid>,
 ) -> Result<Checked, ApiError> {
     let Some(user) = access.user_id() else {
         return Err(unclaimed());
     };
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     let key = access.key_id();
-    let row =
-        files::claim_pending(&mut tx, c.id, &f.filename, at.scope, user, key, at.document).await?;
+    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, key, document).await?;
     tx.commit().await.map_err(DbError::from)?;
     let row = row.ok_or_else(unclaimed)?;
     let id = row.id;
@@ -251,11 +236,8 @@ async fn checked_claim(
     let unread = |e: StorageError| ApiError::Internal(format!("can't read a stored file: {e}"));
     let size = match storage.head(staging).await {
         Ok(meta) => meta.size,
-        Err(e) if e.is_not_found() => {
-            return Err(at_file(
-                "the file isn't in storage; put it there first".into(),
-            ));
-        }
+        // Never put, or swept: as unclaimable as any other.
+        Err(e) if e.is_not_found() => return Err(unclaimed()),
         Err(e) => return Err(unread(e)),
     };
     if size > cap {
@@ -1558,8 +1540,7 @@ async fn upload_instructions_in(
     let static_dir = u.static_dir.as_deref();
     // Where the client puts it: a key of its own that nothing serves or links to. The
     // file's key is only ever written by the server, from what it checked.
-    let staging = staging_key(static_dir, &c.schema.slug)
-        .map_err(|e| ApiError::Internal(format!("can't make a staging key: {e}")))?;
+    let staging = staging_key();
     let issued = files::issue(&state.pool, &new, &staging, |id, name| {
         object_key(static_dir, &c.schema.slug, id, name).map_err(|e| e.to_string())
     })

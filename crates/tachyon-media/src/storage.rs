@@ -338,6 +338,32 @@ impl Storage {
         Ok(self.store.copy(&self.key(from)?, &self.key(to)?).await?)
     }
 
+    /// The keys under directory `dir` (as given to `put_file`, without the prefix) last
+    /// written before `before`.
+    pub async fn written_before(
+        &self,
+        dir: &str,
+        before: std::time::SystemTime,
+    ) -> Result<Vec<String>, StorageError> {
+        use futures_util::TryStreamExt as _;
+        let prefix = self.key(dir)?;
+        let before = epoch_secs(before);
+        let found: Vec<ObjectMeta> = self.store.list(Some(&prefix)).try_collect().await?;
+        let strip = self.config.prefix.as_ref().map(|p| format!("{p}/"));
+        Ok(found
+            .into_iter()
+            .filter(|m| m.last_modified.timestamp() < before)
+            .map(|m| {
+                let key = m.location.as_ref();
+                strip
+                    .as_deref()
+                    .and_then(|p| key.strip_prefix(p))
+                    .unwrap_or(key)
+                    .to_owned()
+            })
+            .collect())
+    }
+
     /// Deletes `key`. One that isn't there is already deleted.
     pub async fn delete(&self, key: &str) -> Result<(), StorageError> {
         match self.store.delete(&self.key(key)?).await {
@@ -384,6 +410,12 @@ fn check_signing(name: &str, c: &StorageConfig) -> Result<(), String> {
         }
     }
     Ok(())
+}
+
+/// `t` in whole seconds since the epoch, as object times are compared.
+fn epoch_secs(t: std::time::SystemTime) -> i64 {
+    t.duration_since(std::time::UNIX_EPOCH)
+        .map_or(0, |d| i64::try_from(d.as_secs()).unwrap_or(i64::MAX))
 }
 
 /// Whether every `/`-separated segment of `path` is a plain name: none empty, `.` or
@@ -444,16 +476,15 @@ pub fn object_key(
     Ok(key)
 }
 
-/// Where a client puts a file before the server checks it:
-/// `{staticDir}/{collection}/staging/{random}`. A file's own keys are `{collection}/{file
-/// id}/…`, so no file is ever stored, served or linked to under it.
-pub fn staging_key(static_dir: Option<&str>, collection: &str) -> Result<String, StorageError> {
-    let key = match static_dir {
-        Some(dir) => format!("{dir}/{collection}/staging/{}", Uuid::new_v4()),
-        None => format!("{collection}/staging/{}", Uuid::new_v4()),
-    };
-    checked(&key)?;
-    Ok(key)
+/// The one directory of a storage, under its `prefix`, that clients put files in before the
+/// server checks them. A file's own keys are `{collection}/{file id}/…` (or under a
+/// `staticDir`), which never begin with it, so no file is stored, served or linked there,
+/// and one bucket lifecycle rule on it covers every collection.
+pub const STAGING: &str = "_staging";
+
+/// A new key in `STAGING`: `_staging/{random}`.
+pub fn staging_key() -> String {
+    format!("{STAGING}/{}", Uuid::new_v4())
 }
 
 /// Every open storage by name. There's always a `default`.

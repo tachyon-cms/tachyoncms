@@ -3373,6 +3373,7 @@ dependencies = [
  "avif-parse",
  "blurhash",
  "fast_image_resize",
+ "futures-util",
  "gif",
  "image",
  "img-parts",

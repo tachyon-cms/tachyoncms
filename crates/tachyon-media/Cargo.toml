@@ -11,6 +11,7 @@ avif-decode.workspace = true
 avif-parse.workspace = true
 blurhash.workspace = true
 fast_image_resize.workspace = true
+futures-util.workspace = true
 gif.workspace = true
 image.workspace = true
 img-parts.workspace = true

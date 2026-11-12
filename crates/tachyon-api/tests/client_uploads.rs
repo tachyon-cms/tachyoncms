@@ -320,7 +320,8 @@ async fn instructions_shape_and_rights(pool: PgPool) {
     );
     // The client puts to a staging key of its own, never to the file's.
     let staging = signed_key(&url);
-    assert!(staging.starts_with("media/staging/"), "{staging}");
+    // One staging area per storage, for one lifecycle rule to cover.
+    assert!(staging.starts_with("_staging/"), "{staging}");
     assert_ne!(staging, *key);
     assert_eq!(query(&url, "method").as_deref(), Some("PUT"));
     assert_eq!(query(&url, "expires").as_deref(), Some("900"));
@@ -1279,7 +1280,8 @@ async fn claims_are_matched_in_their_scope(pool: PgPool) {
     )
     .await;
     let ask = |alt: &str, size: usize| json!({"filename": "a.png", "mimeType": "image/png", "filesize": size, "data": {"alt": alt}});
-    // Two scopes, one name: each create takes its own scope's bytes.
+    // Two scopes, one name: one issuer's waiting names are kept apart across scopes, so
+    // each create takes its own bytes.
     let (x, y) = (png(3, 3), png(7, 7));
     let for_x = call(
         &app,
@@ -1296,7 +1298,7 @@ async fn claims_are_matched_in_their_scope(pool: PgPool) {
     )
     .await;
     assert_eq!(for_x.json["file"]["filename"], "a.png");
-    assert_eq!(for_y.json["file"]["filename"], "a.png");
+    assert_eq!(for_y.json["file"]["filename"], "a-1.png");
     let fx = put_to(&d.bucket, &for_x.json, &x);
     let fy = put_to(&d.bucket, &for_y.json, &y);
     let doc = ok(&app, "POST", "/api/media", json!({"file": fy, "alt": "y"})).await;
@@ -1305,7 +1307,7 @@ async fn claims_are_matched_in_their_scope(pool: PgPool) {
     assert_eq!(doc["width"], 3);
 
     // A replacement waiting for one document doesn't stand in the way of a create in
-    // another scope under the same name.
+    // another scope: the create's name is numbered apart, and it claims.
     let id = doc["id"].as_str().unwrap();
     let body = json!({"filename": "b.png", "mimeType": "image/png", "filesize": 70, "id": id});
     let replace = call(&app, "POST", "/api/media/upload-instructions", body).await;
@@ -1313,7 +1315,7 @@ async fn claims_are_matched_in_their_scope(pool: PgPool) {
     let mut create = ask("z", x.len());
     create["filename"] = "b.png".into();
     let create = call(&app, "POST", "/api/media/upload-instructions", create).await;
-    assert_eq!(create.json["file"]["filename"], "b.png");
+    assert_eq!(create.json["file"]["filename"], "b-1.png");
     let file = put_to(&d.bucket, &create.json, &x);
     let res = call(
         &app,
@@ -1475,4 +1477,136 @@ async fn signed_storages_keep_the_route_s_rules(pool: PgPool) {
     assert_eq!(res.header("content-security-policy"), "sandbox");
     upload(&app, "POST", "/api/art", Some(&png(1, 1)), "a.png", None).await;
     assert_eq!(fetch(&anon, "GET", "/api/art/file/a.png").await.status, 302);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_create_later_in_the_grace_still_claims(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let image = png(2, 2);
+    let res = instructions(&app, "media", "a.png", "image/png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let staging = signed_key(res.json["request"]["url"].as_str().unwrap());
+    // The staging key is swept once the claim's grace is over, not when the URL is.
+    let late: bool = sqlx::query_scalar(
+        "SELECT run_at > now() + interval '1 hour' FROM jobs WHERE payload->'keys' ? $1",
+    )
+    .bind(&staging)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(late);
+    // Twenty minutes on (no clock: the file and its jobs are moved back), with a worker
+    // running whatever is due.
+    sqlx::query("UPDATE files SET created_at = created_at - interval '20 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET created_at = created_at - interval '20 minutes',
+                         run_at = run_at - interval '20 minutes' WHERE kind = $1",
+    )
+    .bind(CLEANUP)
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(d.bucket.join(&staging).exists());
+    let doc = ok(&app, "POST", "/api/media", json!({"file": file})).await;
+    assert_eq!(doc["width"], 2);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_swept_upload_is_like_any_other_unclaimable(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    let made_up = call(
+        &app,
+        "POST",
+        "/api/media",
+        json!({"file": {"filename": "nope.png"}}),
+    )
+    .await;
+    assert_problem(&made_up, 422);
+    // Put, then swept before the create (or never put): the same answer.
+    let res = instructions(&app, "media", "a.png", "image/png", 70).await;
+    put_to(&d.bucket, &res.json, &png(1, 1));
+    std::fs::remove_file(
+        d.bucket
+            .join(signed_key(res.json["request"]["url"].as_str().unwrap())),
+    )
+    .unwrap();
+    let swept = call(
+        &app,
+        "POST",
+        "/api/media",
+        json!({"file": res.json["file"]}),
+    )
+    .await;
+    assert_eq!(refusal(&swept), refusal(&made_up));
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_compound_create_claims_without_hints(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(
+        &app,
+        "media",
+        json!({"upload": {"storage": "bucket", "filenameCompoundIndex": ["alt"]}}),
+    )
+    .await;
+    // Asked for as a client written for the reference shape asks: no `data`.
+    let image = png(3, 3);
+    let res = instructions(&app, "media", "a.png", "image/png", image.len() as u64).await;
+    let file = put_to(&d.bucket, &res.json, &image);
+    let doc = ok(
+        &app,
+        "POST",
+        "/api/media",
+        json!({"file": file, "alt": "x"}),
+    )
+    .await;
+    assert_eq!(
+        (doc["filename"].clone(), doc["width"].clone()),
+        (json!("a.png"), json!(3))
+    );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn stray_staging_objects_are_swept(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "media", json!({})).await;
+    // Objects in the staging area that no file knows: one long finished, one just put.
+    let old = d.bucket.join(format!("_staging/{}", Uuid::new_v4()));
+    let fresh = d.bucket.join(format!("_staging/{}", Uuid::new_v4()));
+    std::fs::create_dir_all(old.parent().unwrap()).unwrap();
+    std::fs::write(&old, b"slow").unwrap();
+    std::fs::write(&fresh, b"new").unwrap();
+    let three_hours = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
+    std::fs::File::options()
+        .write(true)
+        .open(&old)
+        .unwrap()
+        .set_modified(three_hours)
+        .unwrap();
+    // The hourly sweep runs now.
+    sqlx::query(
+        "UPDATE jobs SET run_at = now() WHERE kind = 'file_cleanup_sweep' AND state = 'queued'",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
+        .await
+        .unwrap();
+    until("the stray object is deleted", async || !old.exists()).await;
+    assert!(fresh.exists());
+    drop(app);
 }

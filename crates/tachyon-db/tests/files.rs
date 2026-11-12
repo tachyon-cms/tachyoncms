@@ -361,12 +361,12 @@ async fn lookups_find_live_files_and_their_holders(pool: PgPool) {
     // Only whoever it was issued to claims it, with the same key.
     let mut tx = pool.begin().await.unwrap();
     for (u, k) in [(user, None), (Uuid::now_v7(), Some(key))] {
-        let none = files::claim_pending(&mut tx, c.id, "a.png", "", u, k, None)
+        let none = files::claim_pending(&mut tx, c.id, "a.png", u, k, None)
             .await
             .unwrap();
         assert!(none.is_none());
     }
-    let claimed = files::claim_pending(&mut tx, c.id, "a.png", "", user, Some(key), None)
+    let claimed = files::claim_pending(&mut tx, c.id, "a.png", user, Some(key), None)
         .await
         .unwrap();
     assert_eq!(claimed.map(|f| f.id), Some(a.id));
