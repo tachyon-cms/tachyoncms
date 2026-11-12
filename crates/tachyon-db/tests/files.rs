@@ -1127,3 +1127,111 @@ async fn an_edit_needs_the_file_it_was_made_from(pool: PgPool) {
     );
     assert_eq!(state(&pool, a).await, "gone", "nothing else held it");
 }
+
+/// This connection's subtransactions in its open transaction: how many, and whether
+/// Postgres's cache of them overflowed.
+async fn subxacts(conn: &mut sqlx::PgConnection) -> (i32, bool) {
+    sqlx::query_as(
+        "SELECT subxact_count, subxact_overflowed FROM pg_stat_get_backend_subxact(
+             (SELECT b FROM pg_stat_get_backend_idset() b
+              WHERE pg_stat_get_backend_pid(b) = pg_backend_pid()))",
+    )
+    .fetch_one(conn)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_collection_drops_its_files_without_a_savepoint_each(pool: PgPool) {
+    let c = seed(&pool).await;
+    let mut held = Vec::new();
+    for i in 0..100 {
+        let f = reserve(&pool, &c, &format!("{i}.png"), "", None).await;
+        draft_with(&pool, &c, f.id).await;
+        held.push(f.id);
+    }
+    // Live, though nothing holds it (as a past bug or a hand edit could leave one).
+    let loose = reserve(&pool, &c, "loose.png", "", None).await.id;
+    sqlx::query("UPDATE files SET state = 'live' WHERE id = $1")
+        .bind(loose)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let pending = reserve(&pool, &c, "pending.png", "", None).await.id;
+
+    let mut tx = pool.begin().await.unwrap();
+    files::drop_collection_in(&mut tx, c.id).await.unwrap();
+    assert_eq!(subxacts(&mut tx).await, (0, false));
+    tx.commit().await.unwrap();
+    for id in held.iter().chain([&loose]) {
+        assert_eq!(state(&pool, *id).await, "gone", "{id}");
+        assert_eq!(cleanups(&pool, *id).await, 1, "{id}");
+    }
+    let due: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = $1 AND state = 'queued' AND run_at <= now()",
+    )
+    .bind(CLEANUP)
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(due, 101, "each released file's cleanup is due now");
+    // A pending file keeps the cleanup it was reserved with, after its grace.
+    assert_eq!(state(&pool, pending).await, "gone");
+    let later: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM jobs WHERE kind = $1 AND payload->>'file' = $2
+           AND state = 'queued' AND run_at > now() + interval '50 minutes'",
+    )
+    .bind(CLEANUP)
+    .bind(pending.to_string())
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(later, 1);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_newer_walk_cancels_a_batch_that_was_committing(pool: PgPool) {
+    let c = seed(&pool).await;
+    let mut conn = pool.acquire().await.unwrap();
+    let batch = tachyon_db::jobs::add(&mut conn, &files::regenerate_job(c.id, None))
+        .await
+        .unwrap();
+    drop(conn);
+    // The batch completes and queues the next one, and holds that open...
+    let mut tx = pool.begin().await.unwrap();
+    sqlx::query("UPDATE jobs SET state = 'done', finished_at = now() WHERE id = $1")
+        .bind(batch)
+        .execute(&mut *tx)
+        .await
+        .unwrap();
+    let next = tachyon_db::jobs::add(&mut tx, &files::regenerate_job(c.id, Some(Uuid::now_v7())))
+        .await
+        .unwrap();
+    // ...while a schema change queues a new walk.
+    let newer = {
+        let pool = pool.clone();
+        tokio::spawn(async move {
+            let mut conn = pool.acquire().await.unwrap();
+            tachyon_db::jobs::enqueue(&mut conn, &files::regenerate_job(c.id, None))
+                .await
+                .unwrap()
+        })
+    };
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    tx.commit().await.unwrap();
+    let newer = newer.await.unwrap();
+    let states: Vec<(Uuid, String)> =
+        sqlx::query_as("SELECT id, state FROM jobs WHERE kind = 'regenerate_sizes' ORDER BY id")
+            .fetch_all(&pool)
+            .await
+            .unwrap();
+    assert_eq!(
+        states,
+        [
+            (batch, "done".into()),
+            (next, "cancelled".into()),
+            (newer, "queued".into()),
+        ],
+        "one walk goes on, the newer, from the start"
+    );
+}

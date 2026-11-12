@@ -97,13 +97,14 @@ pub(crate) async fn run_regenerate(state: &AppState, job: &Job) -> Result<(), Jo
         .await
         .map_err(retry)?;
     let mut tx = state.pool.begin().await.map_err(retry)?;
-    for (file, mime) in &batch {
-        if picture::size_format(mime).is_some() {
-            jobs::enqueue(&mut tx, &size_job(collection, *file, true))
-                .await
-                .map_err(retry)?;
-        }
-    }
+    let sized: Vec<NewJob<'static>> = batch
+        .iter()
+        .filter(|(_, mime)| picture::size_format(mime).is_some())
+        .map(|(file, _)| size_job(collection, *file, true))
+        .collect();
+    // One statement for the batch, not a savepoint per file. A size job queued for one of
+    // these files meanwhile (only a restore or a first run does) fails it, and it retries.
+    jobs::enqueue_all(&mut tx, &sized).await.map_err(retry)?;
     if !jobs::complete_in(&mut tx, job).await.map_err(retry)? {
         return Ok(());
     }
@@ -900,9 +901,9 @@ async fn complete(state: &AppState, job: &Job, forget: Option<Uuid>) -> Result<(
     Ok(())
 }
 
-/// Queues the next sweep, then each failed cleanup still worth trying. The next run is
-/// queued first, in its own transaction, so it's there whatever happens to this one's work,
-/// which is safe to repeat.
+/// Queues the next sweep, then each failed cleanup still worth trying and each failed size
+/// walk still its collection's latest. The next run is queued first, in its own
+/// transaction, so it's there whatever happens to this one's work, which is safe to repeat.
 pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(), JobError> {
     let mut tx = state.pool.begin().await.map_err(retry)?;
     if !jobs::complete_in(&mut tx, job).await.map_err(retry)? {
@@ -918,11 +919,17 @@ pub(crate) async fn run_cleanup_sweep(state: &AppState, job: &Job) -> Result<(),
     let requeued = async {
         let mut tx = state.pool.begin().await?;
         let n = files::requeue_cleanups_in(&mut tx, &names).await?;
+        let walks = files::requeue_walks_in(&mut tx).await?;
         tx.commit().await?;
-        Ok::<_, DbError>(n)
+        Ok::<_, DbError>((n, walks))
     };
     let n = match requeued.await {
-        Ok(n) => n,
+        Ok((n, walks)) => {
+            if walks > 0 {
+                tracing::info!(walks, "queued failed size walks again");
+            }
+            n
+        }
         Err(error) => {
             tracing::error!(%error, "couldn't queue failed file cleanups again; the next sweep tries in an hour");
             return Ok(());

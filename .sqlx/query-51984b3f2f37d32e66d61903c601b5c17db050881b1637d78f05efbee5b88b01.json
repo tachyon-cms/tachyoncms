@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH old AS (SELECT id FROM versions\n                        WHERE tenant_id = $1 AND collection_id = $2 AND file_id IS NOT NULL\n                        ORDER BY id FOR UPDATE)\n           UPDATE versions v SET file_id = NULL FROM old WHERE v.id = old.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "51984b3f2f37d32e66d61903c601b5c17db050881b1637d78f05efbee5b88b01"
+}

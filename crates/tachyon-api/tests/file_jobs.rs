@@ -114,6 +114,100 @@ impl ObjectStore for Flaky {
     }
 }
 
+/// Local storage whose object is written again (its ETag moves on) just after each of the
+/// next `changes` HEADs, or that has no ETag at all, as a store might not.
+#[derive(Debug)]
+struct Shifting {
+    inner: LocalFileSystem,
+    changes: AtomicUsize,
+    tag: AtomicUsize,
+    no_etag: bool,
+}
+
+impl fmt::Display for Shifting {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "Shifting({})", self.inner)
+    }
+}
+
+impl Shifting {
+    fn tag(&self) -> String {
+        format!("v{}", self.tag.load(Ordering::SeqCst))
+    }
+}
+
+#[async_trait::async_trait]
+impl ObjectStore for Shifting {
+    async fn put_opts(
+        &self,
+        location: &Key,
+        payload: PutPayload,
+        opts: PutOptions,
+    ) -> object_store::Result<PutResult> {
+        self.inner.put_opts(location, payload, opts).await
+    }
+
+    async fn put_multipart_opts(
+        &self,
+        location: &Key,
+        opts: PutMultipartOptions,
+    ) -> object_store::Result<Box<dyn MultipartUpload>> {
+        self.inner.put_multipart_opts(location, opts).await
+    }
+
+    async fn get_opts(
+        &self,
+        location: &Key,
+        mut options: GetOptions,
+    ) -> object_store::Result<GetResult> {
+        if options.head {
+            let mut got = self.inner.get_opts(location, options).await?;
+            got.meta.e_tag = (!self.no_etag).then(|| self.tag());
+            let changing = self
+                .changes
+                .try_update(Ordering::SeqCst, Ordering::SeqCst, |n| n.checked_sub(1))
+                .is_ok();
+            if changing {
+                self.tag.fetch_add(1, Ordering::SeqCst);
+            }
+            return Ok(got);
+        }
+        if let Some(tag) = options.if_match.take()
+            && tag != self.tag()
+        {
+            return Err(object_store::Error::Precondition {
+                path: location.to_string(),
+                source: "written again".into(),
+            });
+        }
+        self.inner.get_opts(location, options).await
+    }
+
+    fn delete_stream(
+        &self,
+        locations: BoxStream<'static, object_store::Result<Key>>,
+    ) -> BoxStream<'static, object_store::Result<Key>> {
+        self.inner.delete_stream(locations)
+    }
+
+    fn list(&self, prefix: Option<&Key>) -> BoxStream<'static, object_store::Result<ObjectMeta>> {
+        self.inner.list(prefix)
+    }
+
+    async fn list_with_delimiter(&self, prefix: Option<&Key>) -> object_store::Result<ListResult> {
+        self.inner.list_with_delimiter(prefix).await
+    }
+
+    async fn copy_opts(
+        &self,
+        from: &Key,
+        to: &Key,
+        options: CopyOptions,
+    ) -> object_store::Result<()> {
+        self.inner.copy_opts(from, to, options).await
+    }
+}
+
 /// A fresh directory, removed on drop.
 struct Temp(tempfile::TempDir);
 
@@ -940,6 +1034,10 @@ fn api_options(d: &Dirs, workers: usize, inline_rows: Option<i64>) -> Options {
         StorageConfig::local(&d.store),
     )]))
     .unwrap();
+    options_on(d, storages, workers, inline_rows)
+}
+
+fn options_on(d: &Dirs, storages: Storages, workers: usize, inline_rows: Option<i64>) -> Options {
     Options {
         jobs: JobsConfig {
             workers,
@@ -969,6 +1067,23 @@ async fn api_with(pool: &PgPool, d: &Dirs, inline_rows: Option<i64>) -> Router {
     if res.status != 201 {
         assert_eq!(res.status, 403, "setup: {}", res.json);
     }
+    signed_in(app, ADMIN).await
+}
+
+/// The API with no workers, signed in as its first Admin, its files on `store` (over
+/// `d.store`).
+async fn api_on(pool: &PgPool, d: &Dirs, store: Arc<dyn ObjectStore>) -> Router {
+    let storage = Storage::with_store("default", store, None, StorageConfig::local(&d.store));
+    let storages = Storages(std::collections::HashMap::from([(
+        "default".to_owned(),
+        Arc::new(storage),
+    )]));
+    let app = tachyon_api::router_with(pool.clone(), options_on(d, storages, 0, None))
+        .await
+        .unwrap();
+    let setup = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+    let res = send(&app, "POST", "/api/setup", Some(&setup.to_string())).await;
+    assert_eq!(res.status, 201, "setup: {}", res.json);
     signed_in(app, ADMIN).await
 }
 
@@ -1391,6 +1506,15 @@ async fn regeneration_walks_every_batch(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(keyed, 3, "every batch can be replaced by a newer walk");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM jobs WHERE kind = 'regenerate_sizes' AND max_attempts <> 20"
+        )
+        .await,
+        0,
+        "a walk keeps trying as a cleanup does"
+    );
     assert_eq!(regenerated(&pool, since).await, ids);
 }
 
@@ -1523,11 +1647,21 @@ async fn removing_upload_needs_confirm(pool: PgPool) {
     assert_eq!(res.status, 200, "{}", res.json);
     // A is in the trash.
     ok(&app, "DELETE", &format!("/api/media/{a_id}"), None).await;
+    // D's copies hold no file; only its version does.
+    let d_doc = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "e.png", None).await;
+    assert_eq!(d_doc.status, 201, "{}", d_doc.json);
+    let d_file = held(&pool, &d_doc.json["id"]).await;
+    sqlx::query("UPDATE documents SET published_file = NULL, draft_file = NULL WHERE id = $1")
+        .bind(d_doc.json["id"].as_str().unwrap().parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
     let held_files: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM files ORDER BY id")
         .fetch_all(&pool)
         .await
         .unwrap();
-    assert_eq!(held_files.len(), 3);
+    assert_eq!(held_files.len(), 4);
+    assert!(held_files.contains(&d_file));
     assert!(held_files.contains(&first_b));
     // An upload under way.
     let c = collections::get_by_slug(&pool, "media").await.unwrap();
@@ -1551,6 +1685,28 @@ async fn removing_upload_needs_confirm(pool: PgPool) {
     )
     .await
     .unwrap();
+    // A walk and a size job waiting on the collection.
+    let mut conn = pool.acquire().await.unwrap();
+    jobs::add(&mut conn, &files::regenerate_job(c.id, None))
+        .await
+        .unwrap();
+    jobs::add(
+        &mut conn,
+        &NewJob {
+            kind: "image_sizes",
+            document_id: None,
+            collection_id: Some(c.id),
+            payload: json!({"file": first_b}),
+            run_at: OffsetDateTime::now_utc(),
+            dedupe_key: Some(format!("image_sizes:{first_b}")),
+            created_by: None,
+            key_id: None,
+            max_attempts: None,
+        },
+    )
+    .await
+    .unwrap();
+    drop(conn);
 
     // Upload fields point at media: no confirm passes that.
     let off = json!({"slug": "media", "versions": {"maxVersions": 10},
@@ -1571,17 +1727,17 @@ async fn removing_upload_needs_confirm(pool: PgPool) {
     assert_eq!(res.status, 409, "{}", res.json);
     assert_eq!(
         res.json["detail"],
-        "2 documents hold files; they'll be removed. This change removes or retypes fields, \
+        "3 documents hold files; they'll be removed. This change removes or retypes fields, \
          or leaves documents that won't validate. Send it again with \"confirm\": true to go ahead.",
         "{}",
         res.json
     );
-    assert_eq!(res.json["preview"]["holdingFiles"], 2, "{}", res.json);
+    assert_eq!(res.json["preview"]["holdingFiles"], 3, "{}", res.json);
     let stored = ok(&app, "GET", "/api/admin/collections/media", None).await;
     assert_eq!(stored["schema"]["upload"], true, "{stored}");
     assert_eq!(
         count(&pool, "SELECT count(*) FROM files WHERE state = 'live'").await,
-        3
+        4
     );
 
     // With it: every file reference goes, and every file is released.
@@ -1604,7 +1760,18 @@ async fn removing_upload_needs_confirm(pool: PgPool) {
         .await,
         0
     );
-    assert!(count(&pool, "SELECT count(*) FROM versions").await >= 3);
+    assert!(count(&pool, "SELECT count(*) FROM versions").await >= 4);
+    // Nothing is left to make sizes for: the walk and the size job are cancelled, not
+    // left to fail.
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM jobs WHERE kind IN ('image_sizes', 'regenerate_sizes')
+             AND state <> 'cancelled'"
+        )
+        .await,
+        0
+    );
     for id in held_files.iter().chain([&pending.id]) {
         let row = files::get(&pool, *id).await.unwrap();
         assert_eq!(row.state, "gone", "{id}");
@@ -1690,8 +1857,8 @@ async fn fetch_tagged(app: &Router, url: &Value, tag: Option<&str>) -> (u16, Str
     (status, etag, body)
 }
 
-/// The `Last-Modified` `url` (a full URL) is served with.
-async fn last_modified(app: &Router, url: &Value) -> String {
+/// The `Last-Modified` `url` (a full URL) is served with, if any.
+async fn last_modified(app: &Router, url: &Value) -> Option<String> {
     let url = url::Url::parse(url.as_str().unwrap()).unwrap();
     let res = app
         .clone()
@@ -1702,7 +1869,9 @@ async fn last_modified(app: &Router, url: &Value) -> String {
         )
         .await
         .unwrap();
-    res.headers()["last-modified"].to_str().unwrap().to_owned()
+    res.headers()
+        .get("last-modified")
+        .map(|v| v.to_str().unwrap().to_owned())
 }
 
 /// The red, green and blue of the centre of PNG `bytes`.
@@ -1743,9 +1912,9 @@ async fn a_size_remade_under_its_name_gets_a_new_etag(pool: PgPool) {
     let (status, old_tag, old_bytes) = fetch_tagged(&app, &url, None).await;
     assert_eq!(status, 200);
     assert_eq!(centre(&old_bytes)[0], 255, "cut from the left: red");
-    let old_date = last_modified(&app, &url).await;
-    // `Last-Modified` has whole seconds: the remade size's must be a later one.
-    tokio::time::sleep(Duration::from_millis(1100)).await;
+    // A size has no date to go stale by; caches go by its ETag. The original keeps its.
+    assert_eq!(last_modified(&app, &url).await, None);
+    assert!(last_modified(&app, &before["url"]).await.is_some());
 
     let res = change(&app, "media", media(square("right"), json!({})), false).await;
     assert_eq!(res.status, 200, "{}", res.json);
@@ -1775,20 +1944,273 @@ async fn a_size_remade_under_its_name_gets_a_new_etag(pool: PgPool) {
     let (status, tag, bytes) = fetch_tagged(&app, &url, Some(&old_tag)).await;
     assert_eq!((status, tag.as_str()), (200, new_tag.as_str()));
     assert_eq!(bytes, new_bytes);
-    // So does one that only kept the date.
+    // A date alone never passes for the size's bytes.
+    let now = httpdate::fmt_http_date(std::time::SystemTime::now());
     let res = app
         .clone()
         .oneshot(
             axum::http::Request::get(url::Url::parse(url.as_str().unwrap()).unwrap().path())
-                .header("if-modified-since", &old_date)
+                .header("if-modified-since", &now)
                 .body(axum::body::Body::empty())
                 .unwrap(),
         )
         .await
         .unwrap();
     assert_eq!(res.status().as_u16(), 200);
-    assert_ne!(last_modified(&app, &url).await, old_date);
     // One holding the new bytes is told they're still good.
     let (status, _, bytes) = fetch_tagged(&app, &url, Some(&new_tag)).await;
     assert_eq!((status, bytes.len()), (304, 0));
+}
+
+/// A failed walk, its collection's `latest` or not, queued for collection `c`.
+async fn failed_walk(pool: &PgPool, c: Uuid) -> Uuid {
+    let mut conn = pool.acquire().await.unwrap();
+    let id = jobs::add(&mut conn, &files::regenerate_job(c, None))
+        .await
+        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET state = 'failed', attempts = 20, finished_at = now() WHERE id = $1",
+    )
+    .bind(id)
+    .execute(pool)
+    .await
+    .unwrap();
+    id
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn failed_walks_are_requeued_when_theyre_the_latest(pool: PgPool) {
+    let (store, _root) = storage(0);
+    let _app = serve(&pool, store).await;
+    let (lone, older) = (Uuid::now_v7(), Uuid::now_v7());
+    // The latest walk of its collection, failed: worth going on with.
+    let latest = failed_walk(&pool, lone).await;
+    // One a newer walk followed, which finished: that one's work stands.
+    let stale = failed_walk(&pool, older).await;
+    let newer = failed_walk(&pool, older).await;
+    sqlx::query("UPDATE jobs SET state = 'done' WHERE id = $1")
+        .bind(newer)
+        .execute(&pool)
+        .await
+        .unwrap();
+    sweep_now(&pool).await;
+    until("the latest walk runs again", async || {
+        job_state(&pool, latest).await.0 != "failed"
+    })
+    .await;
+    assert_eq!(job_state(&pool, stale).await.0, "failed");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_walk_batch_takes_no_savepoint_per_file(pool: PgPool) {
+    let c = seed_with(
+        &pool,
+        json!({"upload": {"imageSizes": [{"name": "thumb", "width": 10}]}}),
+    )
+    .await;
+    many(&pool, &c, 100).await;
+    // What the batch queues, as it queues it, on one connection in one transaction.
+    let mut tx = pool.begin().await.unwrap();
+    let ids: Vec<Uuid> = sqlx::query_scalar("SELECT id FROM files ORDER BY id")
+        .fetch_all(&mut *tx)
+        .await
+        .unwrap();
+    let batch: Vec<NewJob> = ids
+        .iter()
+        .map(|id| NewJob {
+            kind: "image_sizes",
+            document_id: None,
+            collection_id: Some(c.id),
+            payload: json!({"file": id, "regenerate": true}),
+            run_at: OffsetDateTime::now_utc(),
+            dedupe_key: Some(format!("image_sizes:{id}")),
+            created_by: None,
+            key_id: None,
+            max_attempts: None,
+        })
+        .collect();
+    jobs::enqueue_all(&mut tx, &batch).await.unwrap();
+    assert_eq!(subxacts(&mut tx).await, (0, false));
+    tx.commit().await.unwrap();
+    // And the walk itself, run by a worker, queues one job per file.
+    apply(&pool, &sized(&c, 20)).await;
+    let (store, _root) = storage(0);
+    let _app = serve(&pool, store).await;
+    until("the walk is done", async || {
+        walks(&pool, &c).await.iter().any(|(_, s)| s == "done")
+    })
+    .await;
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM jobs WHERE kind = 'image_sizes' AND state <> 'cancelled'"
+        )
+        .await,
+        100
+    );
+}
+
+/// This connection's subtransactions in its open transaction: how many, and whether
+/// Postgres's cache of them overflowed.
+async fn subxacts(conn: &mut sqlx::PgConnection) -> (i32, bool) {
+    sqlx::query_as(
+        "SELECT subxact_count, subxact_overflowed FROM pg_stat_get_backend_subxact(
+             (SELECT b FROM pg_stat_get_backend_idset() b
+              WHERE pg_stat_get_backend_pid(b) = pg_backend_pid()))",
+    )
+    .fetch_one(conn)
+    .await
+    .unwrap()
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_size_written_again_mid_read_is_read_again(pool: PgPool) {
+    let d = dirs();
+    let store = Arc::new(Shifting {
+        inner: LocalFileSystem::new_with_prefix(&d.store).unwrap(),
+        changes: AtomicUsize::new(0),
+        tag: AtomicUsize::new(0),
+        no_etag: false,
+    });
+    let app = api_on(&pool, &d, store.clone()).await;
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(media(json!(true), json!({}))),
+    )
+    .await;
+    let res = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "a.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let url = res.json["url"].clone();
+    let (status, tag, bytes) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    // Written again once between the HEAD and the read: read again, and the answer is
+    // the new object's, ETag and all.
+    store.changes.store(1, Ordering::SeqCst);
+    let (status, again, same) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    assert_ne!(again, tag, "the ETag of what was read");
+    assert_eq!(same, bytes);
+    // Written again each time: a 503 to try again in a moment, never a mismatched body.
+    store.changes.store(2, Ordering::SeqCst);
+    let res = app
+        .clone()
+        .oneshot(
+            axum::http::Request::get(url::Url::parse(url.as_str().unwrap()).unwrap().path())
+                .body(axum::body::Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(res.status().as_u16(), 503);
+    assert_eq!(res.headers()["retry-after"], "1");
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_store_without_etags_still_versions_them(pool: PgPool) {
+    let d = dirs();
+    let store = Arc::new(Shifting {
+        inner: LocalFileSystem::new_with_prefix(&d.store).unwrap(),
+        changes: AtomicUsize::new(0),
+        tag: AtomicUsize::new(0),
+        no_etag: true,
+    });
+    let app = api_on(&pool, &d, store).await;
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(media(json!(true), json!({}))),
+    )
+    .await;
+    let res = upload(&app, "POST", "/api/media", Some(&png(4, 3)), "a.png", None).await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let url = res.json["url"].clone();
+    let (status, tag, _) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    let file = files::get(&pool, held(&pool, &res.json["id"]).await)
+        .await
+        .unwrap();
+    let prefix = format!("\"{}-a.png-", file.id);
+    let token = tag
+        .strip_prefix(&prefix)
+        .and_then(|t| t.strip_suffix('"'))
+        .unwrap_or_else(|| panic!("{tag}"));
+    assert_eq!(token.len(), 16, "{tag}");
+    assert!(token.chars().all(|c| c.is_ascii_hexdigit()), "{tag}");
+    assert_eq!(
+        fetch_tagged(&app, &url, None).await.1,
+        tag,
+        "stable while unchanged"
+    );
+    // Written again (other bytes, another size): when and how big say so.
+    std::fs::write(d.store.join(&file.key), png(9, 9)).unwrap();
+    let (status, again, _) = fetch_tagged(&app, &url, None).await;
+    assert_eq!(status, 200);
+    assert_ne!(again, tag);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_wait_answers_with_what_is_made_when_a_walk_takes_its_job(pool: PgPool) {
+    let d = dirs();
+    let app = api(&pool, &d).await;
+    let sizes = json!({"imageSizes": [{"name": "thumb", "width": 2}]});
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(media(sizes, json!({}))),
+    )
+    .await;
+    let c = collections::get_by_slug(&pool, "media").await.unwrap();
+    let waiting = {
+        let app = app.clone();
+        tokio::spawn(async move {
+            upload(
+                &app,
+                "POST",
+                "/api/media?wait=true",
+                Some(&png(4, 3)),
+                "a.png",
+                None,
+            )
+            .await
+        })
+    };
+    // Its first size job is queued (no worker runs it); a walk's batch takes its key.
+    let queued = async || -> Option<Uuid> {
+        sqlx::query_scalar(
+            "SELECT (payload->>'file')::uuid FROM jobs WHERE kind = 'image_sizes' AND state = 'queued'",
+        )
+        .fetch_optional(&pool)
+        .await
+        .unwrap()
+    };
+    until("the size job is queued", async || queued().await.is_some()).await;
+    let file = queued().await.unwrap();
+    let mut conn = pool.acquire().await.unwrap();
+    jobs::enqueue(
+        &mut conn,
+        &NewJob {
+            kind: "image_sizes",
+            document_id: None,
+            collection_id: Some(c.id),
+            payload: json!({"file": file, "regenerate": true}),
+            run_at: OffsetDateTime::now_utc(),
+            dedupe_key: Some(format!("image_sizes:{file}")),
+            created_by: None,
+            key_id: None,
+            max_attempts: None,
+        },
+    )
+    .await
+    .unwrap();
+    // Call 5: it answers with what's made so far, at once, not at its time limit.
+    let res = tokio::time::timeout(Duration::from_secs(10), waiting)
+        .await
+        .expect("the wait ends when its job is taken")
+        .unwrap();
+    assert_eq!(res.status, 201, "{}", res.json);
+    assert!(res.json["sizes"]["thumb"].is_null(), "{}", res.json);
 }

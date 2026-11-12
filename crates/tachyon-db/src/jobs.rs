@@ -126,6 +126,65 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
     Ok(id)
 }
 
+/// `enqueue` for every one of `jobs` at once: the pending jobs of their dedupe keys
+/// cancelled in one statement, then all of them added in one, without a savepoint per job
+/// (each would take a subtransaction, and past 64 in one transaction Postgres's cache of
+/// them overflows for every snapshot taken meanwhile). A key a concurrent caller adds in
+/// between fails the statement, and with it the caller's transaction: only for keys
+/// nothing else adds at once, such as those of rows the caller holds locked.
+pub async fn enqueue_all(conn: &mut PgConnection, jobs: &[NewJob<'_>]) -> Result<(), DbError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = jobs.iter().filter_map(|j| j.dedupe_key.clone()).collect();
+    sqlx::query!(
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+           WHERE tenant_id = $1 AND dedupe_key = ANY($2) AND state IN ('queued', 'running')"#,
+        DEFAULT_TENANT,
+        &keys,
+    )
+    .execute(&mut *conn)
+    .await?;
+    let ids: Vec<Uuid> = jobs.iter().map(|_| Uuid::now_v7()).collect();
+    let kinds: Vec<String> = jobs.iter().map(|j| j.kind.to_owned()).collect();
+    let documents: Vec<Option<Uuid>> = jobs.iter().map(|j| j.document_id).collect();
+    let collections: Vec<Option<Uuid>> = jobs.iter().map(|j| j.collection_id).collect();
+    let payloads: Vec<Value> = jobs.iter().map(|j| j.payload.clone()).collect();
+    let run_at: Vec<OffsetDateTime> = jobs.iter().map(|j| j.run_at).collect();
+    let dedupe: Vec<Option<String>> = jobs.iter().map(|j| j.dedupe_key.clone()).collect();
+    let created_by: Vec<Option<Uuid>> = jobs.iter().map(|j| j.created_by).collect();
+    let key_ids: Vec<Option<Uuid>> = jobs.iter().map(|j| j.key_id).collect();
+    let attempts: Vec<i32> = jobs
+        .iter()
+        .map(|j| j.max_attempts.unwrap_or(DEFAULT_ATTEMPTS))
+        .collect();
+    sqlx::query!(
+        r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
+                             state, dedupe_key, created_by, key_id, max_attempts)
+           SELECT id, $1, kind, document_id, collection_id, payload, run_at, 'queued',
+                  dedupe_key, created_by, key_id, max_attempts
+           FROM unnest($2::uuid[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[],
+                       $7::timestamptz[], $8::text[], $9::uuid[], $10::uuid[], $11::int[])
+                AS t(id, kind, document_id, collection_id, payload, run_at, dedupe_key,
+                     created_by, key_id, max_attempts)"#,
+        DEFAULT_TENANT,
+        &ids,
+        &kinds,
+        &documents as &[Option<Uuid>],
+        &collections as &[Option<Uuid>],
+        &payloads,
+        &run_at,
+        &dedupe as &[Option<String>],
+        &created_by as &[Option<Uuid>],
+        &key_ids as &[Option<Uuid>],
+        &attempts,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_unique)?;
+    Ok(())
+}
+
 /// Cancels the pending (queued or running) job with `dedupe_key`. False when there was none.
 pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, DbError> {
     let done = sqlx::query!(

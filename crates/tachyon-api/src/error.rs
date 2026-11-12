@@ -26,6 +26,11 @@ pub enum ApiError {
     Timeout,
     /// Something this needs, such as a storage's signer, is failing for now; says what.
     Unavailable(String),
+    /// `Unavailable` for a moment: worth asking again after `retry_after` seconds.
+    Busy {
+        detail: String,
+        retry_after: u64,
+    },
     /// Too much is waiting on this caller already; worth asking again after `retry_after`
     /// seconds.
     TooManyRequests {
@@ -126,7 +131,7 @@ impl ApiError {
                 Some("the request took too long; try again".to_owned()),
                 None,
             ),
-            Self::Unavailable(d) => (
+            Self::Unavailable(d) | Self::Busy { detail: d, .. } => (
                 StatusCode::SERVICE_UNAVAILABLE,
                 "Service unavailable",
                 Some(d),
@@ -193,7 +198,9 @@ impl IntoResponse for ApiError {
             _ => None,
         };
         let retry = match self {
-            Self::TooManyRequests { retry_after, .. } => Some(retry_after),
+            Self::TooManyRequests { retry_after, .. } | Self::Busy { retry_after, .. } => {
+                Some(retry_after)
+            }
             _ => None,
         };
         let (status, body) = self.problem();

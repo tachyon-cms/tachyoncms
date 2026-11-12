@@ -122,96 +122,117 @@ async fn serve_file(
         false => ApiError::Internal(format!("can't read a stored file: {e}")),
     };
 
-    let mut out = HeaderMap::new();
-    // The object as stored now: a size made again under the same name is new bytes, so a
-    // cache asking with the old ETag or date gets them.
-    let meta = storage.head(&found.key).await.map_err(failed)?;
-    let size = meta.size;
-    let etag = format!(
-        "\"{}-{}-{}\"",
-        found.file.id,
-        encoded(&name, etag_char),
-        version(meta.e_tag.as_deref(), meta.last_modified.into(), size)
-    );
-    // An original's key is written once (a new file is a new row); a size's object can be
-    // made again under its name, so its own write time counts.
-    let made = SystemTime::from(found.file.created_at);
-    let stored = match found.key == found.file.key {
-        true => made,
-        false => made.max(meta.last_modified.into()),
-    };
-    // Whole seconds, as the header has them, so `If-Modified-Since` compares like for like.
-    let modified = httpdate::fmt_http_date(stored);
-    let at_second = httpdate::parse_http_date(&modified).ok();
-    let disposition = format!(
-        "inline; filename=\"{}\"; filename*=UTF-8''{}",
-        ascii_name(&name),
-        encoded(&name, attr_char)
-    );
-    let mut set = |k: HeaderName, v: &str| {
-        if let Ok(v) = HeaderValue::from_str(v) {
-            out.insert(k, v);
+    let mut tries = 0;
+    loop {
+        tries += 1;
+        let mut out = HeaderMap::new();
+        // The object as stored now: a size made again under the same name is new bytes, so a
+        // cache asking with the old ETag gets them.
+        let meta = storage.head(&found.key).await.map_err(failed)?;
+        let size = meta.size;
+        let etag = format!(
+            "\"{}-{}-{}\"",
+            found.file.id,
+            encoded(&name, etag_char),
+            version(meta.e_tag.as_deref(), meta.last_modified.into(), size)
+        );
+        // An original's key is written once (a new file is a new row), so its row's date is
+        // its date. A size's object can be made again under its name within the second a date
+        // has, so a size has none: caches go by its ETag.
+        let modified = (found.key == found.file.key)
+            .then(|| httpdate::fmt_http_date(SystemTime::from(found.file.created_at)));
+        // Whole seconds, as the header has them, so `If-Modified-Since` compares like for like.
+        let at_second = modified
+            .as_deref()
+            .and_then(|m| httpdate::parse_http_date(m).ok());
+        let disposition = format!(
+            "inline; filename=\"{}\"; filename*=UTF-8''{}",
+            ascii_name(&name),
+            encoded(&name, attr_char)
+        );
+        let mut set = |k: HeaderName, v: &str| {
+            if let Ok(v) = HeaderValue::from_str(v) {
+                out.insert(k, v);
+            }
+        };
+        set(ETAG, &etag);
+        if let Some(modified) = &modified {
+            set(LAST_MODIFIED, modified);
         }
-    };
-    set(ETAG, &etag);
-    set(LAST_MODIFIED, &modified);
-    // A `?draft=true` answer is never stored, whoever asks and whichever copy it gives: a
-    // shared cache could otherwise hand one caller's answer to another.
-    set(
-        CACHE_CONTROL,
-        if found.public && !draft {
-            PUBLIC
-        } else {
-            PRIVATE
-        },
-    );
-    set(CONTENT_TYPE, &found.mime);
-    set(CONTENT_DISPOSITION, &disposition);
-    set(ACCEPT_RANGES, "bytes");
-    if sandboxed(&found.mime) {
-        set(CONTENT_SECURITY_POLICY, "sandbox");
-    }
-    // Last, and never over a header the server sets (those are refused at save already).
-    for (k, v) in &u.modify_response_headers {
-        if PROTECTED_HEADERS.iter().any(|p| p.eq_ignore_ascii_case(k)) {
-            continue;
+        // A `?draft=true` answer is never stored, whoever asks and whichever copy it gives: a
+        // shared cache could otherwise hand one caller's answer to another.
+        set(
+            CACHE_CONTROL,
+            if found.public && !draft {
+                PUBLIC
+            } else {
+                PRIVATE
+            },
+        );
+        set(CONTENT_TYPE, &found.mime);
+        set(CONTENT_DISPOSITION, &disposition);
+        set(ACCEPT_RANGES, "bytes");
+        if sandboxed(&found.mime) {
+            set(CONTENT_SECURITY_POLICY, "sandbox");
         }
-        if let (Ok(k), Ok(v)) = (
-            HeaderName::from_bytes(k.as_bytes()),
-            HeaderValue::from_str(v),
-        ) && !out.contains_key(&k)
-        {
-            out.insert(k, v);
+        // Last, and never over a header the server sets (those are refused at save already).
+        for (k, v) in &u.modify_response_headers {
+            if PROTECTED_HEADERS.iter().any(|p| p.eq_ignore_ascii_case(k)) {
+                continue;
+            }
+            if let (Ok(k), Ok(v)) = (
+                HeaderName::from_bytes(k.as_bytes()),
+                HeaderValue::from_str(v),
+            ) && !out.contains_key(&k)
+            {
+                out.insert(k, v);
+            }
         }
-    }
 
-    if fresh(&headers, &etag, at_second) {
-        return Ok(answer(StatusCode::NOT_MODIFIED, out, Body::empty()));
+        if fresh(&headers, &etag, at_second) {
+            return Ok(answer(StatusCode::NOT_MODIFIED, out, Body::empty()));
+        }
+        let wanted = match method {
+            // A `HEAD` answers as the whole file's `GET` would.
+            // An `If-Range` naming another copy wants the whole of this one (RFC 9110 13.1.5).
+            Method::GET if !same_copy(headers.get(IF_RANGE), &etag, modified.as_deref()) => {
+                Wanted::All
+            }
+            Method::GET => range(headers.get(RANGE), size),
+            _ => Wanted::All,
+        };
+        let (status, part) = match wanted {
+            Wanted::All => (StatusCode::OK, None),
+            Wanted::Part(r) => (StatusCode::PARTIAL_CONTENT, Some(r)),
+            Wanted::Unsatisfiable => return Err(ApiError::RangeNotSatisfiable(size)),
+        };
+        let length = part.as_ref().map_or(size, |r| r.end - r.start);
+        if let Some(r) = &part
+            && let Ok(v) = HeaderValue::from_str(&format!("bytes {}-{}/{size}", r.start, r.end - 1))
+        {
+            out.insert(CONTENT_RANGE, v);
+        }
+        out.insert(CONTENT_LENGTH, HeaderValue::from(length));
+        if method == Method::HEAD {
+            return Ok(answer(status, out, Body::empty()));
+        }
+        // The bytes of the object the headers describe: one written again since the `HEAD`
+        // (a size made again under its name) is read again once, headers and all.
+        let got = match storage
+            .get_range_if(&found.key, part, meta.e_tag.clone())
+            .await
+        {
+            Err(e) if e.is_changed() && tries < 2 => continue,
+            Err(e) if e.is_changed() => {
+                return Err(ApiError::Busy {
+                    detail: "the file is being written; try again in a moment".into(),
+                    retry_after: 1,
+                });
+            }
+            other => other.map_err(failed)?,
+        };
+        return Ok(answer(status, out, Body::from_stream(got.into_stream())));
     }
-    let wanted = match method {
-        // A `HEAD` answers as the whole file's `GET` would.
-        // An `If-Range` naming another copy wants the whole of this one (RFC 9110 13.1.5).
-        Method::GET if !same_copy(headers.get(IF_RANGE), &etag, &modified) => Wanted::All,
-        Method::GET => range(headers.get(RANGE), size),
-        _ => Wanted::All,
-    };
-    let (status, part) = match wanted {
-        Wanted::All => (StatusCode::OK, None),
-        Wanted::Part(r) => (StatusCode::PARTIAL_CONTENT, Some(r)),
-        Wanted::Unsatisfiable => return Err(ApiError::RangeNotSatisfiable(size)),
-    };
-    let length = part.as_ref().map_or(size, |r| r.end - r.start);
-    if let Some(r) = &part
-        && let Ok(v) = HeaderValue::from_str(&format!("bytes {}-{}/{size}", r.start, r.end - 1))
-    {
-        out.insert(CONTENT_RANGE, v);
-    }
-    out.insert(CONTENT_LENGTH, HeaderValue::from(length));
-    if method == Method::HEAD {
-        return Ok(answer(status, out, Body::empty()));
-    }
-    let got = storage.get_range(&found.key, part).await.map_err(failed)?;
-    Ok(answer(status, out, Body::from_stream(got.into_stream())))
 }
 
 fn answer(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
@@ -369,10 +390,10 @@ fn fresh(req: &HeaderMap, etag: &str, modified: Option<SystemTime>) -> bool {
 
 /// Whether `if_range`, when sent, names this copy: its entity tag, compared strongly, or
 /// exactly its `Last-Modified`.
-fn same_copy(if_range: Option<&HeaderValue>, etag: &str, modified: &str) -> bool {
+fn same_copy(if_range: Option<&HeaderValue>, etag: &str, modified: Option<&str>) -> bool {
     if_range.is_none_or(|v| {
         v.to_str()
-            .is_ok_and(|v| v.trim() == etag || v.trim() == modified)
+            .is_ok_and(|v| v.trim() == etag || Some(v.trim()) == modified)
     })
 }
 

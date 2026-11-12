@@ -1179,8 +1179,32 @@ pub fn regenerate_job(collection_id: Uuid, after: Option<Uuid>) -> NewJob<'stati
         dedupe_key: Some(format!("{REGENERATE}:{collection_id}")),
         created_by: None,
         key_id: None,
-        max_attempts: None,
+        // A walk cut short leaves stale sizes and objects: it keeps trying as a cleanup
+        // does, and the hourly sweep revives it should it run out (`requeue_walks_in`).
+        max_attempts: Some(CLEANUP_ATTEMPTS),
     }
+}
+
+/// Queues again, with fresh attempts, each failed walk that's still its collection's
+/// latest: no newer walk, pending or finished, has its key. It goes on from its batch.
+/// Returns how many.
+pub async fn requeue_walks_in(tx: &mut PgConnection) -> Result<u64, DbError> {
+    let done = sqlx::query!(
+        r#"UPDATE jobs SET state = 'queued', attempts = 0, run_at = now(), locked_until = NULL,
+               finished_at = NULL, result = NULL
+           WHERE id IN (
+               SELECT id FROM (
+                   SELECT DISTINCT ON (dedupe_key) id, state FROM jobs
+                   WHERE tenant_id = $1 AND kind = $2
+                   ORDER BY dedupe_key, id DESC
+               ) latest
+               WHERE state = 'failed')"#,
+        DEFAULT_TENANT,
+        REGENERATE,
+    )
+    .execute(&mut *tx)
+    .await?;
+    Ok(done.rows_affected())
 }
 
 /// Up to `limit` live files of `collection_id` after file `after` (from the first without
@@ -1293,46 +1317,57 @@ pub async fn holding_documents(
 }
 
 /// Takes every file of `collection_id` from whatever holds it, both copies of each document
-/// (trashed ones too) and every version, and releases each; for a collection that stops
-/// holding files. Its pending files turn `gone` too, so nothing can take them, keeping the
-/// cleanup each was reserved with: due once an upload that may still be storing it is done
-/// (and a client's staging object keeps the sweep its issue queued).
+/// (trashed ones too) and every version, and releases every live one, held or not, each
+/// with its cleanup due now; for a collection that stops holding files. Its pending files
+/// (issued ones too) turn `gone` as well, so nothing can take them, keeping the cleanup each
+/// was reserved with: due once an upload that may still be storing it is done (and a
+/// client's staging object keeps the sweep its issue queued). The collection's size jobs
+/// and walk are cancelled: there's nothing left for them to make. All of it set-based, a
+/// statement per step whatever the collection holds, with no savepoint per file.
 pub async fn drop_collection_in(tx: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
-    // Documents, then versions, then files: the order every write locks them in.
-    let copies = sqlx::query!(
-        r#"WITH old AS (SELECT id, published_file, draft_file FROM documents
+    // Documents, then versions, then files, then jobs: the order every write locks them in.
+    sqlx::query!(
+        r#"WITH old AS (SELECT id FROM documents
                         WHERE tenant_id = $1 AND collection_id = $2
                           AND (published_file IS NOT NULL OR draft_file IS NOT NULL)
                         ORDER BY id FOR NO KEY UPDATE)
            UPDATE documents d SET published_file = NULL, draft_file = NULL FROM old
-           WHERE d.id = old.id
-           RETURNING old.published_file, old.draft_file"#,
+           WHERE d.id = old.id"#,
         DEFAULT_TENANT,
         collection_id,
     )
-    .fetch_all(&mut *tx)
+    .execute(&mut *tx)
     .await?;
-    let versions = sqlx::query_scalar!(
-        r#"WITH old AS (SELECT id, file_id FROM versions
+    sqlx::query!(
+        r#"WITH old AS (SELECT id FROM versions
                         WHERE tenant_id = $1 AND collection_id = $2 AND file_id IS NOT NULL
                         ORDER BY id FOR UPDATE)
-           UPDATE versions v SET file_id = NULL FROM old
-           WHERE v.id = old.id
-           RETURNING old.file_id"#,
+           UPDATE versions v SET file_id = NULL FROM old WHERE v.id = old.id"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .execute(&mut *tx)
+    .await?;
+    sqlx::query!(
+        "SELECT id FROM files WHERE tenant_id = $1 AND collection_id = $2 AND state <> 'gone'
+         ORDER BY id FOR UPDATE",
         DEFAULT_TENANT,
         collection_id,
     )
     .fetch_all(&mut *tx)
     .await?;
-    let mut held: Vec<Uuid> = copies
-        .into_iter()
-        .flat_map(|c| [c.published_file, c.draft_file])
-        .chain(versions)
-        .flatten()
-        .collect();
-    held.sort();
-    held.dedup();
-    release_in(&mut *tx, &held).await?;
+    let gone = sqlx::query_scalar!(
+        r#"UPDATE files f SET state = 'gone', released_at = now()
+           WHERE f.tenant_id = $1 AND f.collection_id = $2 AND f.state = 'live'
+             AND NOT EXISTS (SELECT 1 FROM documents d
+                             WHERE d.published_file = f.id OR d.draft_file = f.id)
+             AND NOT EXISTS (SELECT 1 FROM versions v WHERE v.file_id = f.id)
+           RETURNING f.id"#,
+        DEFAULT_TENANT,
+        collection_id,
+    )
+    .fetch_all(&mut *tx)
+    .await?;
     sqlx::query!(
         "UPDATE files SET state = 'gone', released_at = now()
          WHERE tenant_id = $1 AND collection_id = $2 AND state = 'pending'",
@@ -1341,5 +1376,18 @@ pub async fn drop_collection_in(tx: &mut PgConnection, collection_id: Uuid) -> R
     )
     .execute(&mut *tx)
     .await?;
-    Ok(())
+    sqlx::query!(
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+           WHERE tenant_id = $1 AND collection_id = $2 AND kind IN ('image_sizes', $3)
+             AND state IN ('queued', 'running')"#,
+        DEFAULT_TENANT,
+        collection_id,
+        REGENERATE,
+    )
+    .execute(&mut *tx)
+    .await?;
+    // Their rows are locked above, so no other caller can queue these keys meanwhile.
+    let now = OffsetDateTime::now_utc();
+    let cleanups: Vec<NewJob<'static>> = gone.into_iter().map(|id| cleanup(id, now)).collect();
+    jobs::enqueue_all(&mut *tx, &cleanups).await
 }

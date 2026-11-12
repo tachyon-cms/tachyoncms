@@ -106,6 +106,11 @@ impl StorageError {
     pub fn is_not_found(&self) -> bool {
         matches!(self, Self::Store(object_store::Error::NotFound { .. }))
     }
+
+    /// Whether a conditional read found the object written again since.
+    pub fn is_changed(&self) -> bool {
+        matches!(self, Self::Store(object_store::Error::Precondition { .. }))
+    }
 }
 
 /// An open `[storage.<name>]`.
@@ -575,7 +580,19 @@ impl Storage {
         key: &str,
         range: Option<Range<u64>>,
     ) -> Result<GetResult, StorageError> {
-        let options = GetOptions::new().with_range(range.map(GetRange::Bounded));
+        self.get_range_if(key, range, None).await
+    }
+
+    /// `get_range`, only while the object's ETag is `if_match` (when given): an object
+    /// written again since is `is_changed`.
+    pub async fn get_range_if(
+        &self,
+        key: &str,
+        range: Option<Range<u64>>,
+        if_match: Option<String>,
+    ) -> Result<GetResult, StorageError> {
+        let mut options = GetOptions::new().with_range(range.map(GetRange::Bounded));
+        options.if_match = if_match;
         Ok(self.store.get_opts(&self.key(key)?, options).await?)
     }
 
