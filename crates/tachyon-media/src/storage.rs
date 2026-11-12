@@ -270,7 +270,11 @@ impl Storage {
                     credential_var(name, "access_key"),
                     credential_var(name, "sas_token"),
                 );
-                let signs = match (cred("access_key"), cred("sas_token")) {
+                let (key, sas) = (cred("access_key"), cred("sas_token"));
+                if key.is_some() || sas.is_some() {
+                    keyed(name, c)?;
+                }
+                let signs = match (key, sas) {
                     (Some(_), Some(_)) => {
                         return Err(format!(
                             "storage.{name}: set one of {key_var} and {sas_var}, not both"
@@ -338,6 +342,7 @@ impl Storage {
                 let path_var = credential_var(name, "service_account_path");
                 let signs = match cred("service_account_path") {
                     Some(path) => {
+                        keyed(name, c)?;
                         let key = gcs_key_file(&path)
                             .map_err(|e| format!("storage.{name}: {path_var}: {e}"))?;
                         if key
@@ -401,8 +406,9 @@ impl Storage {
             store,
             signer,
             config,
+            // Unlike `SafeFetch`, this reaches the operator's own store, as object_store's
+            // client does, proxies included.
             http: reqwest::Client::builder()
-                .no_proxy()
                 .redirect(reqwest::redirect::Policy::none())
                 .timeout(Duration::from_secs(30))
                 .build()
@@ -767,7 +773,8 @@ fn check_signing_config(
             ));
         }
         // object_store keeps an Azure identity's delegation key only for links this short;
-        // past it, every link would be a call to Azure, which Azure throttles.
+        // past it, every link would be a call to Azure, which Azure throttles. The flag is
+        // refused beside a key (`keyed`), so here the identity is what signs.
         if c.sign_with_identity
             && matches!(c.adapter, Adapter::Azure { .. })
             && *expires_in > IDENTITY_SIGNED
@@ -788,6 +795,16 @@ fn no_identity(name: &str, c: &StorageConfig) -> Result<(), String> {
     match c.sign_with_identity {
         true => Err(format!(
             "storage.{name}.sign_with_identity: only an Azure or Google storage signs through the machine's own identity"
+        )),
+        false => Ok(()),
+    }
+}
+
+/// `sign_with_identity` with a key or SAS set, where the identity signs nothing.
+fn keyed(name: &str, c: &StorageConfig) -> Result<(), String> {
+    match c.sign_with_identity {
+        true => Err(format!(
+            "storage.{name}.sign_with_identity: it's only for a storage with no key, which signs through the machine's own identity; this one has a key in the environment, so take it out"
         )),
         false => Ok(()),
     }

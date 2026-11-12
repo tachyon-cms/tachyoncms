@@ -1128,6 +1128,43 @@ fn identity_links_last_two_hours_at_most_on_azure() {
     let mut keyed = lasting(48);
     keyed.sign_with_identity = false;
     assert!(open("az", &keyed, &[("access_key", AZURE_KEY)]).is_ok());
+    assert_eq!(sas_secs("1970-01-02T00:00:01Z"), 86_401);
+    assert_eq!(
+        sas_secs("2024-03-01T00:00:00Z") - sas_secs("2024-02-28T23:59:00Z"),
+        86_460
+    );
+}
+
+#[test]
+fn identity_signing_is_only_for_keyless_storages() {
+    // With a key or SAS set, the identity signs nothing, so asking for it is a mistake.
+    let dir = temp_root();
+    let gcs_key = service_account(&dir);
+    let gcs_key = gcs_key.to_str().unwrap();
+    for (c, name, vars) in [
+        (
+            with_identity(azure(None)),
+            "az",
+            vec![("access_key", AZURE_KEY)],
+        ),
+        (
+            with_identity(azure(None)),
+            "az",
+            vec![("sas_token", "sv=1&sig=x")],
+        ),
+        (
+            with_identity(gcs(None)),
+            "g",
+            vec![("service_account_path", gcs_key)],
+        ),
+    ] {
+        let err = open(name, &c, &vars).unwrap_err();
+        assert!(
+            err.starts_with(&format!("storage.{name}.sign_with_identity: ")),
+            "{err}"
+        );
+        assert!(err.contains("only for a storage with no key"), "{err}");
+    }
 }
 
 #[tokio::test]
@@ -1144,9 +1181,8 @@ async fn azure_staging_deletes_break_leases_and_snapshots() {
         assert_eq!(query(url, "sr").as_deref(), Some("b"));
         assert_eq!(query(url, "sp").as_deref(), Some(sp));
         assert!(query(url, "sig").is_some());
-        let lasts =
-            chrono_secs(&query(url, "se").unwrap()) - chrono_secs(&query(url, "st").unwrap());
-        assert!(lasts <= 300, "{lasts} s");
+        let lasts = sas_secs(&query(url, "se").unwrap()) - sas_secs(&query(url, "st").unwrap());
+        assert_eq!(lasts, 60, "signed for a minute");
     }
     assert_eq!(query(lease.url(), "comp").as_deref(), Some("lease"));
     assert_eq!(lease.headers()["x-ms-lease-action"], "break");
@@ -1166,12 +1202,18 @@ async fn azure_staging_deletes_break_leases_and_snapshots() {
 }
 
 /// Seconds since the epoch of an Azure SAS time, `2026-11-11T18:00:00Z`.
-fn chrono_secs(t: &str) -> i64 {
+fn sas_secs(t: &str) -> i64 {
     let (date, time) = t.trim_end_matches('Z').split_once('T').unwrap();
     let d: Vec<i64> = date.split('-').map(|p| p.parse().unwrap()).collect();
     let h: Vec<i64> = time.split(':').map(|p| p.parse().unwrap()).collect();
-    // Only differences are taken, within a day or two, so whole days since a fixed point do.
-    ((d[0] * 372 + d[1] * 31 + d[2]) * 86_400) + h[0] * 3600 + h[1] * 60 + h[2]
+    // Days from 1970-01-01 to a proleptic Gregorian date (Howard Hinnant's days_from_civil).
+    let y = if d[1] <= 2 { d[0] - 1 } else { d[0] };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * ((d[1] + 9) % 12) + 2) / 5 + d[2] - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    let days = era * 146_097 + doe - 719_468;
+    days * 86_400 + h[0] * 3600 + h[1] * 60 + h[2]
 }
 
 /// A store whose puts fail, as a bucket that goes down mid-copy does, and with `cut_reads`
