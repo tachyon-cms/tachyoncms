@@ -1021,19 +1021,14 @@ async fn uploads_never_leak(pool: PgPool) {
     };
 
     for (who, app) in &callers {
-        // Asking where to put a file named like the hidden one, the same as any other name,
-        // for whoever can't add files.
+        // Asking where to put a file named like the hidden one, the same as any other name.
         let (a, b) = (
             issue(app.clone(), "ghostfile.png").await,
             issue(app.clone(), "nothingfile.png").await,
         );
-        if *who == "other author" {
-            // KNOWN ORACLE, awaiting a ruling: names are unique across the collection,
-            // drafts included, so whoever may add a file learns a hidden one's name is
-            // taken from the number added to theirs. A plain upload says the same.
-            assert_eq!(a.json["file"]["filename"], "ghostfile-1.png", "{}", a.json);
-            assert_eq!(b.json["file"]["filename"], "nothingfile.png", "{}", b.json);
-        } else {
+        // Whoever may add files learns only that the name is taken: see
+        // `a_guessed_filename_shows_only_that_it_is_taken`.
+        if *who != "other author" {
             assert_eq!(scrub(&a), scrub(&b), "{who}: {}", a.json);
         }
         // Whether it's someone else's, past its time, taken, or made up, a claim is
@@ -1225,4 +1220,78 @@ async fn removing_uploads_stays_in_its_tenant(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(queued, 0);
+}
+
+/// Accepted, as the reference does it (F18: one document per filename). Names are unique
+/// across the collection, drafts included, so an Author can tell that some document holds a
+/// name they guessed, from the number added to theirs: not which document holds it, nor
+/// anything in it. Upload instructions and a plain upload say the same.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_guessed_filename_shows_only_that_it_is_taken(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    ok(
+        &app,
+        "POST",
+        "/api/admin/collections",
+        Some(json!({"slug": "media", "versions": {"drafts": true},
+                    "upload": {"storage": "bucket"}, "fields": []})),
+    )
+    .await;
+    let ghost = upload(
+        &app,
+        "POST",
+        "/api/media",
+        Some(&png(2, 2)),
+        "ghostfile.png",
+        None,
+    )
+    .await;
+    assert_eq!(ghost.status, 201, "{}", ghost.json);
+    let (ghost, file) = (
+        id_of(&ghost.json),
+        file_of(&pool, &id_of(&ghost.json)).await,
+    );
+    add_user(&pool, "other@example.com", "author").await;
+    let other = signed_in(router(&pool, &d).await, "other@example.com").await;
+
+    let issue = |name: &str| {
+        let body = json!({"filename": name, "mimeType": "image/png", "filesize": 70});
+        call(&other, "POST", "/api/media/upload-instructions", Some(body))
+    };
+    let (taken, free) = (issue("ghostfile.png").await, issue("nothingfile.png").await);
+    assert_eq!(
+        taken.json["file"]["filename"], "ghostfile-1.png",
+        "{}",
+        taken.json
+    );
+    assert_eq!(
+        free.json["file"]["filename"], "nothingfile.png",
+        "{}",
+        free.json
+    );
+    let made = upload(
+        &other,
+        "POST",
+        "/api/media",
+        Some(&png(3, 3)),
+        "ghostfile.png",
+        None,
+    )
+    .await;
+    assert_eq!(made.status, 201, "{}", made.json);
+    // `-1` is held by the instructions above.
+    assert_eq!(made.json["filename"], "ghostfile-2.png");
+    for res in [&taken, &made] {
+        let text = res.json.to_string();
+        for word in [ghost.clone(), file.to_string()] {
+            assert!(!text.contains(&word), "{word} in {text}");
+        }
+    }
+    // Its own document and bytes stay its owner's.
+    let mine = fetch(&other, "/api/media/file/ghostfile-2.png").await;
+    assert_eq!(mine.status, 302);
+    assert!(!mine.header("location").contains(&file.to_string()));
+    let res = fetch(&other, "/api/media/file/ghostfile.png").await;
+    assert_eq!(res.status, 404);
 }
