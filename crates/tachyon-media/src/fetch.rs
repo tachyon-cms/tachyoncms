@@ -244,10 +244,10 @@ fn failed(e: reqwest::Error) -> FetchError {
 }
 
 /// Whether any of `patterns` matches `url`, as `allowList` and `skipSafeFetch` entries do.
-/// `protocol` is `https` when unset; `hostname` takes a leading `*.` for one label or `**.`
-/// for any number; `pathname` takes `*` within a segment, `**` across them, and a trailing
-/// `/` that may be left off; `port` matches exactly, and unset means the protocol's default
-/// port only; `search` matches exactly. An empty value is unset.
+/// `protocol` is `https` when unset, in any case; `hostname` takes a leading `*.` for one
+/// label or `**.` for any number; `pathname` takes `*` within a segment, `**` across them,
+/// and a trailing `/` that may be left off; `port` matches exactly, and unset means the
+/// protocol's default port only; `search` matches exactly. An empty value is unset.
 pub fn pattern_allows(patterns: &[UrlPattern], url: &Url) -> bool {
     let set = |v: &Option<String>| v.clone().filter(|v| !v.is_empty());
     patterns.iter().any(|p| {
@@ -255,7 +255,10 @@ pub fn pattern_allows(patterns: &[UrlPattern], url: &Url) -> bool {
         // `url` holds no port when it's the scheme's default.
         let port = url.port_or_known_default().map(|p| p.to_string());
         let search = url.query().map(|q| format!("?{q}")).unwrap_or_default();
-        protocol.trim_end_matches(':') == url.scheme()
+        // A URL's scheme is lowercase; a pattern's is read without case, as its host is.
+        protocol
+            .trim_end_matches(':')
+            .eq_ignore_ascii_case(url.scheme())
             && host_matches(&p.hostname, url.host_str().unwrap_or_default())
             && match set(&p.port) {
                 Some(want) => Some(want) == port,
@@ -444,6 +447,10 @@ mod tests {
         assert!(!allows(host, "https://example.com:8443/"));
         let http = serde_json::json!({"protocol": "http", "hostname": "example.com"});
         assert!(allows(http.clone(), "http://example.com:80/"));
+        // A scheme is read without case, as a URL's is.
+        let upper = serde_json::json!({"protocol": "HTTPS:", "hostname": "example.com"});
+        assert!(allows(upper.clone(), "https://example.com/"));
+        assert!(!allows(upper, "http://example.com/"));
         assert!(!allows(http, "http://example.com:8080/"));
         // With one, that port alone, the default included when it's named.
         let port = serde_json::json!({"hostname": "example.com", "port": "8443"});
