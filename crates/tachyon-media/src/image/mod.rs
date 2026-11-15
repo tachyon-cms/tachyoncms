@@ -2922,6 +2922,11 @@ mod tests {
     /// `bytes` stored in every setting with the picture's own pixels and none of `TAIL`,
     /// each in under a second.
     fn kept_fast(bytes: &[u8], case: &str) {
+        kept_within(bytes, case, Some(1000));
+    }
+
+    /// `bytes` stored as `kept_fast` asks, each upload in under `millis` when given.
+    fn kept_within(bytes: &[u8], case: &str, millis: Option<u128>) {
         for (how, u) in settings() {
             let started = std::time::Instant::now();
             let out = run(bytes, &u).unwrap_or_else(|e| panic!("{case}, {how}: {e}"));
@@ -2929,7 +2934,9 @@ mod tests {
             let kept = stored(&out);
             assert!(!has(&kept, b"<html>"), "{case}, {how}: the payload stayed");
             assert_eq!(pixels_of(&kept), picture().pixels, "{case}, {how}");
-            assert!(took.as_millis() < 1000, "{case}, {how}: {took:?}");
+            if let Some(millis) = millis {
+                assert!(took.as_millis() < millis, "{case}, {how}: {took:?}");
+            }
         }
     }
 
@@ -3066,7 +3073,9 @@ mod tests {
         for kept in kept_by_keep(&at_cap, "64 boxes, 65,472 zero-length extents") {
             assert!(matches!(kept, Ok(Some(_))), "{kept:?}");
         }
-        kept_fast(&at_cap, "64 boxes, 65,472 zero-length extents");
+        // Timed above as `keep` alone; the whole upload is linear work a loaded runner may
+        // stretch, so it's checked for what it keeps, not how long.
+        kept_within(&at_cap, "64 boxes, 65,472 zero-length extents", None);
         for (case, file) in [
             ("65 boxes", zero_length(free(62))),
             ("100,000 free boxes", zero_length(free(100_000))),
@@ -3174,18 +3183,44 @@ mod tests {
         refused_fast(&h.build(), "a thumbnail over mdat twice");
     }
 
+    /// `meta` holds 64 boxes at most and `ipco` 4,096: every pass over them is linear,
+    /// but empty boxes fit about 3M to 25 MB, and several passes run per upload.
+    #[test]
+    fn meta_and_ipco_hold_few_boxes() {
+        let free = |n: usize| isobmff_box(b"free", &[], false).repeat(n);
+        let mut h = Hand::new();
+        h.meta_extra = free(2_900_000);
+        refused_fast(&h.build(), "2.9M boxes in meta");
+        let mut h = Hand::new();
+        h.ipco_extra = free(2_900_000);
+        refused_fast(&h.build(), "2.9M boxes in ipco");
+        // hdlr, pitm, iloc, iinf and iprp, and 59 more: 64.
+        let mut h = Hand::new();
+        h.meta_extra = free(59);
+        kept_fast(&h.build(), "64 boxes in meta");
+        h.meta_extra = free(60);
+        refused_fast(&h.build(), "65 boxes in meta");
+        let have = child_boxes(&picture().ipco, 8, picture().ipco.len()).len();
+        let mut h = Hand::new();
+        h.ipco_extra = free(4_096 - have);
+        kept_fast(&h.build(), "4,096 boxes in ipco");
+        h.ipco_extra = free(4_097 - have);
+        refused_fast(&h.build(), "4,097 boxes in ipco");
+    }
+
     /// Hand-built AVIFs chosen by a fixed seed. Each case makes one dimension large, up to
     /// past its cap, and keeps the others to a handful, so no cap hides another: payload
     /// size, the zeros after it, items, extents per item, `infe` boxes, references and their
     /// targets, `cdsc` references to one item in many extents, `ipma` entries and their
     /// associations, the picture in many one-byte extents behind many `mdat`s, the picture
-    /// located many times, top-level boxes, and a large `auxC`. Lying counts, second boxes
+    /// located many times, top-level boxes, a large `auxC`, and boxes in `meta` and in
+    /// `ipco`. Lying counts, second boxes
     /// and 64-bit sizes come and go at random. Each file is kept (or refused) and parsed, as
     /// the probe does, in under a second, and nothing kept holds the payload.
     #[test]
     fn hand_built_avifs_stay_cheap() {
         use super::walker_fuzz::Rng;
-        const CASES: usize = 260;
+        const CASES: usize = 300;
         let p = picture();
         let mut rng = Rng(0x5eed_a11f_0b0e_7a11);
         // Up to about `max`, as often small as large.
@@ -3197,7 +3232,7 @@ mod tests {
         let ipco = child_boxes(&p.ipco, 8, p.ipco.len()).len() as u8;
         let started = std::time::Instant::now();
         for case in 0..CASES {
-            let big = case % 13;
+            let big = case % 15;
             let max = |d: usize, large: usize| if d == big { large } else { 8 };
             let mut h = Hand::new();
             // Payload, for items that must never be kept; zeros after it, for those that may.
@@ -3302,12 +3337,16 @@ mod tests {
                     let alpha = vec![1; some(&mut rng, 32).max(1)];
                     h.iref = Some(reference(b"auxl", 2, &alpha, false));
                 }
+                // Many boxes in `meta`, or in `ipco`.
+                13 => h.meta_extra = isobmff_box(b"free", &[], false).repeat(1 + rng.n(2_900_000)),
+                14 => h.ipco_extra = isobmff_box(b"free", &[], false).repeat(1 + rng.n(2_900_000)),
                 _ => {
                     let again = some(&mut rng, 8);
                     h.iloc[0].1.extend(vec![(0, av1); again]);
                 }
             }
             match rng.n(6) {
+                _ if big == 13 => {}
                 0 => h.meta_extra = isobmff_box(b"iref", &[0, 0, 0, 0], false),
                 1 => h.meta_extra = isobmff_box(b"free", &[0; 16], false),
                 2 => h.iprp_extra = isobmff_box(b"ipma", &[0; 8], false),

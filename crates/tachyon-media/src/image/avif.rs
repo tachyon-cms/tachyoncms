@@ -839,7 +839,14 @@ const MAX_AUX_BYTES: u64 = 65_536;
 const MAX_TOP_BOXES: usize = 64;
 const MAX_MDATS: usize = 8;
 
+/// The most boxes `meta` may hold, and the most properties `ipco` may: each is walked
+/// several times per upload, and a real file has about eight children in `meta` and ten
+/// properties.
+const MAX_META_BOXES: usize = 64;
+const MAX_PROPERTIES: usize = 4096;
+
 /// Refuses an AVIF with more than `MAX_TOP_BOXES` top-level boxes or `MAX_MDATS` `mdat`s,
+/// more than `MAX_META_BOXES` boxes in `meta` or `MAX_PROPERTIES` in `ipco`,
 /// listing more than `MAX_ITEMS` items or references, `MAX_ASSOCIATIONS` associations,
 /// `MAX_AUX_BYTES` associated `auxC` bytes or `MAX_ALPHA_REFS` `auxl` references, or holding
 /// a second `iinf`, `iloc`, `iref`, `iprp`, `ipma` or `ipco` (ISO 14496-12 allows one each,
@@ -857,8 +864,25 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
     let Some(meta) = find(&top, b"meta") else {
         return Ok(());
     };
-    let inner = boxes(data, meta.body + 4, meta.end);
-    let props = find(&inner, b"iprp").map_or_else(Vec::new, |b| boxes(data, b.body, b.end));
+    let within = |b: &Box4, from: usize, most: usize| {
+        let list = first_boxes(data, from, b.end, most + 1);
+        if list.len() > most {
+            return Err(ImageError::Corrupt(format!(
+                "this AVIF's {} holds more than {most} boxes",
+                b.kind.escape_ascii()
+            )));
+        }
+        Ok(list)
+    };
+    let inner = within(&meta, meta.body + 4, MAX_META_BOXES)?;
+    let props = match find(&inner, b"iprp") {
+        Some(b) => boxes(data, b.body, b.end),
+        None => Vec::new(),
+    };
+    let list = match find(&props, b"ipco") {
+        Some(b) => within(&b, b.body, MAX_PROPERTIES)?,
+        None => Vec::new(),
+    };
     for (list, kind) in [
         (&inner, b"iinf"),
         (&inner, b"iloc"),
@@ -902,7 +926,6 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
         } else {
             1
         };
-        let list = find(&props, b"ipco").map_or_else(Vec::new, |b| boxes(data, b.body, b.end));
         let (mut at, mut total, mut aux) = (ipma.body + 8, 0u64, 0u64);
         'entries: for _ in 0..entries {
             at += id;
