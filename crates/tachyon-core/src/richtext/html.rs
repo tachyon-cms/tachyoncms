@@ -558,10 +558,10 @@ mod tests {
                         // in the image itself. No srcset repeats a width.
                         "<picture>",
                         "<source type=\"image/avif\" ",
-                        "srcset=\"{u}/a-400x300.avif 400w, {u}/a.png 800w\" ",
+                        "srcset=\"{u}/a-400x300.avif 400w\" ",
                         "sizes=\"(max-width: 800px) 100vw, 800px\">",
                         "<source type=\"image/webp\" ",
-                        "srcset=\"{u}/a-40x30.webp 40w, {u}/a-400x300.webp 400w, {u}/a.png 800w\" ",
+                        "srcset=\"{u}/a-40x30.webp 40w, {u}/a-400x300.webp 400w\" ",
                         "sizes=\"(max-width: 800px) 100vw, 800px\">",
                         "<img src=\"{u}/a.png\" width=\"800\" height=\"600\" alt=\"Cover\" ",
                         "srcset=\"{u}/a-400x300.png 400w, {u}/a.png 800w\" ",

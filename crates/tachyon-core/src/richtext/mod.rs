@@ -68,7 +68,8 @@ pub struct UploadView {
     /// of its `<img>`'s `srcset`.
     pub srcset: Vec<(String, u32)>,
     /// The same for AVIF and WebP, from sizes made in them and each size's copies, by type
-    /// (AVIF first, the smaller, and an AVIF image's own): a `<picture>`'s `<source>`s.
+    /// (AVIF first, the smaller, and an AVIF image's own), each holding only its type:
+    /// a `<picture>`'s `<source>`s.
     pub sources: Vec<(String, Vec<(String, u32)>)>,
 }
 
@@ -117,15 +118,17 @@ pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
             by_type.entry(t).or_default().extend(candidate(made));
         }
     }
-    // The original is the widest candidate, where it's one a browser shows and wider than
-    // every size: a source's type only picks it, so any candidate in it still loads.
+    // The original is the widest candidate of its own type's set, where it's one a browser
+    // shows and wider than every size. Only there: a browser picks a source by its type, so
+    // any other type in it may be one it can't show.
     let original = text(doc, "url")
         .zip(number(doc, "width"))
         .filter(|_| shown(&mime_type));
-    for set in by_type.values_mut() {
+    for (t, set) in by_type.iter_mut() {
         set.sort_by_key(|(_, w)| *w);
         set.dedup_by_key(|(_, w)| *w);
         if let Some((url, w)) = &original
+            && *t == mime_type
             && set.last().is_some_and(|(_, last)| last < w)
         {
             set.push((url.clone(), *w));
@@ -2287,6 +2290,30 @@ mod tests {
 
     #[test]
     fn upload_views_offer_each_made_size() {
+        // Every candidate is of its set's type: the image's own (PNG for one a browser
+        // can't show) in `srcset`, the source's in each source.
+        fn ext(t: &str) -> &str {
+            match t {
+                "image/png"
+                | "image/tiff"
+                | "image/bmp"
+                | "image/x-icon"
+                | "image/vnd.microsoft.icon" => ".png",
+                "image/jpeg" => ".jpg",
+                other => other.strip_prefix("image/").unwrap_or(other),
+            }
+        }
+        let upload_view = |doc: &Map<String, Value>| {
+            let view = super::upload_view(doc)?;
+            let sets = std::iter::once((view.mime_type.as_str(), &view.srcset))
+                .chain(view.sources.iter().map(|(t, set)| (t.as_str(), set)));
+            for (t, set) in sets {
+                for (url, _) in set {
+                    assert!(url.ends_with(ext(t)), "{url} in a {t} set: {view:?}");
+                }
+            }
+            Some(view)
+        };
         let view = upload_view(&cover()).unwrap();
         let u = |name: &str| format!("https://cms.example/api/media/file/{name}");
         assert_eq!(
@@ -2299,20 +2326,14 @@ mod tests {
                 mime_type: "image/png".into(),
                 filename: "a.png".into(),
                 // By type and width: the JPEG size only by its WebP copy, the size not made
-                // not at all, and the original last in each, wider than any size.
+                // not at all, and the original last in its own type's set, wider than any
+                // size.
                 srcset: vec![(u("a-400x300.png"), 400), (u("a.png"), 800)],
                 sources: vec![
-                    (
-                        "image/avif".into(),
-                        vec![(u("a-400x300.avif"), 400), (u("a.png"), 800)]
-                    ),
+                    ("image/avif".into(), vec![(u("a-400x300.avif"), 400)]),
                     (
                         "image/webp".into(),
-                        vec![
-                            (u("a-40x30.webp"), 40),
-                            (u("a-400x300.webp"), 400),
-                            (u("a.png"), 800)
-                        ]
+                        vec![(u("a-40x30.webp"), 40), (u("a-400x300.webp"), 400)]
                     ),
                 ],
             }
@@ -2332,17 +2353,10 @@ mod tests {
         assert_eq!(
             view.sources,
             vec![
-                (
-                    "image/avif".into(),
-                    vec![(u("a-200.avif"), 200), (u("a.png"), 800)]
-                ),
+                ("image/avif".into(), vec![(u("a-200.avif"), 200)]),
                 (
                     "image/webp".into(),
-                    vec![
-                        (u("a-200.webp"), 200),
-                        (u("a-400.webp"), 400),
-                        (u("a.png"), 800)
-                    ]
+                    vec![(u("a-200.webp"), 200), (u("a-400.webp"), 400)]
                 ),
             ]
         );
@@ -2405,10 +2419,7 @@ mod tests {
             view.sources,
             vec![
                 ("image/avif".into(), set.clone()),
-                (
-                    "image/webp".into(),
-                    vec![(u("a-400.webp"), 400), (u("a.avif"), 800)]
-                ),
+                ("image/webp".into(), vec![(u("a-400.webp"), 400)]),
             ]
         );
         // No URL, as when it's hidden from the caller: nothing to show.
