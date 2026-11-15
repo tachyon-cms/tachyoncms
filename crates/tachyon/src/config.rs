@@ -493,10 +493,7 @@ impl Config {
             ));
         }
         Ok(AuthConfig {
-            public_url: self
-                .public_url
-                .clone()
-                .unwrap_or_else(|| format!("http://localhost:{}", self.listen.port())),
+            public_url: self.cms_url(),
             allowed_origins: a.allowed_origins.clone(),
             session_idle,
             session_absolute,
@@ -531,8 +528,19 @@ impl Config {
         })
     }
 
-    /// Each `[storage.<name>]` as the storage reads it, checked but not opened.
+    /// Where people reach the CMS: `public_url`, else this machine on the listening port.
+    fn cms_url(&self) -> String {
+        self.public_url
+            .clone()
+            .unwrap_or_else(|| format!("http://localhost:{}", self.listen.port()))
+    }
+
+    /// Each `[storage.<name>]` as the storage reads it, checked but not opened. A bucket's
+    /// `public_url` on the CMS's own host and port is refused: its files have no `sandbox`
+    /// there, so an SVG or HTML upload would run as the CMS.
     fn storage_configs(&self) -> Result<BTreeMap<String, StorageConfig>, String> {
+        let origin = |u: &url::Url| (u.host_str().map(str::to_owned), u.port_or_known_default());
+        let cms = web_url(&self.cms_url()).map(|u| origin(&u));
         let mut configs = BTreeMap::new();
         for (name, s) in &self.storage {
             // Environment variables are named from it, upper-cased and split on `__`.
@@ -544,7 +552,18 @@ impl Config {
                     "storage.{name}: a storage name is lowercase letters and digits, with single _ between them"
                 ));
             }
-            configs.insert(name.clone(), s.to_config(name)?);
+            let config = s.to_config(name)?;
+            if config
+                .public_url
+                .as_ref()
+                .map(origin)
+                .is_some_and(|o| Some(o) == cms)
+            {
+                return Err(format!(
+                    "storage.{name}.public_url is on the CMS's own address (public_url), where an uploaded SVG or HTML file would run as the CMS; serve the bucket from another host, like https://files.example.com"
+                ));
+            }
+            configs.insert(name.clone(), config);
         }
         Ok(configs)
     }
@@ -950,6 +969,41 @@ mod tests {
             Ok(())
         });
         out.unwrap()
+    }
+
+    #[test]
+    fn a_bucket_cant_share_the_cms_address() {
+        let toml = |cms: &str, bucket: &str| {
+            format!(
+                "public_url = \"{cms}\"\n[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\nregion = \"auto\"\npublic_url = \"{bucket}\"\n"
+            )
+        };
+        let keys = [
+            ("TACHYON_STORAGE__R2__ACCESS_KEY_ID", "id"),
+            ("TACHYON_STORAGE__R2__SECRET_ACCESS_KEY", "secret"),
+        ];
+        let refused = "storage.r2.public_url is on the CMS's own address (public_url), where an uploaded SVG or HTML file would run as the CMS; serve the bucket from another host, like https://files.example.com";
+        for (cms, bucket) in [
+            ("https://cms.example.com", "https://cms.example.com/files"),
+            ("https://cms.example.com", "https://CMS.example.com:443/"),
+            ("http://localhost:3000", "http://localhost:3000/media"),
+        ] {
+            assert_eq!(
+                uploads_with(&toml(cms, bucket), &keys).unwrap_err(),
+                refused,
+                "{bucket}"
+            );
+        }
+        for (cms, bucket) in [
+            ("https://cms.example.com", "https://files.example.com"),
+            ("https://cms.example.com", "https://cms.example.com:8443"),
+            ("http://localhost:3000", "http://localhost:3001"),
+        ] {
+            assert!(uploads_with(&toml(cms, bucket), &keys).is_ok(), "{bucket}");
+        }
+        // No public_url: the CMS is at localhost on its port.
+        let default = "listen = \"127.0.0.1:3000\"\n[storage.r2]\nadapter = \"s3\"\nbucket = \"media\"\nregion = \"auto\"\npublic_url = \"http://localhost:3000/m\"\n";
+        assert_eq!(uploads_with(default, &keys).unwrap_err(), refused);
     }
 
     #[test]
