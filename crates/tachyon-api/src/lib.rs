@@ -361,13 +361,21 @@ fn layers<S: Clone + Send + Sync + 'static>(routes: Router<S>, limit: TimeLimits
         .layer(axum::middleware::map_response(add_security_headers))
 }
 
+/// On a response that may be framed: a served file, whose body is inert or sandboxed.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct Frameable;
+
 async fn add_security_headers(mut response: Response) -> Response {
+    let frameable = response.extensions().get::<Frameable>().is_some();
     let headers = response.headers_mut();
     headers.insert(
         "x-content-type-options",
         HeaderValue::from_static("nosniff"),
     );
-    headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    // A file gets one only from its collection's `modifyResponseHeaders`.
+    if !frameable {
+        headers.insert("x-frame-options", HeaderValue::from_static("DENY"));
+    }
     headers.insert("referrer-policy", HeaderValue::from_static("no-referrer"));
     response
 }

@@ -21,6 +21,7 @@ use axum::http::header::{
 use axum::http::{HeaderMap, HeaderName, HeaderValue, Method, StatusCode};
 use axum::response::{IntoResponse, Response};
 use serde_json::{Map, Value};
+use sha2::Digest;
 use tachyon_core::auth::Action;
 use tachyon_core::query::DocCopy;
 use tachyon_core::uploads::PROTECTED_HEADERS;
@@ -130,9 +131,10 @@ async fn serve_file(
         // cache asking with the old ETag gets them.
         let meta = storage.head(&found.key).await.map_err(failed)?;
         let size = meta.size;
+        // The file's id hashed: it's the secret half of every key, sizes' and formats' too.
         let etag = format!(
             "\"{}-{}-{}\"",
-            found.file.id,
+            hex::encode(&sha2::Sha256::digest(found.file.id.as_bytes())[..8]),
             encoded(&name, etag_char),
             version(meta.e_tag.as_deref(), meta.last_modified.into(), size)
         );
@@ -239,6 +241,7 @@ fn answer(status: StatusCode, headers: HeaderMap, body: Body) -> Response {
     let mut res = Response::new(body);
     *res.status_mut() = status;
     *res.headers_mut() = headers;
+    res.extensions_mut().insert(crate::Frameable);
     res
 }
 
@@ -257,7 +260,7 @@ struct Found {
 /// judges each copy), document `id` when given, through the field that names it. With
 /// `draft`, drafts they may read come first, as a draft request reads (T4-1); one they
 /// can't read is passed over, so they get what they'd get without it. Trashed documents
-/// hold nothing here (`holders`).
+/// hold nothing here (`by_name`).
 async fn find(
     state: &AppState,
     access: &Access,
@@ -268,20 +271,19 @@ async fn find(
 ) -> Result<Option<Found>, ApiError> {
     let candidates = files::by_name(&state.pool, c.id, name).await?;
     // An original's name wins over a size of another file that happens to share it.
-    let originals = candidates.iter().any(|f| f.filename == name);
+    let originals = candidates.iter().any(|(f, _)| f.filename == name);
     let anonymous = access.anonymous();
     // Every published holder of every file with the name before any draft holder, or the
     // other way round with `draft`: a replace or an edit keeps the name, so the draft's
     // file and the published one can share it.
     let mut held = Vec::new();
-    for file in candidates {
+    for (file, holders) in candidates {
         let Some((field, mime)) = served_as(&file, name, originals) else {
             continue;
         };
         if !access.reads(c, &field) {
             continue;
         }
-        let holders = files::holders(&state.pool, file.id).await?;
         let file = Arc::new(file);
         for (doc, copy) in holders {
             if id.is_none_or(|id| id == doc) {
@@ -357,7 +359,6 @@ fn beside(key: &str, name: &str) -> String {
 /// A short token for the stored object's version: its store's own ETag where it has one,
 /// else when it was written and how big it is.
 fn version(e_tag: Option<&str>, written: SystemTime, size: u64) -> String {
-    use sha2::Digest;
     let of = match e_tag {
         Some(tag) => tag.to_owned(),
         None => {

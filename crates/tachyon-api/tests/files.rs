@@ -184,6 +184,12 @@ async fn held(pool: &PgPool, id: &Value, column: &str) -> Option<Uuid> {
         .unwrap()
 }
 
+/// How an ETag names `file`: hashed, since its id is the secret half of its storage keys.
+fn tag(file: Uuid) -> String {
+    use sha2::Digest;
+    hex::encode(&sha2::Sha256::digest(file.as_bytes())[..8])
+}
+
 /// Gives file `file` a size `size`, as the sizes job will once there is one: its object
 /// beside the original in `root`, its entry (with a WebP copy) in `files.sizes` and every
 /// document copy that holds it, and its names in `files.names`. Returns the entry.
@@ -257,7 +263,7 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert_eq!(res.header("content-length"), bytes.len().to_string());
     assert!(
         res.header("etag")
-            .starts_with(&format!("\"{file}-cat.png-")),
+            .starts_with(&format!("\"{}-cat.png-", tag(file))),
         "{}",
         res.header("etag")
     );
@@ -391,7 +397,7 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert!(
         small
             .header("etag")
-            .starts_with(&format!("\"{file}-cat-10x5.png-")),
+            .starts_with(&format!("\"{}-cat-10x5.png-", tag(file))),
         "{}",
         small.header("etag")
     );
@@ -426,7 +432,7 @@ async fn serves_the_original_and_sizes(pool: PgPool) {
     assert_eq!(res.body, twin_bytes);
     assert!(
         res.header("etag")
-            .starts_with(&format!("\"{twin_file}-cat-10x5.png-")),
+            .starts_with(&format!("\"{}-cat-10x5.png-", tag(twin_file))),
         "{}",
         res.header("etag")
     );
@@ -648,6 +654,38 @@ async fn modify_response_headers_cant_override_security(pool: PgPool) {
         "{}",
         res.json
     );
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn files_may_be_framed_and_the_rest_may_not(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    collection(
+        &app,
+        "embeds",
+        json!({"upload": {"modifyResponseHeaders": {"X-Frame-Options": "SAMEORIGIN"}}}),
+    )
+    .await;
+    let anon = router(&pool, &d).await;
+    put(&app, "images", &png(1, 1), "a.png", None).await;
+    put(&app, "embeds", &png(1, 1), "b.png", None).await;
+    // Bodies are inert or sandboxed, so a file is frameable unless its collection says not.
+    let res = fetch(&anon, "/api/images/file/a.png").await;
+    assert_eq!(res.status, 200);
+    assert!(!res.headers.contains_key("x-frame-options"));
+    assert_eq!(res.header("x-content-type-options"), "nosniff");
+    let res = fetch_with(&anon, "HEAD", "/api/images/file/a.png", &[]).await;
+    assert!(!res.headers.contains_key("x-frame-options"));
+    let res = fetch(&anon, "/api/embeds/file/b.png").await;
+    assert_eq!(res.status, 200);
+    assert_eq!(res.header("x-frame-options"), "SAMEORIGIN");
+    // A refusal, and every other route, keep the default.
+    let res = fetch(&anon, "/api/images/file/zzz.png").await;
+    assert_eq!(res.status, 404);
+    assert_eq!(res.header("x-frame-options"), "DENY");
+    let res = fetch(&anon, "/api/images").await;
+    assert_eq!(res.header("x-frame-options"), "DENY");
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -889,10 +927,12 @@ async fn urls_are_filled_on_every_read(pool: PgPool) {
         let res = fetch(&anon, &path_of(&doc["url"])).await;
         assert_eq!(res.status, 200);
         assert!(
-            res.header("etag").starts_with(&format!("\"{file}-x.png-")),
+            res.header("etag")
+                .starts_with(&format!("\"{}-x.png-", tag(file))),
             "{}",
             res.header("etag")
         );
+        assert!(!res.header("etag").contains(&file.to_string()));
     }
     assert_eq!(
         fetch(
@@ -1369,7 +1409,8 @@ async fn a_published_file_wins_over_an_older_draft_of_the_same_name(pool: PgPool
     let res = fetch(&editor, "/api/images/file/a.png").await;
     assert_eq!(res.status, 200);
     assert!(
-        res.header("etag").starts_with(&format!("\"{b}-a.png-")),
+        res.header("etag")
+            .starts_with(&format!("\"{}-a.png-", tag(b))),
         "{}",
         res.header("etag")
     );

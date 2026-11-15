@@ -373,25 +373,41 @@ async fn lookups_find_live_files_and_their_holders(pool: PgPool) {
     tx.commit().await.unwrap();
 
     let doc = draft_with(&pool, &c, a.id).await;
-    let found: Vec<Uuid> = files::by_name(&pool, c.id, "a.png")
-        .await
-        .unwrap()
-        .iter()
-        .map(|f| f.id)
-        .collect();
-    assert_eq!(found, [a.id]);
+    let found = |pool: PgPool| async move {
+        files::by_name(&pool, c.id, "a.png")
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(f, holders)| (f.id, holders))
+            .collect::<Vec<_>>()
+    };
     assert_eq!(
-        files::holders(&pool, a.id).await.unwrap(),
-        [(doc, DocCopy::Draft)]
+        found(pool.clone()).await,
+        [(a.id, vec![(doc, DocCopy::Draft)])]
     );
     publish(&pool, &c, doc).await;
     assert_eq!(
-        files::holders(&pool, a.id).await.unwrap(),
-        [(doc, DocCopy::Published), (doc, DocCopy::Draft)]
+        found(pool.clone()).await,
+        [(a.id, vec![(doc, DocCopy::Published), (doc, DocCopy::Draft)])]
+    );
+    // A second document holding it, in ID order.
+    let other = draft_with(&pool, &c, a.id).await;
+    assert_eq!(
+        found(pool.clone()).await,
+        [(
+            a.id,
+            vec![
+                (doc, DocCopy::Published),
+                (doc, DocCopy::Draft),
+                (other, DocCopy::Draft)
+            ]
+        )]
     );
     documents::delete(&pool, c.id, doc).await.unwrap();
-    assert!(
-        files::holders(&pool, a.id).await.unwrap().is_empty(),
+    documents::delete(&pool, c.id, other).await.unwrap();
+    assert_eq!(
+        found(pool.clone()).await,
+        [(a.id, vec![])],
         "only live documents"
     );
 

@@ -914,29 +914,81 @@ pub async fn queue_key_cleanup(
     .await
 }
 
-/// Live files of `collection_id` served under `name`, the original's or a size's. More than
-/// one when scopes share a name; `holders` tells them apart.
+/// Live files of `collection_id` served under `name`, the original's or a size's, each with
+/// the live documents whose copy holds it now, once per copy. More than one file when
+/// scopes share a name; the holders tell them apart. One query, so a name only a hidden
+/// file has costs about what a missing one does.
 pub async fn by_name(
     pool: &PgPool,
     collection_id: Uuid,
     name: &str,
-) -> Result<Vec<FileRow>, DbError> {
-    Ok(sqlx::query_as!(
-        FileRow,
-        r#"SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,
-                  height, focal_x, focal_y, blurhash,
-                  sizes AS "sizes: Json<Map<String, Value>>", names, state, created_at,
-                  issued_to, issued_key
-           FROM files
-           WHERE tenant_id = $1 AND collection_id = $2 AND names @> ARRAY[$3]
-             AND state = 'live'
-           ORDER BY id"#,
+) -> Result<Vec<(FileRow, Vec<(Uuid, DocCopy)>)>, DbError> {
+    let rows = sqlx::query!(
+        r#"SELECT f.id, f.collection_id, f.storage, f.key, f.filename, f.mime_type,
+                  f.filesize, f.width, f.height, f.focal_x, f.focal_y, f.blurhash,
+                  f.sizes AS "sizes: Json<Map<String, Value>>", f.names, f.state,
+                  f.created_at, f.issued_to, f.issued_key,
+                  COALESCE(h.docs, '{}') AS "docs!: Vec<Uuid>",
+                  COALESCE(h.published, '{}') AS "published!: Vec<bool>",
+                  COALESCE(h.drafts, '{}') AS "drafts!: Vec<bool>"
+           FROM files f
+           LEFT JOIN LATERAL (
+               SELECT array_agg(d.id ORDER BY d.id) AS docs,
+                      array_agg(d.published_file IS NOT DISTINCT FROM f.id ORDER BY d.id)
+                          AS published,
+                      array_agg(d.draft_file IS NOT DISTINCT FROM f.id ORDER BY d.id)
+                          AS drafts
+               FROM documents d
+               WHERE d.tenant_id = $1 AND d.deleted_at IS NULL
+                 AND (d.published_file = f.id OR d.draft_file = f.id)
+           ) h ON true
+           WHERE f.tenant_id = $1 AND f.collection_id = $2 AND f.names @> ARRAY[$3]
+             AND f.state = 'live'
+           ORDER BY f.id"#,
         DEFAULT_TENANT,
         collection_id,
         name,
     )
     .fetch_all(pool)
-    .await?)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|r| {
+            let holders = r
+                .docs
+                .iter()
+                .zip(r.published.iter().zip(&r.drafts))
+                .flat_map(|(&doc, (&published, &draft))| {
+                    [
+                        published.then_some((doc, DocCopy::Published)),
+                        draft.then_some((doc, DocCopy::Draft)),
+                    ]
+                })
+                .flatten()
+                .collect();
+            let file = FileRow {
+                id: r.id,
+                collection_id: r.collection_id,
+                storage: r.storage,
+                key: r.key,
+                filename: r.filename,
+                mime_type: r.mime_type,
+                filesize: r.filesize,
+                width: r.width,
+                height: r.height,
+                focal_x: r.focal_x,
+                focal_y: r.focal_y,
+                blurhash: r.blurhash,
+                sizes: r.sizes,
+                names: r.names,
+                state: r.state,
+                created_at: r.created_at,
+                issued_to: r.issued_to,
+                issued_key: r.issued_key,
+            };
+            (file, holders)
+        })
+        .collect())
 }
 
 /// The storage key of the file each of `docs` holds in its published copy, by document;
@@ -954,32 +1006,6 @@ pub async fn published_keys(
     .fetch_all(pool)
     .await?;
     Ok(rows.into_iter().map(|r| (r.id, r.key)).collect())
-}
-
-/// Live documents whose copy holds `file` as its current file, once per copy.
-pub async fn holders(pool: &PgPool, file: Uuid) -> Result<Vec<(Uuid, DocCopy)>, DbError> {
-    let rows = sqlx::query!(
-        r#"SELECT id, published_file IS NOT DISTINCT FROM $2 AS "published!",
-                  draft_file IS NOT DISTINCT FROM $2 AS "draft!"
-           FROM documents
-           WHERE tenant_id = $1 AND deleted_at IS NULL
-             AND (published_file = $2 OR draft_file = $2)
-           ORDER BY id"#,
-        DEFAULT_TENANT,
-        file,
-    )
-    .fetch_all(pool)
-    .await?;
-    Ok(rows
-        .into_iter()
-        .flat_map(|r| {
-            [
-                r.published.then_some((r.id, DocCopy::Published)),
-                r.draft.then_some((r.id, DocCopy::Draft)),
-            ]
-        })
-        .flatten()
-        .collect())
 }
 
 /// Takes the pending file of `collection_id` named `filename` that was issued to `user`

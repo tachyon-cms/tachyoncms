@@ -1,6 +1,6 @@
 {
   "db_name": "PostgreSQL",
-  "query": "SELECT id, collection_id, storage, key, filename, mime_type, filesize, width,\n                  height, focal_x, focal_y, blurhash,\n                  sizes AS \"sizes: Json<Map<String, Value>>\", names, state, created_at,\n                  issued_to, issued_key\n           FROM files\n           WHERE tenant_id = $1 AND collection_id = $2 AND names @> ARRAY[$3]\n             AND state = 'live'\n           ORDER BY id",
+  "query": "SELECT f.id, f.collection_id, f.storage, f.key, f.filename, f.mime_type,\n                  f.filesize, f.width, f.height, f.focal_x, f.focal_y, f.blurhash,\n                  f.sizes AS \"sizes: Json<Map<String, Value>>\", f.names, f.state,\n                  f.created_at, f.issued_to, f.issued_key,\n                  COALESCE(h.docs, '{}') AS \"docs!: Vec<Uuid>\",\n                  COALESCE(h.published, '{}') AS \"published!: Vec<bool>\",\n                  COALESCE(h.drafts, '{}') AS \"drafts!: Vec<bool>\"\n           FROM files f\n           LEFT JOIN LATERAL (\n               SELECT array_agg(d.id ORDER BY d.id) AS docs,\n                      array_agg(d.published_file IS NOT DISTINCT FROM f.id ORDER BY d.id)\n                          AS published,\n                      array_agg(d.draft_file IS NOT DISTINCT FROM f.id ORDER BY d.id)\n                          AS drafts\n               FROM documents d\n               WHERE d.tenant_id = $1 AND d.deleted_at IS NULL\n                 AND (d.published_file = f.id OR d.draft_file = f.id)\n           ) h ON true\n           WHERE f.tenant_id = $1 AND f.collection_id = $2 AND f.names @> ARRAY[$3]\n             AND f.state = 'live'\n           ORDER BY f.id",
   "describe": {
     "columns": [
       {
@@ -200,6 +200,24 @@
             "name": "issued_key"
           }
         }
+      },
+      {
+        "ordinal": 18,
+        "name": "docs!: Vec<Uuid>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 19,
+        "name": "published!: Vec<bool>",
+        "type_info": "BoolArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 20,
+        "name": "drafts!: Vec<bool>",
+        "type_info": "BoolArray",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -227,8 +245,11 @@
       false,
       false,
       true,
-      true
+      true,
+      null,
+      null,
+      null
     ]
   },
-  "hash": "d8c60ca1a18f3181bae5d0a2624f7cbd3c88de28beb7529ae08d55990bcf36e9"
+  "hash": "af2f705a9590c568ff82d90129c91ed7f1372e292a15d5818abac1dc7e41d92d"
 }
