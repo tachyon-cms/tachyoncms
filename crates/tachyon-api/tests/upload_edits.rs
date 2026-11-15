@@ -417,6 +417,13 @@ async fn edits_obey_options_and_bounds(pool: PgPool) {
     .await;
     collection(
         &app,
+        "free",
+        json!({"focalPoint": false, "imageSizes": [{"name": "s", "width": 10}]}),
+        json!({}),
+    )
+    .await;
+    collection(
+        &app,
         "images",
         json!({"imageSizes": [{"name": "s", "width": 10}]}),
         json!({}),
@@ -445,11 +452,32 @@ async fn edits_obey_options_and_bounds(pool: PgPool) {
     let one = format!("/api/fixed/{}", fixed["id"].as_str().unwrap());
     refused(&one, crop(0, 0, 10, 10), 422, Some("uploadEdits.crop")).await;
     refused(&one, focal(10, 10), 422, Some("uploadEdits.focalPoint")).await;
-    // Without focalPoint, a focal value is only a field: the file stays.
+    // Without focalPoint there are no focal fields: naming one is naming any unknown field.
+    assert!(
+        fixed.get("focalX").is_none() && fixed.get("focalY").is_none(),
+        "{fixed}"
+    );
     let before = held(&pool, &fixed["id"]).await;
-    let got = ok(&app, "PATCH", &one, Some(json!({"focalX": 10}))).await;
-    assert_eq!(got["focalX"], 10);
+    for sent in [json!({"focalX": 10}), json!({"focalY": "a"})] {
+        let res = call(&app, "PATCH", &one, sent.clone()).await;
+        assert_problem(&res, 422);
+        let key = sent.as_object().unwrap().keys().next().unwrap().clone();
+        assert_eq!(
+            res.json["errors"],
+            json!([{"path": key, "message": "unknown field"}]),
+            "{sent}"
+        );
+    }
     assert_eq!(held(&pool, &fixed["id"]).await, before);
+    // A crop there writes no focal point either.
+    let free = post(&app, "free", &image, "a.png").await;
+    let free_one = format!("/api/free/{}", free["id"].as_str().unwrap());
+    let got = ok(&app, "PATCH", &free_one, Some(crop(0, 0, 10, 10))).await;
+    assert_eq!(
+        (got["width"].clone(), got.get("focalX")),
+        (json!(10), None),
+        "{got}"
+    );
 
     let doc = post(&app, "images", &image, "a.png").await;
     let one = format!("/api/images/{}", doc["id"].as_str().unwrap());
@@ -709,29 +737,6 @@ async fn a_stale_focal_point_isnt_written_back(pool: PgPool) {
         (row.focal_x, row.focal_y, row.state.as_str()),
         (20.0, 30.0, "live")
     );
-}
-
-/// Two plain focal writes on a collection without `focalPoint` are only field writes: the
-/// later one wins, with no file to disagree with.
-#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
-async fn field_only_focal_writes_dont_conflict(pool: PgPool) {
-    let d = dirs();
-    let app = admin(&pool, &d).await;
-    collection(&app, "images", json!({"focalPoint": false}), json!({})).await;
-    let doc = post(&app, "images", &png(fixtures::gradient(100, 80)), "a.png").await;
-    let id: Uuid = doc["id"].as_str().unwrap().parse().unwrap();
-    let one = format!("/api/images/{id}");
-    let pause = tachyon_api::pause_next_update(id);
-    let first = tokio::spawn({
-        let (app, one) = (app.clone(), one.clone());
-        async move { call(&app, "PATCH", &one, json!({"focalX": 10})).await }
-    });
-    pause.reached().await;
-    ok(&app, "PATCH", &one, Some(json!({"focalX": 20}))).await;
-    pause.resume();
-    let res = first.await.unwrap();
-    assert_eq!(res.status, 200, "{}", res.json);
-    assert_eq!(ok(&app, "GET", &one, None).await["focalX"], 10);
 }
 
 /// A focal write that read the document before another edit remade its file is refused,

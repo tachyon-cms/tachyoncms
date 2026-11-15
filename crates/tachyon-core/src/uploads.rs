@@ -316,7 +316,7 @@ pub fn pattern_host(raw: &str) -> Result<String, &'static str> {
     Ok(format!("{wild}{host}"))
 }
 
-/// The fields every upload collection has.
+/// The fields every upload collection has, `focalX` and `focalY` only with `focalPoint`.
 pub const UPLOAD_FIELDS: &[&str] = &[
     "filename",
     "mimeType",
@@ -488,7 +488,7 @@ fn built_ins(u: &Upload) -> Vec<Field> {
         f.default = Some(json!(50));
         f
     };
-    vec![
+    let mut fields = vec![
         text("filename"),
         text("mimeType"),
         number("filesize", Some(0.0), None, true),
@@ -500,7 +500,12 @@ fn built_ins(u: &Upload) -> Vec<Field> {
         computed("thumbnailURL"),
         group("sizes", sizes),
         text("blurhash"),
-    ]
+    ];
+    // Without a focal point there's nothing for them to set.
+    if !u.focal_point {
+        fields.retain(|f| f.name != "focalX" && f.name != "focalY");
+    }
+    fields
 }
 
 /// `user` (data fields) with the built-in upload fields: a user field of the same name keeps
@@ -1317,6 +1322,27 @@ impl CropRect {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn focal_fields_come_with_the_focal_point() {
+        let names = |u: &Upload| -> Vec<String> {
+            upload_fields(u, &[]).into_iter().map(|f| f.name).collect()
+        };
+        let on = names(&Upload::default());
+        assert!(
+            on.contains(&"focalX".into()) && on.contains(&"focalY".into()),
+            "{on:?}"
+        );
+        let off = Upload {
+            focal_point: false,
+            ..Upload::default()
+        };
+        let n = names(&off);
+        assert!(!n.iter().any(|n| n.starts_with("focal")), "{n:?}");
+        assert_eq!(n.len(), on.len() - 2, "{n:?}");
+        // A field of that name is then the schema's own, of any type.
+        assert_eq!(built_in_kind(&off, "focalX"), None);
+    }
 
     #[test]
     fn upload_edits_are_read_with_paths() {

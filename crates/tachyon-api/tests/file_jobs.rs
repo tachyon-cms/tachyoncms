@@ -1323,34 +1323,30 @@ async fn regeneration_takes_the_focal_point_from_the_document(pool: PgPool) {
         &image::DynamicImage::ImageRgb8(halves),
         image::ImageFormat::Png,
     );
-    let res = upload(
-        &app,
-        "POST",
-        "/api/media",
-        Some(&image),
-        "a.png",
-        Some(&json!({"focalX": 90})),
-    )
-    .await;
+    let res = upload(&app, "POST", "/api/media", Some(&image), "a.png", None).await;
     assert_eq!(res.status, 201, "{}", res.json);
     let id = res.json["id"].as_str().unwrap().to_owned();
     ok(&app, "POST", &format!("/api/media/{id}/publish"), None).await;
-    // Without a focal point, a focal write keeps the file: both copies hold it, each with
-    // its own focalX, the published copy's on the blue side, the draft's on the red.
-    ok(
-        &app,
-        "PATCH",
-        &format!("/api/media/{id}"),
-        Some(json!({"focalX": 10})),
-    )
-    .await;
+    let uuid = id.parse::<Uuid>().unwrap();
     let (published, draft): (Option<Uuid>, Option<Uuid>) =
         sqlx::query_as("SELECT published_file, draft_file FROM documents WHERE id = $1")
-            .bind(id.parse::<Uuid>().unwrap())
+            .bind(uuid)
             .fetch_one(&pool)
             .await
             .unwrap();
     assert_eq!(published, draft, "one file for both copies");
+    // Both copies holding one file, each with its own focalX, the published copy's on the
+    // blue side, the draft's on the red. No write makes that now (without a focal point
+    // there are no focal fields, and with one a focal write makes a new file), so it's set
+    // here, to keep which copy wins pinned.
+    sqlx::query(
+        "UPDATE documents SET published = published || '{\"focalX\": 90}',
+                              draft = draft || '{\"focalX\": 10}' WHERE id = $1",
+    )
+    .bind(uuid)
+    .execute(&pool)
+    .await
+    .unwrap();
 
     let res = change(&app, "media", media(square, drafts), false).await;
     assert_eq!(res.status, 200, "{}", res.json);

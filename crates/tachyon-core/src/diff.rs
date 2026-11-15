@@ -1965,13 +1965,24 @@ mod tests {
             &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
             "focalPoint": false})),
         );
+        // Turning the focal point off takes its fields, and their values, with it.
         assert_eq!(
             c,
-            [Change::UploadChanged {
-                sizes: false,
-                focal_point: true,
-                removed: false
-            }]
+            [
+                Change::Removed {
+                    path: "focalX".into(),
+                    kind: "number"
+                },
+                Change::Removed {
+                    path: "focalY".into(),
+                    kind: "number"
+                },
+                Change::UploadChanged {
+                    sizes: false,
+                    focal_point: true,
+                    removed: false
+                }
+            ]
         );
         // Every option sizes are made with remakes them.
         for option in [

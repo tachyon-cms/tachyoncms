@@ -1124,9 +1124,17 @@ pub(crate) fn edit_of(
     };
     // `null` is the default, as on create; `None` inside for a value that isn't a number.
     let sent = |k: &str| p.get(k).map(|v| v.as_f64().or(v.is_null().then_some(50.0)));
+    // Without a focal point there are no focal fields: one sent is validation's to refuse,
+    // and a crop writes none.
+    if !u.focal_point {
+        return Ok(edits.map(|e| Edit {
+            crop: e.crop,
+            plain: false,
+        }));
+    }
     let Some(edits) = edits else {
         let (x, y) = (sent("focalX"), sent("focalY"));
-        if !u.focal_point || with_file || x == Some(None) || y == Some(None) {
+        if with_file || x == Some(None) || y == Some(None) {
             return Ok(None);
         }
         let was = focal_in(stored);
@@ -1175,6 +1183,7 @@ pub(crate) fn edit_of(
 /// has another: its file was remade for that one meanwhile, and writing over it would
 /// leave the document and its file disagreeing. Only where a focal point remakes the file
 /// (`focalPoint` on, an image stored); elsewhere it's a field, and the last write wins.
+/// Without `focalPoint` there's no focal field to send.
 pub(crate) fn focal_moved(
     c: &Collection,
     patch: &Value,
