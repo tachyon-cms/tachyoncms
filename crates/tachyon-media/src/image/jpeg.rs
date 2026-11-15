@@ -11,11 +11,28 @@ pub(super) struct Walked {
     pub end: usize,
 }
 
-/// Walks `bytes`, keeping every segment decoding needs (JFIF, an ICC profile, Adobe's
-/// colour transform, tables, frames, scans) and dropping the other APPn segments and
-/// comments wherever they are. Stops at the first end-of-image marker; what follows it
-/// (more pictures, a video, a vendor trailer) goes.
+/// Walks `bytes`, keeping every segment decoding needs (JFIF, an ICC profile shaped like
+/// one, Adobe's colour transform, tables, frames, scans) and dropping the other APPn
+/// segments and comments wherever they are. Stops at the first end-of-image marker; what
+/// follows it (more pictures, a video, a vendor trailer) goes.
 pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
+    let mut icc = Vec::new();
+    let mut w = walk_keeping(bytes, &mut icc)?;
+    // The profile is the APP2 segments' data, after their name and sequence numbers, in turn.
+    let profile: Vec<u8> = icc
+        .iter()
+        .flat_map(|r: &std::ops::Range<usize>| w.stripped[r.start + 18..r.end].iter().copied())
+        .collect();
+    if !super::icc_shaped(&profile) {
+        for r in icc.into_iter().rev() {
+            w.stripped.drain(r);
+        }
+    }
+    Ok(w)
+}
+
+/// `walk`, every ICC segment kept, where each sits in what's kept added to `icc`.
+fn walk_keeping(bytes: &[u8], icc: &mut Vec<std::ops::Range<usize>>) -> Result<Walked, ImageError> {
     if !bytes.starts_with(&[0xFF, 0xD8]) {
         return Err(ImageError::Corrupt("it doesn't start like a JPEG".into()));
     }
@@ -73,9 +90,14 @@ pub(super) fn walk(bytes: &[u8]) -> Result<Walked, ImageError> {
         let body = &segment[4.min(segment.len())..];
         // What decoding uses, and nothing else: frames (not JPG, 0xC8), Huffman and
         // arithmetic tables, quantisation tables, restart interval, scans, DNL, EXP.
+        // Name, sequence number and count before any data.
+        let is_icc = marker == 0xE2 && body.starts_with(b"ICC_PROFILE\0") && body.len() >= 14;
+        if is_icc {
+            icc.push(out.len()..out.len() + segment.len());
+        }
         let keep = match marker {
             0xE0 => body.starts_with(b"JFIF\0"),
-            0xE2 => body.starts_with(b"ICC_PROFILE\0"),
+            0xE2 => is_icc,
             0xEE => body.starts_with(b"Adobe"),
             0xC8 => false,
             0xC0..=0xCF | 0xDA..=0xDD | 0xDF => true,

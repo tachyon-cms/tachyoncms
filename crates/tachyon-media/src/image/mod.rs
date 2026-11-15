@@ -36,10 +36,11 @@ pub use sizes::{Made, Original, SizeOut, size_format};
 /// The most a header read may allocate: ICC profiles and text chunks, never pixels.
 const HEADER_ALLOC: u64 = 16 * 1024 * 1024;
 
-/// The PNG chunks kept when metadata is stripped: what decoding and colour need.
+/// The PNG chunks kept when metadata is stripped: what decoding and colour need. Not
+/// `sPLT` or `hIST`: a suggested palette and a histogram show nothing.
 const PNG_KEEP: &[&[u8; 4]] = &[
     b"IHDR", b"PLTE", b"IDAT", b"IEND", b"tRNS", b"cHRM", b"gAMA", b"iCCP", b"sBIT", b"sRGB",
-    b"cICP", b"mDCv", b"cLLi", b"bKGD", b"hIST", b"pHYs", b"sPLT", b"acTL", b"fcTL", b"fdAT",
+    b"cICP", b"mDCv", b"cLLi", b"bKGD", b"pHYs", b"acTL", b"fcTL", b"fdAT",
 ];
 
 const XMP_JPEG: &[u8] = b"http://ns.adobe.com/xap/1.0/\0";
@@ -568,11 +569,20 @@ fn decode(bytes: &[u8], p: &Probe, cap: u64, all: bool, keep: bool) -> Result<De
             f.image.apply_orientation(o);
         }
     }
+    meta.icc = meta.icc.filter(|icc| icc_shaped(icc));
     Ok(Decoded {
         frames,
         loops,
         meta,
     })
+}
+
+/// Whether `icc` is shaped like an ICC profile: the size it declares is its length, and
+/// `acsp` is at 36. A profile may carry private tags, so this is all that can be checked;
+/// one that isn't so shaped could be anything and isn't kept.
+pub(super) fn icc_shaped(icc: &[u8]) -> bool {
+    icc.get(36..40) == Some(b"acsp")
+        && icc[..4] == u32::try_from(icc.len()).map_or([0; 4], u32::to_be_bytes)
 }
 
 /// `bytes` decoded on this thread, rav1d refusing a frame over `pixels`.
@@ -1330,7 +1340,12 @@ fn strip(format: InputFormat, bytes: &[u8]) -> Result<Option<Vec<u8>>, ImageErro
     let out = match format {
         InputFormat::Png => {
             let mut png = img_parts::png::Png::from_bytes(b).map_err(corrupt)?;
-            png.chunks_mut().retain(|c| PNG_KEEP.contains(&&c.kind()));
+            // The first profile, inflated as the probe allowed, when it's shaped like one.
+            let mut icc = png.icc_profile().is_some_and(|i| icc_shaped(&i));
+            png.chunks_mut().retain(|c| match &c.kind() {
+                b"iCCP" => std::mem::take(&mut icc),
+                kind => PNG_KEEP.contains(&kind),
+            });
             png.encoder().bytes()
         }
         InputFormat::Webp => {
@@ -1341,6 +1356,8 @@ fn strip(format: InputFormat, bytes: &[u8]) -> Result<Option<Vec<u8>>, ImageErro
                     b"VP8 " | b"VP8L" | b"VP8X" | b"ALPH" | b"ANIM" | b"ANMF" | b"ICCP"
                 )
             });
+            let icc = webp.icc_profile().filter(|i| icc_shaped(i));
+            webp.set_icc_profile(icc);
             // Rewrites the VP8X flags to the chunks that are left.
             webp.set_exif(None);
             webp.encoder().bytes()
@@ -3580,6 +3597,59 @@ mod tests {
         );
     }
 
+    /// What no reader of the picture takes from `meta` keeps only its header: `hdlr`'s name,
+    /// `dinf`, `grpl`, and every property but those avif-parse reads.
+    #[test]
+    fn avif_structure_carries_no_payload() {
+        let avif = encoded(&gradient(8, 8), Codec::Avif);
+        let want = pixels_of(&avif);
+        let (meta, meta_end, _) = child_boxes(&avif, 0, avif.len())
+            .into_iter()
+            .find(|b| &b.2 == b"meta")
+            .unwrap();
+        let hdlr = child_boxes(&avif, meta + 12, meta_end)
+            .into_iter()
+            .find(|b| &b.2 == b"hdlr")
+            .unwrap();
+        let at_end = |kind: &[u8; 4]| {
+            avif_insert(
+                avif.clone(),
+                meta_end,
+                &isobmff_box(kind, TAIL, false),
+                &[meta],
+            )
+        };
+        let property = |kind: &[u8; 4]| {
+            crate::fixtures::avif_with_property(8, 8, &isobmff_box(kind, TAIL, false))
+        };
+        for (name, bytes) in [
+            (
+                "hdlr name",
+                avif_insert(avif.clone(), hdlr.0 + 32, TAIL, &[meta, hdlr.0]),
+            ),
+            ("dinf", at_end(b"dinf")),
+            ("grpl", at_end(b"grpl")),
+            ("unknown property", property(b"zzzz")),
+            ("free property", property(b"free")),
+            ("uuid property", property(b"uuid")),
+        ] {
+            for (how, u) in settings() {
+                let at = format!("{name}, {how}");
+                let out = run(&bytes, &u).unwrap_or_else(|e| panic!("{at}: {e}"));
+                let kept = stored(&out);
+                assert_eq!(out.mime, "image/avif", "{at}");
+                assert!(!has(&kept, b"<html>"), "{at}: the payload stayed");
+                assert_eq!(pixels_of(&kept), want, "{at}: the picture changed");
+            }
+        }
+        // What the picture is read from stays: a rotation still turns it.
+        let turned = crate::fixtures::avif_rotated(8, 4, 1);
+        for (how, u) in settings() {
+            let out = run(&turned, &u).unwrap();
+            assert_eq!((out.width, out.height), (4, 8), "{how}");
+        }
+    }
+
     /// What's inside an AVIF's `meta` and among its items is kept only where it's the
     /// picture's; a TIFF's gaps go; an extent of length 0 ends with its box.
     #[test]
@@ -4724,5 +4794,116 @@ mod tests {
         let g = gif::with_meta(&moving_gif(2, 2, 2), None, Some(&steering));
         assert_eq!(gif::walk(&g, false).unwrap().xmp, None);
         assert_eq!(gif::walk(&g, false).unwrap().frames, 2);
+    }
+
+    /// A suggested palette and a histogram describe a picture without being needed to show
+    /// it, and a palette may repeat: they go with the rest of the metadata, in an icon too.
+    #[test]
+    fn png_palettes_and_histograms_go() {
+        let mut png =
+            img_parts::png::Png::from_bytes(encoded(&gradient(4, 4), Codec::Png).into()).unwrap();
+        let at = png.chunks().len() - 1;
+        let mut splt = b"pal\0\x08".to_vec();
+        splt.extend_from_slice(TAIL);
+        for (kind, body) in [
+            (b"sPLT", &splt),
+            (b"sPLT", &splt),
+            (b"hIST", &TAIL.to_vec()),
+        ] {
+            png.chunks_mut().insert(
+                at,
+                img_parts::png::PngChunk::new(*kind, body.clone().into()),
+            );
+        }
+        let png = png.encoder().bytes().to_vec();
+        assert!(has(&png, b"<html>"));
+        for (name, bytes) in [("png", png.clone()), ("icon", ico_around(&png))] {
+            let out = run(&bytes, &upload(serde_json::json!({}))).unwrap();
+            let kept = stored(&out);
+            assert!(!has(&kept, b"<html>"), "{name}");
+            assert!(!has(&kept, b"sPLT") && !has(&kept, b"hIST"), "{name}");
+        }
+    }
+
+    /// A colour profile is kept only when it's shaped like one: its declared size its
+    /// length, `acsp` at 36. Anything else could be anything, so it goes.
+    #[test]
+    fn a_colour_profile_that_isnt_one_goes() {
+        let good = crate::fixtures::fake_icc(600);
+        let mut sized = good.clone();
+        sized[100..100 + TAIL.len()].copy_from_slice(TAIL);
+        sized[..4].copy_from_slice(&599u32.to_be_bytes());
+        let mut unsigned = good.clone();
+        unsigned[100..100 + TAIL.len()].copy_from_slice(TAIL);
+        unsigned[36..40].copy_from_slice(b"none");
+        let profile = |kept: &[u8], mime: &str| -> Option<Vec<u8>> {
+            match mime {
+                "image/avif" => avif::meta(kept)
+                    .unwrap()
+                    .icc
+                    .map(|(s, e)| kept[s..e].to_vec()),
+                _ => img_parts::DynImage::from_bytes(kept.to_vec().into())
+                    .unwrap()
+                    .unwrap()
+                    .icc_profile()
+                    .map(|b| b.to_vec()),
+            }
+        };
+        let gradient = gradient(8, 8);
+        // JPEG's profile is split across APP2 segments: over 64 KiB makes two.
+        let big = crate::fixtures::fake_icc(70_000);
+        let as_png = || encoded(&gradient, Codec::Png);
+        for (name, icc, bytes) in [
+            ("jpeg", &good, encoded(&gradient, Codec::Jpeg)),
+            ("jpeg in two", &big, encoded(&gradient, Codec::Jpeg)),
+            ("png", &good, as_png()),
+            ("webp", &good, encoded(&gradient, Codec::WebP)),
+        ]
+        .into_iter()
+        .map(|(n, i, b)| (n, i, crate::fixtures::with_icc(b, i)))
+        .chain([(
+            "avif",
+            &good,
+            avif::with_icc(&encoded(&gradient, Codec::Avif), &good).unwrap(),
+        )]) {
+            let out = run(&bytes, &upload(serde_json::json!({}))).unwrap();
+            assert_eq!(
+                profile(&stored(&out), out.mime).as_ref(),
+                Some(icc),
+                "{name}: kept"
+            );
+        }
+        for (shape, bad) in [("size", &sized), ("signature", &unsigned)] {
+            for (name, bytes) in [
+                (
+                    "jpeg",
+                    crate::fixtures::with_icc(encoded(&gradient, Codec::Jpeg), bad),
+                ),
+                ("png", crate::fixtures::with_icc(as_png(), bad)),
+                (
+                    "webp",
+                    crate::fixtures::with_icc(encoded(&gradient, Codec::WebP), bad),
+                ),
+                (
+                    "avif",
+                    avif::with_icc(&encoded(&gradient, Codec::Avif), bad).unwrap(),
+                ),
+            ] {
+                let at = format!("{name}, {shape}");
+                for u in [
+                    upload(serde_json::json!({})),
+                    upload(serde_json::json!({"constructorOptions": {"failOn": "none"}})),
+                    // Re-encoded, it isn't carried over either.
+                    upload(serde_json::json!({"formatOptions": {"format": "png"}})),
+                    upload(serde_json::json!({"formatOptions": {"format": "avif"}})),
+                ] {
+                    let out = run(&bytes, &u).unwrap_or_else(|e| panic!("{at}: {e}"));
+                    let kept = stored(&out);
+                    assert!(!has(&kept, b"<html>"), "{at}: the profile stayed");
+                    assert_eq!(profile(&kept, out.mime), None, "{at}");
+                    assert_eq!(pixels_of(&kept).len(), 8 * 8 * 4, "{at}");
+                }
+            }
+        }
     }
 }

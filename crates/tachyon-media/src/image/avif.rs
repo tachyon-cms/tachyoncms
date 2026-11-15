@@ -792,11 +792,30 @@ fn orientation_of(ops: &[Op]) -> u8 {
 }
 
 /// The `meta` children whose bodies an AVIF's picture is read from: the rest (`free`,
-/// `skip`, anything unknown) keep only their headers. `idat` keeps only the items kept
-/// from it, as `mdat` does.
-const META_KEEP: [&[u8; 4]; 8] = [
-    b"hdlr", b"pitm", b"iloc", b"iinf", b"iref", b"iprp", b"dinf", b"grpl",
+/// `skip`, `dinf`, `grpl`, anything unknown) keep only their headers. `hdlr` keeps its
+/// fixed fields, not its name; `iprp` keeps `ipma` and, in `ipco`, the bodies of
+/// `PROPERTY_KEEP`. `idat` keeps only the items kept from it, as `mdat` does.
+const META_KEEP: [&[u8; 4]; 4] = [b"pitm", b"iloc", b"iinf", b"iref"];
+
+/// The properties avif-parse and the decoder read, HDR light levels included: every other
+/// keeps only its header, so `ipma`'s indices still hold. A `colr` profile is kept only
+/// when it's shaped like one.
+const PROPERTY_KEEP: [&[u8; 4]; 11] = [
+    b"ispe", b"pixi", b"av1C", b"colr", b"auxC", b"irot", b"imir", b"clap", b"pasp", b"clli",
+    b"mdcv",
 ];
+
+/// Whether `b` is a `colr` holding an ICC profile not shaped like one: zeroed, its type
+/// reads as none a reader knows, and it's passed over.
+fn odd_profile(data: &[u8], b: &Box4) -> bool {
+    &b.kind == b"colr"
+        && matches!(data.get(b.body..b.body + 4), Some(b"prof" | b"rICC"))
+        && !super::icc_shaped(&data[b.body + 4..b.end])
+}
+
+/// `hdlr`'s version, flags, pre-defined, handler type and reserved fields: its name
+/// follows, zeroed, which reads as an empty one.
+const HANDLER_FIXED: usize = 24;
 
 /// `data` with nothing but what its picture is made of, each byte where it was so every
 /// offset still holds: `ftyp`; `meta`'s header and the bodies of its `META_KEEP` children
@@ -1019,6 +1038,18 @@ fn keep_counted(
         kept.push((b.start, b.body));
         if META_KEEP.contains(&&b.kind) {
             kept.push((b.body, b.end));
+        } else if &b.kind == b"hdlr" {
+            kept.push((b.body, b.end.min(b.body + HANDLER_FIXED)));
+        } else if &b.kind == b"iprp" {
+            for p in boxes(data, b.body, b.end) {
+                kept.push((p.start, if &p.kind == b"ipco" { p.body } else { p.end }));
+                if &p.kind == b"ipco" {
+                    for c in boxes(data, p.body, p.end) {
+                        let whole = PROPERTY_KEEP.contains(&&c.kind) && !odd_profile(data, &c);
+                        kept.push((c.start, if whole { c.end } else { c.body }));
+                    }
+                }
+            }
         }
     }
     let primary = find(&inner, b"pitm").and_then(|b| {

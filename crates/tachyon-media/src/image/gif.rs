@@ -102,11 +102,7 @@ pub(super) fn walk(bytes: &[u8], strip: bool) -> Result<Walked, ImageError> {
                     }
                     (0xFF, Some(id)) if id == ICC_ID => {
                         let d = data();
-                        let plausible = d.get(36..40) == Some(b"acsp")
-                            && d.get(..4).is_some_and(|n| {
-                                u32::from_be_bytes([n[0], n[1], n[2], n[3]]) as usize == d.len()
-                            });
-                        plausible.then(|| {
+                        super::icc_shaped(&d).then(|| {
                             let b = extension(ICC_ID, &d);
                             icc = Some(d);
                             b

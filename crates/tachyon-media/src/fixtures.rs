@@ -4,7 +4,7 @@
 use std::io::Cursor;
 
 use ::image::{DynamicImage, ImageFormat as Codec, RgbImage, Rgba, RgbaImage};
-use img_parts::ImageEXIF;
+use img_parts::{ImageEXIF, ImageICC};
 
 /// `img` in `format`.
 pub fn encoded(img: &DynamicImage, format: Codec) -> Vec<u8> {
@@ -436,16 +436,25 @@ pub fn tiff_with_description(description: &str) -> Vec<u8> {
     out
 }
 
-/// A `w`×`h` PNG with an ICC profile of `icc_len` zero bytes and EXIF orientation 6.
+/// A `w`×`h` PNG with the ICC profile `fake_icc(icc_len)` and EXIF orientation 6.
 pub fn png_icc_turned(w: u32, h: u32, icc_len: usize) -> Vec<u8> {
     let full = encoded(&gradient(w, h), Codec::Png);
     let mut png = img_parts::png::Png::from_bytes(full.into()).unwrap();
-    let mut body = b"Display P3\0\0".to_vec();
-    body.extend_from_slice(&zlib(icc_len));
-    png.chunks_mut()
-        .insert(1, img_parts::png::PngChunk::new(*b"iCCP", body.into()));
+    png.set_icc_profile(Some(fake_icc(icc_len).into()));
     png.set_exif(Some(exif(Some(6), false).into()));
     png.encoder().bytes().to_vec()
+}
+
+/// `bytes`, a JPEG, PNG or WebP, carrying `icc` as its colour profile, however it's
+/// shaped.
+pub fn with_icc(bytes: Vec<u8>, icc: &[u8]) -> Vec<u8> {
+    let mut image = img_parts::DynImage::from_bytes(bytes.into())
+        .unwrap()
+        .unwrap();
+    image.set_icc_profile(Some(icc.to_vec().into()));
+    let mut out = Vec::new();
+    image.encoder().write_to(&mut out).unwrap();
+    out
 }
 
 /// Every extent `iloc` gives, in order: the item id, where its (offset, length) fields are,
