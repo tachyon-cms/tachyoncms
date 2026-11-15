@@ -539,7 +539,13 @@ impl Config {
     /// `public_url` on the CMS's own host and port is refused: its files have no `sandbox`
     /// there, so an SVG or HTML upload would run as the CMS.
     fn storage_configs(&self) -> Result<BTreeMap<String, StorageConfig>, String> {
-        let origin = |u: &url::Url| (u.host_str().map(str::to_owned), u.port_or_known_default());
+        // `cms.example.com.` is the same host as `cms.example.com`.
+        let origin = |u: &url::Url| {
+            let host = u
+                .host_str()
+                .map(|h| h.strip_suffix('.').unwrap_or(h).to_owned());
+            (host, u.port_or_known_default())
+        };
         let cms = web_url(&self.cms_url()).map(|u| origin(&u));
         let mut configs = BTreeMap::new();
         for (name, s) in &self.storage {
@@ -564,6 +570,57 @@ impl Config {
                 ));
             }
             configs.insert(name.clone(), config);
+        }
+        // Two names for one place would each sweep the other's `_staging/`.
+        let place = |c: &StorageConfig| {
+            let at = match &c.adapter {
+                Adapter::Local { root } => {
+                    let root: std::path::PathBuf = root
+                        .components()
+                        .filter(|p| !matches!(p, std::path::Component::CurDir))
+                        .collect();
+                    vec!["local".to_owned(), root.display().to_string()]
+                }
+                Adapter::S3 {
+                    bucket, endpoint, ..
+                } => {
+                    vec![
+                        "s3".into(),
+                        bucket.clone(),
+                        endpoint.clone().unwrap_or_default(),
+                    ]
+                }
+                Adapter::Azure {
+                    container,
+                    account,
+                    endpoint,
+                } => vec![
+                    "azure".into(),
+                    account.clone(),
+                    container.clone(),
+                    endpoint.clone().unwrap_or_default(),
+                ],
+                Adapter::Gcs { bucket, endpoint } => {
+                    vec![
+                        "gcs".into(),
+                        bucket.clone(),
+                        endpoint.clone().unwrap_or_default(),
+                    ]
+                }
+            };
+            let prefix = c.prefix.as_deref().unwrap_or_default().trim_matches('/');
+            (at, prefix.to_owned())
+        };
+        for (i, (a, ca)) in configs.iter().enumerate() {
+            if let Some((b, _)) = configs
+                .iter()
+                .skip(i + 1)
+                .find(|(_, cb)| place(cb) == place(ca))
+            {
+                return Err(format!(
+                    "storage.{a} and storage.{b} are the same place (adapter, bucket or root, and prefix), so each would sweep the other's _staging/; give one its own prefix"
+                ));
+            }
         }
         Ok(configs)
     }
@@ -972,6 +1029,57 @@ mod tests {
     }
 
     #[test]
+    fn two_storages_cant_be_one_place() {
+        let keys = [
+            ("TACHYON_STORAGE__A__ACCESS_KEY_ID", "id"),
+            ("TACHYON_STORAGE__A__SECRET_ACCESS_KEY", "secret"),
+            ("TACHYON_STORAGE__B__ACCESS_KEY_ID", "id"),
+            ("TACHYON_STORAGE__B__SECRET_ACCESS_KEY", "secret"),
+        ];
+        let refused = "storage.a and storage.b are the same place (adapter, bucket or root, and prefix), so each would sweep the other's _staging/; give one its own prefix";
+        let s3 = |name: &str, extra: &str| {
+            format!(
+                "[storage.{name}]\nadapter = \"s3\"\nbucket = \"media\"\nregion = \"auto\"\n{extra}\n"
+            )
+        };
+        let local = |name: &str, extra: &str| {
+            format!("[storage.{name}]\nadapter = \"local\"\nroot = \"shared\"\n{extra}\n")
+        };
+        for toml in [
+            format!("{}{}", s3("a", ""), s3("b", "")),
+            format!(
+                "{}{}",
+                s3("a", "prefix = \"site\""),
+                s3("b", "prefix = \"/site/\"")
+            ),
+            format!("{}{}", local("a", ""), local("b", "")),
+            format!(
+                "{}{}",
+                local("a", ""),
+                "[storage.b]\nadapter = \"local\"\nroot = \"./shared/\"\n"
+            ),
+        ] {
+            assert_eq!(uploads_with(&toml, &keys).unwrap_err(), refused, "{toml}");
+        }
+        for toml in [
+            format!("{}{}", s3("a", ""), s3("b", "prefix = \"other\"")),
+            format!(
+                "{}{}",
+                s3("a", ""),
+                s3("b", "endpoint = \"https://acct.r2.cloudflarestorage.com\"")
+            ),
+            format!(
+                "{}{}",
+                local("a", ""),
+                "[storage.b]\nadapter = \"local\"\nroot = \"elsewhere\"\n"
+            ),
+            format!("{}{}", local("a", ""), s3("b", "")),
+        ] {
+            assert!(uploads_with(&toml, &keys).is_ok(), "{toml}");
+        }
+    }
+
+    #[test]
     fn a_bucket_cant_share_the_cms_address() {
         let toml = |cms: &str, bucket: &str| {
             format!(
@@ -986,6 +1094,8 @@ mod tests {
         for (cms, bucket) in [
             ("https://cms.example.com", "https://cms.example.com/files"),
             ("https://cms.example.com", "https://CMS.example.com:443/"),
+            ("https://cms.example.com", "https://cms.example.com./files"),
+            ("https://cms.example.com.", "https://cms.example.com/files"),
             ("http://localhost:3000", "http://localhost:3000/media"),
         ] {
             assert_eq!(
