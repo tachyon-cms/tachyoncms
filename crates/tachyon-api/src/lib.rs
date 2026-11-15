@@ -448,6 +448,12 @@ impl Limit {
         self.0.arrival + self.0.limits.uploads + self.0.limits.normal
     }
 
+    /// How long until `last`.
+    pub(crate) fn left(&self) -> Duration {
+        self.last()
+            .saturating_duration_since(tokio::time::Instant::now())
+    }
+
     pub(crate) fn at(&self) -> tokio::time::Instant {
         *self.0.at.lock().unwrap_or_else(|e| e.into_inner())
     }

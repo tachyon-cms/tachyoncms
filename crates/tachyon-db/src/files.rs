@@ -1009,7 +1009,7 @@ pub async fn published_keys(
 }
 
 /// Takes the pending file of `collection_id` named `filename` that was issued to `user`
-/// with `key` (none for a session), within its grace, for `document`: one issued
+/// with `key` (none for a session), with `margin` of its grace left, for `document`: one issued
 /// for no document is taken by any write, one issued for a document only by that
 /// document's update. Once taken it's issued to nobody, so no other request can take it:
 /// of two at once, the second waits for the first's row lock and then finds nothing. It
@@ -1021,9 +1021,12 @@ pub async fn claim_pending(
     user: Uuid,
     key: Option<Uuid>,
     document: Option<Uuid>,
+    margin: Duration,
 ) -> Result<Option<FileRow>, DbError> {
     // The row locked is the row taken: every condition is in the lock's query, and checked
-    // again once the lock is had.
+    // again once the lock is had. Its grace must outlast the claiming request (`margin`):
+    // a cleanup run meanwhile would delete its row and object before the request stores
+    // the file, and nothing would remove what it stored then.
     Ok(sqlx::query_as!(
         FileRow,
         r#"UPDATE files SET issued_to = NULL, issued_key = NULL
@@ -1032,7 +1035,8 @@ pub async fn claim_pending(
                        WHERE tenant_id = $1 AND collection_id = $2 AND filename = $3
                          AND state = 'pending' AND issued_to = $4
                          AND issued_key IS NOT DISTINCT FROM $5
-                         AND created_at + make_interval(secs => $6) > now()
+                         AND created_at + make_interval(secs => $6)
+                             > now() + make_interval(secs => $8)
                          AND (document_id IS NULL OR document_id = $7)
                        ORDER BY id LIMIT 1 FOR UPDATE)
            RETURNING id, collection_id, storage, key, filename, mime_type, filesize, width,
@@ -1046,6 +1050,7 @@ pub async fn claim_pending(
         key,
         PENDING_GRACE.as_secs_f64(),
         document,
+        margin.as_secs_f64(),
     )
     .fetch_optional(&mut *tx)
     .await?)
@@ -1088,6 +1093,20 @@ pub async fn abandon(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
     jobs::enqueue(&mut tx, &cleanup(id, OffsetDateTime::now_utc())).await?;
     tx.commit().await?;
     Ok(true)
+}
+
+/// `abandon` for `file`, whose object the failed write may have stored. When it was no
+/// longer pending (its grace ran out and its cleanup ran meanwhile), its key is queued for
+/// deletion now, kept should a file serve it by then: the object may have landed after
+/// that cleanup looked.
+pub async fn abandon_stored(pool: &PgPool, file: &FileRow) -> Result<bool, DbError> {
+    if abandon(pool, file.id).await? {
+        return Ok(true);
+    }
+    let mut conn = pool.acquire().await?;
+    let keys = [file.key.clone()];
+    queue_key_cleanup(&mut conn, &file.storage, &keys, OffsetDateTime::now_utc()).await?;
+    Ok(false)
 }
 
 /// Deletes gone file `id`'s row, its objects deleted, unless something points at it again.

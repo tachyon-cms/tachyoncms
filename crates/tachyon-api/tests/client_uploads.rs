@@ -548,6 +548,14 @@ async fn client_upload_cant_be_claimed_by_another_user(pool: PgPool) {
         .unwrap();
     let late = call(&app, "POST", "/api/media", json!({"file": file})).await;
     assert_eq!(refusal(&late), refusal(&invented));
+    // So is one whose grace would end before the request could: its cleanup could delete
+    // the object before the request stored it, and nothing would remove what it stored.
+    sqlx::query("UPDATE files SET created_at = now() - interval '59 minutes'")
+        .execute(&pool)
+        .await
+        .unwrap();
+    let closing = call(&app, "POST", "/api/media", json!({"file": file})).await;
+    assert_eq!(refusal(&closing), refusal(&invented));
     sqlx::query("UPDATE files SET created_at = now()")
         .execute(&pool)
         .await
@@ -1613,6 +1621,32 @@ async fn stray_staging_objects_are_swept(pool: PgPool) {
     drop(app);
 }
 
+/// A storage that stopped taking client uploads may still hold what they put: it's swept
+/// while it can sign, so it could have taken them.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_storage_no_longer_taking_client_uploads_is_still_swept(pool: PgPool) {
+    let d = dirs();
+    let root = d.temp.parent().unwrap().join("off");
+    std::fs::create_dir_all(root.join("_staging")).unwrap();
+    let mut c = StorageConfig::local(&root);
+    c.client_uploads = false;
+    let store = LocalFileSystem::new_with_prefix(&root).unwrap();
+    let off =
+        Storage::with_store("off", Arc::new(store), None, c).with_signer(Arc::new(FakeSigner));
+    let stray = root.join(format!("_staging/{}", Uuid::new_v4()));
+    std::fs::write(&stray, "left").unwrap();
+    age(&stray);
+    let mut o = options(&d, 1);
+    let mut all: HashMap<String, Arc<Storage>> = o.uploads.storages.0.clone();
+    all.insert("off".into(), Arc::new(off));
+    o.uploads.storages = Arc::new(Storages(all));
+    let app = admin(&pool, &d).await;
+    sweep_now(&pool).await;
+    let _worker = tachyon_api::router_with(pool.clone(), o).await.unwrap();
+    until("the stray object is deleted", async || !stray.exists()).await;
+    drop(app);
+}
+
 /// `path` written three hours ago.
 fn age(path: &Path) {
     let three_hours = std::time::SystemTime::now() - Duration::from_secs(3 * 3600);
@@ -1744,33 +1778,47 @@ async fn a_claimed_upload_isnt_swept_from_under_its_claim(pool: PgPool) {
             .await
             .unwrap();
     let mut tx = pool.begin().await.unwrap();
-    let claimed = files::claim_pending(&mut tx, c, "a.png", user, None, None)
+    let claimed = files::claim_pending(&mut tx, c, "a.png", user, None, None, Duration::ZERO)
         .await
         .unwrap();
     assert!(claimed.is_some());
     tx.commit().await.unwrap();
-    // Its key's sweep comes due meanwhile, and leaves it to the claim.
-    let moved =
+    // Its key's sweep comes due meanwhile, and waits for the claim: put back, not done.
+    let due = || {
         sqlx::query("UPDATE jobs SET run_at = now() WHERE kind = $1 AND payload->'keys' ? $2")
             .bind(CLEANUP)
             .bind(&staging)
             .execute(&pool)
-            .await
-            .unwrap();
-    assert_eq!(moved.rows_affected(), 1);
+    };
+    assert_eq!(due().await.unwrap().rows_affected(), 1);
     let _worker = tachyon_api::router_with(pool.clone(), options(&d, 1))
         .await
         .unwrap();
-    until("the sweep is done", async || {
-        sqlx::query_scalar::<_, String>("SELECT state FROM jobs WHERE payload->'keys' ? $1")
-            .bind(&staging)
-            .fetch_one(&pool)
-            .await
-            .unwrap()
-            == "done"
+    let job = || {
+        sqlx::query_as::<_, (String, Option<String>)>(
+            "SELECT state, payload->>'deferred' FROM jobs WHERE payload->'keys' ? $1",
+        )
+        .bind(&staging)
+        .fetch_one(&pool)
+    };
+    until("the sweep is put back", async || {
+        job().await.unwrap().1.is_some()
     })
     .await;
     assert!(d.bucket.join(&staging).exists());
+    // The claim's request dies before it ends, and the file's cleanup expires it: the
+    // key's next run finds no claim, and deletes what the client put.
+    sqlx::query("UPDATE files SET state = 'gone' WHERE staging_key = $1")
+        .bind(&staging)
+        .execute(&pool)
+        .await
+        .unwrap();
+    due().await.unwrap();
+    until("the sweep is done", async || {
+        job().await.unwrap().0 == "done"
+    })
+    .await;
+    assert!(!d.bucket.join(&staging).exists());
 }
 
 /// A bucket whose staging objects vanish when read: `head` finds them, the download doesn't.

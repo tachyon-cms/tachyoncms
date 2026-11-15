@@ -825,13 +825,14 @@ pub(crate) async fn run_cleanup(state: &AppState, job: &Job) -> Result<(), JobEr
                 continue;
             }
             // A claim under way reads what the client put, then deletes it itself; the row
-            // is locked as the claim locks it, so it can't start or end in between.
+            // is locked as the claim locks it, so it can't start or end in between. Asked
+            // again later: a claim cut off leaves it to this job once its file expires.
             if staging
                 && files::staging_in_claim_in(&mut tx, name, key)
                     .await
                     .map_err(retry)?
             {
-                continue;
+                return Err(JobError::Defer(format!("`{key}` is being claimed")));
             }
             // Bounded, so a stalled store can't hold the file's row from the writes that
             // wait on it.
@@ -970,8 +971,9 @@ const STAGING_BATCH: usize = 500;
 async fn sweep_staging(state: &AppState) {
     let before = std::time::SystemTime::now() - STAGING_KEPT;
     for (name, storage) in &state.media.storages.0 {
-        // Only a storage that takes client uploads has a staging area.
-        if !storage.takes_client_uploads() {
+        // Only a storage that signs can have a staging area, whether or not it still
+        // takes client uploads.
+        if !storage.may_hold_staging() {
             continue;
         }
         let mut keys = match storage.staging_before(before).await {

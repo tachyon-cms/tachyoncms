@@ -191,7 +191,9 @@ async fn claimed(
     };
     let mut tx = state.pool.begin().await.map_err(DbError::from)?;
     let key = access.key_id();
-    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, key, document).await?;
+    // What this request may still take; outside the router, an upload's limit.
+    let margin = limit.map_or(state.media.timeout, crate::Limit::left);
+    let row = files::claim_pending(&mut tx, c.id, &f.filename, user, key, document, margin).await?;
     tx.commit().await.map_err(DbError::from)?;
     let row = row.ok_or_else(unclaimed)?;
     let id = row.id;
@@ -1356,7 +1358,7 @@ pub(crate) async fn persist(
         Source::Copy { key, .. } => storage.copy(key, &file.key).await,
     };
     if let Err(e) = stored {
-        abandon(state, file.id).await;
+        abandon_stored(state, &file).await;
         return Err(match e.is_not_found() {
             true => gone_meanwhile(),
             false => ApiError::Internal(format!("can't store an upload: {e}")),
@@ -1375,6 +1377,14 @@ async fn abandon(state: &AppState, file: Uuid) {
     }
 }
 
+/// `abandon` for a file this request stored, or tried to: should its row be gone already,
+/// its object is deleted by key.
+async fn abandon_stored(state: &AppState, file: &FileRow) {
+    if let Err(error) = files::abandon_stored(&state.pool, file).await {
+        tracing::warn!(%error, file = %file.id, "couldn't give up an upload; it's cleaned up within the hour");
+    }
+}
+
 /// `write`'s result; when it failed, the file `stored` reserved for it is given up.
 pub(crate) async fn taken_or_abandoned<T>(
     state: &AppState,
@@ -1385,7 +1395,7 @@ pub(crate) async fn taken_or_abandoned<T>(
     if result.is_err()
         && let Some(s) = stored
     {
-        abandon(state, s.file.id).await;
+        abandon_stored(state, &s.file).await;
     }
     result
 }

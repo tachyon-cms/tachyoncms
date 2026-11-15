@@ -444,6 +444,12 @@ impl Storage {
         self.config.client_uploads && self.signer.is_some()
     }
 
+    /// Whether it signs links, so may have taken client uploads, now or before
+    /// `client_uploads` was turned off: what its staging area may hold.
+    pub fn may_hold_staging(&self) -> bool {
+        self.signer.is_some()
+    }
+
     /// How long a signed link to a file of type `mime` lasts, when this storage serves
     /// that type through signed links (`signed_downloads`).
     pub fn signs(&self, mime: &str) -> Option<Duration> {

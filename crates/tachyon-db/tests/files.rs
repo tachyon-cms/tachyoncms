@@ -339,6 +339,48 @@ async fn pending_files_expire(pool: PgPool) {
     assert_eq!(kept, 0);
 }
 
+/// A write that stored a file and then failed gives it up. Should its cleanup have run
+/// meanwhile (its grace over), the row is gone but the object may have landed after: its
+/// key is queued for deletion, due now.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_stored_file_given_up_too_late_is_deleted_by_key(pool: PgPool) {
+    let c = seed(&pool).await;
+    let keys_queued = |key: String| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, i64>(
+                "SELECT count(*) FROM jobs WHERE kind = $1 AND payload->'keys' ? $2
+                   AND payload->>'storage' = 'default'
+                   AND state = 'queued' AND run_at <= now()",
+            )
+            .bind(CLEANUP)
+            .bind(key)
+            .fetch_one(&pool)
+            .await
+            .unwrap()
+        }
+    };
+    let f = reserve(&pool, &c, "a.png", "", None).await;
+    assert!(files::abandon_stored(&pool, &f).await.unwrap());
+    assert_eq!(state(&pool, f.id).await, "gone");
+    assert_eq!(cleanups(&pool, f.id).await, 1);
+    assert_eq!(
+        keys_queued(f.key.clone()).await,
+        0,
+        "the file's own cleanup has it"
+    );
+
+    // Expired and forgotten by its cleanup before the write gave up.
+    let late = reserve(&pool, &c, "b.png", "", None).await;
+    sqlx::query("DELETE FROM files WHERE id = $1")
+        .bind(late.id)
+        .execute(&pool)
+        .await
+        .unwrap();
+    assert!(!files::abandon_stored(&pool, &late).await.unwrap());
+    assert_eq!(keys_queued(late.key.clone()).await, 1);
+}
+
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn lookups_find_live_files_and_their_holders(pool: PgPool) {
     let c = seed(&pool).await;
@@ -361,14 +403,36 @@ async fn lookups_find_live_files_and_their_holders(pool: PgPool) {
     // Only whoever it was issued to claims it, with the same key.
     let mut tx = pool.begin().await.unwrap();
     for (u, k) in [(user, None), (Uuid::now_v7(), Some(key))] {
-        let none = files::claim_pending(&mut tx, c.id, "a.png", u, k, None)
-            .await
-            .unwrap();
-        assert!(none.is_none());
-    }
-    let claimed = files::claim_pending(&mut tx, c.id, "a.png", user, Some(key), None)
+        let none = files::claim_pending(
+            &mut tx,
+            c.id,
+            "a.png",
+            u,
+            k,
+            None,
+            std::time::Duration::ZERO,
+        )
         .await
         .unwrap();
+        assert!(none.is_none());
+    }
+    // Nor when its grace would end before the claiming request could.
+    let past = files::PENDING_GRACE + std::time::Duration::from_secs(1);
+    let late = files::claim_pending(&mut tx, c.id, "a.png", user, Some(key), None, past)
+        .await
+        .unwrap();
+    assert!(late.is_none());
+    let claimed = files::claim_pending(
+        &mut tx,
+        c.id,
+        "a.png",
+        user,
+        Some(key),
+        None,
+        std::time::Duration::ZERO,
+    )
+    .await
+    .unwrap();
     assert_eq!(claimed.map(|f| f.id), Some(a.id));
     tx.commit().await.unwrap();
 
