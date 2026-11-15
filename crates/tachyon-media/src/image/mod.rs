@@ -703,7 +703,7 @@ fn process_unguarded(
             }
             None => Own::Unended,
         },
-        InputFormat::Bmp => Own::cut(bmp_end(&bytes)),
+        InputFormat::Bmp => Own::replace(bmp_end(&bytes).map(|end| bmp_profiled(&bytes[..end]))),
         InputFormat::Ico => Own::replace(ico::repack(&bytes, &ico::walk(&bytes)?, u.with_metadata)),
         // Thumbnails get what the cap leaves after the picture, all frames counted.
         InputFormat::Avif => Own::replace(avif::keep(
@@ -1178,6 +1178,29 @@ fn bmp_end(bytes: &[u8]) -> Option<usize> {
     (54..=bytes.len()).contains(&end).then_some(end)
 }
 
+/// `bmp` with the profile a version 5 header embeds (`bV5CSType` `PROFILE_EMBEDDED`)
+/// zeroed when it isn't shaped like one; any other BMP as it is.
+fn bmp_profiled(bmp: &[u8]) -> Vec<u8> {
+    let mut out = bmp.to_vec();
+    let u32_at = |i: usize| {
+        bmp.get(i..i + 4)
+            .map(|b| u32::from_le_bytes([b[0], b[1], b[2], b[3]]) as usize)
+    };
+    // The header starts at 14; its profile's offset is counted from there.
+    if u32_at(14) != Some(124) || bmp.get(70..74) != Some(b"DEBM") {
+        return out;
+    }
+    let (Some(at), Some(len)) = (u32_at(14 + 112), u32_at(14 + 116)) else {
+        return out;
+    };
+    let from = (14 + at).min(bmp.len());
+    let to = from.saturating_add(len).min(bmp.len());
+    if !icc_shaped(&bmp[from..to]) {
+        out[from..to].fill(0);
+    }
+    out
+}
+
 /// A TIFF tag kept as bytes: its number, type, count and value. Only byte, text and
 /// undefined types, whose values read the same in either byte order.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1553,13 +1576,14 @@ fn encode_to(
 }
 
 /// Refuses, as a picture the format can't hold, a `w`×`h` wider or taller than `format`'s
-/// encoder takes: JPEG and GIF 65,535, WebP 16,383, an icon 256.
+/// encoder takes: JPEG, GIF and AVIF 65,535, WebP 16,383, an icon 256.
 fn fits(w: u32, h: u32, format: InputFormat) -> Result<(), ImageError> {
     let (name, most) = match format {
         InputFormat::Jpeg => ("JPEG", 65_535),
         InputFormat::Gif => ("GIF", 65_535),
         InputFormat::Webp => ("WebP", 16_383),
         InputFormat::Ico => ("icon", 256),
+        InputFormat::Avif => ("AVIF", 65_535),
         _ => return Ok(()),
     };
     match w.max(h) {
@@ -4935,6 +4959,56 @@ mod tests {
         }
     }
 
+    /// A 2×2 24-bit BMP with a version 5 header and `profile` embedded after its pixels.
+    fn bmp_v5(profile: &[u8]) -> Vec<u8> {
+        let pixels = [
+            [10u8, 80, 160, 240, 30, 60, 0, 0],
+            [90, 20, 200, 5, 70, 140, 0, 0],
+        ]
+        .concat();
+        let start = 14 + 124 + pixels.len();
+        let le = |v: u32| v.to_le_bytes();
+        let mut out = b"BM".to_vec();
+        out.extend(le((start + profile.len()) as u32));
+        out.extend([0; 4]);
+        out.extend(le(14 + 124));
+        let mut info = vec![0u8; 124];
+        info[..4].copy_from_slice(&le(124));
+        info[4..8].copy_from_slice(&le(2));
+        info[8..12].copy_from_slice(&le(2));
+        info[12..14].copy_from_slice(&1u16.to_le_bytes());
+        info[14..16].copy_from_slice(&24u16.to_le_bytes());
+        info[20..24].copy_from_slice(&le(pixels.len() as u32));
+        info[56..60].copy_from_slice(b"DEBM"); // PROFILE_EMBEDDED, 'MBED' read little-endian
+        info[112..116].copy_from_slice(&le((124 + pixels.len()) as u32));
+        info[116..120].copy_from_slice(&le(profile.len() as u32));
+        out.extend(info);
+        out.extend(pixels);
+        out.extend_from_slice(profile);
+        out
+    }
+
+    /// A version 5 BMP's embedded profile is kept only when it's shaped like one.
+    #[test]
+    fn a_bmp_profile_that_isnt_one_goes() {
+        let good = crate::fixtures::fake_icc(600);
+        let mut bad = good.clone();
+        bad[100..100 + TAIL.len()].copy_from_slice(TAIL);
+        bad[36..40].copy_from_slice(b"none");
+        let want = pixels_of(&bmp_v5(&good));
+        for (how, u) in settings() {
+            let kept = stored(&run(&bmp_v5(&good), &u).unwrap());
+            assert!(
+                kept.windows(good.len()).any(|w| w == good),
+                "{how}: the profile went"
+            );
+            let out = run(&bmp_v5(&bad), &u).unwrap_or_else(|e| panic!("{how}: {e}"));
+            let kept = stored(&out);
+            assert!(!has(&kept, b"<html>"), "{how}: the profile stayed");
+            assert_eq!(pixels_of(&kept), want, "{how}");
+        }
+    }
+
     #[test]
     fn a_picture_wider_than_its_encoder_takes_is_refused() {
         let png = |w, h| encoded(&gradient(w, h), Codec::Png);
@@ -4959,6 +5033,11 @@ mod tests {
                 "{format}"
             );
         }
+        // AVIF's limit is rav1e's; a picture at it is stored.
+        let u = upload(serde_json::json!({"formatOptions": {"format": "avif"}}));
+        let got = run(&png(65_536, 2), &u).map(|p| p.width);
+        assert_eq!(got, refused("AVIF", 65_536, 65_535));
+        assert_eq!(run(&png(65_535, 2), &u).map(|p| p.width), Ok(65_535));
         // An animation goes through its own encoder.
         let u = upload(serde_json::json!({"formatOptions": {"format": "webp"}}));
         let got = run(&moving_gif(16_384, 1, 2), &u).map(|p| p.width);
