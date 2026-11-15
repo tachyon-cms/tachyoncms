@@ -1,6 +1,6 @@
 //! Rich text: a tree of nodes and marks, stored as the JSON the editor works in.
 
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -63,9 +63,12 @@ pub struct UploadView {
     pub alt: Option<String>,
     pub mime_type: String,
     pub filename: String,
-    /// Each size made of the image in its own type or as WebP, and each size's WebP copy,
-    /// by width: the candidates of an `<img>`'s `srcset`.
+    /// Each size made of the image in its own type, by width and no two of one width:
+    /// the candidates of its `<img>`'s `srcset`.
     pub srcset: Vec<(String, u32)>,
+    /// The same for AVIF and WebP, from sizes made in them and each size's copies, by type
+    /// (AVIF first, the smaller): a `<picture>`'s `<source>`s.
+    pub sources: Vec<(String, Vec<(String, u32)>)>,
 }
 
 /// `doc`, an upload document as the caller reads it with its URLs filled, as an upload
@@ -79,25 +82,32 @@ pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
             .and_then(|n| u32::try_from(n).ok())
     };
     let mime_type = text(doc, "mimeType").unwrap_or_default();
-    // A size not made yet has no URL; one of another type is left to its `formats`.
+    // A size not made yet has no URL.
     let candidate = |m: &Map<String, Value>| Some((text(m, "url")?, number(m, "width")?));
-    let mut srcset = Vec::new();
-    for size in doc
-        .get("sizes")
-        .and_then(Value::as_object)
-        .into_iter()
-        .flat_map(Map::values)
-        .filter_map(Value::as_object)
-    {
-        // A size made as WebP from another type has no WebP copy of its own.
-        let own = text(size, "mimeType");
-        if own.as_deref() == Some(&mime_type) || own.as_deref() == Some("image/webp") {
-            srcset.extend(candidate(size));
-        }
-        let webp = size.get("formats").and_then(|f| f.get("webp"));
-        srcset.extend(webp.and_then(Value::as_object).and_then(candidate));
+    fn objects(v: Option<&Value>) -> impl Iterator<Item = &Map<String, Value>> {
+        v.and_then(Value::as_object)
+            .into_iter()
+            .flat_map(Map::values)
+            .filter_map(Value::as_object)
     }
-    srcset.sort_by_key(|(_, w)| *w);
+    let mut by_type: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
+    for size in objects(doc.get("sizes")) {
+        for made in std::iter::once(size).chain(objects(size.get("formats"))) {
+            // A source of any other type would win over the original in every browser.
+            let Some(t) = text(made, "mimeType")
+                .filter(|t| *t == mime_type || t == "image/avif" || t == "image/webp")
+            else {
+                continue;
+            };
+            by_type.entry(t).or_default().extend(candidate(made));
+        }
+    }
+    for set in by_type.values_mut() {
+        set.sort_by_key(|(_, w)| *w);
+        set.dedup_by_key(|(_, w)| *w);
+    }
+    let srcset = by_type.remove(&mime_type).unwrap_or_default();
+    let sources = by_type.into_iter().filter(|(_, s)| !s.is_empty()).collect();
     Some(UploadView {
         url: text(doc, "url")?,
         width: number(doc, "width"),
@@ -106,6 +116,7 @@ pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
         mime_type,
         filename: text(doc, "filename").unwrap_or_default(),
         srcset,
+        sources,
     })
 }
 
@@ -2258,16 +2269,19 @@ mod tests {
                 alt: Some("Cover".into()),
                 mime_type: "image/png".into(),
                 filename: "a.png".into(),
-                // By width: the JPEG size only by its WebP copy, the size not made not at all.
-                srcset: vec![
-                    (u("a-40x30.webp"), 40),
-                    (u("a-400x300.png"), 400),
-                    (u("a-400x300.webp"), 400),
+                // By type and width: the JPEG size only by its WebP copy, the size not made
+                // not at all.
+                srcset: vec![(u("a-400x300.png"), 400)],
+                sources: vec![
+                    ("image/avif".into(), vec![(u("a-400x300.avif"), 400)]),
+                    (
+                        "image/webp".into(),
+                        vec![(u("a-40x30.webp"), 40), (u("a-400x300.webp"), 400)]
+                    ),
                 ],
             }
         );
-        // A size made as WebP has no WebP copy, so it's offered itself; an AVIF size only
-        // by its copy.
+        // A size made as WebP or AVIF is offered itself, beside its copies.
         let made =
             |name: &str, w: u32, mime: &str| json!({"url": u(name), "width": w, "mimeType": mime});
         let mut avif = made("a-200.avif", 200, "image/avif");
@@ -2277,9 +2291,28 @@ mod tests {
             "sizes".into(),
             json!({"w": made("a-400.webp", 400, "image/webp"), "j": avif}),
         );
+        let view = upload_view(&converted).unwrap();
+        assert_eq!(view.srcset, vec![]);
         assert_eq!(
-            upload_view(&converted).unwrap().srcset,
-            vec![(u("a-200.webp"), 200), (u("a-400.webp"), 400)]
+            view.sources,
+            vec![
+                ("image/avif".into(), vec![(u("a-200.avif"), 200)]),
+                (
+                    "image/webp".into(),
+                    vec![(u("a-200.webp"), 200), (u("a-400.webp"), 400)]
+                ),
+            ]
+        );
+        // Two sizes of one width and type: one candidate, as a srcset can't hold two.
+        let mut twice = cover();
+        twice.insert(
+            "sizes".into(),
+            json!({"x": made("a-400x400.png", 400, "image/png"),
+                "y": made("a-400x300.png", 400, "image/png")}),
+        );
+        assert_eq!(
+            upload_view(&twice).unwrap().srcset,
+            vec![(u("a-400x400.png"), 400)]
         );
         // No URL, as when it's hidden from the caller: nothing to show.
         let mut hidden = cover();

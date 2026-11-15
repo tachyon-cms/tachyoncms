@@ -1143,11 +1143,15 @@ async fn upload_nodes_hold_files(pool: PgPool) {
         res.json["body"].as_str().unwrap().to_owned()
     };
     let shown = html(get(&viewer, &format!("{url}?format=html")).await);
+    // The node's own fields are `data-*`, as a block node's are.
     assert_eq!(
         shown,
-        concat!(
-            "<img src=\"http://localhost:3000/api/media/file/a.png\" width=\"8\" height=\"6\" ",
-            "alt=\"Cover &lt;b&gt;\"><p>between</p>"
+        format!(
+            concat!(
+                "<img src=\"http://localhost:3000/api/media/file/a.png\" width=\"8\" height=\"6\" ",
+                "alt=\"Cover &lt;b&gt;\" data-caption=\"C\" data-credit=\"{}\"><p>between</p>"
+            ),
+            ann
         )
     );
     let all = html(get(&editor, &format!("{url}?format=html")).await);

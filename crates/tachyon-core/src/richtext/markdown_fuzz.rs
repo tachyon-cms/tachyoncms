@@ -197,6 +197,7 @@ fn file(to: &str, v: &Value) -> Option<UploadView> {
         mime_type: "image/png".into(),
         filename: "a.png".into(),
         srcset: Vec::new(),
+        sources: Vec::new(),
     })
 }
 

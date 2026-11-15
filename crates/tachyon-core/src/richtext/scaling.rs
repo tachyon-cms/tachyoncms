@@ -170,10 +170,11 @@ fn render<T>(f: impl FnOnce(&RenderCtx) -> T) -> T {
             alt: Some("A *cover* [x]".into()),
             mime_type: "image/png".into(),
             filename: "a.png".into(),
-            srcset: vec![
-                ("/api/media/file/a-400x300.png".into(), 400),
-                ("/api/media/file/a-400x300.webp".into(), 400),
-            ],
+            srcset: vec![("/api/media/file/a-400x300.png".into(), 400)],
+            sources: vec![(
+                "image/webp".into(),
+                vec![("/api/media/file/a-400x300.webp".into(), 400)],
+            )],
         })
     };
     f(&RenderCtx {
