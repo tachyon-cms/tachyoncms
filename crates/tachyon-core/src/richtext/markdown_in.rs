@@ -17,6 +17,20 @@ const HTML: &str = "raw HTML isn't allowed; the only tags are <u>…</u> and <br
 
 const IMAGES: &str = "images must be media:<id>; local paths arrive with content push";
 
+const URLS: &str = "an image must be an upload, as media:<collection>/<id>, not a URL";
+
+/// `dest` names a URL: it starts `//` or with a scheme, which a one-letter drive isn't.
+fn is_url(dest: &str) -> bool {
+    dest.starts_with("//")
+        || dest.split_once(':').is_some_and(|(scheme, _)| {
+            scheme.len() > 1
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
+}
+
 /// The ways a hard break may be written as HTML, where Markdown can't write `\` (W1-R36).
 const BR: [&str; 3] = ["<br>", "<br/>", "<br />"];
 
@@ -736,7 +750,7 @@ impl<'s, 'k> Reader<'s, 'k> {
             ));
         }
         if !dest.starts_with("media:") {
-            return Err((line, IMAGES.into()));
+            return Err((line, if is_url(dest) { URLS } else { IMAGES }.into()));
         }
         let (to, id) = self.file(dest, line)?;
         self.inline(line)?;
@@ -1975,11 +1989,30 @@ mod tests {
                 "",
                 format!("line 1: {IMAGES}"),
             ),
+            // A URL is named as one: it's never fetched.
             (
                 &media,
                 "a\n\n![x](https://x.example/a.png)".into(),
                 "",
-                format!("line 3: {IMAGES}"),
+                format!("line 3: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](//x.example/a.png)".into(),
+                "",
+                format!("line 1: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](data:image/png;base64,AA==)".into(),
+                "",
+                format!("line 1: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](C:/a.png)".into(),
+                "",
+                format!("line 1: {IMAGES}"),
             ),
             (
                 &media,
