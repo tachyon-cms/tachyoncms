@@ -93,9 +93,11 @@ jobs:
           docker run -d --name azurite -p 10000:10000 \
             mcr.microsoft.com/azure-storage/azurite@sha256:0a47e12e3693483cef5c71f35468b91d751611f172d2f97414e9c69113b106d9 \
             azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck # 3.34.0
+          # Upstream fake-gcs-server refuses the XML API's plain PUT that object_store
+          # uploads with (fsouza/fake-gcs-server#1164); object_store's own CI uses this fork.
           docker run -d --name gcs -p 4443:4443 \
-            fsouza/fake-gcs-server@sha256:d47b4cf8b87006cab8fbbecfa5f06a2a3c5722e464abddc0d107729663d40ec4 \
-            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443 # 1.52.2
+            tustvold/fake-gcs-server@sha256:dcd3aeacc07c731f1336e90c2889be2af8626ae993ee1fe2c0ba042ebbeb5a04 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443 # latest, 2023-10-27
       - name: Wait for them, and make a bucket in each
         run: |
           # `curl -f` for the two with a health answer; Azurite's root answers 400 when up.
