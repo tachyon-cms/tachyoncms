@@ -605,7 +605,7 @@ fn locations(
                 "this AVIF lists too many extents".into(),
             ));
         }
-        let mut ranges = Some(Vec::new());
+        let (mut ranges, mut item_len) = (Some(Vec::new()), 0);
         for _ in 0..n {
             let extent = (|| {
                 read(data, &mut at, index_size, end)?;
@@ -636,7 +636,16 @@ fn locations(
                 (start <= stop && stop <= data.len()).then_some((start, stop))
             });
             match (range, ranges.as_mut()) {
-                (Some(r), Some(list)) => list.push(r),
+                (Some(r), Some(list)) => {
+                    // Extents may overlap: more than the file is a file made to cost more.
+                    item_len += r.1 - r.0;
+                    if item_len > data.len() {
+                        return Err(ImageError::Corrupt(
+                            "an AVIF item's extents add up to more than the file".into(),
+                        ));
+                    }
+                    list.push(r);
+                }
                 _ => ranges = None,
             }
         }
@@ -786,31 +795,56 @@ pub(super) fn keep(
     thumbnail_budget: u64,
 ) -> Result<Option<Vec<u8>>, ImageError> {
     check_counts(data)?;
-    Ok(keep_counted(data, keep_metadata, thumbnail_budget))
+    let mut refused = Ok(());
+    let kept = keep_counted(data, keep_metadata, thumbnail_budget, &mut refused);
+    refused.map(|()| kept)
 }
 
 /// The most items an AVIF may list (in `iinf`, `iloc` or `ipma`), and the most item
 /// references its `iref` may hold: a picture needs a handful, and every item is work.
 const MAX_ITEMS: u64 = 4096;
 
-/// Refuses an AVIF listing more than `MAX_ITEMS` items or references, from the counts its
-/// boxes declare, before anything walks them.
+/// The most property associations `ipma` may make, and the most `auxl` references `iref`
+/// may hold: avif-parse looks through every association for each `auxl` reference, and a
+/// picture has one alpha.
+const MAX_ASSOCIATIONS: u64 = 16_384;
+const MAX_ALPHA_REFS: u64 = 16;
+
+/// Refuses an AVIF listing more than `MAX_ITEMS` items or references, `MAX_ASSOCIATIONS`
+/// associations or `MAX_ALPHA_REFS` `auxl` references, or holding a second `iinf`, `iloc`,
+/// `iref`, `iprp`, `ipma` or `ipco` (ISO 14496-12 allows one each, and avif-parse would read
+/// every one), before anything walks them.
 pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
-    let too_many = || {
-        Err(ImageError::Corrupt(format!(
-            "this AVIF lists more than {MAX_ITEMS} items"
-        )))
-    };
+    let corrupt = |why: String| Err(ImageError::Corrupt(why));
+    let too_many = || corrupt(format!("this AVIF lists more than {MAX_ITEMS} items"));
     let top = boxes(data, 0, data.len());
     let Some(meta) = find(&top, b"meta") else {
         return Ok(());
     };
     let inner = boxes(data, meta.body + 4, meta.end);
+    let props = find(&inner, b"iprp").map_or_else(Vec::new, |b| boxes(data, b.body, b.end));
+    for (list, kind) in [
+        (&inner, b"iinf"),
+        (&inner, b"iloc"),
+        (&inner, b"iref"),
+        (&inner, b"iprp"),
+        (&props, b"ipma"),
+        (&props, b"ipco"),
+    ] {
+        if list.iter().filter(|b| &b.kind == kind).count() > 1 {
+            return corrupt(format!(
+                "this AVIF has more than one {}",
+                kind.escape_ascii()
+            ));
+        }
+    }
     let version = |b: &Box4| data.get(b.body).copied().unwrap_or(0);
     let count = |b: &Box4, at: usize, wide: usize| read(data, &mut (b.body + at), wide, b.end);
     if let Some(b) = find(&inner, b"iinf") {
         let wide = if version(&b) == 0 { 2 } else { 4 };
-        if count(&b, 4, wide).is_some_and(|n| n > MAX_ITEMS) {
+        // avif-parse reads every `infe` there, whatever the count says.
+        let present = boxes(data, b.body + 4 + wide, b.end).len() as u64;
+        if present > MAX_ITEMS || count(&b, 4, wide).is_some_and(|n| n > MAX_ITEMS) {
             return too_many();
         }
     }
@@ -820,35 +854,61 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
             return too_many();
         }
     }
-    if let Some(b) = find(&inner, b"iprp") {
-        let props = boxes(data, b.body, b.end);
-        if let Some(ipma) = find(&props, b"ipma")
-            && count(&ipma, 4, 4).is_some_and(|n| n > MAX_ITEMS)
-        {
+    if let Some(ipma) = find(&props, b"ipma") {
+        let entries = count(&ipma, 4, 4).unwrap_or(0);
+        if entries > MAX_ITEMS {
             return too_many();
+        }
+        let id = if version(&ipma) < 1 { 2 } else { 4 };
+        let index = if data.get(ipma.body + 3).is_some_and(|f| f & 1 == 1) {
+            2
+        } else {
+            1
+        };
+        let (mut at, mut total) = (ipma.body + 8, 0u64);
+        for _ in 0..entries {
+            at += id;
+            let Some(n) = read(data, &mut at, 1, ipma.end) else {
+                break;
+            };
+            total += n;
+            if total > MAX_ASSOCIATIONS {
+                return corrupt(format!(
+                    "this AVIF makes more than {MAX_ASSOCIATIONS} property associations"
+                ));
+            }
+            at += n as usize * index;
         }
     }
     if let Some(b) = find(&inner, b"iref") {
         let wide = if version(&b) == 0 { 2 } else { 4 };
-        let mut total = 0u64;
-        let (mut at, end) = (b.body + 4, b.end.min(data.len()));
-        while let Some(h) = data.get(at..at + 8).filter(|_| at + 8 <= end) {
-            let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as usize;
-            let n = read(data, &mut (at + 8 + wide), 2, end).unwrap_or(0);
+        let (mut total, mut alpha) = (0u64, 0u64);
+        for r in boxes(data, b.body + 4, b.end) {
+            let n = read(data, &mut (r.body + wide), 2, r.end).unwrap_or(0);
             total += 1 + n;
+            if &r.kind == b"auxl" {
+                alpha += n;
+            }
             if total > MAX_ITEMS {
                 return too_many();
             }
-            if size < 8 {
-                break;
+            if alpha > MAX_ALPHA_REFS {
+                return corrupt(format!(
+                    "this AVIF has more than {MAX_ALPHA_REFS} auxiliary references"
+                ));
             }
-            at += size;
         }
     }
     Ok(())
 }
 
-fn keep_counted(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Option<Vec<u8>> {
+/// `keep`'s work, a file `locations` refuses leaving its refusal in `refused`.
+fn keep_counted(
+    data: &[u8],
+    keep_metadata: bool,
+    thumbnail_budget: u64,
+    refused: &mut Result<(), ImageError>,
+) -> Option<Vec<u8>> {
     // The top-level boxes: (start, header length, end, type, whether its size is "to the
     // end"), up to one that overruns the file.
     let mut top = Vec::new();
@@ -889,18 +949,21 @@ fn keep_counted(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Opti
         let wide = if *data.get(b.body)? == 0 { 2 } else { 4 };
         read(data, &mut (b.body + 4), wide, b.end)
     })?;
-    // An extent of length 0 runs to the end of the box it starts in, when that has one.
+    // An extent of length 0 runs to the end of the box it starts in, when that has one:
+    // `top` is in file order, so that's the last box starting at or before it.
     let box_end = |at: usize| {
-        top.iter()
-            .find(|b| b.0 <= at && at < b.2 && !b.4)
-            .map(|b| b.2)
+        let b = top[..top.partition_point(|b| b.0 <= at)].last()?;
+        (at < b.2 && !b.4).then_some(b.2)
     };
     // Each item's ranges, type and property kinds, read once.
     let located: HashMap<u64, Option<Vec<(usize, usize)>>> =
-        locations(data, &inner, &[], Some(&box_end))
-            .ok()?
-            .into_iter()
-            .collect();
+        match locations(data, &inner, &[], Some(&box_end)) {
+            Ok(l) => l.into_iter().collect(),
+            Err(e) => {
+                *refused = Err(e);
+                return None;
+            }
+        };
     let ranges_of = |id: u64| located.get(&id).cloned().flatten();
     let kinds = item_kinds(data, &inner);
     let props = property_kinds(data, &inner);
@@ -928,13 +991,11 @@ fn keep_counted(data: &[u8], keep_metadata: bool, thumbnail_budget: u64) -> Opti
     // thumbnails of the picture, the first that's an AV1 picture by its headers, held in
     // one extent, no larger than the picture and fitting what's left. Every other is
     // zeroed without a look. With no budget there's nothing to look for.
+    // The picture's size from its first extent, borrowed: its headers lead, and a picture
+    // split so they don't has no thumbnail kept.
     let primary_pixels = ranges_of(primary)
-        .map(|r| {
-            r.iter()
-                .flat_map(|&(s, e)| data[s..e].iter().copied())
-                .collect::<Vec<_>>()
-        })
-        .and_then(|b| decode_bound(&b).ok())
+        .and_then(|r| data.get(r.first()?.0..r.first()?.1))
+        .and_then(|b| decode_bound(b).ok())
         .map_or(0, |(w, h)| u64::from(w) * u64::from(h));
     let candidates = refs
         .iter()

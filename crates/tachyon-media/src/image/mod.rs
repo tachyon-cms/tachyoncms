@@ -2717,6 +2717,450 @@ mod tests {
         }
     }
 
+    /// What a hand-built AVIF takes from the 8×8 picture: its `ftyp`, `hdlr` and `pitm`
+    /// boxes, its `ipco`, its `ipma` entries (version 0, narrow indices) and their count, how
+    /// many associations they make, the index of its `pixi`, and its AV1 data.
+    struct Picture {
+        ftyp: Vec<u8>,
+        hdlr: Vec<u8>,
+        pitm: Vec<u8>,
+        ipco: Vec<u8>,
+        entries: Vec<u8>,
+        count: u32,
+        associations: usize,
+        pixi: u8,
+        av1: Vec<u8>,
+        pixels: Vec<u8>,
+    }
+
+    fn picture() -> &'static Picture {
+        static P: std::sync::OnceLock<Picture> = std::sync::OnceLock::new();
+        P.get_or_init(|| {
+            let a = encoded(&gradient(8, 8), Codec::Avif);
+            let top = child_boxes(&a, 0, a.len());
+            let whole = |list: &[(usize, usize, [u8; 4])], kind: &[u8; 4]| {
+                let b = list.iter().find(|b| &b.2 == kind).unwrap();
+                (b.0, b.1)
+            };
+            let (meta, meta_end) = whole(&top, b"meta");
+            let inner = child_boxes(&a, meta + 12, meta_end);
+            let (pitm, pitm_end) = whole(&inner, b"pitm");
+            assert_eq!(
+                &a[pitm + 8..pitm_end],
+                &[0, 0, 0, 0, 0, 1],
+                "pitm says item 1"
+            );
+            let (iprp, iprp_end) = whole(&inner, b"iprp");
+            let props = child_boxes(&a, iprp + 8, iprp_end);
+            let (ipco, ipco_end) = whole(&props, b"ipco");
+            let (ipma, ipma_end) = whole(&props, b"ipma");
+            assert_eq!(&a[ipma + 8..ipma + 12], &[0, 0, 0, 0], "ipma v0, narrow");
+            let entries = a[ipma + 16..ipma_end].to_vec();
+            let count = u32::from_be_bytes(a[ipma + 12..ipma + 16].try_into().unwrap());
+            let mut at = 0;
+            let mut associations = 0;
+            for _ in 0..count {
+                let n = usize::from(entries[at + 2]);
+                associations += n;
+                at += 3 + n;
+            }
+            let pixi = child_boxes(&a, ipco + 8, ipco_end)
+                .iter()
+                .position(|b| &b.2 == b"pixi")
+                .unwrap();
+            let (_, off, len) = crate::fixtures::avif_extents(&a)[0];
+            let (ftyp, ftyp_end) = whole(&top, b"ftyp");
+            let (hdlr, hdlr_end) = whole(&inner, b"hdlr");
+            Picture {
+                ftyp: a[ftyp..ftyp_end].to_vec(),
+                hdlr: a[hdlr..hdlr_end].to_vec(),
+                pitm: a[pitm..pitm_end].to_vec(),
+                ipco: a[ipco..ipco_end].to_vec(),
+                entries,
+                count,
+                associations,
+                pixi: u8::try_from(pixi + 1).unwrap(),
+                av1: a[off..off + len].to_vec(),
+                pixels: pixels_of(&a),
+            }
+        })
+    }
+
+    /// An AVIF written whole around the 8×8 picture, as the reviewer's probes were: `ftyp`;
+    /// a `meta` of the picture's `hdlr` and `pitm`, then `iloc`, `iinf`, `iref` and `iprp`
+    /// from the fields below, then `meta_extra`; then `top`; then `mdat`, the picture's AV1
+    /// data followed by `extra`. Extents are (offset into `mdat`'s body, length), item 1
+    /// being the picture.
+    struct Hand {
+        iloc: Vec<(u16, Vec<(u32, u32)>)>,
+        infe: Vec<(u16, [u8; 4])>,
+        /// The count `iinf` declares, when it isn't the truth.
+        declared: Option<u16>,
+        /// `iref`'s children, written whole; `None` for no `iref`.
+        iref: Option<Vec<u8>>,
+        /// `ipma` entries after the picture's: (item, property indices).
+        ipma: Vec<(u16, Vec<u8>)>,
+        /// Boxes inside `iprp`, after its `ipco` and `ipma`.
+        iprp_extra: Vec<u8>,
+        meta_extra: Vec<u8>,
+        top: Vec<u8>,
+        extra: Vec<u8>,
+    }
+
+    impl Hand {
+        fn new() -> Self {
+            Hand {
+                iloc: vec![(1, vec![(0, picture().av1.len() as u32)])],
+                infe: vec![(1, *b"av01")],
+                declared: None,
+                iref: None,
+                ipma: Vec::new(),
+                iprp_extra: Vec::new(),
+                meta_extra: Vec::new(),
+                top: Vec::new(),
+                extra: Vec::new(),
+            }
+        }
+
+        fn meta(&self, base: u32) -> Vec<u8> {
+            let p = picture();
+            let mut iloc = vec![0, 0, 0, 0, 0x44, 0];
+            iloc.extend((self.iloc.len() as u16).to_be_bytes());
+            for (id, extents) in &self.iloc {
+                iloc.extend(id.to_be_bytes());
+                iloc.extend([0, 0]);
+                iloc.extend((extents.len() as u16).to_be_bytes());
+                for &(off, len) in extents {
+                    iloc.extend((base + off).to_be_bytes());
+                    iloc.extend(len.to_be_bytes());
+                }
+            }
+            let mut iinf = vec![0, 0, 0, 0];
+            iinf.extend(
+                self.declared
+                    .unwrap_or(self.infe.len() as u16)
+                    .to_be_bytes(),
+            );
+            for (id, kind) in &self.infe {
+                let body = [&[2, 0, 0, 0][..], &id.to_be_bytes(), &[0, 0], kind, &[0]].concat();
+                iinf.extend(isobmff_box(b"infe", &body, false));
+            }
+            let mut ipma = vec![0, 0, 0, 0];
+            ipma.extend((p.count + self.ipma.len() as u32).to_be_bytes());
+            ipma.extend(&p.entries);
+            for (id, indices) in &self.ipma {
+                ipma.extend(id.to_be_bytes());
+                ipma.push(u8::try_from(indices.len()).unwrap());
+                ipma.extend(indices);
+            }
+            let iprp = [
+                &p.ipco[..],
+                &isobmff_box(b"ipma", &ipma, false),
+                &self.iprp_extra,
+            ]
+            .concat();
+            let mut body = vec![0, 0, 0, 0];
+            body.extend(&p.hdlr);
+            body.extend(&p.pitm);
+            body.extend(isobmff_box(b"iloc", &iloc, false));
+            body.extend(isobmff_box(b"iinf", &iinf, false));
+            if let Some(refs) = &self.iref {
+                body.extend(isobmff_box(
+                    b"iref",
+                    &[&[0, 0, 0, 0][..], refs].concat(),
+                    false,
+                ));
+            }
+            body.extend(isobmff_box(b"iprp", &iprp, false));
+            body.extend(&self.meta_extra);
+            isobmff_box(b"meta", &body, false)
+        }
+
+        fn build(&self) -> Vec<u8> {
+            let p = picture();
+            let base = p.ftyp.len() + self.meta(0).len() + self.top.len() + 8;
+            let mut out = p.ftyp.clone();
+            out.extend(self.meta(u32::try_from(base).unwrap()));
+            out.extend(&self.top);
+            out.extend(isobmff_box(
+                b"mdat",
+                &[&p.av1[..], &self.extra].concat(),
+                false,
+            ));
+            out
+        }
+    }
+
+    /// An `iref` child of `kind` from item `from` to each of `to`.
+    fn reference(kind: &[u8; 4], from: u16, to: &[u16], large: bool) -> Vec<u8> {
+        let mut body = from.to_be_bytes().to_vec();
+        body.extend((to.len() as u16).to_be_bytes());
+        for t in to {
+            body.extend(t.to_be_bytes());
+        }
+        isobmff_box(kind, &body, large)
+    }
+
+    /// `bytes` refused as corrupt in every setting, each in under a second.
+    fn refused_fast(bytes: &[u8], case: &str) {
+        for (how, u) in settings() {
+            let started = std::time::Instant::now();
+            let res = run(bytes, &u);
+            let took = started.elapsed();
+            assert!(
+                matches!(res, Err(ImageError::Corrupt(_))),
+                "{case}, {how}: {res:?}"
+            );
+            assert!(took.as_millis() < 1000, "{case}, {how}: {took:?}");
+        }
+    }
+
+    /// `bytes` stored in every setting with the picture's own pixels and none of `TAIL`,
+    /// each in under a second.
+    fn kept_fast(bytes: &[u8], case: &str) {
+        for (how, u) in settings() {
+            let started = std::time::Instant::now();
+            let out = run(bytes, &u).unwrap_or_else(|e| panic!("{case}, {how}: {e}"));
+            let took = started.elapsed();
+            let kept = stored(&out);
+            assert!(!has(&kept, b"<html>"), "{case}, {how}: the payload stayed");
+            assert_eq!(pixels_of(&kept), picture().pixels, "{case}, {how}");
+            assert!(took.as_millis() < 1000, "{case}, {how}: {took:?}");
+        }
+    }
+
+    /// `ipma` entries, ids from 2, making `n` associations to `pixi` in all.
+    fn associations(n: usize) -> Vec<(u16, Vec<u8>)> {
+        let pixi = picture().pixi;
+        (0..n)
+            .step_by(255)
+            .enumerate()
+            .map(|(i, at)| (2 + i as u16, vec![pixi; (n - at).min(255)]))
+            .collect()
+    }
+
+    #[test]
+    fn a_hand_built_avif_is_kept() {
+        kept_fast(&Hand::new().build(), "baseline");
+    }
+
+    /// avif-parse looks through every association for each `auxl` reference to the picture,
+    /// so both are bounded: 16 references and 16,384 associations at most.
+    #[test]
+    fn an_alpha_search_stays_small() {
+        let p = picture();
+        // The reviewer's shape: 1,000 references, 1,000 entries of 255 associations.
+        let mut h = Hand::new();
+        h.iref = Some(reference(b"auxl", 2, &[1; 1000], false));
+        h.ipma = (2..1002).map(|id| (id, vec![p.pixi; 255])).collect();
+        refused_fast(&h.build(), "1,000 auxl × 1,000×255");
+        let at_caps = |refs: usize, total: usize| {
+            let mut h = Hand::new();
+            h.iref = Some(reference(b"auxl", 2, &vec![1; refs], false));
+            h.ipma = associations(total - p.associations);
+            h.build()
+        };
+        kept_fast(&at_caps(16, 16_384), "at both caps");
+        refused_fast(&at_caps(17, 16_384), "17 auxl");
+        refused_fast(&at_caps(16, 16_385), "16,385 associations");
+    }
+
+    /// Each list avif-parse walks is counted as it's walked: every `infe` there, whatever
+    /// `iinf` declares; one `iinf`, `iloc`, `iref`, `iprp`, `ipma` and `ipco` only; `iref`'s
+    /// children followed through 64-bit sizes.
+    #[test]
+    fn no_list_goes_uncounted() {
+        let ids = || 2..60_002u16;
+        let mut lying = Hand::new();
+        lying.infe.extend(ids().map(|id| (id, *b"av01")));
+        lying.declared = Some(2);
+        refused_fast(&lying.build(), "iinf says 2, holds 60,001");
+        let thumbs: Vec<u8> = ids()
+            .flat_map(|id| reference(b"thmb", id, &[1], false))
+            .collect();
+        let mut second = Hand::new();
+        second.iref = Some(Vec::new());
+        second.meta_extra = isobmff_box(b"iref", &[&[0, 0, 0, 0][..], &thumbs].concat(), false);
+        refused_fast(&second.build(), "a second iref of 60,000");
+        let mut wide = Hand::new();
+        wide.iref = Some([reference(b"thmb", 2, &[1], true), thumbs].concat());
+        refused_fast(&wide.build(), "a 64-bit iref child, then 60,000");
+        let mut entries = vec![0, 0, 0, 0];
+        entries.extend(60_000u32.to_be_bytes());
+        for id in ids().take(60_000) {
+            entries.extend(id.to_be_bytes());
+            entries.extend([1, picture().pixi]);
+        }
+        let ipma = isobmff_box(b"ipma", &entries, false);
+        let mut iprp = Hand::new();
+        iprp.meta_extra = isobmff_box(b"iprp", &ipma, false);
+        refused_fast(&iprp.build(), "a second iprp of 60,000");
+        let mut inside = Hand::new();
+        inside.iprp_extra = ipma;
+        refused_fast(&inside.build(), "a second ipma of 60,000");
+        // One of each, however small the second.
+        let meta_child = |kind: &[u8; 4]| {
+            let first = Hand::new().meta(0);
+            let inner = child_boxes(&first, 12, first.len());
+            let b = inner.iter().find(|b| &b.2 == kind).unwrap();
+            first[b.0..b.1].to_vec()
+        };
+        for kind in [b"iinf", b"iloc", b"iprp"] {
+            let mut h = Hand::new();
+            h.meta_extra = meta_child(kind);
+            refused_fast(&h.build(), &format!("a second {}", kind.escape_ascii()));
+        }
+        let mut h = Hand::new();
+        h.iref = Some(Vec::new());
+        h.meta_extra = isobmff_box(b"iref", &[0, 0, 0, 0], false);
+        refused_fast(&h.build(), "a second empty iref");
+        let mut h = Hand::new();
+        h.iprp_extra = picture().ipco.clone();
+        refused_fast(&h.build(), "a second ipco");
+    }
+
+    /// An extent of length 0 finds the top-level box it starts in by a search, not a scan:
+    /// 65,472 of them behind 100,000 `free` boxes cost what a few do.
+    #[test]
+    fn zero_length_extents_find_their_box_fast() {
+        let mut h = Hand::new();
+        h.top = isobmff_box(b"free", &[], false).repeat(100_000);
+        h.extra = vec![0; 16];
+        let last = (picture().av1.len() + 15) as u32;
+        h.iloc
+            .extend((2..66u16).map(|id| (id, vec![(last, 0); 1023])));
+        kept_fast(
+            &h.build(),
+            "64 × 1,023 zero-length extents, 100,000 free boxes",
+        );
+    }
+
+    /// An item whose extents add up to more than the file is refused before any is copied:
+    /// overlapping extents can't make a file cost its size a thousand times over.
+    #[test]
+    fn overlapping_extents_cant_multiply_a_file() {
+        let p = picture();
+        let payload: Vec<u8> = TAIL.iter().copied().cycle().take(1_000_000).collect();
+        let body = (p.av1.len() + payload.len()) as u32;
+        let mut h = Hand::new();
+        h.extra = payload;
+        h.iloc[0].1.extend(vec![(0, body); 1023]);
+        refused_fast(&h.build(), "1,024 extents over 1 MB");
+        h.iloc[0].1.truncate(3);
+        refused_fast(&h.build(), "the picture, then mdat twice");
+        // A thumbnail's too, though it's never looked at past its first extent.
+        let mut h = Hand::new();
+        h.extra = vec![0; 4096];
+        let body = (p.av1.len() + h.extra.len()) as u32;
+        h.iloc.push((2, vec![(0, body); 2]));
+        h.iref = Some(reference(b"thmb", 2, &[1], false));
+        refused_fast(&h.build(), "a thumbnail over mdat twice");
+    }
+
+    /// Hand-built AVIFs of every shape the builder can make, chosen by a fixed seed: lists
+    /// long and short, lying counts, second boxes, 64-bit sizes, overlapping and zero-length
+    /// extents, payload bytes in every non-picture item. Each is kept (or refused) and parsed,
+    /// as the probe does, in under a second, and nothing kept holds the payload.
+    #[test]
+    fn hand_built_avifs_stay_cheap() {
+        use super::walker_fuzz::Rng;
+        let p = picture();
+        let mut rng = Rng(0x5eed_a11f_0b0e_7a11);
+        // Up to about `max`, as often small as large.
+        let some = |rng: &mut Rng, max: usize| {
+            let bits = rng.n(usize::BITS as usize - max.leading_zeros() as usize + 1);
+            rng.n(1 << bits).min(max)
+        };
+        let started = std::time::Instant::now();
+        for case in 0..60 {
+            let mut h = Hand::new();
+            h.extra = TAIL
+                .iter()
+                .copied()
+                .cycle()
+                .take(some(&mut rng, 200_000))
+                .collect();
+            let av1 = p.av1.len() as u32;
+            let body = av1 + h.extra.len() as u32;
+            let extent = |rng: &mut Rng| {
+                let off = av1 + rng.n(h.extra.len().max(1)) as u32;
+                let len = [0, 1, rng.n((body - off) as usize + 1) as u32, body - off][rng.n(4)];
+                (off.min(body.saturating_sub(1)), len)
+            };
+            let items = some(&mut rng, 5_000);
+            let mut iloc = Vec::new();
+            for id in 0..items {
+                let most = if rng.n(8) == 0 { 1_024 } else { 4 };
+                let n = some(&mut rng, most).max(1);
+                iloc.push((2 + id as u16, (0..n).map(|_| extent(&mut rng)).collect()));
+            }
+            h.iloc.extend(iloc);
+            // The picture's own bytes, again and overlapping.
+            let again = some(&mut rng, 2_000);
+            h.iloc[0].1.extend(vec![(0, av1); again]);
+            let kinds = [*b"av01", *b"hvc1", *b"jpeg", *b"grid"];
+            let named = some(&mut rng, 5_000);
+            h.infe
+                .extend((0..named).map(|i| (2 + i as u16, kinds[rng.n(kinds.len())])));
+            if rng.n(4) == 0 {
+                h.declared = Some(rng.n(8) as u16);
+            }
+            let ref_kinds = [b"thmb", b"auxl", b"dimg", b"prem"];
+            let mut refs = Vec::new();
+            for _ in 0..some(&mut rng, 3_000) {
+                let kind = ref_kinds[rng.n(ref_kinds.len())];
+                let from = 2 + rng.n(items.max(1)) as u16;
+                let most = if rng.n(8) == 0 { 4_000 } else { 2 };
+                let to = vec![1; some(&mut rng, most).max(1)];
+                refs.extend(reference(kind, from, &to, rng.n(16) == 0));
+            }
+            h.iref = (rng.n(4) != 0).then_some(refs);
+            let entries = some(&mut rng, 4_000);
+            let ipco = child_boxes(&p.ipco, 8, p.ipco.len()).len() as u8;
+            h.ipma = (0..entries)
+                .map(|i| {
+                    let n = some(&mut rng, 255);
+                    (
+                        2 + i as u16,
+                        (0..n).map(|_| rng.n(ipco as usize + 2) as u8).collect(),
+                    )
+                })
+                .collect();
+            h.top = isobmff_box(b"free", &[], false).repeat(some(&mut rng, 50_000));
+            match rng.n(6) {
+                0 => h.meta_extra = isobmff_box(b"iref", &[0, 0, 0, 0], false),
+                1 => h.meta_extra = isobmff_box(b"free", &[0; 16], false),
+                2 => h.iprp_extra = isobmff_box(b"ipma", &[0; 8], false),
+                _ => {}
+            }
+            let file = h.build();
+            for (keep_metadata, budget) in [
+                (false, 0),
+                (true, 0),
+                (false, 50_000_000),
+                (true, 50_000_000),
+            ] {
+                let one = std::time::Instant::now();
+                let kept = avif::keep(&file, keep_metadata, budget);
+                if let Ok(Some(k)) = &kept {
+                    assert!(!has(k, b"<html>"), "case {case}: the payload stayed");
+                }
+                if let Ok(k) = &kept
+                    && let Ok(parsed) = avif::parse(k.as_deref().unwrap_or(&file))
+                {
+                    let _ = avif::decode_bound(&parsed.primary_item);
+                }
+                let took = one.elapsed();
+                assert!(
+                    took.as_millis() < 1000,
+                    "case {case} ({} bytes, {items} items, {entries} entries): {took:?}",
+                    file.len()
+                );
+            }
+        }
+        println!("60 hand-built AVIFs × 4: {:?}", started.elapsed());
+    }
+
     /// Thumbnails share one budget, what the cap leaves after the picture: at most one is
     /// decoded, the first that's an AV1 picture no larger than the primary and fitting what's
     /// left; every other is zeroed undecoded.

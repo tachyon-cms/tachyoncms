@@ -13,10 +13,10 @@ use crate::fixtures::{
 use ::image::ImageFormat as Codec;
 
 /// xorshift64: the same cases every run.
-struct Rng(u64);
+pub(super) struct Rng(pub(super) u64);
 
 impl Rng {
-    fn n(&mut self, m: usize) -> usize {
+    pub(super) fn n(&mut self, m: usize) -> usize {
         self.0 ^= self.0 << 13;
         self.0 ^= self.0 >> 7;
         self.0 ^= self.0 << 17;
