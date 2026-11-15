@@ -2128,7 +2128,12 @@ async fn a_store_without_etags_still_versions_them(pool: PgPool) {
     let file = files::get(&pool, held(&pool, &res.json["id"]).await)
         .await
         .unwrap();
-    let prefix = format!("\"{}-a.png-", file.id);
+    // The file's id hashed, never the id: it's the secret half of the file's keys.
+    let id = {
+        use sha2::Digest;
+        hex::encode(&sha2::Sha256::digest(file.id.as_bytes())[..8])
+    };
+    let prefix = format!("\"{id}-a.png-");
     let token = tag
         .strip_prefix(&prefix)
         .and_then(|t| t.strip_suffix('"'))
