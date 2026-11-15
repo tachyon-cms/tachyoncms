@@ -103,6 +103,14 @@ pub enum ImageError {
     Unsupported(&'static str),
     #[error("this image can't be read: {0}")]
     Corrupt(String),
+    /// Fine to read, but past what the format it's made into holds (`made`, with its
+    /// article: "a WebP").
+    #[error("this image can't be made into {made}: it's {side} pixels across; the limit is {most}")]
+    TooWide {
+        made: &'static str,
+        side: u32,
+        most: u32,
+    },
     /// The server's fault: a file it couldn't write.
     #[error("{0}")]
     Internal(String),
@@ -1575,21 +1583,19 @@ fn encode_to(
     Ok(out)
 }
 
-/// Refuses, as a picture the format can't hold, a `w`×`h` wider or taller than `format`'s
-/// encoder takes: JPEG, GIF and AVIF 65,535, WebP 16,383, an icon 256.
+/// Refuses (`TooWide`, a `422`) a `w`×`h` wider or taller than `format`'s encoder takes:
+/// JPEG, GIF and AVIF 65,535, WebP 16,383, an icon 256.
 fn fits(w: u32, h: u32, format: InputFormat) -> Result<(), ImageError> {
-    let (name, most) = match format {
-        InputFormat::Jpeg => ("JPEG", 65_535),
-        InputFormat::Gif => ("GIF", 65_535),
-        InputFormat::Webp => ("WebP", 16_383),
-        InputFormat::Ico => ("icon", 256),
-        InputFormat::Avif => ("AVIF", 65_535),
+    let (made, most) = match format {
+        InputFormat::Jpeg => ("a JPEG", 65_535),
+        InputFormat::Gif => ("a GIF", 65_535),
+        InputFormat::Webp => ("a WebP", 16_383),
+        InputFormat::Ico => ("an icon", 256),
+        InputFormat::Avif => ("an AVIF", 65_535),
         _ => return Ok(()),
     };
     match w.max(h) {
-        v if v > most => Err(ImageError::Corrupt(format!(
-            "a {name} can't be {v} pixels across; the limit is {most}"
-        ))),
+        side if side > most => Err(ImageError::TooWide { made, side, most }),
         _ => Ok(()),
     }
 }
@@ -5010,17 +5016,44 @@ mod tests {
     }
 
     #[test]
+    fn each_encoder_s_limit_is_exact() {
+        for (format, name, most) in [
+            (InputFormat::Jpeg, "a JPEG", 65_535),
+            (InputFormat::Gif, "a GIF", 65_535),
+            (InputFormat::Avif, "an AVIF", 65_535),
+            (InputFormat::Webp, "a WebP", 16_383),
+            (InputFormat::Ico, "an icon", 256),
+        ] {
+            // The limit is the format made's, not the image's: it read fine.
+            let refused = Err(format!(
+                "this image can't be made into {name}: it's {} pixels across; the limit is {most}",
+                most + 1
+            ));
+            let fits = |w, h| fits(w, h, format).map_err(|e| e.to_string());
+            assert_eq!(fits(most, 1), Ok(()), "{name}");
+            assert_eq!(fits(1, most), Ok(()), "{name}, tall");
+            assert_eq!(fits(most + 1, 1), refused, "{name}");
+            assert_eq!(fits(1, most + 1), refused, "{name}, tall");
+        }
+        for format in [InputFormat::Png, InputFormat::Tiff, InputFormat::Bmp] {
+            assert_eq!(fits(u32::MAX, u32::MAX, format), Ok(()));
+        }
+    }
+
+    #[test]
     fn a_picture_wider_than_its_encoder_takes_is_refused() {
         let png = |w, h| encoded(&gradient(w, h), Codec::Png);
-        let refused = |name: &str, v: u32, most: u32| {
-            Err(ImageError::Corrupt(format!(
-                "a {name} can't be {v} pixels across; the limit is {most}"
-            )))
+        let refused = |name: &'static str, v: u32, most: u32| {
+            Err(ImageError::TooWide {
+                made: name,
+                side: v,
+                most,
+            })
         };
         for (format, name, most) in [
-            ("webp", "WebP", 16_383),
-            ("gif", "GIF", 65_535),
-            ("jpeg", "JPEG", 65_535),
+            ("webp", "a WebP", 16_383),
+            ("gif", "a GIF", 65_535),
+            ("jpeg", "a JPEG", 65_535),
         ] {
             let u = upload(serde_json::json!({"formatOptions": {"format": format}}));
             let got = run(&png(most + 1, 2), &u).map(|p| p.width);
@@ -5033,19 +5066,19 @@ mod tests {
                 "{format}"
             );
         }
-        // AVIF's limit is rav1e's; a picture at it is stored.
+        // AVIF's limit is rav1e's. Storing one at it takes minutes in a debug build, so
+        // `each_encoder_s_limit_is_exact` checks the edge.
         let u = upload(serde_json::json!({"formatOptions": {"format": "avif"}}));
         let got = run(&png(65_536, 2), &u).map(|p| p.width);
-        assert_eq!(got, refused("AVIF", 65_536, 65_535));
-        assert_eq!(run(&png(65_535, 2), &u).map(|p| p.width), Ok(65_535));
+        assert_eq!(got, refused("an AVIF", 65_536, 65_535));
         // An animation goes through its own encoder.
         let u = upload(serde_json::json!({"formatOptions": {"format": "webp"}}));
         let got = run(&moving_gif(16_384, 1, 2), &u).map(|p| p.width);
-        assert_eq!(got, refused("WebP", 16_384, 16_383));
+        assert_eq!(got, refused("a WebP", 16_384, 16_383));
         // An icon's entry wider than its directory says, made again.
         let ico = ico_around(&png(280, 2));
         let u = upload(serde_json::json!({"resizeOptions": {"width": 270}}));
-        assert_eq!(run(&ico, &u).map(|p| p.width), refused("icon", 270, 256));
+        assert_eq!(run(&ico, &u).map(|p| p.width), refused("an icon", 270, 256));
     }
 
     #[test]
