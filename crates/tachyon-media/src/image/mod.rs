@@ -1326,7 +1326,7 @@ fn with_tiff_tags(mut tiff: Vec<u8>, tags: &[TiffTag]) -> Vec<u8> {
 
 /// A new file in `dir` holding `bytes`, and its size. Nothing is left behind on failure.
 fn write_new(dir: &Path, bytes: &[u8]) -> Result<(PathBuf, u64), ImageError> {
-    let mut file = tempfile::NamedTempFile::new_in(dir).map_err(internal)?;
+    let mut file = crate::spool_in(dir).map_err(internal)?;
     file.write_all(bytes).map_err(internal)?;
     file.flush().map_err(internal)?;
     let (_, path) = file.keep().map_err(|e| internal(e.error))?;

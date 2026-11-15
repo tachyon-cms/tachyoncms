@@ -163,7 +163,7 @@ impl SafeFetch {
             return Err(FetchError::TooLarge(cap));
         }
         let io = |e: std::io::Error| FetchError::Io(e.to_string());
-        let file = NamedTempFile::new_in(dir).map_err(io)?;
+        let file = crate::spool_in(dir).map_err(io)?;
         let mut out = tokio::fs::File::from_std(file.as_file().try_clone().map_err(io)?);
         let (mut head, mut len) = (Vec::with_capacity(HEAD), 0u64);
         // On any error `file` is dropped, which deletes it.

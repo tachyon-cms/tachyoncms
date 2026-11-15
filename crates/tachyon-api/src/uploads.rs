@@ -35,7 +35,6 @@ use tachyon_media::image::{self as picture, ImageError};
 use tachyon_media::sniff::sniff;
 use tachyon_media::storage::{Storage, StorageError, object_key, staging_key};
 use tachyon_media::svg::{self, SvgError};
-use tempfile::NamedTempFile;
 use tokio::io::AsyncWriteExt;
 use tokio::sync::{Semaphore, SemaphorePermit};
 use url::Url;
@@ -276,7 +275,7 @@ pub(crate) async fn download(
     cap: u64,
 ) -> Result<Option<Spool>, StorageError> {
     let got = storage.get_range(key, None).await?;
-    let file = NamedTempFile::new_in(dir)?;
+    let file = tachyon_media::spool_in(dir)?;
     let mut out = tokio::fs::File::from_std(file.reopen()?);
     let (mut head, mut len) = (Vec::with_capacity(HEAD), 0u64);
     let mut chunks = got.into_stream();
@@ -651,7 +650,7 @@ fn refused(e: multer::Error) -> ApiError {
 async fn spool_part(part: &mut multer::Field<'_>, temp_dir: &Path) -> Result<Spool, ApiError> {
     let name = sanitize_filename(part.file_name().unwrap_or_default());
     let internal = |e: std::io::Error| ApiError::Internal(format!("can't spool an upload: {e}"));
-    let file = NamedTempFile::new_in(temp_dir).map_err(internal)?;
+    let file = tachyon_media::spool_in(temp_dir).map_err(internal)?;
     let mut out = tokio::fs::File::from_std(file.as_file().try_clone().map_err(internal)?);
     let (mut head, mut len) = (Vec::with_capacity(HEAD), 0u64);
     // On any error `file` is dropped, which deletes it.

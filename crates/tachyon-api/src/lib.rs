@@ -150,6 +150,17 @@ pub async fn router_with(pool: PgPool, options: Options) -> Result<Router, Start
         .check_signing()
         .await
         .map_err(StartError::Config)?;
+    // A process killed mid-upload leaves its spools behind: none is live this much later.
+    let (spools, age) = (
+        options.uploads.temp_dir.clone(),
+        options.uploads.timeout + Duration::from_secs(3_600),
+    );
+    match tokio::task::spawn_blocking(move || tachyon_media::sweep_spools(&spools, age)).await {
+        Ok(Ok(0)) => {}
+        Ok(Ok(n)) => tracing::info!(files = n, "removed spools a crash left in temp_dir"),
+        Ok(Err(error)) => tracing::warn!(%error, "couldn't sweep temp_dir"),
+        Err(error) => tracing::warn!(%error, "couldn't sweep temp_dir"),
+    }
     let auth = Arc::new(auth::AuthState::new(options.auth).map_err(StartError::Config)?);
     // Users are a collection like any other, so make sure it's there before serving.
     tachyon_db::auth::ensure_users_collection(&pool).await?;

@@ -349,6 +349,25 @@ async fn an_aborted_upload_leaves_no_spool_file(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_crash_s_spools_are_swept_at_startup(pool: PgPool) {
+    let d = dirs();
+    let left = d
+        .temp
+        .join(format!("{}crashed", tachyon_media::SPOOL_PREFIX));
+    let live = d.temp.join(format!("{}live", tachyon_media::SPOOL_PREFIX));
+    for (p, ago) in [(&left, 4_201), (&live, 3_000)] {
+        std::fs::File::create(p)
+            .unwrap()
+            .set_modified(std::time::SystemTime::now() - std::time::Duration::from_secs(ago))
+            .unwrap();
+    }
+    // Older than the upload timeout (10 min) and an hour more: no request could hold it.
+    let _app = router(&pool, &d).await;
+    assert!(!left.exists());
+    assert!(live.exists());
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn stray_parts_are_refused(pool: PgPool) {
     let d = dirs();
     let app = admin(&pool, &d).await;
