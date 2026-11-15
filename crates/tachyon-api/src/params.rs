@@ -161,7 +161,8 @@ pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
 /// A file read's `?id`, the document holding it, taken only where `filenameCompoundIndex`
 /// lets documents share a name, and its `?draft`: prefer a draft's file of that name. Not
 /// refused for a caller who can't read drafts, who gets what they'd get without it, so it
-/// can't tell them whether a draft holds the name.
+/// can't tell them whether a draft holds the name; where there are no drafts, the 400 a
+/// document read gives.
 pub(crate) fn file_params(
     raw: Option<&str>,
     c: &Collection,
@@ -177,7 +178,10 @@ pub(crate) fn file_params(
     let id = single(&params, "id")?
         .map(|id| uuid::Uuid::try_parse(id).map_err(|_| bad("`id` must be a document ID")))
         .transpose()?;
-    Ok((id, draft && c.schema.drafts()))
+    if draft && !c.schema.drafts() {
+        return Err(bad(format!("`draft`: `{}` has no drafts", c.schema.slug)));
+    }
+    Ok((id, draft))
 }
 
 /// `?wait=true` on a create, the only parameter it takes: answer once the file's sizes

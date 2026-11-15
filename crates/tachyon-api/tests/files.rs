@@ -962,6 +962,27 @@ async fn a_missing_object_is_not_found(pool: PgPool) {
     }
 }
 
+/// `?draft=true` where there are no drafts is the 400 a document read gives it.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn draft_needs_a_collection_with_drafts(pool: PgPool) {
+    let d = dirs();
+    let app = admin(&pool, &d).await;
+    collection(&app, "images", json!({})).await;
+    let doc = put(&app, "images", &png(1, 1), "a.png", None).await;
+    let file = fetch(&app, "/api/images/file/a.png?draft=true").await;
+    assert_eq!(file.status, 400, "{}", file.json());
+    assert_eq!(file.header("cache-control"), "no-store");
+    let id = doc["id"].as_str().unwrap();
+    let read = fetch(&app, &format!("/api/images/{id}?draft=true")).await;
+    assert_eq!(read.status, 400, "{}", read.json());
+    for key in ["type", "title", "status", "detail"] {
+        assert_eq!(file.json()[key], read.json()[key], "{key}");
+    }
+    assert_eq!(file.json()["detail"], "`draft`: `images` has no drafts");
+    let plain = fetch(&app, "/api/images/file/a.png?draft=false").await;
+    assert_eq!(plain.status, 200);
+}
+
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn refusals_are_never_cached(pool: PgPool) {
     let d = dirs();

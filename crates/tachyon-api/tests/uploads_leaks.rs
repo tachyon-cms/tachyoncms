@@ -991,7 +991,8 @@ async fn uploads_never_leak(pool: PgPool) {
         }
         let drafts = hit.contains("draft=true");
         let differs = if hit.contains("/file/") {
-            true
+            // `downloads` has no drafts: asking for one is the same 400 for any name.
+            !(drafts && hit.contains("/api/downloads/"))
         } else if ["/api/folders", "/api/downloads", "seenfile"]
             .iter()
             .any(|w| hit.contains(w))
