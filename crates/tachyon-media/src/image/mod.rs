@@ -1443,6 +1443,7 @@ fn encode_to(
     o: &EncodeOptions,
     meta: &Meta,
 ) -> Result<Vec<u8>, ImageError> {
+    fits(img.width(), img.height(), format)?;
     let mut out = Vec::new();
     match format {
         InputFormat::Jpeg => {
@@ -1451,10 +1452,8 @@ fn encode_to(
             } else {
                 (img.to_luma8().into_raw(), jpeg_encoder::ColorType::Luma)
             };
-            let side = |v: u32| {
-                u16::try_from(v)
-                    .map_err(|_| ImageError::Corrupt(format!("a JPEG can't be {v} pixels across")))
-            };
+            // Under 65,536 each, by `fits`.
+            let side = |v: u32| u16::try_from(v).map_err(failed);
             let (w, h) = (side(img.width())?, side(img.height())?);
             let mut e = jpeg_encoder::Encoder::new(&mut out, o.quality.unwrap_or(80));
             e.set_progressive(o.progressive);
@@ -1505,7 +1504,7 @@ fn encode_to(
             out = webp_with_meta(&memory, meta)?;
         }
         InputFormat::Avif => {
-            let speed = 10u8.saturating_sub(o.effort.unwrap_or(4)).clamp(1, 10);
+            let speed = avif_speed(o.effort, u64::from(img.width()) * u64::from(img.height()));
             let quality = if o.lossless {
                 100
             } else {
@@ -1553,6 +1552,32 @@ fn encode_to(
     Ok(out)
 }
 
+/// Refuses, as a picture the format can't hold, a `w`×`h` wider or taller than `format`'s
+/// encoder takes: JPEG and GIF 65,535, WebP 16,383, an icon 256.
+fn fits(w: u32, h: u32, format: InputFormat) -> Result<(), ImageError> {
+    let (name, most) = match format {
+        InputFormat::Jpeg => ("JPEG", 65_535),
+        InputFormat::Gif => ("GIF", 65_535),
+        InputFormat::Webp => ("WebP", 16_383),
+        InputFormat::Ico => ("icon", 256),
+        _ => return Ok(()),
+    };
+    match w.max(h) {
+        v if v > most => Err(ImageError::Corrupt(format!(
+            "a {name} can't be {v} pixels across; the limit is {most}"
+        ))),
+        _ => Ok(()),
+    }
+}
+
+/// ravif's speed for `effort` (4 when unset): 10 less it, but at least 9 above 16 MP,
+/// so a picture at the 50 MP cap encodes in about 30 s (61 s at effort 4, release, 12 cores)
+/// while it holds a decode permit.
+fn avif_speed(effort: Option<u8>, pixels: u64) -> u8 {
+    let fastest = if pixels > 16_000_000 { 9 } else { 1 };
+    10u8.saturating_sub(effort.unwrap_or(4)).clamp(fastest, 10)
+}
+
 /// libwebp's settings for `o`: quality (80), lossless, and effort as its method (4).
 fn webp_config(o: &EncodeOptions) -> Result<webp::WebPConfig, ImageError> {
     let mut c = webp::WebPConfig::new().map_err(|()| failed("libwebp's defaults"))?;
@@ -1572,6 +1597,9 @@ fn encode_animation(
     o: &EncodeOptions,
     meta: &Meta,
 ) -> Result<Vec<u8>, ImageError> {
+    if let Some(f) = frames.first() {
+        fits(f.image.width(), f.image.height(), format)?;
+    }
     let mut out = Vec::new();
     if format == InputFormat::Gif {
         let mut e = GifEncoder::new(&mut out);
@@ -4905,5 +4933,49 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn a_picture_wider_than_its_encoder_takes_is_refused() {
+        let png = |w, h| encoded(&gradient(w, h), Codec::Png);
+        let refused = |name: &str, v: u32, most: u32| {
+            Err(ImageError::Corrupt(format!(
+                "a {name} can't be {v} pixels across; the limit is {most}"
+            )))
+        };
+        for (format, name, most) in [
+            ("webp", "WebP", 16_383),
+            ("gif", "GIF", 65_535),
+            ("jpeg", "JPEG", 65_535),
+        ] {
+            let u = upload(serde_json::json!({"formatOptions": {"format": format}}));
+            let got = run(&png(most + 1, 2), &u).map(|p| p.width);
+            assert_eq!(got, refused(name, most + 1, most), "{format}");
+            let got = run(&png(2, most + 1), &u).map(|p| p.width);
+            assert_eq!(got, refused(name, most + 1, most), "{format}, tall");
+            assert_eq!(
+                run(&png(most, 2), &u).map(|p| p.width),
+                Ok(most),
+                "{format}"
+            );
+        }
+        // An animation goes through its own encoder.
+        let u = upload(serde_json::json!({"formatOptions": {"format": "webp"}}));
+        let got = run(&moving_gif(16_384, 1, 2), &u).map(|p| p.width);
+        assert_eq!(got, refused("WebP", 16_384, 16_383));
+        // An icon's entry wider than its directory says, made again.
+        let ico = ico_around(&png(280, 2));
+        let u = upload(serde_json::json!({"resizeOptions": {"width": 270}}));
+        assert_eq!(run(&ico, &u).map(|p| p.width), refused("icon", 270, 256));
+    }
+
+    #[test]
+    fn a_big_avif_is_encoded_fast() {
+        // Effort 4 (speed 6) on 50 MP took 61 s in release on 12 cores; speed 9, 27 s.
+        assert_eq!(avif_speed(None, 16_000_000), 6);
+        assert_eq!(avif_speed(Some(9), 16_000_000), 1);
+        assert_eq!(avif_speed(None, 16_000_001), 9);
+        assert_eq!(avif_speed(Some(9), 50_000_000), 9);
+        assert_eq!(avif_speed(Some(0), 50_000_000), 10);
     }
 }
