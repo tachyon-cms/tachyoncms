@@ -165,8 +165,8 @@ pub(crate) async fn run_sizes(state: &AppState, job: &Job) -> Result<(), JobErro
         Ok(_) | Err(DbError::NotFound) => return Err(released()),
         Err(e) => return Err(retry(e)),
     };
-    // The document's, not the row's: without a focal point a focal edit keeps the file, so
-    // only the document knows it once the option's turned on. Read before the lease, which
+    // The document's, not the row's: a focal edit makes a new file for the copy it edits,
+    // and the row keeps the point the file was created with. Read before the lease, which
     // holds a connection of its own, so a run never waits on a second.
     let focal = files::focal_of(&state.pool, id).await.map_err(retry)?;
     let leased = keep_leased(state, job, LEASE).await?;

@@ -316,21 +316,6 @@ pub fn pattern_host(raw: &str) -> Result<String, &'static str> {
     Ok(format!("{wild}{host}"))
 }
 
-/// The fields every upload collection has, `focalX` and `focalY` only with `focalPoint`.
-pub const UPLOAD_FIELDS: &[&str] = &[
-    "filename",
-    "mimeType",
-    "filesize",
-    "width",
-    "height",
-    "focalX",
-    "focalY",
-    "url",
-    "thumbnailURL",
-    "sizes",
-    "blurhash",
-];
-
 /// Built-in fields only the server sets.
 pub const SERVER_SET: &[&str] = &[
     "filename", "mimeType", "filesize", "width", "height", "sizes", "blurhash",
