@@ -402,6 +402,45 @@ fn field_names<T: serde::de::DeserializeOwned>() -> &'static [&'static str] {
     names
 }
 
+/// `endpoint` as a place: its scheme, host (one trailing dot dropped), port and path
+/// without its slashes, so spellings of one address compare equal. Empty when unset.
+fn endpoint_place(endpoint: Option<&str>) -> String {
+    let Some(raw) = endpoint else {
+        return String::new();
+    };
+    match web_url(raw) {
+        Some(u) => {
+            let host = u.host_str().unwrap_or_default();
+            format!(
+                "{}://{}:{}/{}",
+                u.scheme(),
+                host.strip_suffix('.').unwrap_or(host),
+                u.port_or_known_default().unwrap_or_default(),
+                u.path().trim_matches('/')
+            )
+        }
+        None => raw.to_owned(),
+    }
+}
+
+/// A local `root` as a place: absolute, `.` dropped and `..` folded by name, since the
+/// directory may not exist yet to be resolved.
+fn root_place(root: &std::path::Path) -> String {
+    use std::path::Component;
+    let absolute = std::path::absolute(root).unwrap_or_else(|_| root.to_path_buf());
+    let mut out = std::path::PathBuf::new();
+    for part in absolute.components() {
+        match part {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                out.pop();
+            }
+            other => out.push(other),
+        }
+    }
+    out.display().to_string()
+}
+
 /// An `http` or `https` address with a host, as `public_url` and each allowed origin must be.
 fn web_url(text: &str) -> Option<url::Url> {
     url::Url::parse(text).ok().filter(|u| {
@@ -574,20 +613,14 @@ impl Config {
         // Two names for one place would each sweep the other's `_staging/`.
         let place = |c: &StorageConfig| {
             let at = match &c.adapter {
-                Adapter::Local { root } => {
-                    let root: std::path::PathBuf = root
-                        .components()
-                        .filter(|p| !matches!(p, std::path::Component::CurDir))
-                        .collect();
-                    vec!["local".to_owned(), root.display().to_string()]
-                }
+                Adapter::Local { root } => vec!["local".to_owned(), root_place(root)],
                 Adapter::S3 {
                     bucket, endpoint, ..
                 } => {
                     vec![
                         "s3".into(),
                         bucket.clone(),
-                        endpoint.clone().unwrap_or_default(),
+                        endpoint_place(endpoint.as_deref()),
                     ]
                 }
                 Adapter::Azure {
@@ -598,13 +631,13 @@ impl Config {
                     "azure".into(),
                     account.clone(),
                     container.clone(),
-                    endpoint.clone().unwrap_or_default(),
+                    endpoint_place(endpoint.as_deref()),
                 ],
                 Adapter::Gcs { bucket, endpoint } => {
                     vec![
                         "gcs".into(),
                         bucket.clone(),
-                        endpoint.clone().unwrap_or_default(),
+                        endpoint_place(endpoint.as_deref()),
                     ]
                 }
             };
@@ -1058,9 +1091,44 @@ mod tests {
                 local("a", ""),
                 "[storage.b]\nadapter = \"local\"\nroot = \"./shared/\"\n"
             ),
-        ] {
+            format!(
+                "{}{}",
+                local("a", ""),
+                "[storage.b]\nadapter = \"local\"\nroot = \"other/../shared\"\n"
+            ),
+        ]
+        .into_iter()
+        // One endpoint, spelt five ways.
+        .chain(
+            [
+                "https://acct.r2.cloudflarestorage.com/",
+                "https://acct.r2.cloudflarestorage.com:443",
+                "https://ACCT.R2.cloudflarestorage.com",
+                "https://acct.r2.cloudflarestorage.com./",
+            ]
+            .map(|other| {
+                format!(
+                    "{}{}",
+                    s3("a", "endpoint = \"https://acct.r2.cloudflarestorage.com\""),
+                    s3("b", &format!("endpoint = \"{other}\""))
+                )
+            }),
+        ) {
             assert_eq!(uploads_with(&toml, &keys).unwrap_err(), refused, "{toml}");
         }
+        // A root spelt relative and absolute: the jail is the working directory.
+        Jail::expect_with(|jail| {
+            let absolute = jail.directory().join("shared");
+            let toml = format!(
+                "{}[storage.b]\nadapter = \"local\"\nroot = \"{}\"\n",
+                local("a", ""),
+                absolute.display()
+            );
+            jail.create_file("tachyon.toml", &toml)?;
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            assert_eq!(Config::load(None)?.uploads_config().unwrap_err(), refused);
+            Ok(())
+        });
         for toml in [
             format!("{}{}", s3("a", ""), s3("b", "prefix = \"other\"")),
             format!(
