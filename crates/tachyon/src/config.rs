@@ -171,6 +171,37 @@ impl Default for SignedSetting {
     }
 }
 
+/// The keys a `[storage.<name>]` may set: its fields but the credentials.
+static STORAGE_KEYS: std::sync::LazyLock<Vec<&'static str>> = std::sync::LazyLock::new(|| {
+    field_names::<StorageSettings>()
+        .iter()
+        .copied()
+        .filter(|k| !CREDENTIALS.contains(k))
+        .collect()
+});
+
+/// `e` with an unknown `[storage.<name>]` key offered only the keys that can be set there,
+/// not the credentials, which would only be refused.
+fn settable_only(e: figment::Error) -> figment::Error {
+    let errors: Vec<figment::Error> = e
+        .into_iter()
+        .map(|mut e| {
+            if let figment::error::Kind::UnknownField(_, expected) = &mut e.kind
+                && expected.contains(&CREDENTIALS[0])
+            {
+                *expected = &STORAGE_KEYS;
+            }
+            e
+        })
+        .collect();
+    // Iterated newest first; chained back oldest first.
+    errors
+        .into_iter()
+        .rev()
+        .reduce(|older, newer| older.chain(newer))
+        .expect("an error is at least itself")
+}
+
 /// Environment variables that are storage credentials, which the settings never read.
 fn is_credential_var(key: &str) -> bool {
     let key = key.to_ascii_lowercase();
@@ -589,7 +620,8 @@ impl Config {
                     .filter(|k| !is_credential_var(k.as_str()))
                     .split("__"),
             )
-            .extract()?;
+            .extract()
+            .map_err(settable_only)?;
         if config.database_url.trim().is_empty() {
             return Err("database_url is empty".to_owned().into());
         }
@@ -988,6 +1020,14 @@ mod tests {
             )?;
             let err = Config::load(None).unwrap_err().to_string();
             assert!(err.contains("unknown field: found `buckt`"), "{err}");
+            // Only what can be set is offered: credentials come from the environment.
+            assert!(
+                err.contains("`bucket`") && err.contains("`signed_downloads`"),
+                "{err}"
+            );
+            for key in super::CREDENTIALS {
+                assert!(!err.contains(&format!("`{key}`")), "{key}: {err}");
+            }
             jail.create_file("tachyon.toml", "[uploads]\nmax_size = \"1MB\"\n")?;
             let err = Config::load(None).unwrap_err().to_string();
             assert!(err.contains("unknown field: found `max_size`"), "{err}");
