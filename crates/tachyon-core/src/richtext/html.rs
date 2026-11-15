@@ -164,20 +164,30 @@ fn data_fields(node: &Value, out: &mut String) {
 }
 
 /// An upload node: an image as `<img>` with its sizes in its own type as `srcset`, inside
-/// a `<picture>` with a `<source>` per other type its sizes are made in; any other file as
-/// a link to it by its name. The node's fields are `data-*` attributes on the outermost
+/// a `<picture>` with a `<source>` per other type its sizes are made in; a TIFF, BMP or
+/// icon as its widest PNG size; any other file, or one of those with no size, as a link
+/// to it by its name. The node's fields are `data-*` attributes on the outermost
 /// element. One the caller can't read, or whose URL fails the scheme check, is left out
 /// (W1-R24).
 fn upload_html(node: &Value, ctx: &RenderCtx, out: &mut String) {
     let Some(file) = super::upload_of(node, ctx).filter(|f| safe_href(&f.url)) else {
         return;
     };
-    if !file.mime_type.starts_with("image/") {
+    // An image a browser can't show is its widest size, made as PNG; with none, a link.
+    let src = match super::shown(&file.mime_type) {
+        true => Some(&file.url),
+        false => file
+            .srcset
+            .last()
+            .map(|(url, _)| url)
+            .filter(|u| safe_href(u)),
+    };
+    let Some(src) = src.filter(|_| file.mime_type.starts_with("image/")) else {
         let _ = write!(out, "<a href=\"{}\"", esc(&file.url));
         data_fields(node, out);
         let _ = write!(out, ">{}</a>", esc(&file.filename));
         return;
-    }
+    };
     // A comma or space would split a candidate in two.
     let srcset = |set: &[(String, u32)]| {
         let set: Vec<String> = set
@@ -205,7 +215,7 @@ fn upload_html(node: &Value, ctx: &RenderCtx, out: &mut String) {
             let _ = write!(out, "<source type=\"{}\"{set}>", esc(t));
         }
     }
-    let _ = write!(out, "<img src=\"{}\"", esc(&file.url));
+    let _ = write!(out, "<img src=\"{}\"", esc(src));
     for (name, n) in [("width", file.width), ("height", file.height)] {
         if let Some(n) = n {
             let _ = write!(out, " {name}=\"{n}\"");
@@ -442,6 +452,61 @@ mod tests {
     }
 
     #[test]
+    fn upload_nodes_show_what_a_browser_can() {
+        // A TIFF shows as its widest PNG size, with the PNG sizes as its srcset; with no
+        // size it's a link to the file, never an image a browser can't show.
+        let tiff = |sizes: Vec<(String, u32)>| {
+            move |_: &str, _: &Value| {
+                Some(super::super::UploadView {
+                    url: "/api/media/file/a.tif".into(),
+                    width: Some(800),
+                    height: Some(600),
+                    alt: None,
+                    mime_type: "image/tiff".into(),
+                    filename: "a.tif".into(),
+                    srcset: sizes.clone(),
+                    sources: Vec::new(),
+                })
+            }
+        };
+        let none = |_: &str, _: &Value| None;
+        let html = |upload: &dyn Fn(&str, &Value) -> Option<super::super::UploadView>| {
+            let node = json!({"type": "upload", "attrs": {"relationTo": "media", "value": M1,
+                "fields": {"caption": "c"}}});
+            to_html(
+                &doc(json!([node])),
+                &RenderCtx {
+                    link_url: &none,
+                    title: &none,
+                    slug: &none,
+                    upload,
+                },
+            )
+        };
+        let sized = tiff(vec![
+            ("/api/media/file/a-100.png".into(), 100),
+            ("/api/media/file/a-400.png".into(), 400),
+        ]);
+        assert_eq!(
+            html(&sized),
+            concat!(
+                "<img src=\"/api/media/file/a-400.png\" width=\"800\" height=\"600\" alt=\"\" ",
+                "srcset=\"/api/media/file/a-100.png 100w, /api/media/file/a-400.png 400w\" ",
+                "sizes=\"(max-width: 800px) 100vw, 800px\" data-caption=\"c\">"
+            )
+        );
+        assert_eq!(
+            html(&tiff(Vec::new())),
+            "<a href=\"/api/media/file/a.tif\" data-caption=\"c\">a.tif</a>"
+        );
+        // One whose only size fails the scheme check is a link too.
+        assert_eq!(
+            html(&tiff(vec![("javascript:alert(1)".into(), 4)])),
+            "<a href=\"/api/media/file/a.tif\" data-caption=\"c\">a.tif</a>"
+        );
+    }
+
+    #[test]
     fn upload_node_fields_are_data_attributes() {
         ctx_for(|ctx| {
             // The node's own fields are `data-*` attributes, as a block node's are, on the
@@ -492,13 +557,14 @@ mod tests {
                         // One source per other type, the best first; the original's type
                         // in the image itself. No srcset repeats a width.
                         "<picture>",
-                        "<source type=\"image/avif\" srcset=\"{u}/a-400x300.avif 400w\" ",
+                        "<source type=\"image/avif\" ",
+                        "srcset=\"{u}/a-400x300.avif 400w, {u}/a.png 800w\" ",
                         "sizes=\"(max-width: 800px) 100vw, 800px\">",
                         "<source type=\"image/webp\" ",
-                        "srcset=\"{u}/a-40x30.webp 40w, {u}/a-400x300.webp 400w\" ",
+                        "srcset=\"{u}/a-40x30.webp 40w, {u}/a-400x300.webp 400w, {u}/a.png 800w\" ",
                         "sizes=\"(max-width: 800px) 100vw, 800px\">",
                         "<img src=\"{u}/a.png\" width=\"800\" height=\"600\" alt=\"Cover\" ",
-                        "srcset=\"{u}/a-400x300.png 400w\" ",
+                        "srcset=\"{u}/a-400x300.png 400w, {u}/a.png 800w\" ",
                         "sizes=\"(max-width: 800px) 100vw, 800px\">",
                         "</picture>",
                         "<a href=\"/api/media/file/terms.pdf\">terms.pdf</a>"

@@ -63,12 +63,22 @@ pub struct UploadView {
     pub alt: Option<String>,
     pub mime_type: String,
     pub filename: String,
-    /// Each size made of the image in its own type, by width and no two of one width:
-    /// the candidates of its `<img>`'s `srcset`.
+    /// Each size made of the image in its own type (PNG for one a browser can't show), by
+    /// width and no two of one width, then the original where it's wider: the candidates
+    /// of its `<img>`'s `srcset`.
     pub srcset: Vec<(String, u32)>,
     /// The same for AVIF and WebP, from sizes made in them and each size's copies, by type
-    /// (AVIF first, the smaller): a `<picture>`'s `<source>`s.
+    /// (AVIF first, the smaller, and an AVIF image's own): a `<picture>`'s `<source>`s.
     pub sources: Vec<(String, Vec<(String, u32)>)>,
+}
+
+/// Whether a browser can be relied on to show an image of type `mime`: not a TIFF, BMP or
+/// icon, whose sizes are made as PNG instead.
+pub(crate) fn shown(mime: &str) -> bool {
+    !matches!(
+        mime,
+        "image/tiff" | "image/bmp" | "image/x-icon" | "image/vnd.microsoft.icon"
+    )
 }
 
 /// `doc`, an upload document as the caller reads it with its URLs filled, as an upload
@@ -90,24 +100,43 @@ pub fn upload_view(doc: &Map<String, Value>) -> Option<UploadView> {
             .flat_map(Map::values)
             .filter_map(Value::as_object)
     }
+    // The image's own type, or PNG, which the sizes of one a browser can't show are made in.
+    let own = match shown(&mime_type) {
+        true => mime_type.as_str(),
+        false => "image/png",
+    };
     let mut by_type: BTreeMap<String, Vec<(String, u32)>> = BTreeMap::new();
     for size in objects(doc.get("sizes")) {
         for made in std::iter::once(size).chain(objects(size.get("formats"))) {
-            // A source of any other type would win over the original in every browser.
+            // A source of any other type would win over the image in every browser.
             let Some(t) = text(made, "mimeType")
-                .filter(|t| *t == mime_type || t == "image/avif" || t == "image/webp")
+                .filter(|t| t == own || t == "image/avif" || t == "image/webp")
             else {
                 continue;
             };
             by_type.entry(t).or_default().extend(candidate(made));
         }
     }
+    // The original is the widest candidate, where it's one a browser shows and wider than
+    // every size: a source's type only picks it, so any candidate in it still loads.
+    let original = text(doc, "url")
+        .zip(number(doc, "width"))
+        .filter(|_| shown(&mime_type));
     for set in by_type.values_mut() {
         set.sort_by_key(|(_, w)| *w);
         set.dedup_by_key(|(_, w)| *w);
+        if let Some((url, w)) = &original
+            && set.last().is_some_and(|(_, last)| last < w)
+        {
+            set.push((url.clone(), *w));
+        }
     }
-    let srcset = by_type.remove(&mime_type).unwrap_or_default();
-    let sources = by_type.into_iter().filter(|(_, s)| !s.is_empty()).collect();
+    let srcset = by_type.remove(own).unwrap_or_default();
+    let mut sources: Vec<_> = by_type.into_iter().filter(|(_, s)| !s.is_empty()).collect();
+    // An AVIF image's own sizes go ahead of a WebP source, which would otherwise shadow them.
+    if own == "image/avif" && !sources.is_empty() && !srcset.is_empty() {
+        sources.insert(0, (own.to_owned(), srcset.clone()));
+    }
     Some(UploadView {
         url: text(doc, "url")?,
         width: number(doc, "width"),
@@ -2270,13 +2299,20 @@ mod tests {
                 mime_type: "image/png".into(),
                 filename: "a.png".into(),
                 // By type and width: the JPEG size only by its WebP copy, the size not made
-                // not at all.
-                srcset: vec![(u("a-400x300.png"), 400)],
+                // not at all, and the original last in each, wider than any size.
+                srcset: vec![(u("a-400x300.png"), 400), (u("a.png"), 800)],
                 sources: vec![
-                    ("image/avif".into(), vec![(u("a-400x300.avif"), 400)]),
+                    (
+                        "image/avif".into(),
+                        vec![(u("a-400x300.avif"), 400), (u("a.png"), 800)]
+                    ),
                     (
                         "image/webp".into(),
-                        vec![(u("a-40x30.webp"), 40), (u("a-400x300.webp"), 400)]
+                        vec![
+                            (u("a-40x30.webp"), 40),
+                            (u("a-400x300.webp"), 400),
+                            (u("a.png"), 800)
+                        ]
                     ),
                 ],
             }
@@ -2296,10 +2332,17 @@ mod tests {
         assert_eq!(
             view.sources,
             vec![
-                ("image/avif".into(), vec![(u("a-200.avif"), 200)]),
+                (
+                    "image/avif".into(),
+                    vec![(u("a-200.avif"), 200), (u("a.png"), 800)]
+                ),
                 (
                     "image/webp".into(),
-                    vec![(u("a-200.webp"), 200), (u("a-400.webp"), 400)]
+                    vec![
+                        (u("a-200.webp"), 200),
+                        (u("a-400.webp"), 400),
+                        (u("a.png"), 800)
+                    ]
                 ),
             ]
         );
@@ -2312,7 +2355,61 @@ mod tests {
         );
         assert_eq!(
             upload_view(&twice).unwrap().srcset,
-            vec![(u("a-400x400.png"), 400)]
+            vec![(u("a-400x400.png"), 400), (u("a.png"), 800)]
+        );
+        // Without a size, the original is the image itself, not a candidate.
+        let mut bare = cover();
+        bare.remove("sizes");
+        assert_eq!(upload_view(&bare).unwrap().srcset, vec![]);
+        // A TIFF, BMP or icon no browser is sure to show: its sizes are made as PNG, and
+        // are the image; the original isn't offered.
+        for mime in [
+            "image/tiff",
+            "image/bmp",
+            "image/x-icon",
+            "image/vnd.microsoft.icon",
+        ] {
+            let mut tiff = cover();
+            tiff.insert("mimeType".into(), json!(mime));
+            tiff.insert("url".into(), json!(u("a.tif")));
+            let mut png = made("a-400.png", 400, "image/png");
+            png["formats"] = json!({"webp": made("a-400.webp", 400, "image/webp")});
+            tiff.insert(
+                "sizes".into(),
+                json!({"s": png, "t": made("a-100.png", 100, "image/png")}),
+            );
+            let view = upload_view(&tiff).unwrap();
+            assert_eq!(
+                view.srcset,
+                vec![(u("a-100.png"), 100), (u("a-400.png"), 400)],
+                "{mime}"
+            );
+            assert_eq!(
+                view.sources,
+                vec![("image/webp".into(), vec![(u("a-400.webp"), 400)])],
+                "{mime}"
+            );
+        }
+        // An AVIF original's own sizes are an AVIF source too, ahead of the WebP one that
+        // would otherwise shadow them.
+        let mut own = made("a-400.avif", 400, "image/avif");
+        own["formats"] = json!({"webp": made("a-400.webp", 400, "image/webp")});
+        let mut avif = cover();
+        avif.insert("mimeType".into(), json!("image/avif"));
+        avif.insert("url".into(), json!(u("a.avif")));
+        avif.insert("sizes".into(), json!({"s": own}));
+        let view = upload_view(&avif).unwrap();
+        let set = vec![(u("a-400.avif"), 400), (u("a.avif"), 800)];
+        assert_eq!(view.srcset, set);
+        assert_eq!(
+            view.sources,
+            vec![
+                ("image/avif".into(), set.clone()),
+                (
+                    "image/webp".into(),
+                    vec![(u("a-400.webp"), 400), (u("a.avif"), 800)]
+                ),
+            ]
         );
         // No URL, as when it's hidden from the caller: nothing to show.
         let mut hidden = cover();
