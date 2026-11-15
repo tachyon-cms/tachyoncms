@@ -314,13 +314,25 @@ fn boxes(data: &[u8], from: usize, to: usize) -> Vec<Box4> {
     walk_boxes(data, from, to).0
 }
 
+/// The first `most` boxes from `from` to `to`: enough to know there are too many.
+fn first_boxes(data: &[u8], from: usize, to: usize, most: usize) -> Vec<Box4> {
+    walk_upto(data, from, to, most).0
+}
+
 /// The boxes from `from` to `to`, and whether they reach `to` exactly: a walk that stops
 /// on a box it can't follow may have missed some.
 fn walk_boxes(data: &[u8], from: usize, to: usize) -> (Vec<Box4>, bool) {
+    walk_upto(data, from, to, usize::MAX)
+}
+
+fn walk_upto(data: &[u8], from: usize, to: usize, most: usize) -> (Vec<Box4>, bool) {
     let mut out = Vec::new();
     let to = to.min(data.len());
     let mut i = from;
-    while let Some(h) = data.get(i..i + 8).filter(|_| i + 8 <= to) {
+    while let Some(h) = data
+        .get(i..i + 8)
+        .filter(|_| i + 8 <= to && out.len() < most)
+    {
         let size = u32::from_be_bytes([h[0], h[1], h[2], h[3]]) as u64;
         let kind = [h[4], h[5], h[6], h[7]];
         let (body, size) = match size {
@@ -581,7 +593,7 @@ fn locations(
     let Some(count) = read(data, &mut at, wide, end) else {
         return cut();
     };
-    let mut total = 0u64;
+    let (mut total, mut seen) = (0u64, std::collections::HashSet::new());
     for _ in 0..count {
         let item = (|| {
             let id = read(data, &mut at, wide, end)?;
@@ -599,6 +611,13 @@ fn locations(
             out.extend(unread());
             break;
         };
+        // avif-parse joins every entry an id has: one id listed twice could be the file
+        // many times over.
+        if !seen.insert(id) {
+            return Err(ImageError::Corrupt(
+                "this AVIF locates an item twice".into(),
+            ));
+        }
         total += n;
         if n > MAX_ITEM_EXTENTS || total > MAX_EXTENTS {
             return Err(ImageError::Corrupt(
@@ -810,14 +829,31 @@ const MAX_ITEMS: u64 = 4096;
 const MAX_ASSOCIATIONS: u64 = 16_384;
 const MAX_ALPHA_REFS: u64 = 16;
 
-/// Refuses an AVIF listing more than `MAX_ITEMS` items or references, `MAX_ASSOCIATIONS`
-/// associations or `MAX_ALPHA_REFS` `auxl` references, or holding a second `iinf`, `iloc`,
-/// `iref`, `iprp`, `ipma` or `ipco` (ISO 14496-12 allows one each, and avif-parse would read
-/// every one), before anything walks them.
+/// The most `auxC` bytes `ipma` may associate, counted once per association: avif-parse
+/// copies an `auxC`'s body for each, and reads each copy again for every `auxl` reference.
+const MAX_AUX_BYTES: u64 = 65_536;
+
+/// The most top-level boxes, and `mdat` boxes among them, an AVIF may have: avif-parse
+/// looks through every `mdat` for each extent of the picture and its alpha, and a real
+/// file has three to five boxes, one of them `mdat`.
+const MAX_TOP_BOXES: usize = 64;
+const MAX_MDATS: usize = 8;
+
+/// Refuses an AVIF with more than `MAX_TOP_BOXES` top-level boxes or `MAX_MDATS` `mdat`s,
+/// listing more than `MAX_ITEMS` items or references, `MAX_ASSOCIATIONS` associations,
+/// `MAX_AUX_BYTES` associated `auxC` bytes or `MAX_ALPHA_REFS` `auxl` references, or holding
+/// a second `iinf`, `iloc`, `iref`, `iprp`, `ipma` or `ipco` (ISO 14496-12 allows one each,
+/// and avif-parse would read every one), before anything walks them.
 pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
     let corrupt = |why: String| Err(ImageError::Corrupt(why));
     let too_many = || corrupt(format!("this AVIF lists more than {MAX_ITEMS} items"));
-    let top = boxes(data, 0, data.len());
+    let top = first_boxes(data, 0, data.len(), MAX_TOP_BOXES + 1);
+    if top.len() > MAX_TOP_BOXES {
+        return corrupt(format!("this AVIF has more than {MAX_TOP_BOXES} boxes"));
+    }
+    if top.iter().filter(|b| &b.kind == b"mdat").count() > MAX_MDATS {
+        return corrupt(format!("this AVIF has more than {MAX_MDATS} mdat boxes"));
+    }
     let Some(meta) = find(&top, b"meta") else {
         return Ok(());
     };
@@ -843,7 +879,8 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
     if let Some(b) = find(&inner, b"iinf") {
         let wide = if version(&b) == 0 { 2 } else { 4 };
         // avif-parse reads every `infe` there, whatever the count says.
-        let present = boxes(data, b.body + 4 + wide, b.end).len() as u64;
+        let present = first_boxes(data, b.body + 4 + wide, b.end, MAX_ITEMS as usize + 1).len();
+        let present = present as u64;
         if present > MAX_ITEMS || count(&b, 4, wide).is_some_and(|n| n > MAX_ITEMS) {
             return too_many();
         }
@@ -865,8 +902,9 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
         } else {
             1
         };
-        let (mut at, mut total) = (ipma.body + 8, 0u64);
-        for _ in 0..entries {
+        let list = find(&props, b"ipco").map_or_else(Vec::new, |b| boxes(data, b.body, b.end));
+        let (mut at, mut total, mut aux) = (ipma.body + 8, 0u64, 0u64);
+        'entries: for _ in 0..entries {
             at += id;
             let Some(n) = read(data, &mut at, 1, ipma.end) else {
                 break;
@@ -877,13 +915,28 @@ pub(super) fn check_counts(data: &[u8]) -> Result<(), ImageError> {
                     "this AVIF makes more than {MAX_ASSOCIATIONS} property associations"
                 ));
             }
-            at += n as usize * index;
+            for _ in 0..n {
+                let Some(i) = read(data, &mut at, index, ipma.end) else {
+                    break 'entries;
+                };
+                let i = i & if index == 2 { 0x7FFF } else { 0x7F };
+                if let Some(b) = (i as usize).checked_sub(1).and_then(|i| list.get(i))
+                    && &b.kind == b"auxC"
+                {
+                    aux += (b.end - b.start) as u64;
+                }
+            }
+            if aux > MAX_AUX_BYTES {
+                return corrupt(format!(
+                    "this AVIF associates more than {MAX_AUX_BYTES} bytes of auxC"
+                ));
+            }
         }
     }
     if let Some(b) = find(&inner, b"iref") {
         let wide = if version(&b) == 0 { 2 } else { 4 };
         let (mut total, mut alpha) = (0u64, 0u64);
-        for r in boxes(data, b.body + 4, b.end) {
+        for r in first_boxes(data, b.body + 4, b.end, MAX_ITEMS as usize + 1) {
             let n = read(data, &mut (r.body + wide), 2, r.end).unwrap_or(0);
             total += 1 + n;
             if &r.kind == b"auxl" {
@@ -1039,9 +1092,13 @@ fn keep_counted(
                 .map(|(id, _)| id),
         );
     }
+    // Each item once, and each byte copied once, however items and extents overlap.
+    items.sort_unstable();
+    items.dedup();
     for id in items {
         kept.extend(ranges_of(id)?);
     }
+    let kept = merged(kept);
     let cut = kept.iter().map(|r| r.1).max()?;
     let mut out = vec![0u8; cut];
     for &(s, e) in &kept {
@@ -1066,6 +1123,19 @@ fn keep_counted(
     reached.then_some(out)
 }
 
+/// `ranges` sorted and joined where they overlap or touch, so none is covered twice.
+fn merged(mut ranges: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
+    ranges.sort_unstable();
+    let mut out: Vec<(usize, usize)> = Vec::with_capacity(ranges.len());
+    for (s, e) in ranges {
+        match out.last_mut() {
+            Some(last) if s <= last.1 => last.1 = last.1.max(e),
+            _ => out.push((s, e)),
+        }
+    }
+    out
+}
+
 /// How many thumbnails of the picture are looked at, at most.
 const THUMBNAIL_LOOKS: usize = 4;
 
@@ -1075,10 +1145,12 @@ const ALPHA_URN: &[u8] = b"urn:mpeg:mpegB:cicp:systems:auxiliary:alpha";
 /// Whether property box `b` is the alpha `auxC`, as avif-parse requires of the alpha item
 /// it decodes.
 fn is_alpha(data: &[u8], b: &Box4) -> bool {
-    // A full box: version and flags, then the type, ending in a zero.
+    // A full box: version and flags, then the type, ending in a zero (or a `?` and its
+    // parameters). Only the URN's length and one byte past it are read.
     let urn = data.get(b.body + 4..b.end).unwrap_or_default();
-    let urn = urn.split(|&c| c == 0).next().unwrap_or_default();
-    &b.kind == b"auxC" && urn.split(|&c| c == b'?').next() == Some(ALPHA_URN)
+    &b.kind == b"auxC"
+        && urn.starts_with(ALPHA_URN)
+        && matches!(urn.get(ALPHA_URN.len()), None | Some(0 | b'?'))
 }
 
 /// Every item's type, as `iinf` gives it, in one pass.
@@ -1190,12 +1262,20 @@ fn references(data: &[u8], inner: &[Box4]) -> Vec<([u8; 4], u64, Vec<u64>)> {
 /// `data` with the EXIF and XMP items blanked, or `None` when it has none. The caller
 /// re-encodes instead when `m.unresolved`.
 pub(super) fn strip(data: &[u8], m: &Meta) -> Option<Vec<u8>> {
-    let ranges = || m.items.iter().flat_map(|i| i.ranges.iter().copied());
-    if ranges().all(|(s, e)| data.get(s..e).is_none_or(|b| b.iter().all(|&x| x == 0))) {
+    let ranges = merged(
+        m.items
+            .iter()
+            .flat_map(|i| i.ranges.iter().copied())
+            .collect(),
+    );
+    if ranges
+        .iter()
+        .all(|&(s, e)| data.get(s..e).is_none_or(|b| b.iter().all(|&x| x == 0)))
+    {
         return None;
     }
     let mut out = data.to_vec();
-    for (start, end) in ranges() {
+    for &(start, end) in &ranges {
         if let Some(b) = out.get_mut(start..end) {
             b.fill(0);
         }
