@@ -14,7 +14,7 @@ use std::time::Duration;
 use serde_json::{Map, Value, json};
 use sqlx::types::Json;
 use sqlx::{PgConnection, PgPool};
-use tachyon_core::uploads::{numbered, numbered_bounds, rename_sizes};
+use tachyon_core::uploads::{numbered, numbered_bounds, numbers, rename_sizes};
 use time::OffsetDateTime;
 use uuid::Uuid;
 
@@ -139,6 +139,9 @@ pub(crate) async fn free_name(
     .fetch_all(&mut *conn)
     .await?
     .into_iter()
+    // The query's bounds are coarse (without an extension, every name starting with the
+    // stem meets them): only the name and the series count.
+    .filter(|name| name == filename || numbers(filename, name))
     .collect();
     taken.extend(also.iter().cloned());
     if !taken.contains(filename) {

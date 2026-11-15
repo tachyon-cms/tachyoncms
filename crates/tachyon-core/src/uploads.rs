@@ -650,6 +650,15 @@ pub fn numbered(filename: &str, n: u32) -> String {
     compose(stem, &format!("-{n}"), ext)
 }
 
+/// Whether `name` is `numbered(filename, n)` for some `n`.
+pub fn numbers(filename: &str, name: &str) -> bool {
+    let (_, tail) = numbered_bounds(filename);
+    name.strip_suffix(tail.as_str())
+        .and_then(|rest| rest.rsplit_once('-'))
+        .and_then(|(_, n)| n.parse::<u32>().ok())
+        .is_some_and(|n| n > 0 && numbered(filename, n) == name)
+}
+
 /// What every `numbered(filename, n)` starts and ends with, so a lookup can find them
 /// all at once: the stem as cut for the widest number, and the extension.
 pub fn numbered_bounds(filename: &str) -> (String, String) {
@@ -1554,7 +1563,22 @@ mod tests {
                     made.starts_with(&head) && made.ends_with(&tail),
                     "{made:?} {head:?} {tail:?}"
                 );
+                assert!(numbers(&name, &made), "{made:?}");
             }
+        }
+        // What only shares the stem and the extension isn't in the series.
+        for (name, other) in [
+            ("README", "README.md"),
+            ("README", "README-old.txt"),
+            ("README", "README-1.md"),
+            ("a.png", "a-x.png"),
+            ("a.png", "a-+2.png"),
+            ("a.png", "a-02.png"),
+            ("a.png", "a--2.png"),
+            ("a.png", "a-0.png"),
+            ("a.png", "a.png"),
+        ] {
+            assert!(!numbers(name, other), "{other:?}");
         }
         assert_eq!(
             numbered_bounds("a.png"),
