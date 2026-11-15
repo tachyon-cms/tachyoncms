@@ -1102,6 +1102,7 @@ pub async fn abandon(pool: &PgPool, id: Uuid) -> Result<bool, DbError> {
 /// longer pending (its grace ran out and its cleanup ran meanwhile), its key is queued for
 /// deletion now, kept should a file serve it by then: the object may have landed after
 /// that cleanup looked.
+/// `key_in_use_in` matches an original's key by basename: don't rely on it after a trash-restore rename.
 pub async fn abandon_stored(pool: &PgPool, file: &FileRow) -> Result<bool, DbError> {
     if abandon(pool, file.id).await? {
         return Ok(true);
