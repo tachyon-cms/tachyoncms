@@ -7,7 +7,7 @@ use serde_json::{Map, Value, json};
 use uuid::Uuid;
 
 use crate::schema::{BlockSource, Field, FieldKind, Link, SelectOption, data_fields};
-use crate::validate::{is_date, normalize_date_time};
+use crate::validate::{is_date, normalize_date_time, normalize_timestamp};
 
 const MAX_PARAMS: usize = 100;
 const MAX_KEY_DEPTH: usize = 16;
@@ -1018,6 +1018,12 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .filter(|s| is_date(s))
             .map(|s| Scalar::Text(s.to_owned()))
             .ok_or_else(|| "expected a date like 2026-10-12".into()),
+        // Postgres keeps these two to the microsecond; date fields are stored to the millisecond.
+        (_, None) if matches!(target, Target::CreatedAt | Target::UpdatedAt) => v
+            .as_str()
+            .and_then(normalize_timestamp)
+            .map(Scalar::Text)
+            .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
         (ValueKind::Date, _) => v
             .as_str()
             .and_then(normalize_date_time)

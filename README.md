@@ -32,7 +32,7 @@ We think you can have both. Here's what we're building toward:
 - Access rules in the schema narrow that per collection, global and field: published posts for everyone, drafts for their authors, a salary field for HR. `GET /api/access` tells each caller what they may do.
 - Create, read, update and delete documents, with validation errors that tell you exactly which field is wrong (`seo.title`, `links.0.url`).
 - Send only what changed. An update to `seo.title` leaves the rest of `seo` alone, lists are replaced whole, and `null` clears a field wherever it sits (inside a `json` field it's just a value).
-- Date-times are stored in UTC to the millisecond, so what you filter on is exactly what was saved.
+- Date fields are stored in UTC to the millisecond, and `createdAt` and `updatedAt` to the microsecond, so what you filter on is exactly what was saved. Copy a timestamp out of a read, filter on it, and you get that document back.
 - Paginated lists, newest first.
 - Errors in the standard [RFC 9457](https://www.rfc-editor.org/rfc/rfc9457) format, each with a request ID you can find in the logs.
 - Soft delete, UUIDv7 IDs, and date-times stored in UTC.

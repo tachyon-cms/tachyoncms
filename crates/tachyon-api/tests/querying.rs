@@ -81,6 +81,85 @@ async fn cursor_pagination(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn system_timestamps_filter_at_full_precision(pool: PgPool) {
+    let app = app(pool).await;
+    let doc = send(&app, "GET", "/api/items?where[title][equals]=b", None)
+        .await
+        .json["docs"][0]
+        .clone();
+    let id = doc["id"].as_str().unwrap();
+    let ids = |json: &serde_json::Value| -> Vec<String> {
+        json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    for target in ["createdAt", "updatedAt"] {
+        let at = doc[target].as_str().unwrap();
+        let fraction = at.rsplit('.').next().unwrap().trim_end_matches('Z');
+        let found = send(
+            &app,
+            "GET",
+            &format!("/api/items?where[{target}][equals]={at}"),
+            None,
+        )
+        .await;
+        assert_eq!(found.status, 200, "{}", found.json);
+        assert_eq!(
+            ids(&found.json),
+            [id],
+            "{target} equals a value from a read"
+        );
+        let newer = send(
+            &app,
+            "GET",
+            &format!("/api/items?where[{target}][gt]={at}"),
+            None,
+        )
+        .await;
+        assert_eq!(newer.status, 200, "{}", newer.json);
+        assert!(
+            !ids(&newer.json).iter().any(|d| d == id),
+            "{target} isn't newer than itself"
+        );
+        // Digits past the microsecond are accepted and dropped: Postgres can't hold them.
+        let nanos = format!(
+            "{}{}999Z",
+            at.trim_end_matches('Z'),
+            "0".repeat(6 - fraction.len())
+        );
+        let found = send(
+            &app,
+            "GET",
+            &format!("/api/items?where[{target}][equals]={nanos}"),
+            None,
+        )
+        .await;
+        assert_eq!(found.status, 200, "{}", found.json);
+        assert_eq!(
+            ids(&found.json),
+            [id],
+            "{target} drops nanoseconds: {nanos}"
+        );
+    }
+    // A cursor on updatedAt carries the full value and pages without a gap or a repeat.
+    let first = send(&app, "GET", "/api/items?sort=updatedAt&limit=2", None).await;
+    assert_eq!(titles(&first.json), ["a", "b"]);
+    let cursor = first.json["nextCursor"].as_str().unwrap().to_owned();
+    let second = send(
+        &app,
+        "GET",
+        &format!("/api/items?sort=updatedAt&limit=2&after={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(second.status, 200, "{}", second.json);
+    assert_eq!(titles(&second.json), ["c"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn bad_parameters_are_400(pool: PgPool) {
     let app = app(pool).await;
     let number_cursor = {
