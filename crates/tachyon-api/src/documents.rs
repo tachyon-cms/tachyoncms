@@ -467,6 +467,45 @@ pub async fn get(
 /// runs as, or the refusal it gets. The update rule and ownership are judged on the stored
 /// document before a byte of the body is read, so a refused caller never has a file spooled
 /// or stored; the lock judges again. Upload instructions for a replacement ask the same.
+/// What a read gives beside the fields, taken out of `sent`, so a read written back unchanged
+/// saves. `id` and `createdAt` must be those of `stored`, the document written, or they're
+/// a 422; `updatedAt`, `status` and `publishedAt` can change between a client's read and its
+/// write, so they're dropped unread. A field of `c` by one of those names is a field.
+pub(crate) fn read_back(
+    c: &Collection,
+    sent: &mut Value,
+    stored: Option<&Document>,
+) -> Result<(), ApiError> {
+    let Value::Object(fields) = sent else {
+        return Ok(());
+    };
+    let built_in = |k: &&str| c.schema.data().iter().all(|f| f.name != *k);
+    let read = stored.map(to_value).transpose()?;
+    let errors: Vec<FieldError> = ["id", "createdAt"]
+        .into_iter()
+        .filter(built_in)
+        .filter(|k| {
+            fields
+                .get(*k)
+                .is_some_and(|v| Some(v) != read.as_ref().and_then(|r| r.get(*k)))
+        })
+        .map(|k| FieldError {
+            path: k.into(),
+            message: "set by the server".into(),
+        })
+        .collect();
+    if !errors.is_empty() {
+        return Err(ApiError::Validation(errors));
+    }
+    for k in ["id", "createdAt", "updatedAt", "status", "publishedAt"]
+        .into_iter()
+        .filter(built_in)
+    {
+        fields.remove(k);
+    }
+    Ok(())
+}
+
 pub(crate) async fn may_update(
     state: &AppState,
     access: &Access,
@@ -538,7 +577,9 @@ pub async fn update(
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
-    let stored = documents::get(&state.pool, c.id, id, copy).await?.data.0;
+    let stored = documents::get(&state.pool, c.id, id, copy).await?;
+    read_back(&c, &mut sent, Some(&stored))?;
+    let stored = stored.data.0;
     paused(id).await;
     // Server-set fields are only compared, here and again against the locked document, and
     // never written from the patch: the stored ones, or the new file's, stay.

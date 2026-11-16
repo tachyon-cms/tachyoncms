@@ -805,3 +805,70 @@ async fn hidden_links_keep_their_schema_position(pool: PgPool) {
     let res = patch(json!({"rows": reordered})).await;
     assert_eq!(res.status, 200, "{}", res.json);
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn files_and_their_links_read_at_depth_save_back_unchanged(pool: PgPool) {
+    let d = dir();
+    let app = admin(&pool, &d).await;
+    blog(&app).await;
+    schema(
+        &app,
+        json!({"slug": "pages", "fields": [
+            {"name": "cover", "type": "upload", "relationTo": "media"},
+            {"name": "body", "type": "richText", "relationTo": ["media"],
+             "upload": {"collections": {"media": {}}}}
+        ]}),
+    )
+    .await;
+    let media = put(&app, "media", &png(4, 4), "cat.png").await;
+    let id = media["id"].as_str().unwrap();
+    let url = format!("/api/media/{id}");
+    let wait = format!("{url}?depth=0");
+    // Sizes are made by a job; whatever it has done by now, the read goes back as it is.
+    let file = ok(&app, "GET", &url, json!(null)).await;
+    assert_eq!(file["filename"], "cat.png", "{file}");
+    let saved = ok(&app, "PATCH", &url, file.clone()).await;
+    let after = ok(&app, "GET", &wait, json!(null)).await;
+    for key in [
+        "filename", "mimeType", "filesize", "width", "height", "focalX", "focalY",
+    ] {
+        assert_eq!(saved[key], file[key], "{key}");
+        assert_eq!(after[key], file[key], "{key}");
+    }
+    assert_eq!(after["createdAt"], file["createdAt"]);
+
+    let page = ok(
+        &app,
+        "POST",
+        "/api/pages",
+        json!({"cover": id, "body": {"type": "doc", "content": [
+            {"type": "upload", "attrs": {"relationTo": "media", "value": id}}
+        ]}}),
+    )
+    .await;
+    let page_url = format!("/api/pages/{}", page["id"].as_str().unwrap());
+    let read = ok(&app, "GET", &page_url, json!(null)).await;
+    assert_eq!(read["cover"]["filename"], "cat.png", "populated: {read}");
+    assert_eq!(
+        read["body"]["content"][0]["attrs"]["value"]["filename"],
+        "cat.png"
+    );
+    ok(&app, "PATCH", &page_url, read).await;
+    let flat = ok(&app, "GET", &format!("{page_url}?depth=0"), json!(null)).await;
+    assert_eq!(flat["cover"], id);
+    assert_eq!(flat["body"]["content"][0]["attrs"]["value"], id);
+
+    // What a read adds beside the fields must be the document's own.
+    for (key, value) in [
+        ("id", json!("0199d5c4-0000-7000-8000-00000000dead")),
+        ("createdAt", json!("2020-01-01T00:00:00Z")),
+    ] {
+        let body = json!({ key: value }).to_string();
+        let res = send(&app, "PATCH", &page_url, Some(&body)).await;
+        assert_problem(&res, 422);
+        assert_eq!(
+            res.json["errors"],
+            json!([{"path": key, "message": "set by the server"}])
+        );
+    }
+}

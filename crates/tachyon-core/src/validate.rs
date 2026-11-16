@@ -57,6 +57,7 @@ pub fn validate_document_in(
     };
     let mut doc = existing.cloned().unwrap_or_default();
     merge(fields, &mut doc, input);
+    unpopulate(fields, &mut doc);
     if existing.is_none() {
         apply_defaults(fields, &mut doc);
         for f in fields {
@@ -1155,15 +1156,43 @@ pub fn map_relations(
     doc: &mut Map<String, Value>,
     f: &mut impl FnMut(&str, &str) -> Option<Value>,
 ) {
-    map_inner(&data_fields(fields), doc, "", f)
+    map_slots(&data_fields(fields), doc, "", &mut |path, slot| {
+        if let Some(found) = slot.as_str().and_then(|id| f(path, id)) {
+            *slot = found;
+        }
+    })
 }
 
-fn map_inner(
+/// A document sent where a link's ID goes, as a read at depth gives it back, is its `id`:
+/// what a client read can be saved as it is. An object with no document ID is left for
+/// validation to refuse where it sits.
+fn unpopulate(fields: &[Field], doc: &mut Map<String, Value>) {
+    map_slots(fields, doc, "", &mut |_, slot| {
+        if let Some(id) = slot
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|s| is_uuid(s))
+        {
+            *slot = id.to_owned().into();
+        }
+    })
+}
+
+/// Calls `f` on the place each link's ID goes, with the path `relations` reports: the link
+/// itself for one collection, the `value` of a polymorphic or rich text link.
+fn map_slots(
     fields: &[Field],
     doc: &mut Map<String, Value>,
     prefix: &str,
-    f: &mut impl FnMut(&str, &str) -> Option<Value>,
+    f: &mut impl FnMut(&str, &mut Value),
 ) {
+    // A link to one collection is its ID; any other is `{relationTo, value}`.
+    fn slot<'v>(relation_to: &RelationTo, link: &'v mut Value) -> Option<&'v mut Value> {
+        match relation_to {
+            RelationTo::One(_) => Some(link),
+            RelationTo::Many(_) => link.get_mut("value"),
+        }
+    }
     for field in fields {
         let Some(value) = doc.get_mut(&field.name) else {
             continue;
@@ -1171,22 +1200,26 @@ fn map_inner(
         let path = join(prefix, &field.name);
         let link = field.kind.link();
         match (&field.kind, value) {
-            (_, slot) if link.is_some_and(|l| !l.has_many) => {
-                replace_link(slot, &mut |id| f(&path, id))
+            (_, one) if link.is_some_and(|l| !l.has_many) => {
+                if let Some(s) = slot(link.expect("a link").relation_to, one) {
+                    f(&path, s)
+                }
             }
             (_, Value::Array(links)) if link.is_some_and(|l| l.has_many) => {
-                for (i, slot) in links.iter_mut().enumerate() {
-                    let here = format!("{path}.{i}");
-                    replace_link(slot, &mut |id| f(&here, id));
+                let relation_to = link.expect("a link").relation_to;
+                for (i, one) in links.iter_mut().enumerate() {
+                    if let Some(s) = slot(relation_to, one) {
+                        f(&format!("{path}.{i}"), s)
+                    }
                 }
             }
             (FieldKind::Group { fields }, Value::Object(inner)) => {
-                map_inner(fields, inner, &path, f)
+                map_slots(fields, inner, &path, f)
             }
             (kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }), Value::Array(rows)) => {
                 for (i, row) in rows.iter_mut().enumerate() {
                     if let Value::Object(inner) = row {
-                        map_inner(row_fields(kind, inner), inner, &format!("{path}.{i}"), f);
+                        map_slots(row_fields(kind, inner), inner, &format!("{path}.{i}"), f);
                     }
                 }
             }
@@ -1195,21 +1228,23 @@ fn map_inner(
                     let here = format!("{path}.{k}");
                     match item {
                         crate::richtext::ItemMut::Link(link) => {
-                            replace_link(link, &mut |id| f(&here, id))
+                            if let Some(s) = slot(&ANY, link) {
+                                f(&here, s)
+                            }
                         }
                         crate::richtext::ItemMut::Block(attrs) => {
                             let fields = node_fields(kind, attrs);
                             if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
-                                map_inner(fields, inner, &here, f);
+                                map_slots(fields, inner, &here, f);
                             }
                         }
                         crate::richtext::ItemMut::Upload(attrs) => {
-                            if let Some(inner) = attrs.get_mut("value") {
-                                replace_id(inner, &mut |id| f(&here, id));
+                            if let Some(s) = attrs.get_mut("value") {
+                                f(&here, s)
                             }
                             let fields = upload_fields(kind, attrs);
                             if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
-                                map_inner(fields, inner, &here, f);
+                                map_slots(fields, inner, &here, f);
                             }
                         }
                     }
@@ -1263,18 +1298,6 @@ pub fn rich_texts_mut(
     walk(&data_fields(fields), doc, "", f)
 }
 
-/// Polymorphic links keep their `relationTo`; only the `value` inside is replaced.
-fn replace_link(slot: &mut Value, f: &mut impl FnMut(&str) -> Option<Value>) {
-    match slot {
-        Value::Object(o) => {
-            if let Some(inner) = o.get_mut("value") {
-                replace_id(inner, f);
-            }
-        }
-        other => replace_id(other, f),
-    }
-}
-
 /// `{"relationTo": "<allowed slug>", "value": "<uuid>"}` and nothing else.
 fn is_link(v: &Value, relation_to: &RelationTo) -> bool {
     v.as_object().is_some_and(|o| {
@@ -1295,12 +1318,6 @@ fn canonical_link(link: &mut Value) {
             }
         }
         _ => {}
-    }
-}
-
-fn replace_id(slot: &mut Value, f: &mut impl FnMut(&str) -> Option<Value>) {
-    if let Some(found) = slot.as_str().and_then(f) {
-        *slot = found;
     }
 }
 
@@ -1748,6 +1765,114 @@ mod tests {
         assert_eq!(doc["author"], a, "unmatched IDs stay as they are");
         assert_eq!(doc["related"][1]["name"], "Bee");
         assert_eq!(doc["links"][1]["author"]["name"], "Bee");
+    }
+
+    #[test]
+    fn populated_documents_save_as_their_ids() {
+        let up = |name: &str| json!({"name": name, "type": "upload", "relationTo": "media"});
+        let f = fields(json!([
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "related", "type": "relationship", "relationTo": "posts", "hasMany": true},
+            {"name": "link", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "more", "type": "relationship", "relationTo": ["posts", "pages"], "hasMany": true},
+            up("cover"),
+            {"name": "meta", "type": "group", "fields": [up("image")]},
+            {"name": "layout", "type": "blocks", "blocks": [{"slug": "hero", "fields": [up("image")]}]},
+            {"name": "body", "type": "richText", "relationTo": ["posts", "media"],
+             "blocks": [{"slug": "card", "fields": [up("image")]}],
+             "upload": {"collections": {"media": {}}}}
+        ]));
+        let id = "0199D5C4-0000-7000-8000-00000000000A";
+        let bare = id.to_lowercase();
+        // As a read at depth gives it back: the whole document, its own links populated too.
+        let doc = json!({"id": id, "title": "T", "value": "x", "author": {"id": id}});
+        let link = |to: &str| json!({"relationTo": to, "value": doc});
+        let body = json!({"type": "doc", "content": [
+            {"type": "paragraph", "content": [{"type": "text", "text": "see", "marks": [
+                {"type": "link", "attrs": {"doc": link("posts")}}
+            ]}]},
+            {"type": "relationship", "attrs": link("posts")},
+            {"type": "upload", "attrs": link("media")},
+            {"type": "block", "attrs": {"blockType": "card", "fields": {"image": doc}}}
+        ]});
+        let saved = ok(
+            &f,
+            json!({
+                "author": doc, "related": [doc, id], "link": link("pages"),
+                "more": [link("posts"), {"relationTo": "pages", "value": id}],
+                "cover": doc, "meta": {"image": doc},
+                "layout": [{"blockType": "hero", "image": doc}], "body": body
+            }),
+        );
+        let ids: Vec<(String, String)> = relations(&f, &saved)
+            .into_iter()
+            .map(|r| (r.path, r.id.to_string()))
+            .collect();
+        assert_eq!(ids.len(), 13, "{ids:?}");
+        assert!(ids.iter().all(|(_, i)| *i == bare), "{ids:?}");
+        // What's stored is the ID alone, in canonical form, wherever the link sat.
+        assert_eq!(saved["author"], bare);
+        assert_eq!(saved["related"], json!([bare, bare]));
+        assert_eq!(saved["link"], json!({"relationTo": "pages", "value": bare}));
+        assert_eq!(
+            saved["more"][0],
+            json!({"relationTo": "posts", "value": bare})
+        );
+        assert_eq!(
+            (&saved["cover"], &saved["meta"]["image"]),
+            (&json!(bare), &json!(bare))
+        );
+        assert_eq!(saved["layout"][0]["image"], bare);
+        let content = &saved["body"]["content"];
+        assert_eq!(
+            content[0]["content"][0]["marks"][0]["attrs"]["doc"]["value"],
+            bare
+        );
+        assert_eq!(
+            content[1]["attrs"],
+            json!({"relationTo": "posts", "value": bare})
+        );
+        assert_eq!(
+            content[2]["attrs"],
+            json!({"relationTo": "media", "value": bare})
+        );
+        assert_eq!(content[3]["attrs"]["fields"]["image"], bare);
+
+        // An object without a document ID is still refused where it sits.
+        for bad in [
+            json!({}),
+            json!({"id": "nope"}),
+            json!({"id": 7}),
+            json!({"title": "T"}),
+        ] {
+            assert_eq!(
+                errs(&f, json!({"author": bad})),
+                vec![e("author", "expected a document ID")],
+                "{bad}"
+            );
+            assert_eq!(
+                errs(&f, json!({"related": [id, bad]})),
+                vec![e("related", "expected a list of document IDs")],
+                "{bad}"
+            );
+            let one = "expected a link like {\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"} to one of: posts, pages";
+            assert_eq!(
+                errs(&f, json!({"link": {"relationTo": "posts", "value": bad}})),
+                vec![e("link", one)],
+                "{bad}"
+            );
+            let node = json!({"type": "doc", "content": [
+                {"type": "relationship", "attrs": {"relationTo": "posts", "value": bad}}
+            ]});
+            let refused = errs(&f, json!({"body": node}));
+            assert_eq!(refused.len(), 1, "{bad}: {refused:?}");
+            assert!(
+                refused[0].0.starts_with("body.content.0.attrs"),
+                "{refused:?}"
+            );
+        }
+        // A populated document is a link's ID, not a polymorphic link.
+        assert!(!errs(&f, json!({"link": doc})).is_empty());
     }
 
     #[test]

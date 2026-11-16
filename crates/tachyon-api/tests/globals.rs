@@ -102,3 +102,40 @@ async fn globals_show_nested_defaults_before_first_save(pool: PgPool) {
         json!({"seo": {"index": true}, "footer": {"note": "Made with care"}})
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_global_read_at_depth_saves_back_unchanged(pool: PgPool) {
+    let app = common::admin_app(pool).await;
+    for schema in [
+        json!({"slug": "pages", "fields": [{"name": "title", "type": "text"}]}),
+        json!({"slug": "settings", "kind": "global", "fields": [
+            {"name": "home", "type": "relationship", "relationTo": "pages"}
+        ]}),
+    ] {
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+    }
+    let page = send(&app, "POST", "/api/pages", Some(r#"{"title": "Home"}"#)).await;
+    let home = page.json["id"].clone();
+    let body = json!({"home": home}).to_string();
+    let first = send(&app, "PATCH", "/api/globals/settings", Some(&body)).await;
+    assert_eq!(first.status, 200, "{}", first.json);
+    let read = send(&app, "GET", "/api/globals/settings", None).await.json;
+    assert_eq!(read["home"]["title"], "Home", "{read}");
+    let res = send(
+        &app,
+        "PATCH",
+        "/api/globals/settings",
+        Some(&read.to_string()),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let flat = send(&app, "GET", "/api/globals/settings?depth=0", None).await;
+    assert_eq!(flat.json["home"], home);
+}

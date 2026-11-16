@@ -17,7 +17,7 @@ use tachyon_db::documents::{self, Document};
 use tachyon_db::query::get_many_readable;
 
 use crate::access::Access;
-use crate::documents::{json_body, mode_for, record, shaped, unique_error};
+use crate::documents::{json_body, mode_for, read_back, record, shaped, unique_error};
 use crate::params::{Format, autosave_param, read_params};
 use crate::populate::{
     Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
@@ -126,10 +126,12 @@ pub async fn update(
     let by = who.map(|a| a.id);
     let mut patch = json_body(body)?;
     let stored = match documents::get(&state.pool, c.id, c.id, copy).await {
-        Ok(doc) => Some(doc.data.0),
+        Ok(doc) => Some(doc),
         Err(DbError::NotFound) => None,
         Err(e) => return Err(e.into()),
     };
+    read_back(&c, &mut patch, stored.as_ref())?;
+    let stored = stored.map(|doc| doc.data.0);
     from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
     let targets = link_targets(&state, &c).await?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked

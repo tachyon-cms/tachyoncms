@@ -628,3 +628,112 @@ async fn populate_without_fields_names_the_collection(pool: PgPool) {
         "populate[authors]: expected populate[authors][field]=true"
     );
 }
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_document_read_at_depth_saves_back_unchanged(pool: PgPool) {
+    let admin = app(pool.clone()).await;
+    // Editors read secrets; a viewer can't, so one is a link they hold only as an ID.
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "secrets", "access": {"read": {"role": "editor"}}, "fields": [
+            {"name": "title", "type": "text"}
+        ]}),
+    )
+    .await;
+    let mine = json!({"role": ["admin", "viewer"]});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "pages", "access": {"create": mine, "update": mine}, "fields": [
+            {"name": "title", "type": "text"},
+            {"name": "author", "type": "relationship", "relationTo": "authors"},
+            {"name": "links", "type": "relationship", "relationTo": ["authors", "secrets"], "hasMany": true},
+            {"name": "body", "type": "richText", "relationTo": ["authors"]}
+        ]}),
+    )
+    .await;
+    let ann = create(&admin, "/api/authors", json!({"name": "Ann"})).await;
+    let bo = create(&admin, "/api/authors", json!({"name": "Bo"})).await;
+    let secret = create(&admin, "/api/secrets", json!({"title": "S"})).await;
+    let other = create(&admin, "/api/secrets", json!({"title": "T"})).await;
+    let (ann, bo) = (ann["id"].as_str().unwrap(), bo["id"].as_str().unwrap());
+    let secret = secret["id"].as_str().unwrap();
+    let page = create(
+        &admin,
+        "/api/pages",
+        json!({
+            "title": "Hi",
+            "author": ann,
+            "links": [{"relationTo": "authors", "value": bo}, {"relationTo": "secrets", "value": secret}],
+            "body": {"type": "doc", "content": [
+                {"type": "paragraph", "content": [{"type": "text", "text": "by", "marks": [
+                    {"type": "link", "attrs": {"doc": {"relationTo": "authors", "value": ann}}}
+                ]}]},
+                {"type": "relationship", "attrs": {"relationTo": "authors", "value": bo}}
+            ]}
+        }),
+    )
+    .await;
+    let url = format!("/api/pages/{}", page["id"].as_str().unwrap());
+    let viewer = common::app_as(&pool, "viewer@example.com", "viewer").await;
+    let stored = send(&admin, "GET", &format!("{url}?depth=0"), None)
+        .await
+        .json;
+
+    // Read at the default depth, then sent straight back.
+    let read = send(&viewer, "GET", &url, None).await.json;
+    assert_eq!(read["author"]["name"], "Ann", "populated: {read}");
+    assert_eq!(read["links"][0]["value"]["name"], "Bo");
+    assert_eq!(
+        read["links"][1]["value"], secret,
+        "a hidden link stays an ID"
+    );
+    let content = &read["body"]["content"];
+    assert_eq!(
+        content[0]["content"][0]["marks"][0]["attrs"]["doc"]["value"]["name"],
+        "Ann"
+    );
+    assert_eq!(content[1]["attrs"]["value"]["name"], "Bo");
+    let res = send(&viewer, "PATCH", &url, Some(&read.to_string())).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    // Each link is stored as the bare ID it was.
+    let saved = send(&admin, "GET", &format!("{url}?depth=0"), None)
+        .await
+        .json;
+    for key in ["author", "links", "body"] {
+        assert_eq!(saved[key], stored[key], "{key}");
+    }
+
+    // A link to a document the viewer can't read is refused as one to no document, whether
+    // it's sent as an ID or as a document holding it.
+    let missing = "0199d5c4-0000-7000-8000-00000000dead";
+    let other = other["id"].as_str().unwrap();
+    let mut refusals = Vec::new();
+    for target in [
+        json!(other),
+        json!({"id": other, "title": "T"}),
+        json!(missing),
+        json!({"id": missing}),
+    ] {
+        let body = json!({"links": [{"relationTo": "secrets", "value": target}]});
+        let res = send(&viewer, "PATCH", &url, Some(&body.to_string())).await;
+        assert_problem(&res, 422);
+        refusals.push(res.json["errors"].clone());
+    }
+    assert!(refusals.windows(2).all(|w| w[0] == w[1]), "{refusals:?}");
+    assert_eq!(refusals[0][0]["path"], "links.0", "{refusals:?}");
+
+    // An object with no document ID is a 422 where it sits.
+    for (body, path) in [
+        (json!({"author": {"name": "Ann"}}), "author"),
+        (
+            json!({"links": [{"relationTo": "authors", "value": {"id": "nope"}}]}),
+            "links",
+        ),
+    ] {
+        let res = send(&viewer, "PATCH", &url, Some(&body.to_string())).await;
+        assert_problem(&res, 422);
+        assert_eq!(res.json["errors"][0]["path"], path, "{}", res.json);
+    }
+}
