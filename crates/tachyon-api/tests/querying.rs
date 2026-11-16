@@ -96,52 +96,56 @@ async fn system_timestamps_filter_at_full_precision(pool: PgPool) {
             .map(|d| d["id"].as_str().unwrap().to_owned())
             .collect()
     };
+    use time::format_description::well_known::Rfc3339;
+    let rfc = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap();
     for target in ["createdAt", "updatedAt"] {
         let at = doc[target].as_str().unwrap();
-        let fraction = at.rsplit('.').next().unwrap().trim_end_matches('Z');
-        let found = send(
-            &app,
-            "GET",
-            &format!("/api/items?where[{target}][equals]={at}"),
-            None,
-        )
-        .await;
-        assert_eq!(found.status, 200, "{}", found.json);
-        assert_eq!(
-            ids(&found.json),
-            [id],
-            "{target} equals a value from a read"
-        );
-        let newer = send(
-            &app,
-            "GET",
-            &format!("/api/items?where[{target}][gt]={at}"),
-            None,
-        )
-        .await;
-        assert_eq!(newer.status, 200, "{}", newer.json);
-        assert!(
-            !ids(&newer.json).iter().any(|d| d == id),
-            "{target} isn't newer than itself"
-        );
+        let t = time::OffsetDateTime::parse(at, &Rfc3339).unwrap();
         // Digits past the microsecond are accepted and dropped: Postgres can't hold them.
-        let nanos = format!(
-            "{}{}999Z",
-            at.trim_end_matches('Z'),
-            "0".repeat(6 - fraction.len())
-        );
-        let found = send(
-            &app,
-            "GET",
-            &format!("/api/items?where[{target}][equals]={nanos}"),
-            None,
-        )
-        .await;
-        assert_eq!(found.status, 200, "{}", found.json);
+        let nanos = rfc(t.replace_nanosecond(t.nanosecond() + 999).unwrap());
+        let west = rfc(t.to_offset(time::UtcOffset::from_hms(-7, 0, 0).unwrap()));
+        let east = rfc(t.to_offset(time::UtcOffset::from_hms(5, 30, 0).unwrap()));
+        // Whether each filter, given the same instant, finds the document.
+        for (op, value, finds) in [
+            ("equals", at.to_owned(), true),
+            ("not_equals", at.to_owned(), false),
+            ("gt", at.to_owned(), false),
+            ("gte", at.to_owned(), true),
+            ("lt", at.to_owned(), false),
+            ("lte", at.to_owned(), true),
+            ("in", format!("{at},2001-01-01T00:00:00Z"), true),
+            ("not_in", at.to_owned(), false),
+            ("equals", nanos, true),
+            ("equals", west, true),
+            ("equals", east.replace('+', "%2B"), true),
+        ] {
+            let res = send(
+                &app,
+                "GET",
+                &format!("/api/items?where[{target}][{op}]={value}"),
+                None,
+            )
+            .await;
+            assert_eq!(res.status, 200, "{target} {op} {value}: {}", res.json);
+            assert_eq!(
+                ids(&res.json).iter().any(|d| d == id),
+                finds,
+                "{target} {op} {value}: {}",
+                res.json
+            );
+        }
+    }
+    // A `+` left raw in a URL reads as a space; the 400 says how to send it.
+    for target in ["createdAt", "updatedAt"] {
+        let qs = format!("where[{target}][gt]=2026-10-12T09:30:00+02:00");
+        let res = send(&app, "GET", &format!("/api/items?{qs}"), None).await;
+        assert_problem(&res, 400);
         assert_eq!(
-            ids(&found.json),
-            [id],
-            "{target} drops nanoseconds: {nanos}"
+            res.json["detail"],
+            format!(
+                "where[{target}][gt]: expected a date-time like 2026-10-12T09:30:00Z; a `+` in a URL reads as a space, so write it as %2B"
+            ),
+            "{qs}"
         );
     }
     // A cursor on updatedAt carries the full value and pages without a gap or a repeat.

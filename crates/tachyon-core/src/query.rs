@@ -1001,6 +1001,18 @@ fn number(v: &Value) -> Option<serde_json::Number> {
     }
 }
 
+/// Why `v` isn't a date-time. A query string decodes a raw `+` to a space, so an offset
+/// like `+02:00` sent unencoded arrives broken; say so when a `+` there would parse.
+fn not_a_date_time(v: &Value) -> String {
+    const EXPECTED: &str = "expected a date-time like 2026-10-12T09:30:00Z";
+    match v.as_str() {
+        Some(s) if s.contains(' ') && normalize_date_time(&s.replace(' ', "+")).is_some() => {
+            format!("{EXPECTED}; a `+` in a URL reads as a space, so write it as %2B")
+        }
+        _ => EXPECTED.into(),
+    }
+}
+
 fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, String> {
     let kind = field.map(|f| &f.kind);
     match (target.kind(), kind) {
@@ -1023,12 +1035,12 @@ fn scalar(target: &Target, field: Option<&Field>, v: &Value) -> Result<Scalar, S
             .as_str()
             .and_then(normalize_timestamp)
             .map(Scalar::Text)
-            .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
+            .ok_or_else(|| not_a_date_time(v)),
         (ValueKind::Date, _) => v
             .as_str()
             .and_then(normalize_date_time)
             .map(Scalar::Text)
-            .ok_or_else(|| "expected a date-time like 2026-10-12T09:30:00Z".into()),
+            .ok_or_else(|| not_a_date_time(v)),
         // The `relationTo` part of a polymorphic link: the path is the field's own name
         // followed by `relationTo` (a field merely named `relationTo` doesn't count).
         (_, Some(f_kind))
@@ -1376,6 +1388,15 @@ mod tests {
             ),
             (
                 "where[at][gt]=soon",
+                "where[at][gt]: expected a date-time like 2026-10-12T09:30:00Z",
+            ),
+            // A raw `+` arrives as a space; the hint only when a `+` there would parse.
+            (
+                "where[at][gt]=2026-10-12T09:30:00+02:00",
+                "where[at][gt]: expected a date-time like 2026-10-12T09:30:00Z; a `+` in a URL reads as a space, so write it as %2B",
+            ),
+            (
+                "where[at][gt]=next+week",
                 "where[at][gt]: expected a date-time like 2026-10-12T09:30:00Z",
             ),
             (
