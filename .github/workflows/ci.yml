@@ -72,9 +72,10 @@ jobs:
       # Azurite's own well-known development key, not a secret.
       TACHYON_STORAGE__AZTEST__ACCESS_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
       TACHYON_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
-      # Under the runner's temp directory, out of the checkout and the cache.
-      TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH: ${{ runner.temp }}/service-account.json
     steps:
+      # Under the runner's temp directory, out of the checkout and the cache. Set here, as
+      # job-level `env` can't read the `runner` context.
+      - run: echo "TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/service-account.json" >> "$GITHUB_ENV"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
         with:
@@ -101,7 +102,7 @@ jobs:
       - name: Wait for them, and make a bucket in each
         run: |
           # `curl -f` for the two with a health answer; Azurite's root answers 400 when up.
-          up() { for _ in $(seq 1 60); do curl $1 -o /dev/null "$2" && return 0; sleep 1; done; docker ps -a; docker logs minio; return 1; }
+          up() { for _ in $(seq 1 60); do curl "$1" -o /dev/null "$2" && return 0; sleep 1; done; docker ps -a; docker logs minio; return 1; }
           up -fsS http://127.0.0.1:9000/minio/health/live
           up -sS http://127.0.0.1:10000/devstoreaccount1
           up -fsS http://127.0.0.1:4443/storage/v1/b

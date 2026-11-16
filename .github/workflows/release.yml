@@ -160,7 +160,7 @@ jobs:
             jq -e '[.packages[] | select(.name == "axum")] | length > 0' "$f.sbom.json" >/dev/null \
               || { echo "$f.sbom.json lists no Rust crates" >&2; exit 1; }
           done
-          sha256sum *.tar.gz *.sbom.json > checksums.txt
+          sha256sum -- *.tar.gz *.sbom.json > checksums.txt
           cat checksums.txt
       - name: Sign the checksums
         if: env.PUBLISH == 'true'
