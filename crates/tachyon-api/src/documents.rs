@@ -7,6 +7,8 @@ use axum::http::StatusCode;
 use serde_json::{Map, Value, json};
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use time::OffsetDateTime;
+use time::format_description::well_known::Rfc3339;
 
 use tachyon_core::auth::Action;
 use tachyon_core::query::value_kind;
@@ -463,49 +465,75 @@ pub async fn get(
     ))
 }
 
-/// The copy an update of document `id` of `c` writes, the guard it runs under and who it
-/// runs as, or the refusal it gets. The update rule and ownership are judged on the stored
-/// document before a byte of the body is read, so a refused caller never has a file spooled
-/// or stored; the lock judges again. Upload instructions for a replacement ask the same.
 /// What a read gives beside the fields, taken out of `sent`, so a read written back unchanged
-/// saves. `id` and `createdAt` must be those of `stored`, the document written, or they're
-/// a 422; `updatedAt`, `status` and `publishedAt` can change between a client's read and its
-/// write, so they're dropped unread. A field of `c` by one of those names is a field.
+/// saves. `id` must be `id`, the document's, and `createdAt` must be `created`, its creation
+/// time (`None` for a global never saved), compared as an ID and as a time to the millisecond,
+/// however they're written; anything else is a 422. `updatedAt`, `status` and `publishedAt`
+/// can change between a client's read and its write, so they're dropped, but only when they
+/// have the shape a read gives them: a 422 otherwise, so a PATCH that means to publish is told
+/// it doesn't. A field of `c` by one of those names is a field.
 pub(crate) fn read_back(
     c: &Collection,
     sent: &mut Value,
-    stored: Option<&Document>,
+    id: Uuid,
+    created: Option<OffsetDateTime>,
 ) -> Result<(), ApiError> {
     let Value::Object(fields) = sent else {
         return Ok(());
     };
     let built_in = |k: &&str| c.schema.data().iter().all(|f| f.name != *k);
-    let read = stored.map(to_value).transpose()?;
-    let errors: Vec<FieldError> = ["id", "createdAt"]
+    let time = |v: &Value| {
+        let t = OffsetDateTime::parse(v.as_str()?, &Rfc3339).ok()?;
+        t.replace_nanosecond(t.nanosecond() / 1_000_000 * 1_000_000)
+            .ok()
+    };
+    let ms = |t: OffsetDateTime| {
+        t.replace_nanosecond(t.nanosecond() / 1_000_000 * 1_000_000)
+            .ok()
+    };
+    let date = "expected a date and time, as a read gives it";
+    let check = |k: &str, v: &Value| -> Option<String> {
+        let ok = match k {
+            "id" => v.as_str().and_then(|s| Uuid::try_parse(s).ok()) == Some(id),
+            "createdAt" => time(v).is_some_and(|t| Some(t) == created.and_then(ms)),
+            "status" => matches!(v.as_str(), Some("draft" | "published")),
+            _ => v.is_null() || time(v).is_some(),
+        };
+        (!ok).then(|| match k {
+            "id" | "createdAt" => "set by the server".to_owned(),
+            "status" => format!(
+                "expected draft or published, as a read gives it; PATCH doesn't change it, \
+                 publish with POST /api/{}/{{id}}/publish",
+                c.schema.slug
+            ),
+            _ => date.to_owned(),
+        })
+    };
+    let keys = ["id", "createdAt", "updatedAt", "status", "publishedAt"];
+    let errors: Vec<FieldError> = keys
         .into_iter()
         .filter(built_in)
-        .filter(|k| {
-            fields
-                .get(*k)
-                .is_some_and(|v| Some(v) != read.as_ref().and_then(|r| r.get(*k)))
-        })
-        .map(|k| FieldError {
-            path: k.into(),
-            message: "set by the server".into(),
+        .filter_map(|k| {
+            let message = check(k, fields.get(k)?)?;
+            Some(FieldError {
+                path: k.into(),
+                message,
+            })
         })
         .collect();
     if !errors.is_empty() {
         return Err(ApiError::Validation(errors));
     }
-    for k in ["id", "createdAt", "updatedAt", "status", "publishedAt"]
-        .into_iter()
-        .filter(built_in)
-    {
+    for k in keys.into_iter().filter(built_in) {
         fields.remove(k);
     }
     Ok(())
 }
 
+/// The copy an update of document `id` of `c` writes, the guard it runs under and who it
+/// runs as, or the refusal it gets. The update rule and ownership are judged on the stored
+/// document before a byte of the body is read, so a refused caller never has a file spooled
+/// or stored; the lock judges again. Upload instructions for a replacement ask the same.
 pub(crate) async fn may_update(
     state: &AppState,
     access: &Access,
@@ -578,7 +606,7 @@ pub async fn update(
     // against the stored document, then again against the locked one. `write_guard` has
     // seen the caller may read this copy of it.
     let stored = documents::get(&state.pool, c.id, id, copy).await?;
-    read_back(&c, &mut sent, Some(&stored))?;
+    read_back(&c, &mut sent, id, Some(stored.created_at))?;
     let stored = stored.data.0;
     paused(id).await;
     // Server-set fields are only compared, here and again against the locked document, and

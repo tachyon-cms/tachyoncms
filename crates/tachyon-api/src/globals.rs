@@ -130,7 +130,9 @@ pub async fn update(
         Err(DbError::NotFound) => None,
         Err(e) => return Err(e.into()),
     };
-    read_back(&c, &mut patch, stored.as_ref())?;
+    // A global's ID is its collection's, saved or not: a hidden global and one never saved
+    // answer the same.
+    read_back(&c, &mut patch, c.id, stored.as_ref().map(|d| d.created_at))?;
     let stored = stored.map(|doc| doc.data.0);
     from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
     let targets = link_targets(&state, &c).await?;

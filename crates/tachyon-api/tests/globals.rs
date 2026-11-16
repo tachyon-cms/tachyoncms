@@ -139,3 +139,51 @@ async fn a_global_read_at_depth_saves_back_unchanged(pool: PgPool) {
     let flat = send(&app, "GET", "/api/globals/settings?depth=0", None).await;
     assert_eq!(flat.json["home"], home);
 }
+
+/// A caller who may change a global but not read it learns nothing from its `id`: a global
+/// that was saved and one that never was answer the same.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn a_global_id_says_nothing_about_whether_it_was_saved(pool: PgPool) {
+    let app = common::admin_app(pool.clone()).await;
+    let mut ids = Vec::new();
+    for slug in ["g1", "g2"] {
+        let schema = json!({"slug": slug, "kind": "global",
+            "access": {"read": {"shown": true}, "update": {"role": ["admin", "viewer"]}},
+            "fields": [{"name": "shown", "type": "checkbox"}, {"name": "t", "type": "text"}]});
+        let res = send(
+            &app,
+            "POST",
+            "/api/admin/collections",
+            Some(&schema.to_string()),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+        ids.push(res.json["id"].as_str().unwrap().to_owned());
+    }
+    let res = send(
+        &app,
+        "PATCH",
+        "/api/globals/g1",
+        Some(r#"{"shown": false}"#),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let viewer = common::app_as(&pool, "viewer@example.com", "viewer").await;
+    let mut answers = Vec::new();
+    for (slug, id) in ["g1", "g2"].into_iter().zip(&ids) {
+        let body = json!({ "id": id }).to_string();
+        let res = send(
+            &viewer,
+            "PATCH",
+            &format!("/api/globals/{slug}"),
+            Some(&body),
+        )
+        .await;
+        answers.push((
+            res.status,
+            res.json["detail"].clone(),
+            res.json["errors"].clone(),
+        ));
+    }
+    assert_eq!(answers[0], answers[1], "{answers:?}");
+}

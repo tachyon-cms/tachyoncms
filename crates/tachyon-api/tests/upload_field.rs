@@ -858,17 +858,62 @@ async fn files_and_their_links_read_at_depth_save_back_unchanged(pool: PgPool) {
     assert_eq!(flat["cover"], id);
     assert_eq!(flat["body"]["content"][0]["attrs"]["value"], id);
 
-    // What a read adds beside the fields must be the document's own.
+    // What a read adds beside the fields must be the document's own, however it's written:
+    // an ID in capitals, a time to the millisecond (as a browser writes one) or as +00:00.
+    let read = ok(&app, "GET", &format!("{page_url}?depth=0"), json!(null)).await;
+    let created = time::OffsetDateTime::parse(
+        read["createdAt"].as_str().unwrap(),
+        &time::format_description::well_known::Rfc3339,
+    )
+    .unwrap();
+    let ms = created
+        .replace_nanosecond(created.nanosecond() / 1_000_000 * 1_000_000)
+        .unwrap();
+    let iso = |t: time::OffsetDateTime| {
+        let f = time::macros::format_description!(
+            "[year]-[month]-[day]T[hour]:[minute]:[second].[subsecond digits:3]"
+        );
+        t.format(&f).unwrap()
+    };
     for (key, value) in [
-        ("id", json!("0199d5c4-0000-7000-8000-00000000dead")),
-        ("createdAt", json!("2020-01-01T00:00:00Z")),
+        ("id", json!(read["id"].as_str().unwrap().to_uppercase())),
+        ("createdAt", json!(format!("{}Z", iso(ms)))),
+        ("createdAt", json!(format!("{}+00:00", iso(ms)))),
+        ("updatedAt", json!(null)),
+        ("status", json!("draft")),
+        ("publishedAt", json!("2020-01-01T00:00:00Z")),
+    ] {
+        let body = json!({ key: value }).to_string();
+        let res = send(&app, "PATCH", &page_url, Some(&body)).await;
+        assert_eq!(res.status, 200, "{key}: {value}: {}", res.json);
+    }
+    let date = "expected a date and time, as a read gives it";
+    let publish = "expected draft or published, as a read gives it; PATCH doesn't change it, publish with POST /api/pages/{id}/publish";
+    for (key, value, message) in [
+        (
+            "id",
+            json!("0199d5c4-0000-7000-8000-00000000dead"),
+            "set by the server",
+        ),
+        ("id", json!(7), "set by the server"),
+        (
+            "createdAt",
+            json!("2020-01-01T00:00:00Z"),
+            "set by the server",
+        ),
+        ("createdAt", json!("yesterday"), "set by the server"),
+        ("updatedAt", json!("garbage"), date),
+        ("publishedAt", json!({"x": 1}), date),
+        ("status", json!(5), publish),
+        ("status", json!("live"), publish),
     ] {
         let body = json!({ key: value }).to_string();
         let res = send(&app, "PATCH", &page_url, Some(&body)).await;
         assert_problem(&res, 422);
         assert_eq!(
             res.json["errors"],
-            json!([{"path": key, "message": "set by the server"}])
+            json!([{"path": key, "message": message}]),
+            "{key}: {value}"
         );
     }
 }
