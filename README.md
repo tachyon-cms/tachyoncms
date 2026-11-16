@@ -434,7 +434,7 @@ Since every write to a collection with drafts lands on the draft, changing or de
 
 API keys have a third kind of scope. `posts:read` reads what's published and nothing else. `posts:write` adds drafts, versions, restoring and the trash, but it can't publish. That takes `posts:publish` (or `*:publish`, or `admin`), which can publish, unpublish and schedule, and nothing more: no reading, no writing. It checks what it publishes with its owner's rights, and its answers hold only the document's `id`. A deploy script that only ever presses the button is what it's for.
 
-`GET /api/access` answers `readDrafts` and `publish` for each collection and global with drafts, and `readVersions` for each with versions, as `true`, `false` or `"conditional"`, like every other answer there.
+`GET /api/access` answers `readDrafts` and `publish` for each collection and global with drafts, and `readVersions` for each with versions, as `true`, `false` or `"conditional"`, like every other answer there. Its `update` and `delete` follow the draft rule too. Where you can't read the drafts, they're `false`. Where a `readDrafts` rule lets only some through, or you may read only your own, they're `"conditional"`.
 
 #### Also changed since v0.2.0
 
