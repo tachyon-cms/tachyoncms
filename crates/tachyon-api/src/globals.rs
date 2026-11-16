@@ -21,7 +21,7 @@ use crate::documents::{json_body, mode_for, record, shaped, unique_error};
 use crate::params::{Format, autosave_param, read_params};
 use crate::populate::{
     Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
-    link_targets, populate, prepare, to_value, vouched_links,
+    link_targets, populate, prepare_kept, to_value, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -130,21 +130,18 @@ pub async fn update(
         Err(DbError::NotFound) => None,
         Err(e) => return Err(e.into()),
     };
-    from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
+    let unseen = from_markdown(&state, &access, &c, &mut patch, stored.as_ref()).await?;
     let targets = link_targets(&state, &c).await?;
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against what's stored (nothing, before the first save) each time it's applied.
     let nothing = Map::new();
     let apply = |current: Option<&Map<String, Value>>| {
-        access.writes(
-            &c,
-            &patch,
-            Action::UpdateGlobal,
-            Some(current.unwrap_or(&nothing)),
-        )?;
+        let current_or_nothing = current.unwrap_or(&nothing);
+        let seen = unseen.seen(&c, &patch, current_or_nothing);
+        access.writes(&c, &patch, Action::UpdateGlobal, Some(&seen))?;
         validate_document_in(mode_for(copy), c.schema.data(), &patch, current)
             .map_err(ApiError::Validation)
-            .and_then(|data| prepare(&targets, &c, data))
+            .and_then(|data| prepare_kept(&targets, &c, data, &unseen, current))
             .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &patch, current))))
     };
     let before = |current: Option<&Map<String, Value>>| {
@@ -152,13 +149,9 @@ pub async fn update(
     };
     // Links the patch adds are checked against the stored document (or none), then again
     // against the one the write locks.
-    let vouched = check_links(
-        &state,
-        &access,
-        &apply(stored.as_ref())?,
-        &before(stored.as_ref()),
-    )
-    .await?;
+    let (dry, own) = apply(stored.as_ref())?;
+    let own = own.as_ref().unwrap_or(&dry);
+    let vouched = check_links(&state, &access, own, &before(stored.as_ref())).await?;
     // Two first saves can race; the loser's insert hits the primary key and retries as an update.
     for _ in 0..2 {
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
@@ -171,8 +164,12 @@ pub async fn update(
             who,
             guard.as_ref(),
             |current| {
-                let next = apply(Some(current))?;
-                vouched_links(&next, &before(Some(current)), &vouched)?;
+                let (next, own) = apply(Some(current))?;
+                vouched_links(
+                    own.as_ref().unwrap_or(&next),
+                    &before(Some(current)),
+                    &vouched,
+                )?;
                 Ok(next)
             },
         )
@@ -199,8 +196,8 @@ pub async fn update(
             Err(e) => return Err(access.hide(&c, unique_error(&c, e), None)),
         }
         drop(tx);
-        let next = apply(None)?;
-        vouched_links(&next, &Held::new(), &vouched)?;
+        let (next, own) = apply(None)?;
+        vouched_links(own.as_ref().unwrap_or(&next), &Held::new(), &vouched)?;
         let mut tx = state.pool.begin().await.map_err(DbError::from)?;
         match documents::insert_in(&mut tx, c.id, c.schema_version, Some(c.id), copy, &next, by)
             .await

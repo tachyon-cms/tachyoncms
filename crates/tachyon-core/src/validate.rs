@@ -171,6 +171,68 @@ pub fn markdown_inputs(
     }
 }
 
+/// Where in `stored` the value at `path` of `sent` (`body`, `layout.0.copy`) was, if it was:
+/// the same place, except that a block row is the stored row with the same `id` and block
+/// type, wherever it sat. A row of a list keeps its index, as list rows have no ID.
+pub fn stored_path(
+    fields: &[Field],
+    path: &str,
+    sent: &Map<String, Value>,
+    stored: &Map<String, Value>,
+) -> Option<String> {
+    fn walk(
+        fields: &[Field],
+        keys: &[&str],
+        sent: &Map<String, Value>,
+        stored: &Map<String, Value>,
+        at: &str,
+    ) -> Option<String> {
+        let (name, rest) = keys.split_first()?;
+        let f = fields.iter().find(|f| f.name == *name)?;
+        let here = join(at, name);
+        let held = stored.get(*name)?;
+        let Some((key, rest)) = rest.split_first() else {
+            return Some(here);
+        };
+        match &f.kind {
+            FieldKind::Group { fields } => walk(
+                fields,
+                &keys[1..],
+                sent.get(*name)?.as_object()?,
+                held.as_object()?,
+                &here,
+            ),
+            kind @ (FieldKind::Array { .. } | FieldKind::Blocks { .. }) => {
+                let row = sent
+                    .get(*name)?
+                    .as_array()?
+                    .get(key.parse::<usize>().ok()?)?;
+                let row = row.as_object()?;
+                let rows = held.as_array()?;
+                let i = match kind {
+                    FieldKind::Blocks { .. } => rows.iter().position(|r| {
+                        r.get("id").is_some_and(Value::is_string)
+                            && r.get("id") == row.get("id")
+                            && r.get("blockType") == row.get("blockType")
+                    })?,
+                    _ => key.parse::<usize>().ok().filter(|i| *i < rows.len())?,
+                };
+                let held = rows[i].as_object()?;
+                walk(
+                    row_fields(kind, row),
+                    rest,
+                    row,
+                    held,
+                    &format!("{here}.{i}"),
+                )
+            }
+            _ => None,
+        }
+    }
+    let keys: Vec<&str> = path.split('.').collect();
+    walk(&data_fields(fields), &keys, sent, stored, "")
+}
+
 /// The document `validate_document` checks, before defaults: `existing` with `input`
 /// written over it. The row indices in its error paths count rows of this.
 pub fn merged(
@@ -1748,6 +1810,39 @@ mod tests {
         assert_eq!(doc["author"], a, "unmatched IDs stay as they are");
         assert_eq!(doc["related"][1]["name"], "Bee");
         assert_eq!(doc["links"][1]["author"]["name"], "Bee");
+    }
+
+    #[test]
+    fn a_sent_text_finds_the_stored_one_it_replaces() {
+        let text = json!({"name": "copy", "type": "richText"});
+        let f = fields(json!([
+            text,
+            {"name": "meta", "type": "group", "fields": [text]},
+            {"name": "rows", "type": "array", "fields": [text]},
+            {"name": "layout", "type": "blocks", "blocks": [
+                {"slug": "a", "fields": [text]}, {"slug": "b", "fields": [text]}
+            ]}
+        ]));
+        let doc = json!({"type": "doc", "content": []});
+        let stored = json!({"copy": doc, "meta": {"copy": doc}, "rows": [{"copy": doc}],
+            "layout": [{"id": "x", "blockType": "a", "copy": doc}, {"id": "y", "blockType": "a", "copy": doc}]});
+        let sent = json!({"copy": doc, "meta": {"copy": doc}, "rows": [{}, {"copy": doc}],
+            "layout": [{"id": "y", "blockType": "a", "copy": doc}, {"id": "x", "blockType": "b", "copy": doc},
+                {"blockType": "a", "copy": doc}]});
+        let (stored, sent) = (stored.as_object().unwrap(), sent.as_object().unwrap());
+        let at = |path: &str| stored_path(&f, path, sent, stored);
+        assert_eq!(at("copy").as_deref(), Some("copy"));
+        assert_eq!(at("meta.copy").as_deref(), Some("meta.copy"));
+        assert_eq!(
+            at("rows.0.copy").as_deref(),
+            Some("rows.0.copy"),
+            "a list row by index"
+        );
+        assert_eq!(at("rows.1.copy"), None, "no second row stored");
+        // A block row by its ID, wherever it moved; not if its type changed, or it's new.
+        assert_eq!(at("layout.0.copy").as_deref(), Some("layout.1.copy"));
+        assert_eq!(at("layout.1.copy"), None);
+        assert_eq!(at("layout.2.copy"), None);
     }
 
     #[test]

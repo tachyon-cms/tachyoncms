@@ -17,11 +17,13 @@ mod markdown_out;
 #[cfg(test)]
 mod scaling;
 mod text;
+mod unseen;
 
 pub use html::to_html;
 pub use markdown_in::{from_markdown, slug_refs_mut};
 pub use markdown_out::to_markdown;
 pub use text::to_text;
+pub use unseen::{Reads, restore_unseen, without_unseen};
 
 /// An upload node's file: `relationTo` and `value` from its attributes, as the context
 /// shows it, if it does.

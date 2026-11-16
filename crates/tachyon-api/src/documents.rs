@@ -32,7 +32,7 @@ use crate::params::{
 };
 use crate::populate::{
     Held, Sent, Shapes, check_links, fill_virtuals, filtered_links, from_markdown, link_ids,
-    link_targets, populate, prepare, to_value, vouched_links,
+    link_targets, populate, prepare, prepare_kept, to_value, vouched_links,
 };
 use crate::uploads::{
     UploadBody, edit_of, edited, file_limit, file_writes, focal_moved, focal_of, or_give_up,
@@ -551,8 +551,15 @@ pub async fn update(
     // validation to judge like any other value.
     let edit = edit_of(&c, edits, &mut patch, &stored, file.is_some())
         .map_err(|e| access.hide(&c, e, Some(&merged(c.schema.data(), &sent, Some(&stored)))))?;
-    from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
-    access.writes(&c, &patch, Action::Update, Some(&stored))?;
+    // What the caller can't read of the texts their Markdown replaces stays: field rules
+    // judge the rest, and it goes back in once the write validates.
+    let unseen = from_markdown(&state, &access, &c, &mut patch, Some(&stored)).await?;
+    access.writes(
+        &c,
+        &patch,
+        Action::Update,
+        Some(&unseen.seen(&c, &patch, &stored)),
+    )?;
     // Decoded only once the write is allowed. An edit makes its new file as a replacement
     // would arrive, and goes the same way from here.
     let checked = match (&c.schema.upload, file, &edit) {
@@ -572,29 +579,37 @@ pub async fn update(
         // they are, `null`s included.
         let apply = |current: &Map<String, Value>, fields: Option<&Map<String, Value>>| {
             settle(current)?;
-            access.writes(&c, &patch, Action::Update, Some(current))?;
+            access.writes(
+                &c,
+                &patch,
+                Action::Update,
+                Some(&unseen.seen(&c, &patch, current)),
+            )?;
             // A new file writes what it sets: the field rules judge what changes. The dry run
             // judges the name as sent, this run the one `reserve` numbered, which only it knows;
             // a refusal here gives up what was stored.
             let file = file_writes(fields, Some(current));
             access.writes(&c, &file, Action::Update, Some(current))?;
             let input = with_fields(&patch, fields);
-            let mut next =
+            // Put back after validation, so an error's path is the same whether or not the
+            // text held anything the caller can't read.
+            let (mut next, own) =
                 validate_document_in(mode_for(copy), c.schema.data(), &input, Some(current))
                     .map_err(ApiError::Validation)
-                    .and_then(|data| prepare(&targets, &c, data))
+                    .and_then(|data| prepare_kept(&targets, &c, data, &unseen, Some(current)))
                     .map_err(|e| {
                         let doc = merged(c.schema.data(), &input, Some(current));
                         access.hide(&c, e, Some(&doc))
                     })?;
             next.data.extend(fields.cloned().unwrap_or_default());
-            Ok::<_, ApiError>(next)
+            Ok::<_, ApiError>((next, own))
         };
         let would = checked.as_ref().map(|(u, f)| server_fields(u, f, &f.name));
         // Links the patch adds are checked against the stored document, then again against the
         // locked one, in case it changed in between.
-        let dry = apply(&stored, would.as_ref())?;
-        let vouched = check_links(&state, &access, &dry, &link_ids(&c, &stored)).await?;
+        let (dry, own) = apply(&stored, would.as_ref())?;
+        let own = own.as_ref().unwrap_or(&dry);
+        let vouched = check_links(&state, &access, own, &link_ids(&c, &stored)).await?;
         let saved = match &checked {
             Some((u, f)) => {
                 let (scope, focal) = (scope_of(u, &dry.data), focal_of(&dry.data));
@@ -619,8 +634,12 @@ pub async fn update(
                 guard.as_ref(),
                 |current| {
                     filed_before = current.get("folder").cloned();
-                    let mut next = apply(current, saved.as_ref().map(|s| &s.fields))?;
-                    vouched_links(&next, &link_ids(&c, current), &vouched)?;
+                    let (mut next, own) = apply(current, saved.as_ref().map(|s| &s.fields))?;
+                    vouched_links(
+                        own.as_ref().unwrap_or(&next),
+                        &link_ids(&c, current),
+                        &vouched,
+                    )?;
                     let from = checked.as_ref().and_then(|(_, f)| f.edits);
                     next.file = match (&saved, from) {
                         (Some(s), Some(from)) => {

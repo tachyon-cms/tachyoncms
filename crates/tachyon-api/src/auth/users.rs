@@ -22,8 +22,8 @@ use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
 use crate::params::{Format, format_param};
 use crate::populate::{
-    Sent, Shapes, check_links, filtered_links, from_markdown, link_ids, link_targets, populate,
-    prepare, vouched_links,
+    Sent, Shapes, Unseen, check_links, filtered_links, from_markdown, link_ids, link_targets,
+    populate, prepare, prepare_kept, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -208,7 +208,8 @@ pub(crate) async fn create(
     let data = match from_markdown(&state, &access, &users, &mut profile, None).await {
         Err(ApiError::Validation(more)) => Err(more),
         Err(e) => return Err(e),
-        Ok(()) => {
+        // A new account replaces nothing, so nothing is unseen.
+        Ok(_) => {
             refuse_fields(&users, &profile, Action::Create, &caller, None)?;
             validate_document(users.schema.data(), &profile, None)
         }
@@ -278,17 +279,18 @@ pub(crate) async fn update(
     let caller = caller_of(&principal);
     // Which fields the patch writes depends on the block rows it replaces, so it's checked
     // against the stored profile, then again against the locked one.
-    let stored = if profile.as_object().is_some_and(|p| !p.is_empty()) {
+    let (stored, unseen) = if profile.as_object().is_some_and(|p| !p.is_empty()) {
         let stored = documents::get(&state.pool, users.id, id, DocCopy::Published)
             .await?
             .data
             .0;
         let access = Access::new(&state, principal.clone(), Reach::From(&users)).await?;
-        from_markdown(&state, &access, &users, &mut profile, Some(&stored)).await?;
-        refuse_fields(&users, &profile, Action::Update, &caller, Some(&stored))?;
-        Some(stored)
+        let unseen = from_markdown(&state, &access, &users, &mut profile, Some(&stored)).await?;
+        let seen = unseen.seen(&users, &profile, &stored);
+        refuse_fields(&users, &profile, Action::Update, &caller, Some(&seen))?;
+        (Some(stored), unseen)
     } else {
-        None
+        (None, Unseen::default())
     };
     let current = auth::account(&state.pool, id)
         .await?
@@ -347,12 +349,13 @@ pub(crate) async fn update(
     // An account-only change (role, email, password) leaves the profile alone.
     let profile_write = if let Some(stored) = stored {
         let targets = link_targets(&state, &users).await?;
-        let (users, patch, caller) = (&users, &profile, &caller);
+        let (users, patch, caller, unseen) = (&users, &profile, &caller, &unseen);
         let apply = move |current: &Map<String, Value>| {
-            refuse_fields(users, patch, Action::Update, caller, Some(current))?;
+            let seen = unseen.seen(users, patch, current);
+            refuse_fields(users, patch, Action::Update, caller, Some(&seen))?;
             validate_document(users.schema.data(), patch, Some(current))
                 .map_err(ApiError::Validation)
-                .and_then(|data| prepare(&targets, users, data))
+                .and_then(|data| prepare_kept(&targets, users, data, unseen, Some(current)))
                 .map_err(|e| {
                     let doc = merged(users.schema.data(), patch, Some(current));
                     hide_errors(users, e, caller, Some(&doc))
@@ -361,8 +364,9 @@ pub(crate) async fn update(
         // Links the profile gains must point at documents the caller can read (all of
         // them, for an Admin editing someone else's).
         let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
-        let next = apply(&stored)?;
-        let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
+        let (next, own) = apply(&stored)?;
+        let own = own.as_ref().unwrap_or(&next);
+        let vouched = check_links(&state, &access, own, &link_ids(users, &stored)).await?;
         Some((apply, vouched, access))
     } else {
         None
@@ -390,8 +394,12 @@ pub(crate) async fn update(
             None,
             |current| {
                 filed_before = current.get("folder").cloned();
-                let next = apply(current)?;
-                vouched_links(&next, &link_ids(&users, current), vouched)?;
+                let (next, own) = apply(current)?;
+                vouched_links(
+                    own.as_ref().unwrap_or(&next),
+                    &link_ids(&users, current),
+                    vouched,
+                )?;
                 Ok(next)
             },
         )

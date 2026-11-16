@@ -579,20 +579,17 @@ fn normal(v: &Value) -> Value {
 /// A cell's blocks as one line of inline nodes, as Markdown writes a cell (R37, R39).
 fn cell_inline(content: &Value) -> Vec<Value> {
     let mut out = Vec::new();
-    for (i, block) in content.as_array().into_iter().flatten().enumerate() {
-        if i > 0 {
-            out.push(br());
-        }
-        match block["type"].as_str() {
-            Some("paragraph" | "heading") => out.extend(
-                block
-                    .get("content")
-                    .and_then(Value::as_array)
-                    .into_iter()
-                    .flatten()
-                    .cloned(),
-            ),
-            _ => {
+    let mut first = true;
+    for block in content.as_array().into_iter().flatten() {
+        let line: Vec<Value> = match block["type"].as_str() {
+            Some("paragraph" | "heading") => block
+                .get("content")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .cloned()
+                .collect(),
+            t => {
                 let none = |_: &str, _: &Value| None;
                 let ctx = RenderCtx {
                     link_url: &none,
@@ -601,9 +598,18 @@ fn cell_inline(content: &Value) -> Vec<Value> {
                     upload: &file,
                 };
                 let text = to_text(&json!({"type": "doc", "content": [block]}), &ctx);
-                out.push(json!({"type": "text", "text": text}))
+                // A node that says nothing takes no line (#325).
+                if text.is_empty() && matches!(t, Some("relationship" | "upload")) {
+                    continue;
+                }
+                vec![json!({"type": "text", "text": text})]
             }
+        };
+        if !first {
+            out.push(br());
         }
+        first = false;
+        out.extend(line);
     }
     out.retain(|n| n["type"] != "text" || n["text"] != "");
     out

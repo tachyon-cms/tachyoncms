@@ -902,6 +902,28 @@ async fn doc_links_resolve_through_access(pool: PgPool) {
     )
     .await;
     assert_problem(&res, 403);
+
+    // A profile's Markdown write keeps what its writer can't read, as a document's does.
+    let draft = id(&create(&admin, "/api/posts", json!({"title": "D", "slug": "d"})).await);
+    let me = format!("/api/users/{}", id(&user));
+    let rel = json!({"type": "relationship", "attrs": {"relationTo": "posts", "value": draft}});
+    let bio = json!({"type": "doc", "content": [
+        {"type": "paragraph", "content": [{"type": "text", "text": "Hi"}]}, rel
+    ]});
+    let res = patch(&admin, &me, json!({ "bio": bio })).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let read = get(&ed, &format!("{me}?format=markdown")).await;
+    assert_eq!(read.json["bio"], "Hi", "{}", read.json);
+    let res = patch(
+        &ed,
+        &me,
+        json!({"bio": {"format": "markdown", "value": "Hello"}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let saved = get(&admin, &me).await.json;
+    assert_eq!(saved["bio"]["content"][1], rel, "{saved}");
+    assert_eq!(saved["bio"]["content"][0]["content"][0]["text"], "Hello");
 }
 
 /// A link's target ID, whether the response populated it or not.
@@ -1476,4 +1498,209 @@ async fn upload_nodes_follow_draft_links(pool: PgPool) {
         }
     }
     create(&viewer, "/api/notes", nodes(&[&live])).await;
+}
+
+/// A field holding what a viewer can't read, and its twin without it, as `admin` stores them:
+/// the viewer's Markdown read of each is the same, and so is everything a Markdown write by
+/// them answers. What they couldn't see stays in the first (#325).
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn markdown_writes_keep_what_the_writer_cant_read(pool: PgPool) {
+    let d = file_dirs();
+    let admin = with_files(&pool, &d, None).await;
+    let editors = json!({"role": "editor"});
+    let open =
+        json!({"create": {"role": ["editor", "viewer"]}, "update": {"role": ["editor", "viewer"]}});
+    for schema in [
+        // A viewer reads published posts only, and none of the private files; editors read all.
+        json!({"slug": "posts", "access": {"read": {"or": [{"role": "editor"}, {"stage": "published"}]}}, "fields": [
+            {"name": "title", "type": "text"}, {"name": "slug", "type": "slug"},
+            {"name": "stage", "type": "text"}
+        ]}),
+        json!({"slug": "private", "upload": true, "access": {"read": editors}, "fields": []}),
+        json!({"slug": "vault", "upload": true, "access": {"read": editors}, "fields": []}),
+        json!({"slug": "pages", "access": open, "fields": [
+            {"name": "body", "type": "richText", "relationTo": ["posts", "private", "vault"],
+             "upload": {"collections": {"vault": {}, "private": {"fields": [
+                 {"name": "note", "type": "text", "access": {"update": editors}}
+             ]}}},
+             "blocks": [{"slug": "notice", "fields": [{"name": "label", "type": "text", "required": true}]}]}
+        ]}),
+        json!({"slug": "site", "kind": "global", "access": {"update": {"role": ["editor", "viewer"]}},
+            "fields": [{"name": "footer", "type": "richText", "relationTo": ["posts"]}]}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    let live = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Live", "slug": "live", "stage": "published"}),
+    )
+    .await);
+    let draft = id(&create(
+        &admin,
+        "/api/posts",
+        json!({"title": "Draft", "slug": "draft"}),
+    )
+    .await);
+    let res = upload(
+        &admin,
+        "POST",
+        "/api/private",
+        Some(&png(4, 4)),
+        "p.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let file = id(&res.json);
+    let res = upload(
+        &admin,
+        "POST",
+        "/api/vault",
+        Some(&png(4, 4)),
+        "q.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let other = id(&res.json);
+
+    let p = |content: Value| json!({"type": "paragraph", "content": content});
+    let t = |s: &str| json!({"type": "text", "text": s});
+    let to = |s: &str, post: &str| {
+        json!({"type": "text", "text": s, "marks": [
+            {"type": "link", "attrs": {"doc": {"relationTo": "posts", "value": post}}}
+        ]})
+    };
+    let rel = |post: &str| json!({"type": "relationship", "attrs": {"relationTo": "posts", "value": post}});
+    let hidden_file = json!({"type": "upload", "attrs": {"relationTo": "private", "value": file, "fields": {"note": "N"}}});
+    // With: a link and a node to the draft and a private file, beside a link to what's live.
+    let with = text(json!([
+        p(json!([
+            t("Read "),
+            to("this", &live),
+            t(" and "),
+            to("that", &draft),
+            t(".")
+        ])),
+        rel(&draft),
+        p(json!([t("Teh end.")])),
+        hidden_file
+    ]));
+    let without = text(json!([
+        p(json!([t("Read "), to("this", &live), t(" and that.")])),
+        p(json!([t("Teh end.")]))
+    ]));
+    let a = format!(
+        "/api/pages/{}",
+        id(&create(&admin, "/api/pages", json!({"body": with})).await)
+    );
+    let b = format!(
+        "/api/pages/{}",
+        id(&create(&admin, "/api/pages", json!({"body": without})).await)
+    );
+    let viewer = with_files(&pool, &d, Some(("viewer@example.com", "viewer"))).await;
+
+    let markdown = |url: String| {
+        let viewer = viewer.clone();
+        async move {
+            let res = get(&viewer, &format!("{url}?format=markdown")).await;
+            assert_eq!(res.status, 200, "{}", res.json);
+            res.json["body"].as_str().unwrap().to_owned()
+        }
+    };
+    let seen = markdown(a.clone()).await;
+    assert_eq!(seen, markdown(b.clone()).await);
+    assert_eq!(seen, "Read [this](doc:posts/live) and that.\n\nTeh end.");
+
+    // Every Markdown write answers the same for both: a 422 at the same node, a field
+    // rule's 403, a slug it can't find, and a save.
+    let md = |s: &str| json!({"body": {"format": "markdown", "value": s}});
+    let answer = |res: Res| {
+        let mut json = res.json;
+        if let Some(o) = json.as_object_mut() {
+            o.remove("requestId");
+        }
+        (res.status, json)
+    };
+    for (body, status) in [
+        (md("Read.\n\n::notice"), 422),
+        // Named by ID, a file the viewer can't read is refused at the node, after the
+        // validated text: the same node either way.
+        (
+            md(&format!("Read.\n\nMore.\n\n![x](media:vault/{other})")),
+            422,
+        ),
+        (md("[x](doc:posts/draft)"), 422),
+        (
+            json!({"body": {"format": "markdown", "value": "x", "extra": 1}}),
+            422,
+        ),
+        (md("Read [this](doc:posts/live) and that.\n\nThe end."), 200),
+    ] {
+        let (ra, rb) = (
+            patch(&viewer, &a, body.clone()).await,
+            patch(&viewer, &b, body.clone()).await,
+        );
+        assert_eq!(ra.status, status, "{body}: {}", ra.json);
+        if status == 200 {
+            assert_eq!(markdown(a.clone()).await, markdown(b.clone()).await);
+        } else {
+            assert_eq!(answer(ra), answer(rb), "{body}");
+        }
+    }
+    // The typo is fixed in both; what the viewer couldn't see is still in the first.
+    let stored = |url: String| {
+        let admin = admin.clone();
+        async move { get(&admin, &format!("{url}?depth=0")).await.json["body"].clone() }
+    };
+    assert_eq!(
+        stored(a.clone()).await,
+        text(json!([
+            p(json!([
+                t("Read "),
+                to("this", &live),
+                t(" and "),
+                to("that", &draft),
+                t(".")
+            ])),
+            rel(&draft),
+            p(json!([t("The end.")])),
+            json!({"type": "upload", "attrs": {"relationTo": "private", "value": file, "fields": {"note": "N"}}})
+        ]))
+    );
+    assert_eq!(
+        stored(b.clone()).await,
+        text(json!([
+            p(json!([t("Read "), to("this", &live), t(" and that.")])),
+            p(json!([t("The end.")]))
+        ]))
+    );
+    assert_eq!(markdown(a.clone()).await, markdown(b.clone()).await);
+
+    // A global's text keeps them too.
+    let footer = text(json!([p(json!([t("Hi")])), rel(&draft)]));
+    let res = patch(&admin, "/api/globals/site", json!({ "footer": footer })).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let res = patch(
+        &viewer,
+        "/api/globals/site",
+        json!({"footer": {"format": "markdown", "value": "Hello"}}),
+    )
+    .await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let site = get(&admin, "/api/globals/site?depth=0").await.json;
+    assert_eq!(
+        site["footer"],
+        text(json!([p(json!([t("Hello")])), rel(&draft)]))
+    );
+
+    // Someone who reads everything gets what they sent, as before.
+    let editor = with_files(&pool, &d, Some(("editor@example.com", "editor"))).await;
+    let res = patch(&editor, &a, md("Only this.")).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        stored(a.clone()).await,
+        text(json!([p(json!([t("Only this.")]))]))
+    );
 }

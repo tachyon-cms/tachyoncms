@@ -33,6 +33,11 @@ pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
 }
 
+/// One block node as Markdown, `""` when it isn't written.
+pub(super) fn block_markdown(node: &Value, k: &FieldKind, ctx: &RenderCtx) -> String {
+    block(node, Some(k), ctx, false)
+}
+
 /// Block nodes apart by a blank line, empty ones left out.
 fn blocks(nodes: &[Value], k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
     let mut parts: Vec<String> = Vec::new();
@@ -494,17 +499,26 @@ fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
 /// one line of Markdown (W1-R37).
 fn cell_inline(cell: &Value, ctx: &RenderCtx) -> Vec<Value> {
     let mut out = Vec::new();
-    for (i, block) in children(cell).iter().enumerate() {
-        if i > 0 {
+    let mut first = true;
+    for block in children(cell) {
+        let line = match kind(block) {
+            "paragraph" | "heading" => children(block).to_vec(),
+            k => {
+                let doc = serde_json::json!({"type": "doc", "content": [block]});
+                let text = super::to_text(&doc, ctx);
+                // A node the reader can't read says nothing, and takes no line either: a
+                // cell with one reads as a cell without it (#325).
+                if text.is_empty() && matches!(k, "relationship" | "upload") {
+                    continue;
+                }
+                vec![serde_json::json!({"type": "text", "text": text})]
+            }
+        };
+        if !first {
             out.push(serde_json::json!({"type": "hardBreak"}));
         }
-        match kind(block) {
-            "paragraph" | "heading" => out.extend(children(block).iter().cloned()),
-            _ => {
-                let doc = serde_json::json!({"type": "doc", "content": [block]});
-                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc, ctx)}));
-            }
-        }
+        first = false;
+        out.extend(line);
     }
     out
 }

@@ -1,5 +1,6 @@
 //! Replaces relationship IDs with the documents they point at, one query per depth level.
 
+use std::borrow::Cow;
 use std::collections::{HashMap, HashSet};
 use std::future::Future;
 use std::pin::Pin;
@@ -8,9 +9,9 @@ use std::sync::Arc;
 use serde_json::{Map, Value};
 use sqlx::PgConnection;
 use tachyon_core::query::parse_filter_with;
-use tachyon_core::richtext::{self, RenderCtx};
+use tachyon_core::richtext::{self, Reads, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
-use tachyon_core::validate::markdown_inputs;
+use tachyon_core::validate::{markdown_inputs, stored_path};
 use tachyon_core::virtuals::{self, VirtualField};
 use tachyon_core::{
     CollectionKind, FieldError, FieldKind, map_relations, merged, relations, rich_texts_mut,
@@ -118,13 +119,15 @@ const MAX_SLUGS: usize = 1000;
 /// fields they guard. Each document the Markdown names by slug (`doc:posts/intro`, `::ref`)
 /// is found among those the caller may read and linked by ID; one they can't read is
 /// refused exactly as one that isn't there. `existing` is the stored document, if any.
+/// Returns what the caller can't read of the stored texts the Markdown replaces, for the
+/// write to keep: always one query when it replaces any, whatever they hold.
 pub(crate) async fn from_markdown(
     state: &AppState,
     access: &Access,
     c: &Collection,
     input: &mut Value,
     existing: Option<&Map<String, Value>>,
-) -> Result<(), ApiError> {
+) -> Result<Unseen, ApiError> {
     let fields = c.schema.data();
     let hide = |e: Vec<FieldError>, input: &Value| {
         let doc = merged(fields, input, existing);
@@ -199,10 +202,31 @@ pub(crate) async fn from_markdown(
             });
         }
     }
-    match errors.is_empty() {
-        true => Ok(()),
-        false => Err(hide(errors, input)),
+    if !errors.is_empty() {
+        return Err(hide(errors, input));
     }
+    let (Some(stored), Value::Object(sent)) = (existing, &*input) else {
+        return Ok(Unseen::default());
+    };
+    if paths.is_empty() {
+        return Ok(Unseen::default());
+    }
+    let within: Vec<String> = paths
+        .iter()
+        .filter_map(|(path, _)| stored_path(fields, path, sent, stored))
+        .map(|at| format!("{at}."))
+        .collect();
+    let mut ids: Vec<Uuid> = relations(fields, stored)
+        .into_iter()
+        .filter(|r| within.iter().any(|w| r.path.starts_with(w)))
+        .map(|r| r.id)
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    Ok(Unseen {
+        texts: paths,
+        targets: targets(state, access, &ids).await?,
+    })
 }
 
 /// `s` cut to 100 characters and `…`, so an error never echoes a whole long input (W1-R44).
@@ -617,29 +641,53 @@ async fn render(
     }
     ids.sort_unstable();
     ids.dedup();
-    let (mut found, mut found_ids) = (Vec::new(), Vec::new());
-    if !ids.is_empty() {
-        for (collection_id, doc) in readable_docs(state, access, &ids).await? {
-            let Some(c) = state.schemas.get_by_id(collection_id) else {
-                continue;
-            };
-            let mut value = to_value(&doc)?;
-            access.strip(&c, &mut value);
-            found.push((value, c));
-            found_ids.push(doc.id);
+    let targets = match ids.is_empty() {
+        true => Targets::new(),
+        false => targets(state, access, &ids).await?,
+    };
+    with_ctx(&targets, |ctx, _| {
+        for (v, c, _) in items.iter_mut() {
+            if let Some(doc) = v.as_object_mut() {
+                rich_texts_mut(c.schema.data(), doc, &mut |_, kind, text| {
+                    *text = Value::String(to_string(text, kind, ctx))
+                });
+            }
         }
+    });
+    Ok(())
+}
+
+/// What rich text links to, as the caller reads it: each document they read, by ID, with
+/// its collection, its hidden fields gone and its file's URLs filled.
+type Targets = HashMap<Uuid, (Arc<Collection>, Map<String, Value>)>;
+
+/// The `Targets` among `ids`, in one query, whatever `ids` holds.
+async fn targets(state: &AppState, access: &Access, ids: &[Uuid]) -> Result<Targets, ApiError> {
+    let (mut found, mut found_ids) = (Vec::new(), Vec::new());
+    for (collection_id, doc) in readable_docs(state, access, ids).await? {
+        let Some(c) = state.schemas.get_by_id(collection_id) else {
+            continue;
+        };
+        let mut value = to_value(&doc)?;
+        access.strip(&c, &mut value);
+        found.push((value, c));
+        found_ids.push(doc.id);
     }
     // An upload node shows its file's URLs, worked out as any read's are.
     crate::files::fill_urls(state, access, &mut found).await?;
-    let targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = found_ids
+    Ok(found_ids
         .into_iter()
         .zip(found)
         .filter_map(|(id, (value, c))| match value {
             Value::Object(fields) => Some((id, (c, fields))),
             _ => None,
         })
-        .collect();
-    // A link's target, if the caller read it and it's in the collection the link names.
+        .collect())
+}
+
+/// Calls `f` with how rich text shows what it links to, from `targets`, and whether the
+/// caller reads a link's target: a document they read, in the collection the link names.
+fn with_ctx<R>(targets: &Targets, f: impl FnOnce(&RenderCtx, Reads) -> R) -> R {
     let target = |to: &str, value: &Value| {
         let (c, doc) = targets.get(&Uuid::try_parse(value.as_str()?).ok()?)?;
         (c.schema.slug == to).then_some((c, doc))
@@ -652,20 +700,124 @@ async fn render(
             .filter(|(c, _)| c.schema.upload.is_some())
             .and_then(|(_, d)| richtext::upload_view(d))
     };
+    let reads = |to: &str, v: &Value| target(to, v).is_some();
     let ctx = RenderCtx {
         link_url: &link_url,
         title: &title,
         slug: &slug,
         upload: &upload,
     };
-    for (v, c, _) in items.iter_mut() {
-        if let Some(doc) = v.as_object_mut() {
-            rich_texts_mut(c.schema.data(), doc, &mut |_, kind, text| {
-                *text = Value::String(to_string(text, kind, &ctx))
-            });
+    f(&ctx, &reads)
+}
+
+/// What a Markdown write's caller can't read of the rich text it replaces. Their Markdown
+/// read left it out, so they never saw it, and it goes back in (`richtext::restore_unseen`)
+/// rather than being deleted by someone who couldn't see it (#325). A write that sends no
+/// Markdown, or replaces nothing stored, has none.
+#[derive(Default)]
+pub(crate) struct Unseen {
+    /// Where each text sent as Markdown is (`body`, `layout.0.copy`), with its field's kind.
+    texts: Vec<(String, FieldKind)>,
+    /// What the stored texts link to that the caller reads, as their Markdown read showed it.
+    targets: Targets,
+}
+
+impl Unseen {
+    /// `stored`, without what the caller can't read in the texts this write replaces, for
+    /// field rules to judge: what goes back in isn't written by them. `sent` is the write.
+    pub(crate) fn seen<'s>(
+        &self,
+        c: &Collection,
+        sent: &Value,
+        stored: &'s Map<String, Value>,
+    ) -> Cow<'s, Map<String, Value>> {
+        let Value::Object(sent) = sent else {
+            return Cow::Borrowed(stored);
+        };
+        if self.texts.is_empty() {
+            return Cow::Borrowed(stored);
         }
+        let mut out = stored.clone();
+        with_ctx(&self.targets, |_, reads| {
+            for (path, _) in &self.texts {
+                if let Some(text) = stored_path(c.schema.data(), path, sent, stored)
+                    .and_then(|at| value_at_mut(&mut out, &at))
+                {
+                    richtext::without_unseen(text, reads);
+                }
+            }
+        });
+        Cow::Owned(out)
     }
-    Ok(())
+
+    /// Puts back into `data`, the document a write validated, what the caller couldn't read of
+    /// the texts `stored` held where it sent Markdown.
+    fn restore(
+        &self,
+        c: &Collection,
+        stored: Option<&Map<String, Value>>,
+        data: &mut Map<String, Value>,
+    ) {
+        let Some(stored) = stored else {
+            return;
+        };
+        with_ctx(&self.targets, |ctx, reads| {
+            for (path, kind) in &self.texts {
+                let Some(old) = stored_path(c.schema.data(), path, data, stored)
+                    .and_then(|at| value_at(stored, &at))
+                else {
+                    continue;
+                };
+                if let Some(new) = value_at_mut(data, path) {
+                    richtext::restore_unseen(old, new, kind, ctx, reads);
+                }
+            }
+        });
+    }
+}
+
+/// `prepare` for a write that may have sent Markdown: the document to store, with what
+/// `unseen` kept put back into `data` (validated, over `current`), and, when it sent any, the
+/// write's own links without it. Links are checked (`check_links`, `vouched_links`) as the
+/// second, so a refused one is named at the same path whatever the stored text held.
+pub(crate) fn prepare_kept(
+    targets: &HashMap<String, Uuid>,
+    c: &Collection,
+    mut data: Map<String, Value>,
+    unseen: &Unseen,
+    current: Option<&Map<String, Value>>,
+) -> Result<(Prepared, Option<Prepared>), ApiError> {
+    if unseen.texts.is_empty() {
+        return Ok((prepare(targets, c, data)?, None));
+    }
+    let own = prepare(targets, c, data.clone())?;
+    unseen.restore(c, current, &mut data);
+    Ok((prepare(targets, c, data)?, Some(own)))
+}
+
+/// The value at `path` (`body`, `layout.0.copy`) in `doc`.
+fn value_at<'v>(doc: &'v Map<String, Value>, path: &str) -> Option<&'v Value> {
+    let mut keys = path.split('.');
+    let mut v = doc.get(keys.next()?)?;
+    for k in keys {
+        v = match (v, k.parse::<usize>()) {
+            (Value::Array(rows), Ok(i)) => rows.get(i)?,
+            _ => v.get(k)?,
+        };
+    }
+    Some(v)
+}
+
+fn value_at_mut<'v>(doc: &'v mut Map<String, Value>, path: &str) -> Option<&'v mut Value> {
+    let mut keys = path.split('.');
+    let mut v = doc.get_mut(keys.next()?)?;
+    for k in keys {
+        v = match (v, k.parse::<usize>()) {
+            (Value::Array(rows), Ok(i)) => rows.get_mut(i)?,
+            (v, _) => v.get_mut(k)?,
+        };
+    }
+    Some(v)
 }
 
 /// Each document carries its own remaining depth, because a field's `maxDepth` can cut it
