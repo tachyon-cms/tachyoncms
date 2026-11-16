@@ -19,7 +19,7 @@ use tachyon_core::access::{
 };
 use tachyon_core::auth::{Action, Decision, Scope, decide, decide_anonymous, scopes_allow};
 use tachyon_core::query::{DocCopy, Filter, Readable, Target};
-use tachyon_core::{CollectionKind, CollectionSchema, Field};
+use tachyon_core::{CollectionKind, CollectionSchema, FOLDERS, Field};
 use tachyon_db::DbError;
 use tachyon_db::auth::USERS;
 use tachyon_db::collections::Collection;
@@ -343,6 +343,35 @@ impl Access {
         &self.schemas
     }
 
+    /// How a signed-out caller would read, to decide what may be cached or linked publicly.
+    pub(crate) fn anonymous(&self) -> Access {
+        Access {
+            principal: Principal::Anonymous,
+            user: None,
+            schemas: self.schemas.clone(),
+            drafts: OnceLock::new(),
+            linked: OnceLock::new(),
+            visible: Mutex::new(HashMap::new()),
+        }
+    }
+
+    /// Whether the caller may read every document of `c`: its read is an unconditional
+    /// `Allow`, not a filter.
+    pub(crate) fn reads_every_document(&self, c: &Collection) -> bool {
+        matches!(self.allows(Action::Read, c), Compiled::Allow)
+    }
+
+    /// Whether the caller may change any account, as the users routes decide.
+    pub(crate) fn manages_users(&self) -> bool {
+        manages_users(&self.principal)
+    }
+
+    /// Whether the caller may do `action` to some document of `c`, if only where a filter
+    /// matches.
+    pub(crate) fn permits_any(&self, action: Action, c: &Collection) -> bool {
+        !matches!(self.allows(action, c), Compiled::Deny)
+    }
+
     pub(crate) fn caller(&self) -> Caller<'_> {
         Caller {
             user: self.user.as_ref(),
@@ -361,7 +390,7 @@ impl Access {
                 Shape {
                     named: match readable_fields(fields, &caller) {
                         Cow::Borrowed(_) => None,
-                        Cow::Owned(fields) => Some(Arc::new(c.schema.with_fields(fields))),
+                        Cow::Owned(fields) => Some(Arc::new(c.schema.with_data(fields))),
                     },
                     rows: match readable_rows(fields, &caller) {
                         Cow::Borrowed(_) => None,
@@ -499,13 +528,66 @@ impl Access {
                 _ => Compiled::Deny,
             };
         }
-        match self.rule(action, c) {
+        let own = match self.rule(action, c) {
             Some(rule) => {
                 let lookup = |s: &str| self.schemas.lookup(s);
                 compile(rule, &self.caller(), c.schema.data(), &lookup)
             }
             None if self.by_role_in(action, slug, scoped) == Decision::Deny => Compiled::Deny,
             None => Compiled::Allow,
+        };
+        match (slug == FOLDERS && action == Action::Read, own) {
+            (true, Compiled::Allow) => self.folder_reads(c, scoped),
+            (true, Compiled::Filter(f)) => match self.folder_reads(c, scoped) {
+                Compiled::Allow => Compiled::Filter(f),
+                Compiled::Deny => Compiled::Deny,
+                Compiled::Filter(g) => Compiled::Filter(Filter::All(vec![f, g])),
+            },
+            (_, own) => own,
+        }
+    }
+
+    /// The folders of `folders` the caller may read besides its own read rule: those for
+    /// a collection they can read, and those for no collection in particular. Every read
+    /// of a folder, linked or asked for, goes through it, so a hidden one is missing.
+    fn folder_reads(&self, folders: &Collection, scoped: bool) -> Compiled {
+        // Every collection a folder may list, folders on or not, so turning a collection's
+        // folders off never opens the folders made for it.
+        let all = self.schemas.all();
+        let listable = tachyon_db::folders::listable(all.iter().map(|c| &c.schema.0));
+        let readable: Vec<&str> = all
+            .iter()
+            .filter(|c| listable.contains(&c.schema.slug))
+            .filter(|c| self.allows_in(Action::Read, c, scoped) != Compiled::Deny)
+            .map(|c| c.schema.slug.as_str())
+            .collect();
+        if readable.len() == listable.len() {
+            return Compiled::Allow;
+        }
+        // Stored lists name listable collections, never an empty one.
+        let mut any: Vec<Value> = readable
+            .iter()
+            .map(|s| json!({"collections": {"contains": s}}))
+            .collect();
+        any.push(json!({"collections": {"exists": false}}));
+        let Value::Object(group) = json!({"or": any}) else {
+            unreachable!("an object")
+        };
+        let lookup = |s: &str| self.schemas.lookup(s);
+        compile(
+            &Rule::Where(group),
+            &self.caller(),
+            folders.schema.data(),
+            &lookup,
+        )
+    }
+
+    /// A refusal that mustn't say why: sign in first when signed out (Ruling F-6), else a
+    /// 404, as for what isn't there.
+    pub(crate) fn hidden(&self) -> ApiError {
+        match self.principal {
+            Principal::Anonymous => self.refuse(),
+            _ => ApiError::NotFound,
         }
     }
 
@@ -862,20 +944,7 @@ impl Access {
         c: &Collection,
         id: Uuid,
     ) -> Result<Option<Filter>, ApiError> {
-        self.may_write(action, c)?;
-        let (read, write) = match self.write_rules(action, c) {
-            Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
-            // Refused for the whole collection, so a 403 before the readability check is
-            // intended: it says nothing about this document.
-            Err(WriteRefusal::Refused) => return Err(self.refuse()),
-            Ok(filters) => filters,
-        };
-        let read = match self.draft_readable(c, read.clone()) {
-            Some(r) => r,
-            // Refused for the whole collection, as above.
-            None if c.schema.drafts() => return Err(self.refuse()),
-            None => Readable::published(read),
-        };
+        let (read, write) = self.guard_rules(action, c)?;
         // Checked first so a hidden document is a 404; the guard checks it again under the
         // lock, so a change in between can only turn this into a 403. The owner never
         // changes, so it needn't be. A draft the caller can't read, of a document whose
@@ -890,6 +959,31 @@ impl Access {
             }
         }
         Ok(both(read.filter, write))
+    }
+
+    /// What `write_guard` judges, worked out without looking at any document: how the
+    /// caller reads the copy the write changes, and the action's own filter. A caller with
+    /// a transaction open uses this, and lets the locked row be judged by both.
+    pub(crate) fn guard_rules(
+        &self,
+        action: Action,
+        c: &Collection,
+    ) -> Result<(Readable, Option<Filter>), ApiError> {
+        self.may_write(action, c)?;
+        let (read, write) = match self.write_rules(action, c) {
+            Err(WriteRefusal::Hidden) => return Err(ApiError::NotFound),
+            // Refused for the whole collection, so a 403 before the readability check is
+            // intended: it says nothing about this document.
+            Err(WriteRefusal::Refused) => return Err(self.refuse()),
+            Ok(filters) => filters,
+        };
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            // Refused for the whole collection, as above.
+            None if c.schema.drafts() => return Err(self.refuse()),
+            None => Readable::published(read),
+        };
+        Ok((read, write))
     }
 
     /// The refusals an update or delete (`action`) of `c` meets before any document is
@@ -915,6 +1009,14 @@ impl Access {
     /// only what they created when either right is own-only. The trash shows a document
     /// only this way, so one it doesn't reach is a 404.
     pub(crate) fn trash_readable(&self, c: &Collection) -> Result<Readable, ApiError> {
+        let read = self.trash_rules(c)?;
+        self.write_copy(c)?;
+        Ok(read)
+    }
+
+    /// `trash_readable`, without making the request one that works on drafts: what a write
+    /// already reading in another copy judges a trashed document by.
+    pub(crate) fn trash_rules(&self, c: &Collection) -> Result<Readable, ApiError> {
         self.may_write(Action::Delete, c)?;
         let (read, delete) = self
             .write_rules(Action::Delete, c)
@@ -924,7 +1026,6 @@ impl Access {
             // `may_write` refused a drafts collection whose drafts they can't read.
             None => Readable::published(read),
         };
-        self.write_copy(c)?;
         let owner = match self.own_only(Action::Delete, c) {
             true => Some(self.user_id().ok_or_else(|| self.refuse())?),
             false => read.owner,
@@ -1362,6 +1463,8 @@ mod tests {
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let viewer = builtin_roles()[3].2.clone();
         let principal = Principal::User {
@@ -1423,6 +1526,8 @@ mod tests {
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let principal = Principal::User {
             identity: Identity {

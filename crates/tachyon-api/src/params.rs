@@ -10,6 +10,7 @@ use tachyon_core::schema::NEAR_IN_JOIN;
 use tachyon_core::select::{Select, parse_select};
 use tachyon_core::{CollectionKind, Field};
 use tachyon_db::collections::Collection;
+use uuid::Uuid;
 
 use crate::ApiError;
 use crate::access::Access;
@@ -149,9 +150,66 @@ fn draft(params: &Map<String, Value>, c: &Collection, access: &Access) -> Result
     access.copy_for(c, draft).map(|_| ())
 }
 
+/// Whether `raw` asks to wait (`wait=true`), read as every other flag is. Malformed or
+/// absent is no.
+pub(crate) fn wants_wait(raw: Option<&str>) -> bool {
+    parse_query(raw.unwrap_or_default())
+        .ok()
+        .is_some_and(|p| flag(&p, "wait").unwrap_or(false))
+}
+
+/// A file read's `?id`, the document holding it, taken only where `filenameCompoundIndex`
+/// lets documents share a name, and its `?draft`: prefer a draft's file of that name. Not
+/// refused for a caller who can't read drafts, who gets what they'd get without it, so it
+/// can't tell them whether a draft holds the name; where there are no drafts, the 400 a
+/// document read gives.
+pub(crate) fn file_params(
+    raw: Option<&str>,
+    c: &Collection,
+) -> Result<(Option<uuid::Uuid>, bool), ApiError> {
+    let shared = c
+        .schema
+        .upload
+        .as_ref()
+        .is_some_and(|u| u.filename_compound_index.is_some());
+    let allowed: &[&str] = if shared { &["draft", "id"] } else { &["draft"] };
+    let params = params(raw, allowed)?;
+    let draft = flag(&params, "draft").map_err(|_| bad("`draft` must be true or false"))?;
+    let id = single(&params, "id")?
+        .map(|id| uuid::Uuid::try_parse(id).map_err(|_| bad("`id` must be a document ID")))
+        .transpose()?;
+    if draft && !c.schema.drafts() {
+        return Err(bad(format!("`draft`: `{}` has no drafts", c.schema.slug)));
+    }
+    Ok((id, draft))
+}
+
+/// `?wait=true` on a create, the only parameter it takes: answer once the file's sizes
+/// are made, or the request's time is nearly up.
+pub(crate) fn create_params(raw: Option<&str>) -> Result<bool, ApiError> {
+    let params = params(raw, &["wait"])?;
+    flag(&params, "wait").map_err(|_| bad("`wait` must be true or false"))
+}
+
 /// Refuses any query parameter, for a write that takes none.
 pub(crate) fn no_params(raw: Option<&str>) -> Result<(), ApiError> {
     params(raw, &[]).map(|_| ())
+}
+
+/// `?moveContentsTo` for deleting a folder: `root`, another folder's ID, or `None`
+/// without it. Inner `None` is the root.
+pub(crate) fn move_params(raw: Option<&str>) -> Result<Option<Option<Uuid>>, ApiError> {
+    let params = params(raw, &["moveContentsTo"])?;
+    Ok(match single(&params, "moveContentsTo")? {
+        None => None,
+        Some("root") => Some(None),
+        Some(id) => Some(Some(id.parse().map_err(|_| {
+            ApiError::Validation(vec![tachyon_core::FieldError {
+                path: "moveContentsTo".into(),
+                message: "must be root or a folder's ID".into(),
+            }])
+        })?)),
+    })
 }
 
 /// `?limit&page` for a list without filters, such as a document's versions.
@@ -183,10 +241,19 @@ pub(crate) fn diff_params(raw: Option<&str>) -> Result<(String, String), ApiErro
 
 /// `PATCH ?autosave=true`: save the draft without recording a version, for a collection
 /// that turns autosave on.
+/// An update's `?autosave` and `?wait` (see `create_params`).
+pub(crate) fn update_params(raw: Option<&str>, c: &Collection) -> Result<(bool, bool), ApiError> {
+    let params = params(raw, &["autosave", "wait"])?;
+    let wait = flag(&params, "wait").map_err(|_| bad("`wait` must be true or false"))?;
+    Ok((autosave(&params, c)?, wait))
+}
+
 pub(crate) fn autosave_param(raw: Option<&str>, c: &Collection) -> Result<bool, ApiError> {
-    let params = params(raw, &["autosave"])?;
-    let autosave =
-        flag(&params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
+    autosave(&params(raw, &["autosave"])?, c)
+}
+
+fn autosave(params: &Map<String, Value>, c: &Collection) -> Result<bool, ApiError> {
+    let autosave = flag(params, "autosave").map_err(|_| bad("`autosave` must be true or false"))?;
     let on = c
         .schema
         .versions

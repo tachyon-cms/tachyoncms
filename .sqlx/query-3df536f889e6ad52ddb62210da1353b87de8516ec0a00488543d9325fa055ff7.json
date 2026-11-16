@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH old AS (SELECT id FROM documents\n                        WHERE tenant_id = $1 AND collection_id = $2\n                          AND (published_file IS NOT NULL OR draft_file IS NOT NULL)\n                        ORDER BY id FOR NO KEY UPDATE)\n           UPDATE documents d SET published_file = NULL, draft_file = NULL FROM old\n           WHERE d.id = old.id",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "3df536f889e6ad52ddb62210da1353b87de8516ec0a00488543d9325fa055ff7"
+}

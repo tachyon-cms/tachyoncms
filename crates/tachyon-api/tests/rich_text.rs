@@ -2,10 +2,18 @@
 
 mod common;
 
+use std::collections::BTreeMap;
+use std::sync::Arc;
+
 use axum::Router;
-use common::{Res, admin_app, app_as, assert_problem, send};
+use common::{
+    ADMIN, PASSWORD, Res, add_user, admin_app, app_as, assert_problem, png, send, signed_in, upload,
+};
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tachyon_api::{Options, UploadsConfig};
+use tachyon_db::documents::MISSING_LINK;
+use tachyon_media::storage::{StorageConfig, Storages};
 
 async fn create(app: &Router, url: &str, body: Value) -> Value {
     let res = send(app, "POST", url, Some(&body.to_string())).await;
@@ -999,4 +1007,473 @@ async fn nul_and_huge_list_numbers_are_422_at_their_node(pool: PgPool) {
         "{}",
         res.json.to_string().len()
     );
+}
+
+/// A test's spool and store for files, removed with everything in them when it's done.
+fn file_dirs() -> tempfile::TempDir {
+    let base = tempfile::Builder::new()
+        .prefix("tachyon-rich-text-")
+        .tempdir()
+        .unwrap();
+    for sub in ["spool", "store"] {
+        std::fs::create_dir_all(base.path().join(sub)).unwrap();
+    }
+    base
+}
+
+/// The API with files kept in `d`, signed in as `email` (the first Admin when `None`).
+async fn with_files(pool: &PgPool, d: &tempfile::TempDir, user: Option<(&str, &str)>) -> Router {
+    let storages = Storages::open(&BTreeMap::from([(
+        "default".into(),
+        StorageConfig::local(d.path().join("store")),
+    )]))
+    .unwrap();
+    let options = Options {
+        uploads: UploadsConfig {
+            temp_dir: d.path().join("spool"),
+            storages: Arc::new(storages),
+            ..UploadsConfig::default()
+        },
+        ..Options::default()
+    };
+    let app = tachyon_api::router_with(pool.clone(), options)
+        .await
+        .unwrap();
+    match user {
+        None => {
+            let body = json!({"email": ADMIN, "name": "Ada", "password": PASSWORD});
+            let res = send(&app, "POST", "/api/setup", Some(&body.to_string())).await;
+            assert_eq!(res.status, 201, "setup: {}", res.json);
+            signed_in(app, ADMIN).await
+        }
+        Some((email, role)) => {
+            add_user(pool, email, role).await;
+            signed_in(app, email).await
+        }
+    }
+}
+
+fn file_node(to: &str, id: &str, fields: Value) -> Value {
+    json!({"type": "upload", "attrs": {"relationTo": to, "value": id, "fields": fields}})
+}
+
+/// Upload nodes hold files from `media`, which anyone signed in reads, and from `private`,
+/// which only editors read: links like any other in the text, rendered as the file.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn upload_nodes_hold_files(pool: PgPool) {
+    let d = file_dirs();
+    let admin = with_files(&pool, &d, None).await;
+    for schema in [
+        json!({"slug": "authors", "fields": [{"name": "name", "type": "text"}]}),
+        json!({"slug": "media", "upload": true, "fields": [{"name": "alt", "type": "text"}]}),
+        json!({"slug": "private", "upload": true, "access": {"read": {"role": "editor"}},
+            "fields": []}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    // Upload nodes hold only files.
+    let pages = |collections: Value| {
+        json!({"slug": "pages",
+            "access": {"create": {"role": ["editor", "viewer"]}, "update": {"role": ["editor", "viewer"]}},
+            "fields": [{"name": "body", "type": "richText",
+                "relationTo": ["media", "private", "authors"],
+                "upload": {"collections": collections}}]})
+    };
+    let res = send(
+        &admin,
+        "POST",
+        "/api/admin/collections",
+        Some(&pages(json!({"authors": {}})).to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"],
+        json!([{"path": "fields.body.upload.collections",
+            "message": "`authors` doesn't hold files; upload nodes link only to collections with upload on"}])
+    );
+    let media_node = json!({"fields": [
+        {"name": "caption", "type": "text"},
+        {"name": "credit", "type": "relationship", "relationTo": "authors"}
+    ]});
+    create(
+        &admin,
+        "/api/admin/collections",
+        pages(json!({"media": media_node, "private": {}})),
+    )
+    .await;
+    let alt = json!({"alt": "Cover <b>"});
+    let res = upload(
+        &admin,
+        "POST",
+        "/api/media",
+        Some(&png(8, 6)),
+        "a.png",
+        Some(&alt),
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let cover = id(&res.json);
+    let res = upload(
+        &admin,
+        "POST",
+        "/api/private",
+        Some(&png(4, 4)),
+        "secret.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let hidden = id(&res.json);
+    let ann = id(&create(&admin, "/api/authors", json!({"name": "Ann"})).await);
+
+    let body = text(json!([
+        file_node("media", &cover, json!({"caption": "C", "credit": ann})),
+        {"type": "paragraph", "content": [{"type": "text", "text": "between"}]},
+        file_node("private", &hidden, json!({}))
+    ]));
+    let page = id(&create(&admin, "/api/pages", json!({"body": body})).await);
+    let url = format!("/api/pages/{page}");
+    let viewer = with_files(&pool, &d, Some(("viewer@example.com", "viewer"))).await;
+    let editor = with_files(&pool, &d, Some(("editor@example.com", "editor"))).await;
+
+    // Rendered as the file the caller reads; one they can't is left out (W1-R24).
+    let html = |res: Res| {
+        assert_eq!(res.status, 200, "{}", res.json);
+        res.json["body"].as_str().unwrap().to_owned()
+    };
+    let shown = html(get(&viewer, &format!("{url}?format=html")).await);
+    // The node's own fields are `data-*`, as a block node's are.
+    assert_eq!(
+        shown,
+        format!(
+            concat!(
+                "<img src=\"http://localhost:3000/api/media/file/a.png\" width=\"8\" height=\"6\" ",
+                "alt=\"Cover &lt;b&gt;\" data-caption=\"C\" data-credit=\"{}\"><p>between</p>"
+            ),
+            ann
+        )
+    );
+    let all = html(get(&editor, &format!("{url}?format=html")).await);
+    assert!(
+        all.ends_with(concat!(
+            "<img src=\"http://localhost:3000/api/private/file/secret.png\" ",
+            "width=\"4\" height=\"4\" alt=\"\">"
+        )),
+        "{all}"
+    );
+    // A node with fields is a directive, named by its file.
+    assert_eq!(
+        html(get(&viewer, &format!("{url}?format=markdown")).await),
+        format!("::media:media/{cover}{{caption=\"C\" credit=\"{ann}\"}}\n\nbetween")
+    );
+    assert_eq!(
+        html(get(&viewer, &format!("{url}?format=text")).await),
+        "Cover <b>\n\nbetween"
+    );
+    // Populated per depth; a file the caller can't read stays an ID.
+    let deep = get(&viewer, &format!("{url}?depth=1")).await.json;
+    let nodes = &deep["body"]["content"];
+    assert_eq!(nodes[0]["attrs"]["value"]["alt"], "Cover <b>");
+    assert_eq!(nodes[0]["attrs"]["fields"]["credit"]["name"], "Ann");
+    assert_eq!(nodes[2]["attrs"]["value"], hidden.as_str());
+
+    // References and delete protection see the node and the links in its fields.
+    let refs = |res: Res| -> Vec<String> {
+        assert_eq!(res.status, 200, "{}", res.json);
+        let mut out: Vec<String> = res.json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["path"].as_str().unwrap().to_owned())
+            .collect();
+        out.sort();
+        out
+    };
+    assert_eq!(
+        refs(get(&admin, &format!("/api/media/{cover}/references")).await),
+        ["body.0"]
+    );
+    assert_eq!(
+        refs(get(&admin, &format!("/api/authors/{ann}/references")).await),
+        ["body.0.credit"]
+    );
+    let res = send(&admin, "DELETE", &format!("/api/media/{cover}"), None).await;
+    assert_problem(&res, 409);
+
+    // A file the caller can't read is refused as one that isn't there (W1-R14), sent as
+    // JSON or as Markdown.
+    let refused = |res: Res| {
+        assert_problem(&res, 422);
+        res.json["errors"].clone()
+    };
+    let gone = "0199d5c4-0000-7000-8000-00000000dead";
+    let sent = |id: &str| json!({"body": text(json!([file_node("private", id, json!({}))]))});
+    let unreadable = refused(
+        send(
+            &viewer,
+            "POST",
+            "/api/pages",
+            Some(&sent(&hidden).to_string()),
+        )
+        .await,
+    );
+    assert_eq!(
+        unreadable,
+        json!([{"path": "body.content.0.attrs.value", "message": MISSING_LINK}])
+    );
+    assert_eq!(
+        refused(send(&viewer, "POST", "/api/pages", Some(&sent(gone).to_string())).await),
+        unreadable
+    );
+    let md = |src: String| json!({"body": {"format": "markdown", "value": src}});
+    let unreadable = refused(
+        send(
+            &viewer,
+            "POST",
+            "/api/pages",
+            Some(&md(format!("![x](media:private/{hidden})")).to_string()),
+        )
+        .await,
+    );
+    assert_eq!(
+        unreadable,
+        json!([{"path": "body.content.0.attrs.value", "message": MISSING_LINK}])
+    );
+    for src in [
+        format!("![x](media:private/{gone})"),
+        format!("::media:private/{hidden}"),
+        format!("::media:private/{gone}"),
+    ] {
+        let res = send(&viewer, "POST", "/api/pages", Some(&md(src).to_string())).await;
+        assert_eq!(refused(res), unreadable);
+    }
+    // Markdown names a file by ID: the collection too, where the field holds more than one.
+    let made = create(
+        &viewer,
+        "/api/pages",
+        md(format!("![Ignored](media:media/{cover})")),
+    )
+    .await;
+    let node = &made["body"]["content"][0];
+    assert_eq!(
+        (&node["type"], &node["attrs"]["relationTo"]),
+        (&json!("upload"), &json!("media"))
+    );
+    assert_eq!(node["attrs"]["value"]["id"], cover.as_str());
+    let res = send(
+        &viewer,
+        "POST",
+        "/api/pages",
+        Some(&md(format!("![x](media:{cover})")).to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    let res = send(
+        &viewer,
+        "POST",
+        "/api/pages",
+        Some(&md("![x](./a.png)".into()).to_string()),
+    )
+    .await;
+    assert_problem(&res, 422);
+    assert_eq!(
+        res.json["errors"][0]["message"],
+        "line 1: images must be media:<id>; local paths arrive with content push"
+    );
+
+    // A node's fields come back through Markdown read and written back.
+    let captioned = text(json!([file_node(
+        "media",
+        &cover,
+        json!({"caption": "Taken \"here\"", "credit": ann})
+    )]));
+    let other = id(&create(&admin, "/api/pages", json!({"body": captioned})).await);
+    let other = format!("/api/pages/{other}");
+    let exported = html(get(&viewer, &format!("{other}?format=markdown")).await);
+    let res = patch(&viewer, &other, md(exported)).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let back = get(&viewer, &format!("{other}?depth=0")).await.json;
+    assert_eq!(back["body"], captioned);
+
+    // The hidden node stays where it is through a read and a write of what was read.
+    let read = get(&viewer, &format!("{url}?depth=0")).await.json;
+    assert_eq!(
+        read["body"]["content"][2]["attrs"]["value"],
+        hidden.as_str()
+    );
+    let res = patch(&viewer, &url, json!({"body": read["body"]})).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    assert_eq!(
+        get(&editor, &format!("{url}?depth=0")).await.json["body"]["content"][2]["attrs"]["value"],
+        hidden.as_str()
+    );
+}
+
+/// An upload node's fields answer to field rules as a block node's do: read, written and
+/// exported as Markdown only by who may read them.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn upload_node_fields_answer_to_field_rules(pool: PgPool) {
+    let d = file_dirs();
+    let admin = with_files(&pool, &d, None).await;
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "media", "upload": true, "fields": []}),
+    )
+    .await;
+    let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+    create(
+        &admin,
+        "/api/admin/collections",
+        json!({"slug": "cards",
+        "access": {"update": {"role": ["editor", "viewer"]}},
+        "fields": [{"name": "body", "type": "richText", "relationTo": ["media"],
+            "upload": {"collections": {"media": {"fields": [
+                {"name": "caption", "type": "text"},
+                {"name": "internal", "type": "text", "access": ed}
+            ]}}}}]}),
+    )
+    .await;
+    let res = upload(
+        &admin,
+        "POST",
+        "/api/media",
+        Some(&png(4, 4)),
+        "a.png",
+        None,
+    )
+    .await;
+    assert_eq!(res.status, 201, "{}", res.json);
+    let file = id(&res.json);
+    let body = text(json!([file_node(
+        "media",
+        &file,
+        json!({"caption": "C", "internal": "I"})
+    )]));
+    let card = id(&create(&admin, "/api/cards", json!({ "body": body })).await);
+    let url = format!("/api/cards/{card}");
+    let viewer = with_files(&pool, &d, Some(("viewer@example.com", "viewer"))).await;
+    let editor = with_files(&pool, &d, Some(("editor@example.com", "editor"))).await;
+
+    let read = get(&viewer, &format!("{url}?depth=0")).await.json;
+    assert_eq!(
+        read["body"]["content"][0]["attrs"]["fields"],
+        json!({"caption": "C"})
+    );
+    let as_markdown = format!("{url}?format=markdown");
+    assert_eq!(
+        get(&viewer, &as_markdown).await.json["body"],
+        format!("::media:media/{file}{{caption=\"C\"}}")
+    );
+    assert_eq!(
+        get(&editor, &as_markdown).await.json["body"],
+        format!("::media:media/{file}{{caption=\"C\" internal=\"I\"}}")
+    );
+    // The text is written whole, so only who may write every field in it may write it.
+    let res = patch(&viewer, &url, json!({"body": read["body"]})).await;
+    assert_problem(&res, 403);
+    let res = patch(&editor, &url, json!({ "body": body })).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+}
+
+/// A draft's upload node shows a draft file its reader may read, by the file route; what's
+/// live holds only files that are live (T4-1). Unreadable is missing (W1-R14).
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn upload_nodes_follow_draft_links(pool: PgPool) {
+    let d = file_dirs();
+    let admin = with_files(&pool, &d, None).await;
+    let body = json!({"name": "body", "type": "richText", "relationTo": ["shots"],
+        "upload": {"collections": {"shots": {}}}});
+    for schema in [
+        // Only authors (and admins) read draft shots.
+        json!({"slug": "shots", "upload": true, "versions": {"drafts": true},
+            "access": {"readDrafts": {"role": "author"}},
+            "fields": [{"name": "alt", "type": "text"}]}),
+        json!({"slug": "pages", "versions": {"drafts": true}, "fields": [body]}),
+        json!({"slug": "notes", "access": {"create": {"role": ["author", "viewer"]}},
+            "fields": [body]}),
+    ] {
+        create(&admin, "/api/admin/collections", schema).await;
+    }
+    let author = with_files(&pool, &d, Some(("author@example.com", "author"))).await;
+    let editor = with_files(&pool, &d, Some(("editor@example.com", "editor"))).await;
+    let viewer = with_files(&pool, &d, Some(("viewer@example.com", "viewer"))).await;
+    let shot = |app: Router, name: &'static str| async move {
+        let alt = json!({ "alt": name });
+        let res = upload(
+            &app,
+            "POST",
+            "/api/shots",
+            Some(&png(4, 4)),
+            name,
+            Some(&alt),
+        )
+        .await;
+        assert_eq!(res.status, 201, "{}", res.json);
+        id(&res.json)
+    };
+    // Never published: the author's own draft.
+    let own = shot(author.clone(), "own.png").await;
+    let live = shot(admin.clone(), "live.png").await;
+    let res = send(&admin, "POST", &format!("/api/shots/{live}/publish"), None).await;
+    assert_eq!(res.status, 200, "{}", res.json);
+    let nodes = |ids: &[&str]| {
+        let nodes: Vec<Value> = ids
+            .iter()
+            .map(|i| file_node("shots", i, json!({})))
+            .collect();
+        json!({ "body": text(json!(nodes)) })
+    };
+
+    // A draft links a draft its writer reads, shown by the file route, never a bucket URL.
+    let page = id(&create(&author, "/api/pages", nodes(&[&own, &live])).await);
+    let html = |res: Res| {
+        assert_eq!(res.status, 200, "{}", res.json);
+        res.json["body"].as_str().unwrap().to_owned()
+    };
+    let draft = format!("/api/pages/{page}?draft=true");
+    // Read as a draft, each file's link asks for the draft's; the route gives the published
+    // file to who can't read it.
+    let img = |name: &str| {
+        format!(
+            "<img src=\"http://localhost:3000/api/shots/file/{name}?draft=true\" width=\"4\" height=\"4\" alt=\"{name}\">"
+        )
+    };
+    assert_eq!(
+        html(get(&author, &format!("{draft}&format=html")).await),
+        format!("{}{}", img("own.png"), img("live.png"))
+    );
+    // A reader who may read the page's draft but not the file's sees no trace of it.
+    assert_eq!(
+        html(get(&editor, &format!("{draft}&format=html")).await),
+        img("live.png")
+    );
+    assert_eq!(
+        html(get(&editor, &format!("{draft}&format=markdown")).await),
+        format!("![live.png](media:shots/{live})")
+    );
+
+    // What's live links only to what's live: a draft file is as missing as a random one.
+    let missing = |res: Res| {
+        assert_problem(&res, 422);
+        res.json["errors"].clone()
+    };
+    let gone = "0199d5c4-0000-7000-8000-00000000dead";
+    let want = json!([{"path": "body.content.0.attrs.value", "message": MISSING_LINK}]);
+    let res = send(&admin, "POST", &format!("/api/pages/{page}/publish"), None).await;
+    assert_eq!(missing(res), want);
+    let md = |src: String| json!({"body": {"format": "markdown", "value": src}});
+    for app in [&author, &viewer] {
+        for sent in [
+            nodes(&[&own]),
+            nodes(&[gone]),
+            md(format!("![x](media:{own})")),
+            md(format!("![x](media:{gone})")),
+        ] {
+            let res = send(app, "POST", "/api/notes", Some(&sent.to_string())).await;
+            assert_eq!(missing(res), want);
+        }
+    }
+    create(&viewer, "/api/notes", nodes(&[&live])).await;
 }

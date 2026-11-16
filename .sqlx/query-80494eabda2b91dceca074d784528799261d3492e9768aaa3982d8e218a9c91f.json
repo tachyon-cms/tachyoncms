@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET state = 'queued', attempts = 0, run_at = now(), locked_until = NULL,\n               finished_at = NULL, result = NULL\n           WHERE id IN (\n               SELECT DISTINCT ON (coalesce(j.dedupe_key, j.id::text)) j.id FROM jobs j\n               LEFT JOIN files f ON f.tenant_id = j.tenant_id\n                   AND f.id = CASE WHEN j.payload->>'file' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\n                                   THEN (j.payload->>'file')::uuid END\n               WHERE j.tenant_id = $1 AND j.kind = $2 AND j.state = 'failed'\n                 AND CASE WHEN j.payload ? 'file' THEN\n                          f.storage = ANY($4)\n                          AND (f.state = 'gone'\n                               OR (f.state = 'pending'\n                                   AND f.created_at + make_interval(secs => $3) <= now()))\n                     ELSE j.payload->>'storage' = ANY($4) AND j.attempts >= j.max_attempts END\n                 AND NOT EXISTS (SELECT 1 FROM jobs o\n                                 WHERE o.tenant_id = $1 AND o.dedupe_key = j.dedupe_key\n                                   AND o.state IN ('queued', 'running'))\n               ORDER BY coalesce(j.dedupe_key, j.id::text), j.id DESC)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Float8",
+        "TextArray"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "80494eabda2b91dceca074d784528799261d3492e9768aaa3982d8e218a9c91f"
+}

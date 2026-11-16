@@ -15,7 +15,8 @@ use tachyon_core::access;
 use tachyon_core::auth::Action;
 use tachyon_core::diff::Renames;
 use tachyon_core::{
-    CollectionKind, CollectionSchema, FieldError, SchemaError, explain_parse_error,
+    CollectionKind, CollectionSchema, FieldError, SchemaError, check_upload_referrers,
+    explain_parse_error,
 };
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
@@ -30,7 +31,8 @@ use crate::auth::authorize;
 use crate::auth::principal::Principal;
 use crate::documents::json_body;
 use crate::jobs::{JobError, LEASE, keep_leased};
-use crate::{ApiError, AppState};
+use crate::{ApiError, AppState, UploadLimits};
+use tachyon_media::storage::check_prefix;
 
 /// The most rows (documents, trashed ones included, and their versions) a schema change or
 /// preview scans inside its request; a bigger one runs on a job worker.
@@ -46,9 +48,15 @@ fn to_json(c: &Collection) -> Value {
 }
 
 fn schema_error(e: SchemaError) -> ApiError {
-    ApiError::Validation(vec![FieldError {
-        path: String::new(),
-        message: e.to_string(),
+    if let SchemaError::Referenced(m) = e {
+        return ApiError::Conflict(m);
+    }
+    ApiError::Validation(vec![match e {
+        SchemaError::At { path, message } => FieldError { path, message },
+        e => FieldError {
+            path: String::new(),
+            message: e.to_string(),
+        },
     }])
 }
 
@@ -72,7 +80,78 @@ fn saved(state: &AppState, schema: &CollectionSchema) -> Result<Vec<CollectionSc
     }
     let world = state.schemas.with_saved(schema).map_err(schema_error)?;
     world[0].check().map_err(schema_error)?;
+    check_upload(&state.media.limits(), schema).map_err(|e| ApiError::Validation(vec![e]))?;
     Ok(world)
+}
+
+/// The parts of `upload` that depend on this server: the storage it names, `staticDir` and
+/// the pixel cap. The error is at its path, such as `upload.storage`. The schema routes and
+/// `tachyon schema apply` both run it.
+pub fn check_upload(limits: &UploadLimits, schema: &CollectionSchema) -> Result<(), FieldError> {
+    let Some(u) = &schema.upload else {
+        return Ok(());
+    };
+    let refuse = |path: &str, message: String| {
+        Err(FieldError {
+            path: path.into(),
+            message,
+        })
+    };
+    match limits.storages.get(&u.storage) {
+        None => {
+            let names: Vec<&str> = limits.storages.keys().map(String::as_str).collect();
+            return refuse(
+                "upload.storage",
+                format!(
+                    "no storage named `{}` is configured; this server has {}",
+                    u.storage,
+                    names.join(", ")
+                ),
+            );
+        }
+        Some(&local) if u.disable_local_storage && local => {
+            return refuse(
+                "upload.storage",
+                format!(
+                    "disableLocalStorage is set, but `{}` is local storage; name a bucket",
+                    u.storage
+                ),
+            );
+        }
+        Some(_) => {}
+    }
+    // The same rule every storage key follows, so a saved staticDir can't fail every upload.
+    if let Some(dir) = &u.static_dir
+        && let Err(message) = check_prefix(dir)
+    {
+        return refuse("upload.staticDir", message);
+    }
+    // Client uploads wait there, and are swept from there.
+    if let Some(dir) = &u.static_dir
+        && dir.split('/').next() == Some(tachyon_media::storage::STAGING)
+    {
+        return refuse(
+            "upload.staticDir",
+            format!(
+                "`{dir}` begins with `{}`, where client uploads wait to be checked; pick another name",
+                tachyon_media::storage::STAGING
+            ),
+        );
+    }
+    let limit = u
+        .constructor_options
+        .as_ref()
+        .and_then(|c| c.limit_input_pixels);
+    if let Some(limit) = limit.filter(|&l| l > limits.max_pixels) {
+        return refuse(
+            "upload.constructorOptions.limitInputPixels",
+            format!(
+                "{limit} is above this server's limit of {} (`[uploads] max_pixels`)",
+                limits.max_pixels
+            ),
+        );
+    }
+    Ok(())
 }
 
 /// Logged here so the cause survives even if the reload after it fails too.
@@ -174,12 +253,13 @@ fn find<'w>(world: &'w [CollectionSchema]) -> impl Fn(&str) -> Option<&'w Collec
 }
 
 /// Every virtual field of the saved schema, `world[0]`, must read a field its targets have,
-/// and every join a field that links here.
+/// every join a field that links here, and every upload field a collection that holds files.
 fn check_virtuals(world: &[CollectionSchema]) -> Result<(), ApiError> {
     let lookup = find(world);
     world[0]
         .check_virtual_targets(&lookup)
         .and_then(|()| world[0].check_join_targets(&lookup))
+        .and_then(|()| world[0].check_upload_targets(&lookup))
         .map_err(schema_error)
 }
 
@@ -191,6 +271,7 @@ fn check_dependents(world: &[CollectionSchema]) -> Result<(), ApiError> {
         other
             .check_virtual_targets(&lookup)
             .and_then(|()| other.check_join_targets(&lookup))
+            .and_then(|()| other.check_upload_targets(&lookup))
             .map_err(|e| {
                 schema_error(SchemaError::InvalidChange(format!(
                     "this change would break {}: {e}",
@@ -270,6 +351,7 @@ pub async fn preview(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
+    check_upload_referrers(&world[0], &world[1..]).map_err(schema_error)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_PREVIEW, &slug, &req).await? {
@@ -291,6 +373,7 @@ pub async fn update(
     let (slug, req, schema) = change_request(path, body)?;
     let world = saved(&state, &schema)?;
     check_virtuals(&world)?;
+    check_upload_referrers(&world[0], &world[1..]).map_err(schema_error)?;
     check_dependents(&world)?;
     check_rules(&state, &world).await?;
     if let Some(queued) = queue(&state, &principal, SCHEMA_CHANGE, &slug, &req).await? {
@@ -337,6 +420,7 @@ async fn queue(
             Principal::Key { key, .. } => Some(*key),
             _ => None,
         },
+        max_attempts: None,
     };
     let mut conn = state.pool.acquire().await.map_err(DbError::from)?;
     let id = match jobs::add(&mut conn, &job).await {
@@ -586,6 +670,8 @@ mod tests {
             schemas: std::sync::Arc::new(Schemas::load(pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let request = json!({
             "schema": {"slug": "posts", "fields": [{"name": "headline", "type": "text"}]},
@@ -600,6 +686,7 @@ mod tests {
             dedupe_key: Some("schema:posts".into()),
             created_by: Some(user),
             key_id: None,
+            max_attempts: None,
         };
         let id = jobs::add(&mut pool.acquire().await.unwrap(), &new)
             .await

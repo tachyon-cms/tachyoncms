@@ -1,6 +1,7 @@
 [workspace]
 resolver = "3"
 members = ["crates/*"]
+exclude = ["vendor"]
 
 [workspace.package]
 version = "0.2.0"
@@ -12,21 +13,39 @@ repository = "https://github.com/tachyon-cms/tachyoncms"
 tachyon-core = { path = "crates/tachyon-core" }
 tachyon-db = { path = "crates/tachyon-db" }
 tachyon-api = { path = "crates/tachyon-api" }
+tachyon-media = { path = "crates/tachyon-media" }
 
 anyhow = "1.0.104"
 argon2 = { version = "0.6.0", features = ["zeroize"] }
+async-trait = "0.1.92"
 base64 = "0.23.1"
+futures-util = "0.3.34"
 hex = "0.4.3"
+infer = "0.22.0"
+image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "gif", "webp", "tiff", "bmp", "ico", "avif"] }
+avif-decode = { version = "3.0.0", default-features = false }
+avif-parse = "2.1.0"
+blurhash = { version = "0.2.3", default-features = false }
+fast_image_resize = { version = "6.1.0", features = ["image"] }
+img-parts = "0.4.2"
+gif = "0.14.2"
+jpeg-encoder = "0.7.1"
+quick-xml = "0.42.0"
+webp = { version = "0.3.1", default-features = false }
+multer = "3.1.0"
+object_store = { version = "0.14.2", features = ["aws", "azure", "gcp"] }
 rand = "0.10.3"
 reqwest = { version = "0.13.5", default-features = false, features = ["rustls"] }
 sha1 = "0.11.0"
 sha2 = "0.11.1"
 subtle = "2.6.1"
+tempfile = "3.27.0"
 arc-swap = "1.9.2"
 axum = "0.8.9"
 clap = { version = "4.6.7", features = ["derive"] }
 figment = { version = "0.10.19", features = ["toml", "env"] }
 http-body-util = "0.1.5"
+httpdate = "1.0.3"
 pulldown-cmark = { version = "0.13.5", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.154"
@@ -39,7 +58,12 @@ tower-http = { version = "0.7.1", features = ["catch-panic"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "json"] }
 url = "2.5.8"
-uuid = { version = "1.28.0", features = ["v7", "serde"] }
+uuid = { version = "1.28.0", features = ["v4", "v7", "serde"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"
+
+# One change to avif-decode: a decoder on the calling thread with a frame size limit (see
+# vendor/avif-decode/Cargo.toml).
+[patch.crates-io]
+avif-decode = { path = "vendor/avif-decode" }

@@ -1,0 +1,5 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="40" height="20">
+  <style>rect { fill: red } <script>alert(document.cookie)</script></style>
+  <style><![CDATA[ </style><script>alert(2)</script> ]]></style>
+  <rect width="40" height="20"/>
+</svg>

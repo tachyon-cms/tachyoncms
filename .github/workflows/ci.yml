@@ -22,6 +22,8 @@ jobs:
           toolchain: stable
           components: rustfmt, clippy
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
@@ -53,4 +55,81 @@ jobs:
         with:
           toolchain: stable
       - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
       - run: cargo test --workspace
+
+  # The storage adapters against emulators of each service, over plain http. Started with
+  # `docker run`, not as services: a service can't be given a command, and Azurite and
+  # fake-gcs-server need one. Images are pinned by digest, their tags beside them.
+  storage:
+    runs-on: ubuntu-latest
+    env:
+      TACHYON_TEST_S3_ENDPOINT: http://127.0.0.1:9000
+      TACHYON_STORAGE__S3TEST__ACCESS_KEY_ID: tachyon
+      TACHYON_STORAGE__S3TEST__SECRET_ACCESS_KEY: tachyon-secret
+      TACHYON_TEST_AZURITE: http://127.0.0.1:10000/devstoreaccount1
+      # Azurite's own well-known development key, not a secret.
+      TACHYON_STORAGE__AZTEST__ACCESS_KEY: Eby8vdM02xNOcqFlqUwJPLlmEtlCDXJ1OUzFT50uSRZ6IFsuFq2UVErCz4I6tq/K1SZFPTOtr/KBHBeksoGMGw==
+      TACHYON_TEST_GCS_ENDPOINT: http://127.0.0.1:4443
+    steps:
+      # Under the runner's temp directory, out of the checkout and the cache. Set here, as
+      # job-level `env` can't read the `runner` context.
+      - run: echo "TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH=$RUNNER_TEMP/service-account.json" >> "$GITHUB_ENV"
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: dtolnay/rust-toolchain@686976e191b89faba57d3206551f0f330d8cb249 # stable
+        with:
+          toolchain: stable
+      - uses: Swatinem/rust-cache@d1527c8f67ef9af357290475d4af4b0fab8f12e0 # v2.9.3
+      # rav1d, the AVIF decoder, assembles its x86 kernels with nasm.
+      - run: sudo apt-get update && sudo apt-get install -y nasm
+      - name: Start MinIO, Azurite and fake-gcs-server
+        run: |
+          # MinIO's own images are no longer published; Bitnami's frozen build makes the
+          # bucket itself.
+          docker run -d --name minio -p 9000:9000 \
+            -e MINIO_ROOT_USER=tachyon -e MINIO_ROOT_PASSWORD=tachyon-secret \
+            -e MINIO_DEFAULT_BUCKETS=tachyon \
+            bitnamilegacy/minio@sha256:6dabb4a2088c9a79908de3bc05f4586c23ad2182c8908e7e3acbf61c1467fb20 # 2025.7.23-debian-12-r5
+          docker run -d --name azurite -p 10000:10000 \
+            mcr.microsoft.com/azure-storage/azurite@sha256:0a47e12e3693483cef5c71f35468b91d751611f172d2f97414e9c69113b106d9 \
+            azurite-blob --blobHost 0.0.0.0 --loose --skipApiVersionCheck # 3.34.0
+          # Upstream fake-gcs-server refuses the XML API's plain PUT that object_store
+          # uploads with (fsouza/fake-gcs-server#1164); object_store's own CI uses this fork.
+          docker run -d --name gcs -p 4443:4443 \
+            tustvold/fake-gcs-server@sha256:dcd3aeacc07c731f1336e90c2889be2af8626ae993ee1fe2c0ba042ebbeb5a04 \
+            -scheme http -port 4443 -public-host 127.0.0.1:4443 -external-url http://127.0.0.1:4443 # latest, 2023-10-27
+      - name: Wait for them, and make a bucket in each
+        run: |
+          # `curl -f` for the two with a health answer; Azurite's root answers 400 when up.
+          up() { for _ in $(seq 1 60); do curl "$1" -o /dev/null "$2" && return 0; sleep 1; done; docker ps -a; docker logs minio; return 1; }
+          up -fsS http://127.0.0.1:9000/minio/health/live
+          up -sS http://127.0.0.1:10000/devstoreaccount1
+          up -fsS http://127.0.0.1:4443/storage/v1/b
+          up -fsS http://127.0.0.1:9000/minio/health/ready
+          # Bitnami's entrypoint makes the bucket on a first start, then starts the server
+          # again: wait until the bucket itself answers (403, unsigned) three times running.
+          seen=0
+          for _ in $(seq 1 120); do
+            code=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:9000/tachyon || true)
+            if [ "$code" = 403 ]; then seen=$((seen + 1)); else seen=0; fi
+            [ "$seen" -ge 3 ] && break
+            sleep 1
+          done
+          [ "$seen" -ge 3 ] || { docker logs minio; exit 1; }
+          az storage container create --name tachyon --connection-string \
+            "DefaultEndpointsProtocol=http;AccountName=devstoreaccount1;AccountKey=$TACHYON_STORAGE__AZTEST__ACCESS_KEY;BlobEndpoint=http://127.0.0.1:10000/devstoreaccount1;"
+          curl -fsS -X POST -H 'content-type: application/json' -d '{"name": "tachyon"}' \
+            http://127.0.0.1:4443/storage/v1/b
+          # Any RSA key: the emulator checks no signature.
+          openssl genpkey -algorithm RSA -pkeyopt rsa_keygen_bits:2048 -out "$RUNNER_TEMP/key.pem"
+          python3 -c 'import json, sys; print(json.dumps({"private_key": open(sys.argv[1]).read(), "private_key_id": "test", "client_email": "cms@tachyon-test.iam.gserviceaccount.com"}))' \
+            "$RUNNER_TEMP/key.pem" > "$TACHYON_STORAGE__GCSTEST__SERVICE_ACCOUNT_PATH"
+      # Every ignored test in the file, and exactly three: a renamed or skipped round trip
+      # fails the job instead of passing it with nothing run.
+      - name: Round trips
+        # `shell: bash` runs with pipefail, so a failing test fails the pipe below.
+        shell: bash
+        run: |
+          cargo test -p tachyon-media --test storage -- --ignored 2>&1 | tee "$RUNNER_TEMP/storage.log"
+          grep -q "test result: ok. 3 passed; 0 failed" "$RUNNER_TEMP/storage.log"

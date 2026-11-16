@@ -107,6 +107,8 @@ async fn main() -> anyhow::Result<()> {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
                 jobs,
                 schema_inline_rows: None,
+                request_timeout: None,
+                uploads: config.uploads_config().map_err(anyhow::Error::msg)?,
             };
             let app = tachyon_api::router_with(pool.clone(), options).await?;
             let listener = tokio::net::TcpListener::bind(config.listen).await?;
@@ -144,13 +146,18 @@ async fn main() -> anyhow::Result<()> {
             }
             SchemaCommand::Diff { .. } => {
                 let (text, renames) = schema_input.expect("read before connecting");
-                println!("{}", schema_cmd::run(&pool, &text, &renames, None).await?);
+                let uploads = config.upload_limits().map_err(anyhow::Error::msg)?;
+                println!(
+                    "{}",
+                    schema_cmd::run(&pool, &uploads, &text, &renames, None).await?
+                );
             }
             SchemaCommand::Apply { yes, .. } => {
                 let (text, renames) = schema_input.expect("read before connecting");
+                let uploads = config.upload_limits().map_err(anyhow::Error::msg)?;
                 println!(
                     "{}",
-                    schema_cmd::run(&pool, &text, &renames, Some(yes)).await?
+                    schema_cmd::run(&pool, &uploads, &text, &renames, Some(yes)).await?
                 );
             }
         },

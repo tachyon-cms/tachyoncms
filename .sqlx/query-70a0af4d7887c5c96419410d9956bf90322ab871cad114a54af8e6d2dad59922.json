@@ -1,0 +1,31 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT fc.slug FROM relations r\n           JOIN documents f ON f.id = r.from_doc\n           JOIN collections fc ON fc.id = f.collection_id AND fc.slug <> $3\n           JOIN documents t ON t.id = r.to_doc\n           JOIN collections tc ON tc.id = t.collection_id AND tc.slug = $3\n           WHERE r.tenant_id = $4 AND r.from_doc = $1 AND r.copy = $2 AND r.field_path = 'folder'\n             AND jsonb_typeof(t.published -> 'collections') = 'array'\n             AND jsonb_array_length(t.published -> 'collections') > 0\n             AND NOT (t.published -> 'collections') ? fc.slug",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "slug",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "collections",
+            "name": "slug"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text",
+        "Text",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "70a0af4d7887c5c96419410d9956bf90322ab871cad114a54af8e6d2dad59922"
+}

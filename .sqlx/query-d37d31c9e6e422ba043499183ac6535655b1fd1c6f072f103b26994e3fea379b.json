@@ -1,0 +1,65 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT storage, key, names, sizes AS \"sizes: Json<Map<String, Value>>\"\n               FROM files WHERE tenant_id = $1 AND id = $2 FOR UPDATE",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "storage",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "storage"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "names"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "sizes: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "sizes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d37d31c9e6e422ba043499183ac6535655b1fd1c6f072f103b26994e3fea379b"
+}

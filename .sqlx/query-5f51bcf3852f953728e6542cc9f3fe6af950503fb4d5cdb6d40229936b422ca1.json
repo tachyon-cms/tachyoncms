@@ -1,0 +1,60 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT d.collection_id, d.id, r.copy, d.deleted_at IS NOT NULL AS \"trashed!\"\n           FROM relations r\n           JOIN documents d ON d.id = r.from_doc\n           WHERE r.tenant_id = $1 AND r.to_doc = $2 AND r.field_path = 'folder'\n             AND r.from_doc <> $2\n           ORDER BY d.id, r.copy",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "collection_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "documents",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "copy",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "relations",
+            "name": "copy"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "trashed!",
+        "type_info": "Bool",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      null
+    ]
+  },
+  "hash": "5f51bcf3852f953728e6542cc9f3fe6af950503fb4d5cdb6d40229936b422ca1"
+}

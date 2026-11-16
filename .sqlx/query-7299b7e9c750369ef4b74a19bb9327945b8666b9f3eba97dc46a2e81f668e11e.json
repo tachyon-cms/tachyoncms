@@ -1,0 +1,34 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data, created_by, file_id)\n           SELECT $1, tenant_id, collection_id, id, $4, $5, $6,\n                  CASE WHEN $4 = 'draft' THEN draft_file ELSE published_file END\n           FROM documents\n           WHERE tenant_id = $2 AND id = $3 AND collection_id = $7\n           RETURNING id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "7299b7e9c750369ef4b74a19bb9327945b8666b9f3eba97dc46a2e81f668e11e"
+}

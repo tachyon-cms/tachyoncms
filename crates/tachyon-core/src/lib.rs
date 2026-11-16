@@ -5,17 +5,19 @@ pub mod auth;
 pub mod diff;
 pub mod history;
 pub mod joins;
+pub mod net;
 pub mod query;
 pub mod richtext;
 pub mod schema;
 pub mod select;
+pub mod uploads;
 pub mod validate;
 pub mod virtuals;
 
 pub use schema::{
     Admin, Autosave, BlockDef, BlockSource, CollectionKind, CollectionSchema, Condition,
-    ConditionTest, Drafts, Field, FieldKind, Labels, Position, RelationTo, SchemaError,
-    SelectOption, Tab, Versions, data_fields, explain_parse_error,
+    ConditionTest, Drafts, FOLDERS, Field, FieldKind, Labels, Position, RelationTo, SchemaError,
+    SelectOption, Tab, Versions, check_upload_referrers, data_fields, explain_parse_error,
 };
 pub use validate::{
     FieldError, RelationRef, defaults, is_email, map_relations, merged, normalize_date_time,

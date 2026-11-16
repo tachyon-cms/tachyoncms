@@ -3,7 +3,7 @@ use std::time::Duration;
 use serde_json::json;
 use sqlx::PgPool;
 use tachyon_core::CollectionSchema;
-use tachyon_db::documents::{self, Prepared};
+use tachyon_db::documents::{self, FileChange, Prepared};
 use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_db::{DbError, collections};
 use time::OffsetDateTime;
@@ -21,6 +21,7 @@ fn job(run_at: OffsetDateTime, key: Option<&str>) -> NewJob<'static> {
         dedupe_key: key.map(str::to_owned),
         created_by: None,
         key_id: None,
+        max_attempts: None,
     }
 }
 
@@ -68,6 +69,7 @@ async fn enqueue_replaces_pending_by_key(pool: PgPool) {
     let prepared = Prepared {
         data: serde_json::Map::new(),
         relations: Vec::new(),
+        file: FileChange::Keep,
     };
     let doc = documents::insert(&pool, posts, 1, None, &prepared)
         .await
@@ -523,4 +525,59 @@ async fn finished_jobs_are_swept_after_30_days(pool: PgPool) {
         .unwrap();
     // Only what finished over 30 days ago goes; a recent one and a queued one stay.
     assert_eq!(left, ids[3..]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn the_default_attempts_match_the_column(pool: PgPool) {
+    let default: String = sqlx::query_scalar(
+        "SELECT column_default FROM information_schema.columns
+         WHERE table_name = 'jobs' AND column_name = 'max_attempts'",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert_eq!(default, jobs::DEFAULT_ATTEMPTS.to_string());
+    let id = add(&pool, &job(now(), None)).await;
+    let max: i32 = sqlx::query_scalar("SELECT max_attempts FROM jobs WHERE id = $1")
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(max, jobs::DEFAULT_ATTEMPTS);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn backoff_stops_growing_at_an_hour(pool: PgPool) {
+    let id = add(
+        &pool,
+        &NewJob {
+            max_attempts: Some(i32::MAX),
+            ..job(now(), None)
+        },
+    )
+    .await;
+    let mut delays = Vec::new();
+    // 18 is the last attempt under an hour (3,240 s), 19 the first over (3,610 s); 50,000
+    // would overflow a 32-bit square.
+    for attempts in [18, 19, 100, 50_000] {
+        sqlx::query("UPDATE jobs SET attempts = $2 - 1, run_at = now() WHERE id = $1")
+            .bind(id)
+            .bind(attempts)
+            .execute(&pool)
+            .await
+            .unwrap();
+        let j = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
+        assert_eq!(j.attempts, attempts);
+        jobs::fail(&pool, &j, "down", true).await.unwrap();
+        let (state, delay): (String, f64) = sqlx::query_as(
+            "SELECT state, extract(epoch FROM run_at - now())::float8 FROM jobs WHERE id = $1",
+        )
+        .bind(id)
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+        assert_eq!(state, "queued");
+        delays.push(delay.round());
+    }
+    assert_eq!(delays, [3240.0, 3600.0, 3600.0, 3600.0]);
 }

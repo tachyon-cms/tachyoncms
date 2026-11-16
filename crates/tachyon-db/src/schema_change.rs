@@ -52,6 +52,9 @@ pub struct Preview {
     /// Versions the change deletes: those past a lowered `maxVersions`, or every one when
     /// `versions` goes. A version a pending job holds is kept.
     pub pruned: i64,
+    /// Documents holding files, trashed ones and those only a version of holds included,
+    /// when the collection stops holding files: their files are removed.
+    pub holding_files: i64,
     /// For a shared block: the change in each schema that names it, by slug.
     #[serde(skip_serializing_if = "BTreeMap::is_empty")]
     pub collections: BTreeMap<String, Preview>,
@@ -65,6 +68,8 @@ pub struct ConfirmationScope {
     pub fields: bool,
     /// Old document versions the change deletes.
     pub versions: i64,
+    /// Documents whose files the change removes, as a collection stops holding files.
+    pub files: i64,
 }
 
 impl ConfirmationScope {
@@ -73,6 +78,7 @@ impl ConfirmationScope {
         Self {
             fields: self.fields || other.fields,
             versions: self.versions + other.versions,
+            files: self.files + other.files,
         }
     }
 
@@ -80,11 +86,16 @@ impl ConfirmationScope {
     pub fn what(&self) -> String {
         const FIELDS: &str =
             "This change removes or retypes fields, or leaves documents that won't validate";
-        match (self.fields, self.versions) {
+        let rest = match (self.fields, self.versions) {
             (true, 0) => format!("{FIELDS}."),
             (false, 0) => "This change needs confirmation.".to_owned(),
             (true, n) => format!("{FIELDS}, and deletes {n} old {}.", versions(n)),
             (false, n) => format!("This change deletes {n} old {}.", versions(n)),
+        };
+        match self.files {
+            0 => rest,
+            1 => format!("1 document holds files; they'll be removed. {rest}"),
+            n => format!("{n} documents hold files; they'll be removed. {rest}"),
         }
     }
 }
@@ -100,6 +111,7 @@ impl Preview {
         let mut scope = ConfirmationScope {
             fields: self.diff.is_destructive() || self.invalid > 0,
             versions: 0,
+            files: self.holding_files,
         };
         if self.collections.is_empty() {
             scope.versions = self.pruned;
@@ -370,6 +382,7 @@ impl Preview {
             cleared: 0,
             indexes: IndexChanges::default(),
             pruned: 0,
+            holding_files: 0,
             collections: BTreeMap::new(),
         }
     }
@@ -439,11 +452,20 @@ async fn run_in(
             ));
         }
         crate::auth::check_users_schema(s.schema).map_err(|e| own(s.slug, e))?;
+        crate::folders::check_folders_schema(s.schema, s.new).map_err(|e| own(s.slug, e))?;
     }
     if write.is_some() {
         // Every schema save holds R42's lock to its commit (W1-R16), so what's read below
         // stays true until then: no other schema, shared block or role changes meanwhile.
         crate::auth::lock_rule_roles(&mut *tx).await?;
+    }
+    // Folders are made when a server starts; a change using them may come first, as a
+    // schema file applied to a new database can. A preview rolls it back with the rest.
+    if saves
+        .iter()
+        .any(|s| s.schema.folders || s.slug == crate::folders::FOLDERS)
+    {
+        crate::folders::ensure_in(&mut *tx).await?;
     }
     let stored = sqlx::query_as!(
         Collection,
@@ -542,6 +564,12 @@ async fn run_in(
     let users = lookup(crate::auth::USERS)
         .map(|u| u.fields)
         .unwrap_or_default();
+    // Before every other check, and before any confirmation: `confirm` can't make links
+    // point at something that holds no files, so it's a conflict naming the referrers.
+    for (schema, _) in world.iter().filter(|(s, _)| saved(&s.slug).is_some()) {
+        tachyon_core::check_upload_referrers(schema, world.iter().map(|(s, _)| s))
+            .map_err(ChangeError::Invalid)?;
+    }
     for (schema, placed) in &world {
         let slug = schema.slug.as_str();
         let fail = |e: SchemaError| match saved(slug) {
@@ -564,6 +592,7 @@ async fn run_in(
         schema
             .check_virtual_targets(lookup)
             .and_then(|()| schema.check_join_targets(lookup))
+            .and_then(|()| schema.check_upload_targets(lookup))
             .and_then(|()| check_rules(schema, &users, &roles, &lookup))
             .map_err(fail)?;
     }
@@ -737,6 +766,16 @@ async fn run_in(
         if drafts == (false, true) {
             seed_drafts(&mut *tx, part.id).await?;
         }
+        if part.old.upload.is_some() && part.new.upload.is_none() {
+            crate::files::drop_collection_in(&mut *tx, part.id).await?;
+        }
+        // Each file's sizes are made again once this commits, with what it saves; without
+        // sizes before or after, there's nothing to make or drop.
+        let remade = |c: &Change| matches!(c, Change::UploadChanged { removed: false, .. });
+        let sized = |s: &CollectionSchema| s.uploads().is_some_and(|u| !u.image_sizes.is_empty());
+        if previews[k].diff.changes.iter().any(remade) && (sized(&part.old) || sized(&part.new)) {
+            crate::jobs::enqueue(&mut *tx, &crate::files::regenerate_job(part.id, None)).await?;
+        }
         if !part.saved {
             // Its fields changed with a shared block, so writes validated against the old
             // ones must retry (see `documents::check_schema`).
@@ -763,6 +802,13 @@ async fn run_in(
         )
         .fetch_one(&mut *tx)
         .await?;
+    }
+    // The folders may name every collection; a save of them answers as refreshed.
+    let listable = crate::folders::listable(world.iter().map(|(s, _)| s));
+    if let Some(folders) = crate::folders::refresh_in(&mut *tx, listable).await?
+        && let Some(i) = saved(crate::folders::FOLDERS)
+    {
+        current[i] = folders;
     }
     for s in saves {
         // Delivered to every listening server when the transaction commits.
@@ -831,7 +877,11 @@ async fn scan(
     if old.versions != new.versions {
         p.pruned = prune(&mut *conn, part.id, kept(new), false).await?;
     }
-    p.needs_confirmation = p.diff.is_destructive() || p.invalid > 0 || p.pruned > 0;
+    if old.upload.is_some() && new.upload.is_none() {
+        p.holding_files = crate::files::holding_documents(&mut *conn, part.id).await?;
+    }
+    p.needs_confirmation =
+        p.diff.is_destructive() || p.invalid > 0 || p.pruned > 0 || p.holding_files > 0;
     Ok(p)
 }
 
@@ -858,7 +908,7 @@ async fn prune(
     // The same rows either way; counting stays a plain SELECT, so a preview runs on a
     // read-only transaction or a replica.
     let n = if delete {
-        sqlx::query!(
+        let dropped: Vec<Option<Uuid>> = sqlx::query_scalar!(
             r#"DELETE FROM versions WHERE id IN (
                    SELECT id FROM (
                        SELECT id, row_number() OVER (
@@ -868,16 +918,18 @@ async fn prune(
                    WHERE n > $3 AND NOT EXISTS (
                        SELECT 1 FROM jobs j
                        WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
-                         AND j.payload->>'version' = ranked.id::text))"#,
+                         AND j.payload->>'version' = ranked.id::text))
+               RETURNING file_id"#,
             DEFAULT_TENANT,
             collection_id,
             keep,
         )
-        .execute(&mut *conn)
-        .await?
-        .rows_affected()
-        .try_into()
-        .unwrap_or(i64::MAX)
+        .fetch_all(&mut *conn)
+        .await?;
+        let n = dropped.len().try_into().unwrap_or(i64::MAX);
+        let files: Vec<Uuid> = dropped.into_iter().flatten().collect();
+        crate::files::release_in(conn, &files).await?;
+        n
     } else {
         sqlx::query_scalar!(
             r#"SELECT count(*) AS "n!" FROM (
@@ -899,8 +951,9 @@ async fn prune(
     Ok(n)
 }
 
-/// Refuses turning drafts off while a document's draft isn't what's published, trashed
-/// documents included: there's no way to do it without publishing or losing that work.
+/// Refuses turning drafts off while a document's draft isn't what's published, its data or
+/// its file, trashed documents included: there's no way to do it without publishing or
+/// losing that work.
 async fn check_no_pending_drafts(
     conn: &mut PgConnection,
     collection_id: Uuid,
@@ -909,7 +962,8 @@ async fn check_no_pending_drafts(
         r#"SELECT count(*) AS "n!", count(*) FILTER (WHERE deleted_at IS NOT NULL) AS "trashed!"
            FROM documents
            WHERE tenant_id = $1 AND collection_id = $2
-             AND (draft IS DISTINCT FROM published OR published IS NULL)"#,
+             AND (draft IS DISTINCT FROM published OR published IS NULL
+                  OR draft_file IS DISTINCT FROM published_file)"#,
         DEFAULT_TENANT,
         collection_id,
     )
@@ -946,9 +1000,10 @@ fn rewritten(
         .unwrap_or(migrated)
 }
 
-/// Drafts turned off: every draft goes, with its links, and every scheduled publish or
-/// unpublish is cancelled. Nothing is lost, since `check_no_pending_drafts` found each draft
-/// the same as what's published.
+/// Drafts turned off: every draft goes, with its links and its file reference (released
+/// when nothing else holds it), and every scheduled publish or unpublish is cancelled.
+/// Nothing is lost, since `check_no_pending_drafts` found each draft the same as what's
+/// published.
 async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
         "DELETE FROM relations r USING documents d
@@ -958,13 +1013,19 @@ async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<()
     )
     .execute(&mut *conn)
     .await?;
-    sqlx::query!(
-        "UPDATE documents SET draft = NULL WHERE tenant_id = $1 AND collection_id = $2",
+    let files: Vec<Option<Uuid>> = sqlx::query_scalar!(
+        "WITH old AS (SELECT id, draft_file FROM documents
+                      WHERE tenant_id = $1 AND collection_id = $2 FOR NO KEY UPDATE)
+         UPDATE documents d SET draft = NULL, draft_file = NULL FROM old
+         WHERE d.id = old.id
+         RETURNING old.draft_file",
         DEFAULT_TENANT,
         collection_id,
     )
-    .execute(&mut *conn)
+    .fetch_all(&mut *conn)
     .await?;
+    let files: Vec<Uuid> = files.into_iter().flatten().collect();
+    crate::files::release_in(conn, &files).await?;
     // Publishing needs drafts, so what's scheduled could only fail; documents first, then
     // their jobs, the order every write locks them in.
     sqlx::query!(
@@ -979,11 +1040,12 @@ async fn clear_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<()
     Ok(())
 }
 
-/// Drafts turned on: every document's draft starts as its published copy, links included,
-/// trashed documents too.
+/// Drafts turned on: every document's draft starts as its published copy, links and file
+/// included, trashed documents too.
 async fn seed_drafts(conn: &mut PgConnection, collection_id: Uuid) -> Result<(), DbError> {
     sqlx::query!(
-        "UPDATE documents SET draft = published WHERE tenant_id = $1 AND collection_id = $2",
+        "UPDATE documents SET draft = published, draft_file = published_file
+         WHERE tenant_id = $1 AND collection_id = $2",
         DEFAULT_TENANT,
         collection_id,
     )
@@ -1059,6 +1121,7 @@ async fn rewrite(
                             Some(Relation {
                                 path: r.path,
                                 at: r.at,
+                                field: r.field,
                                 collection_id: *targets.get(&r.relation_to)?,
                                 id: r.id,
                             })
@@ -1151,12 +1214,14 @@ mod tests {
         let scope = ConfirmationScope {
             fields: false,
             versions: 340,
+            files: 0,
         };
         assert_eq!(scope.what(), "This change deletes 340 old versions.");
         assert_eq!(
             ConfirmationScope {
                 fields: false,
                 versions: 1,
+                files: 0,
             }
             .what(),
             "This change deletes 1 old version."
@@ -1169,6 +1234,7 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 0,
+                files: 0,
             }
             .what(),
             "This change removes or retypes fields, or leaves documents that won't validate."
@@ -1181,6 +1247,7 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 340,
+                files: 0,
             }
             .what(),
             "This change removes or retypes fields, or leaves documents that won't validate, and deletes 340 old versions."
@@ -1192,16 +1259,19 @@ mod tests {
         let fields = ConfirmationScope {
             fields: true,
             versions: 0,
+            files: 0,
         };
         let versions = ConfirmationScope {
             fields: false,
             versions: 2,
+            files: 0,
         };
         assert_eq!(
             fields.combine(versions),
             ConfirmationScope {
                 fields: true,
                 versions: 2,
+                files: 0,
             }
         );
         assert_eq!(
@@ -1209,7 +1279,28 @@ mod tests {
             ConfirmationScope {
                 fields: true,
                 versions: 2,
+                files: 0,
             }
         );
+    }
+
+    #[test]
+    fn a_scope_with_files_counts_their_documents_first() {
+        let scope = |files| ConfirmationScope {
+            fields: true,
+            versions: 0,
+            files,
+        };
+        let fields =
+            "This change removes or retypes fields, or leaves documents that won't validate.";
+        assert_eq!(
+            scope(2).what(),
+            format!("2 documents hold files; they'll be removed. {fields}")
+        );
+        assert_eq!(
+            scope(1).what(),
+            format!("1 document holds files; they'll be removed. {fields}")
+        );
+        assert_eq!(scope(1).combine(scope(2)).files, 3);
     }
 }

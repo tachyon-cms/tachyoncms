@@ -11,7 +11,7 @@
 A headless CMS written in Rust. One binary, one Postgres database, and an API generated from the content types you define.
 
 > [!WARNING]
-> TachyonCMS is pre-alpha. The core content API, sign-in, access rules, drafts and publishing work today. The admin UI, media and GraphQL don't exist yet, so don't put it on a public network. Watch the repo to follow along, or jump in.
+> TachyonCMS is pre-alpha. The core content API, sign-in, access rules, drafts, publishing and uploads work today. The admin UI and GraphQL don't exist yet, so don't put it on a public network. Watch the repo to follow along, or jump in.
 
 The full documentation, with a step-by-step tutorial and a complete API reference, is at **[docs.tachyoncms.com](https://docs.tachyoncms.com)**.
 
@@ -42,6 +42,7 @@ We think you can have both. Here's what we're building toward:
 - Join fields list the documents that link to this one. Give a category `{"type": "join", "collection": "posts", "on": "category"}` and every read shows its posts, newest first. Page, sort, filter and count them per request with `joins[posts][limit]=5&joins[posts][sort]=-title`, or switch them off with `joins=false`. A join inside a group goes by its path, `joins[meta.recent]` or `joins[meta][recent]`.
 - Build pages from blocks, and write long-form text as rich text, in JSON or Markdown. Read it back as JSON, HTML, Markdown or plain text with `?format=`. [Pages and rich text](#pages-and-rich-text) shows how.
 - Write in drafts and publish when you're ready, now or at a set time. Every document can keep its history, show what changed between any two versions and go back to one, and a deleted document waits in the trash until you restore it or delete it for good. [Drafts, versions and publishing](#drafts-versions-and-publishing) shows how.
+- Upload images and files into any collection you like, get each image back resized in AVIF and WebP, crop it, paste it from a URL, and keep it on disk, S3, R2, Azure or Google Cloud Storage. Files answer to the same access rules as everything else. [Uploads and the media library](#uploads-and-the-media-library) shows how.
 
 ## Try it
 
@@ -284,7 +285,7 @@ Every row gets an `id` and keeps it. Lists are replaced whole, so to change one 
 
 Field rules work inside blocks, and inside rich text's block nodes, exactly as they do in groups and lists. Each row answers to its own block type's rules, so a `secret` that only Editors read in a `hero` row stays readable in a `quote` row with no rule on it. Filters go by path without the block type: `where[layout.heading][equals]=Welcome` searches every row that has a `heading`. `/api/access` lists `layout.heading` the same way, and where block types disagree it answers with what all of them allow.
 
-**What rich text holds.** Paragraphs, headings, bullet, numbered and task lists, quotes, code blocks, tables, horizontal rules and hard breaks; bold, italic, underline, strikethrough, subscript, superscript, inline code and links. A `relationship` node points at a document, and a `block` node holds a row of any block type the field lists. Images are coming with the media library. It's stored as a JSON tree:
+**What rich text holds.** Paragraphs, headings, bullet, numbered and task lists, quotes, code blocks, tables, horizontal rules and hard breaks; bold, italic, underline, strikethrough, subscript, superscript, inline code and links. A `relationship` node points at a document, a `block` node holds a row of any block type the field lists, and an `upload` node puts an image or a file in the flow ([below](#uploads-and-the-media-library)). It's stored as a JSON tree:
 
 ```json
 {"type": "doc", "content": [
@@ -296,7 +297,7 @@ Field rules work inside blocks, and inside rich text's block nodes, exactly as t
 ]}
 ```
 
-`features` narrows what a field allows (`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `code`, `link`, `heading`, `bulletList`, `orderedList`, `taskList`, `blockquote`, `horizontalRule`, `hardBreak`, `table`, `codeBlock`, `relationship`, `block`). Leave it out and everything's allowed. Paragraphs and plain text always are.
+`features` narrows what a field allows (`bold`, `italic`, `underline`, `strike`, `subscript`, `superscript`, `code`, `link`, `heading`, `bulletList`, `orderedList`, `taskList`, `blockquote`, `horizontalRule`, `hardBreak`, `table`, `codeBlock`, `relationship`, `block`, `upload`). Leave it out and everything's allowed. Paragraphs and plain text always are.
 
 `relationTo` says which collections links and relationship nodes may point at. A link is either an `href` or a document, `{"doc": {"relationTo": "pages", "value": "<id>"}}`, and `"newTab": true` opens it in a new tab.
 
@@ -320,6 +321,7 @@ That's GitHub-flavoured Markdown (tables, `~~strikethrough~~`, task lists) plus 
 - `::ref{collection="pages" slug="install"}` on its own line is a relationship node.
 - `::cta{label="Get started" href="/start"}` is a block node. Numbers and checkboxes read as you'd expect (`start="30"` is 30), and a `json` field's value is written as JSON.
 - `:::callout{kind="warning"}`, a block of Markdown, then `:::` puts that Markdown in the block's rich text field. It works when the block type has exactly one. Nest one inside another by giving the outer one more colons: `::::callout` around `:::callout`.
+- `![](media:media/<id>)` on its own line is an upload node, or `media:<id>` when the field takes files from one collection. A node with fields is `::media:media/<id>{caption="Taken at dawn"}`, and one whose fields hold rich text takes a body, `:::media:media/<id>{…}` to `:::`. Only files already in TachyonCMS can be named, so an image pointing at a URL is refused.
 - `<u>…</u>` is underline and `<br>` (or `<br/>`, `<br />`) is a hard break. That's all the HTML there is.
 
 Markdown that doesn't fit is refused with a 422 and the line it's on, never half-converted: `line 3: raw HTML isn't allowed; the only tags are <u>…</u> and <br>`, or ``line 3: unknown directive `:::aside` ``. A value can be up to 1 MiB, a numbered list starts at 1,000,000 at most, a NUL character is refused anywhere, and so is a directive straight after a task box (`- [ ] ::cta{…}`). Some things have no Markdown at all: subscript and superscript come out as plain text, and cell spans and `newTab` are dropped.
@@ -333,6 +335,8 @@ Markdown can't say everything JSON can, so a few things change on the way throug
 - A numbered list's `"start": 1` and a block node's empty `fields` aren't written.
 - A table without a header row gets its first row as the header.
 - A task item with no `checked` comes back unchecked.
+- An image's alt text comes from its file's `alt` field, so what you write between the brackets is dropped.
+- A table cell holding only an upload node keeps the image and drops the node's fields. Next to other blocks, it becomes its alt text.
 
 **Reading it back.** Ask for `?format=html`, `markdown` or `text` on any read of a collection or a global, single or list, and every rich text field comes back as a string, in populated and joined documents too. JSON is the default. `GET /api/users/{id}` takes `format` as well, though not `depth` or `select` (both are a 400 there). Here are two pieces of what `?format=html` makes of that body:
 
@@ -436,6 +440,41 @@ API keys have a third kind of scope. `posts:read` reads what's published and not
 
 `POST`, `PATCH` and `DELETE` on documents now refuse query parameters they don't take, with a 400 that names the parameter. v0.2.0 ignored them, so a client that sends extra ones will start getting errors. And a write that collides with another one in the database (a deadlock or a serialization failure) is a 409 that asks you to try again; nothing was saved, so retrying is safe.
 
+### Uploads and the media library
+
+Every site has a pile of images somewhere. Covers, screenshots, headshots, a PDF price list that sales keeps asking about. Here they live in collections like the rest of your content, as many as you want, each with its own fields, rules and storage. Add `upload` to a collection and every document in it holds one file:
+
+```bash
+curl -X POST localhost:3000/api/admin/collections \
+  -H "authorization: Bearer $TOKEN" \
+  -H 'content-type: application/json' \
+  -d '{"slug": "media", "upload": {
+        "mimeTypes": ["image/*"],
+        "imageSizes": [{"name": "thumbnail", "width": 400, "height": 300}, {"name": "card", "width": 768}]
+      },
+      "fields": [{"name": "alt", "type": "text"}]}'
+
+curl -X POST localhost:3000/api/media \
+  -H "authorization: Bearer $TOKEN" \
+  -F file=@harbour.jpg \
+  -F '_payload={"alt": "Boats in the harbour at dawn"}'
+```
+
+You get the document straight back, with `filename`, `mimeType`, `filesize`, `width`, `height`, a `url` and a `blurhash` for a blurred placeholder. What you don't get yet is `sizes`. Each one reads `null` until a job worker has made it, a second or so later, as a JPEG with AVIF and WebP copies beside it. Resizing a big photo five ways in three formats takes longer than a save should, so we answer first. Need them in the response? Add `?wait=true`.
+
+What happens to the file before it's saved matters more than how fast. Its type is read from its bytes, so `holiday.jpg` that's really a Windows program gets a 415, and executables and scripts are refused everywhere unless a collection says otherwise. Images decode on their own threads under a pixel cap, so a 100-megapixel bomb is turned away before it costs anything. GPS and other EXIF data is stripped unless you keep it, a photo shot sideways is turned upright, and SVGs lose their scripts. Nothing from the request ever becomes a path on disk or a key in a bucket: the server makes those itself.
+
+- **Change it.** A JSON `PATCH` edits fields; the same multipart form to `/api/media/{id}` replaces the file. The old one stays as long as a version or a published copy still holds it, so restoring a version brings its picture back.
+- **Crop it.** `{"uploadEdits": {"crop": {"x": 10, "y": 0, "width": 80, "height": 100, "unit": "%"}, "focalPoint": {"x": 40, "y": 50}}}` cuts the stored image and remakes the sizes around the new focal point. `%` values are a share of the width or height, each rounded to the nearest pixel on its own. Coordinates are on the picture as you see it, upright. A moving GIF is cut on every frame. If somebody else changes the file while your crop runs, you get a 409 rather than a muddle.
+- **Paste it.** `{"file": {"url": "https://…"}}` fetches it for you. Private, loopback and cloud metadata addresses are refused at every redirect, and an `allowList` narrows it further. An entry without a `port` matches only the default one. `skipSafeFetch` switches the address check off on every hop, so keep it to your laptop.
+- **Serve it.** `GET /api/media/file/harbour.jpg` checks the same read rules and field rules as the document. A file you can't read is a 404, a draft's file is never public, and an old version's file is never served at all. Public files go out as `public, no-cache` with an ETag, not cached for a year, because a deleted document's filename can be used again. Unlike the rest of the API, files can be framed, so a PDF embeds on your site; `modifyResponseHeaders` can set `X-Frame-Options` back.
+- **Link it.** An `upload` field links a post to its cover, with `filterOptions` to say which files fit. In rich text, an `upload` node is a `<picture>` in HTML, offering AVIF and WebP before the original, with its own fields as `data-*` attributes, and `![alt](media:media/<id>)` in Markdown. A field rule on any of a node's fields means whoever can't write that field can't replace text holding such a node either, the same as block nodes.
+- **File it.** `"folders": true` gives documents a `folder` from the built-in `folders` collection. A folder that still holds something won't delete unless you say where its contents go, with `?moveContentsTo=<id>` or `root`.
+
+Files go wherever `[storage.<name>]` in `tachyon.toml` says, and `upload.storage` picks one per collection. It's local disk out of the box, and S3, Cloudflare R2, MinIO, Azure and Google Cloud Storage work too. Keys come only from the environment, as `TACHYON_STORAGE__R2__ACCESS_KEY_ID` and friends; write one into the file and the server refuses to start, since config files get committed. A bucket with a `public_url` serves a public collection's files directly. `signed_downloads` hands out short-lived links after the access check, and `client_uploads` lets a browser put a big file straight into the bucket via `POST /api/media/upload-instructions`.
+
+A few honest limits. A signed upload URL can't carry a size, so the size is checked when the document is created; set a size limit and lifecycle rules on the bucket, one for `_staging/` (older versions too, if versioning's on) and one to abort incomplete multipart uploads. Someone who can upload can tell that a filename they guess is taken, though not what holds it. Hiding `filename` with a field rule doesn't hide a file whose `sizes` they can still read. A file that isn't re-encoded keeps whatever its own format can hide inside its data, so set `formatOptions` when you need every image rewritten. Collections can't be deleted yet, so there's no file cleanup for that. Vercel Blob and Uploadthing will come as plugins. The [uploads](https://docs.tachyoncms.com/uploads) and [storage](https://docs.tachyoncms.com/storage) docs cover the rest, every option included.
+
 ### Putting it online
 
 Set `public_url` to the address people use, such as `https://cms.example.com`, and serve it over HTTPS. Set it behind a reverse proxy too, even though the server itself listens on `127.0.0.1`: browser sign-ins compare against it. The server won't start on a public address without it, because browser sign-ins only accept changes coming from that address. Other settings live under `[auth]` in `tachyon.toml` (see `tachyon.example.toml`), or in the environment as `TACHYON_AUTH__SETTING`.
@@ -468,14 +507,13 @@ cargo run -p tachyon -- schema apply schema.json --rename posts:title=headline
 
 ## Roadmap
 
-Done: content types, validation and REST CRUD; filters, sorting, relationships and globals; sign-in, sessions, API keys and access rules; rich text and blocks. v0.2.0 ships all of it as signed binaries and a Docker image. Drafts, versions, scheduled publishing and the trash are done too, and come in the next release.
+Done: content types, validation and REST CRUD; filters, sorting, relationships and globals; sign-in, sessions, API keys and access rules; rich text and blocks. v0.2.0 ships all of it as signed binaries and a Docker image. Drafts, versions, scheduled publishing, the trash and the media library are done too, and come in the next release.
 
 Next, in this order, with no dates:
 
-1. Media library and image processing
-2. Live preview
-3. Authoring tools: push and pull content as Markdown files, bulk import
-4. The admin, as easy as WordPress for the people who publish
+1. Live preview
+2. Authoring tools: push and pull content as Markdown files, bulk import
+3. The admin, as easy as WordPress for the people who publish, uploads included
 
 After that: localization and full-text search, GraphQL and OpenAPI, passkeys, two-factor and single sign-on, WebAssembly plugins and webhooks, a WordPress importer, a Helm chart and published benchmarks. [Discussion #35](https://github.com/tachyon-cms/tachyoncms/discussions/35) has the reasoning, and the polls in [#38](https://github.com/tachyon-cms/tachyoncms/discussions/38) and [#39](https://github.com/tachyon-cms/tachyoncms/discussions/39) can change the order.
 

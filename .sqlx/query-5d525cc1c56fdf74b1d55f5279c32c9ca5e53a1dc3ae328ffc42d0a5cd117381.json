@@ -1,0 +1,32 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT filename FROM files\n           WHERE tenant_id = $1 AND collection_id = $2 AND state = 'pending'\n             AND issued_to = $3 AND issued_key IS NOT DISTINCT FROM $4\n             AND (document_id IS DISTINCT FROM $5 OR $5 IS NULL)",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filename",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "filename"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "5d525cc1c56fdf74b1d55f5279c32c9ca5e53a1dc3ae328ffc42d0a5cd117381"
+}

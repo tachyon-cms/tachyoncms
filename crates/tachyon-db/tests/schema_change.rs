@@ -6,7 +6,7 @@ use tachyon_core::CollectionSchema;
 use tachyon_core::diff::Renames;
 use tachyon_db::DocCopy;
 use tachyon_db::collections;
-use tachyon_db::documents::{self, Prepared, Relation};
+use tachyon_db::documents::{self, FileChange, Prepared, Relation};
 use tachyon_db::schema_change::{ChangeError, apply, preview};
 use uuid::Uuid;
 
@@ -60,13 +60,24 @@ async fn seed(pool: &PgPool) -> Seed {
     let relations = vec![Relation {
         path: "author".into(),
         at: "author".into(),
+        field: "author".into(),
         collection_id: authors,
         id: ann,
     }];
-    let post = documents::insert(pool, posts_id, 1, None, &Prepared { data, relations })
-        .await
-        .unwrap()
-        .id;
+    let post = documents::insert(
+        pool,
+        posts_id,
+        1,
+        None,
+        &Prepared {
+            data,
+            relations,
+            file: FileChange::Keep,
+        },
+    )
+    .await
+    .unwrap()
+    .id;
     Seed {
         posts: posts_id,
         post,
@@ -611,4 +622,90 @@ async fn a_schema_reached_by_two_saved_blocks_is_listed_under_both(pool: PgPool)
         let landing = &o.preview.collections["landing"];
         assert_eq!(landing.diff.changes.len(), 3, "{:?}", landing.diff);
     }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn upload_stays_on_while_upload_fields_point_here(pool: PgPool) {
+    let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+    collections::create(&pool, &media).await.unwrap();
+    collections::create(
+        &pool,
+        &posts(json!([{"name": "cover", "type": "upload", "relationTo": "media"}])),
+    )
+    .await
+    .unwrap();
+    let off = schema(json!({"slug": "media", "fields": []}));
+    // Confirmed or not, it's the referrer that's named.
+    for confirm in [false, true] {
+        match apply(&pool, "media", &off, &Renames::new(), confirm).await {
+            Err(ChangeError::Invalid(tachyon_core::SchemaError::Referenced(m))) => {
+                assert!(m.contains("posts.cover"), "{m}")
+            }
+            other => panic!("{other:?}"),
+        }
+    }
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn changes_reach_into_upload_node_fields(pool: PgPool) {
+    use tachyon_db::schema_change::create;
+    let media = create(
+        &pool,
+        &schema(json!({"slug": "media", "upload": true, "fields": []})),
+    )
+    .await
+    .unwrap()
+    .id;
+    let file = documents::insert(&pool, media, 1, None, &Prepared::plain(Default::default()))
+        .await
+        .unwrap()
+        .id;
+    create(&pool, &block("cta", None)).await.unwrap();
+    let pages = |caption: &str| {
+        schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media"], "upload": {"collections": {"media": {"fields": [
+                {"name": caption, "type": "text"},
+                {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+            ]}}}}]}),
+        )
+    };
+    let pages_id = create(&pool, &pages("caption")).await.unwrap().id;
+    let node = |fields: Value| {
+        json!({"body": {"type": "doc", "content": [{"type": "upload", "attrs": {
+            "relationTo": "media", "value": file.to_string(), "fields": fields
+        }}]}})
+    };
+    let row = "0199d5c4-0000-7000-8000-0000000000d1";
+    let data = node(json!({"caption": "c", "layout": [{"id": row, "blockType": "cta", "t": "x"}]}));
+    let page = documents::insert(
+        &pool,
+        pages_id,
+        1,
+        None,
+        &Prepared::plain(data.as_object().unwrap().clone()),
+    )
+    .await
+    .unwrap()
+    .id;
+
+    // The page's own rename, by the node's collection.
+    let renames: Renames = [("body.@media.caption".to_owned(), "alt".to_owned())].into();
+    apply(&pool, "pages", &pages("alt"), &renames, false)
+        .await
+        .unwrap();
+    // A shared block's rename cascades into the node's fields that place it.
+    let mut cta = block("cta", None);
+    cta.fields[0].name = "u".into();
+    let renames: Renames = [("t".to_owned(), "u".to_owned())].into();
+    let (_, p) = apply(&pool, "cta", &cta, &renames, false).await.unwrap();
+    assert_eq!(p.collections["pages"].documents, 1);
+
+    let doc = documents::get(&pool, pages_id, page, DocCopy::Published)
+        .await
+        .unwrap();
+    assert_eq!(
+        Value::Object(doc.data.0),
+        node(json!({"alt": "c", "layout": [{"id": row, "blockType": "cta", "u": "x"}]}))
+    );
 }

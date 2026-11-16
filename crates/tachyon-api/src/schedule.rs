@@ -17,7 +17,7 @@ use tachyon_core::auth::Action;
 use tachyon_core::validate::Mode;
 use tachyon_core::validate_document_in;
 use tachyon_db::collections::Collection;
-use tachyon_db::documents::{self, Prepared};
+use tachyon_db::documents::{self, FileChange, Prepared};
 use tachyon_db::jobs::{self, Job, NewJob};
 use tachyon_db::versions::{self, record_version};
 use tachyon_db::{DbError, DocCopy};
@@ -135,6 +135,7 @@ async fn set(
         dedupe_key: Some(key),
         created_by: access.user_id(),
         key_id: access.key_id(),
+        max_attempts: None,
     };
     match jobs::enqueue(tx, &job).await {
         Ok(_) => Ok(()),
@@ -328,11 +329,10 @@ fn refused(e: ApiError) -> JobError {
     }
 }
 
-/// The snapshot a publish job ships, checked as a publish checks the draft: full
-/// validation, and links only to published documents the scheduler may read.
+/// The snapshot a publish job ships, fully validated. Its links are checked as a publish
+/// checks the draft's, in the job's transaction (`published_links`).
 async fn snapshot(
     state: &AppState,
-    access: &Access,
     c: &Collection,
     id: Uuid,
     job: &Job,
@@ -343,21 +343,21 @@ async fn snapshot(
         .and_then(Value::as_str)
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| JobError::Permanent("the job names no version".into()))?;
-    let data = match versions::get(&state.pool, id, version).await {
-        Ok(v) => v.data.unwrap_or_default(),
+    let v = match versions::get(&state.pool, id, version).await {
+        Ok(v) => v,
         Err(DbError::NotFound) => {
             return Err(JobError::Permanent("the scheduled version is gone".into()));
         }
         Err(e) => return Err(db(e)),
     };
+    let data = v.data.unwrap_or_default();
     let targets = link_targets(state, c).await.map_err(why)?;
-    let prepared = validate_document_in(Mode::Full, c.schema.data(), &json!({}), Some(&data))
+    let mut prepared = validate_document_in(Mode::Full, c.schema.data(), &json!({}), Some(&data))
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
         .map_err(why)?;
-    published_links(state, access, &prepared)
-        .await
-        .map_err(why)?;
+    // What's published is the snapshot, its stored file included.
+    prepared.file = v.file_id.map_or(FileChange::Clear, FileChange::Set);
     Ok(prepared)
 }
 
@@ -404,7 +404,7 @@ pub(crate) async fn run(state: &AppState, job: &Job) -> Result<(), JobError> {
         .await
         .map_err(refused)?;
     let publish = match job.kind == PUBLISH {
-        true => Some(snapshot(state, &access, &c, id, job).await?),
+        true => Some(snapshot(state, &c, id, job).await?),
         false => None,
     };
     let mut tx = state
@@ -434,6 +434,14 @@ pub(crate) async fn run(state: &AppState, job: &Job) -> Result<(), JobError> {
     // here no other worker can take the job over.
     if !jobs::complete_in(&mut tx, job).await.map_err(db)? {
         return Ok(());
+    }
+    if let Some(p) = &publish {
+        published_links(&mut tx, state, &access, &c, p)
+            .await
+            .map_err(|e| match e {
+                ApiError::Conflict(d) if d == crate::error::TRY_AGAIN => JobError::Retry(d),
+                e => why(e),
+            })?;
     }
     match &publish {
         Some(p) => documents::publish_in(&mut tx, &c, id, Some(p), Some(user))

@@ -1,0 +1,29 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT sizes AS \"sizes: Json<Map<String, Value>>\" FROM files\n           WHERE tenant_id = $1 AND id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "sizes: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "sizes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "60111a7baf922721fe43588dfa33798ee6679616007c6c4be9a5b0a1dd35fa0f"
+}

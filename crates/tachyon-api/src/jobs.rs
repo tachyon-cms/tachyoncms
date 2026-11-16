@@ -77,7 +77,13 @@ pub(crate) enum JobError {
         error: String,
         result: Value,
     },
+    /// Held off by other work, such as a schema change or a user's write: run again soon
+    /// without spending an attempt, `MAX_DEFERRALS` times at most, then as a `Retry`.
+    Defer(String),
 }
+
+/// How long a deferred job waits before it's run again.
+const DEFER: Duration = Duration::from_secs(2);
 
 /// A long handler's lease, kept until this drops (see `keep_leased`).
 pub(crate) struct Leased {
@@ -188,6 +194,15 @@ async fn run(state: &AppState, running: &RunningJobs, job: Job) {
     };
     let (error, retry, result) = match outcome {
         Ok(Ok(())) => return,
+        Ok(Err(JobError::Defer(why))) => match jobs::defer(&state.pool, &job, DEFER, &why).await {
+            Ok(true) => return,
+            // Deferred too often: it spends an attempt now.
+            Ok(false) => (why, true, None),
+            Err(e) => {
+                tracing::warn!(job = %job.id, error = %e, "couldn't defer a job");
+                (why, true, None)
+            }
+        },
         Ok(Err(JobError::Retry(e))) => (e, true, None),
         Ok(Err(JobError::Permanent(e))) => (e, false, None),
         Ok(Err(JobError::Failed { error, result })) => (error, false, Some(result)),
@@ -206,6 +221,10 @@ async fn dispatch(state: &AppState, job: &Job) -> Result<(), JobError> {
         crate::collections::SCHEMA_CHANGE | crate::collections::SCHEMA_PREVIEW => {
             crate::collections::run_job(state, job).await
         }
+        tachyon_db::files::CLEANUP => crate::media_jobs::run_cleanup(state, job).await,
+        crate::media_jobs::CLEANUP_SWEEP => crate::media_jobs::run_cleanup_sweep(state, job).await,
+        crate::media_jobs::IMAGE_SIZES => crate::media_jobs::run_sizes(state, job).await,
+        tachyon_db::files::REGENERATE => crate::media_jobs::run_regenerate(state, job).await,
         #[cfg(test)]
         "test-panic" => panic!("a handler panicked"),
         #[cfg(test)]
@@ -235,6 +254,7 @@ mod tests {
             dedupe_key: None,
             created_by: None,
             key_id: None,
+            max_attempts: None,
         };
         jobs::enqueue(&mut pool.acquire().await.unwrap(), &job)
             .await
@@ -320,6 +340,8 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let held = keep_leased(&state, &job, lease).await.unwrap();
@@ -358,6 +380,8 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let _held = keep_leased(&state, &job, lease).await.unwrap();
@@ -393,6 +417,8 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let job = jobs::claim(&pool, lease).await.unwrap().unwrap();
         let _held = keep_leased(&state, &job, lease).await.unwrap();
@@ -421,6 +447,8 @@ mod tests {
             schemas: std::sync::Arc::new(crate::schemas::Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let job = jobs::claim(&pool, LEASE).await.unwrap().unwrap();
         let running = RunningJobs::default();

@@ -22,7 +22,8 @@ use crate::access::{Access, Reach, caller_of, hide_errors, refuse_fields};
 use crate::documents::{any_collection, json_body, unique_error};
 use crate::params::{Format, format_param};
 use crate::populate::{
-    Shapes, check_links, from_markdown, link_ids, link_targets, populate, prepare, vouched_links,
+    Sent, Shapes, check_links, filtered_links, from_markdown, link_ids, link_targets, populate,
+    prepare, vouched_links,
 };
 use crate::{ApiError, AppState};
 
@@ -362,7 +363,7 @@ pub(crate) async fn update(
         let access = Access::new(&state, principal.clone(), Reach::From(users)).await?;
         let next = apply(&stored)?;
         let vouched = check_links(&state, &access, &next, &link_ids(users, &stored)).await?;
-        Some((apply, vouched))
+        Some((apply, vouched, access))
     } else {
         None
     };
@@ -373,12 +374,13 @@ pub(crate) async fn update(
         .begin()
         .await
         .map_err(tachyon_db::DbError::from)?;
-    if let Some((apply, vouched)) = &profile_write {
+    if let Some((apply, vouched, access)) = &profile_write {
         let who = principal.identity().map(|i| Actor {
             id: i.user_id,
             own_only: false,
         });
-        documents::update_in(
+        let mut filed_before = None;
+        let doc = documents::update_in(
             &mut tx,
             users.id,
             users.schema_version,
@@ -387,6 +389,7 @@ pub(crate) async fn update(
             who,
             None,
             |current| {
+                filed_before = current.get("folder").cloned();
                 let next = apply(current)?;
                 vouched_links(&next, &link_ids(&users, current), vouched)?;
                 Ok(next)
@@ -394,6 +397,27 @@ pub(crate) async fn update(
         )
         .await
         .map_err(|e| hide_errors(&users, unique_error(&users, e), &caller, None))?;
+        let after = doc.data.0.get("folder");
+        crate::folders::check_filed(
+            &mut tx,
+            &users,
+            id,
+            DocCopy::Published,
+            filed_before.as_ref(),
+            after,
+        )
+        .await?;
+        let sent = Sent::Keys(&profile);
+        filtered_links(
+            &mut tx,
+            &state,
+            access,
+            &users,
+            &doc.data.0,
+            sent,
+            access.linked(),
+        )
+        .await?;
     }
     if let Some(role) = role {
         auth::set_role(&mut tx, id, role).await?;

@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE documents SET draft = published, draft_file = published_file\n         WHERE tenant_id = $1 AND collection_id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "625d0b368ef41ad0f514f34fffb1e9152d18781ba9d91bacc67982d6c21e8e0f"
+}

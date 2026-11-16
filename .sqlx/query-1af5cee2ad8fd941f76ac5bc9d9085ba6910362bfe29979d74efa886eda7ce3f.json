@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT published -> 'collections' AS \"listed: Json<Value>\" FROM documents\n           WHERE tenant_id = $1 AND id = $2 AND deleted_at IS NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "listed: Json<Value>",
+        "type_info": "Jsonb",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "1af5cee2ad8fd941f76ac5bc9d9085ba6910362bfe29979d74efa886eda7ce3f"
+}

@@ -6,6 +6,8 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use serde_json::{Map, Value};
+use sqlx::PgConnection;
+use tachyon_core::query::parse_filter_with;
 use tachyon_core::richtext::{self, RenderCtx};
 use tachyon_core::select::{Select, parse_select, project};
 use tachyon_core::validate::markdown_inputs;
@@ -15,7 +17,7 @@ use tachyon_core::{
 };
 use tachyon_db::DbError;
 use tachyon_db::collections::{self, Collection};
-use tachyon_db::documents::{Document, MISSING_LINK, Prepared, Relation};
+use tachyon_db::documents::{Document, FileChange, MISSING_LINK, Prepared, Relation};
 use tachyon_db::query::{self, Readable, get_many_readable};
 use uuid::Uuid;
 
@@ -65,6 +67,7 @@ pub(crate) fn prepare(
             Some(&collection_id) => found.push(Relation {
                 path: r.path,
                 at: r.at,
+                field: r.field,
                 collection_id,
                 id: r.id,
             }),
@@ -80,14 +83,20 @@ pub(crate) fn prepare(
     Ok(Prepared {
         data,
         relations: found,
+        file: FileChange::Keep,
     })
 }
 
-/// The IDs `data` of `c` links to.
-pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Vec<Uuid> {
+/// The links a stored document holds, as `(field, ID)`: the field is the link's schema
+/// position (`RelationRef::field`), so a list keeps its links whatever their order and
+/// same-named fields of different block types stay apart.
+pub(crate) type Held = HashSet<(String, Uuid)>;
+
+/// The links `data` of `c` holds (see `Held`).
+pub(crate) fn link_ids(c: &Collection, data: &Map<String, Value>) -> Held {
     relations(c.schema.data(), data)
         .into_iter()
-        .map(|r| r.id)
+        .map(|r| (r.field, r.id))
         .collect()
 }
 
@@ -235,22 +244,23 @@ async fn by_slug(
 /// Links a write adds, as `(document, collection)`, that `check_links` has seen readable.
 pub(crate) type Vouched = HashSet<(Uuid, Uuid)>;
 
-/// Refuses the links in `next` that `before` didn't hold and that the caller can't read,
-/// exactly as a link to no document is refused, so a write can't tell a hidden document
-/// from a missing one. Links already on the document stay as they are. A draft (a request
+/// Refuses the links in `next` that `before` didn't hold in the same field and that the
+/// caller can't read, exactly as a link to no document is refused, so a write can't tell a
+/// hidden document from a missing one. Links already in their field stay as they are; one
+/// the caller can't read can't move to another field, as it can't be added. A draft (a request
 /// working on drafts) may link to a draft the caller may read as well as to what's
 /// published; anything else links only to what's published.
 pub(crate) async fn check_links(
     state: &AppState,
     access: &Access,
     next: &Prepared,
-    before: &[Uuid],
+    before: &Held,
 ) -> Result<Vouched, ApiError> {
     let mut ids: Vec<Uuid> = next
         .relations
         .iter()
+        .filter(|r| !before.contains(&(r.field.clone(), r.id)))
         .map(|r| r.id)
-        .filter(|id| !before.contains(id))
         .collect();
     ids.sort_unstable();
     ids.dedup();
@@ -275,19 +285,144 @@ pub(crate) async fn check_links(
     Ok(vouched)
 }
 
-/// Refuses every link in `next`, about to be published, to a document with no published
-/// copy the caller may read: a draft may link to drafts, what's published may not. A
-/// hidden target and a missing one get the same error.
+/// Which top-level fields a write sends, for `filtered_links`.
+#[derive(Clone, Copy)]
+pub(crate) enum Sent<'a> {
+    /// Every field: a create, a restore or a publish writes the whole copy.
+    All,
+    /// The keys of a patch's body.
+    Keys(&'a Value),
+}
+
+impl Sent<'_> {
+    fn has(self, path: &str) -> bool {
+        match self {
+            Sent::All => true,
+            Sent::Keys(body) => {
+                let top = path.split('.').next().unwrap_or(path);
+                body.get(top).is_some()
+            }
+        }
+    }
+}
+
+/// Refuses each link that `data`, as written in `conn`'s transaction, holds in a field
+/// the write sends whose upload `filterOptions` the linked document doesn't match, in the
+/// copy `read` reads it in. Every link in a sent field is checked, the stored ones too,
+/// except those the caller can't read: checking them would say something about a document
+/// the caller can't see. `vouched_links` has already refused every such link that the
+/// locked document didn't hold in the same field, so those left stay where they were. The error is a missing link's, so nothing leaks.
 ///
-/// Read outside the publish's row locks on purpose. A target trashed meanwhile can't slip
-/// through: `sync_relations` re-checks every target under `FOR KEY SHARE`, which blocks a
-/// delete. A target unpublished, or hidden by a rule change, meanwhile leaves what
-/// unpublishing it a moment later would anyway, which is allowed: published copies keep
-/// their links to it, shown as bare IDs. Locking targets `FOR SHARE` would only add
-/// deadlocks between documents that link each other.
-pub(crate) async fn published_links(
+/// The linked documents are locked `FOR SHARE` first, in ID order, so a replace that
+/// would change what's matched (a new file's `mimeType`) waits for this write to finish,
+/// or this write sees it. Two writes that lock each other's documents can deadlock;
+/// Postgres breaks it and the loser gets a 409 (T8-5). `filterOptions` is the schema's
+/// condition, so it may test fields the caller can't read, as a join's `where` does.
+pub(crate) async fn filtered_links(
+    conn: &mut PgConnection,
     state: &AppState,
     access: &Access,
+    c: &Collection,
+    data: &Map<String, Value>,
+    sent: Sent<'_>,
+    read: &HashMap<Uuid, Readable>,
+) -> Result<(), ApiError> {
+    struct Group {
+        filter: Map<String, Value>,
+        collection: Uuid,
+        links: Vec<(String, Uuid)>,
+    }
+    let missing = |at: String| FieldError {
+        path: at,
+        message: MISSING_LINK.into(),
+    };
+    let (mut groups, mut errors): (Vec<Group>, Vec<FieldError>) = (Vec::new(), Vec::new());
+    for r in relations(c.schema.data(), data) {
+        let Some(filter) = r.filter_options else {
+            continue;
+        };
+        if !sent.has(&r.path) {
+            continue;
+        }
+        let Some(target) = state.schemas.get(&r.relation_to) else {
+            errors.push(missing(r.at));
+            continue;
+        };
+        // One group per field filter and target collection, a handful per schema.
+        match groups
+            .iter_mut()
+            .find(|g| g.collection == target.id && g.filter == filter)
+        {
+            Some(g) => g.links.push((r.at, r.id)),
+            None => groups.push(Group {
+                filter,
+                collection: target.id,
+                links: vec![(r.at, r.id)],
+            }),
+        }
+    }
+    let mut ids: Vec<Uuid> = groups
+        .iter()
+        .flat_map(|g| g.links.iter().map(|(_, id)| *id))
+        .collect();
+    ids.sort_unstable();
+    ids.dedup();
+    if !ids.is_empty() {
+        query::lock_shared(conn, &ids).await?;
+    }
+    for g in groups {
+        // None of it readable: stored links stay unchecked, new ones were refused already.
+        let Some(r) = read.get(&g.collection) else {
+            continue;
+        };
+        let one = HashMap::from([(g.collection, r.clone())]);
+        let ids: Vec<Uuid> = g.links.iter().map(|(_, id)| *id).collect();
+        let found = |docs: Vec<(Uuid, Document)>| -> HashSet<Uuid> {
+            docs.into_iter().map(|(_, d)| d.id).collect()
+        };
+        let readable = found(query::get_many_matching(&mut *conn, &ids, &one, None).await?);
+        // Checked at save against the target's fields; one that no longer parses matches nothing.
+        let filter = state.schemas.get_by_id(g.collection).and_then(|t| {
+            let lookup = |slug: &str| state.schemas.lookup(slug);
+            parse_filter_with(t.schema.data(), &Value::Object(g.filter), &lookup).ok()
+        });
+        let matched = match filter {
+            Some(f) => {
+                let f = access.guard(f);
+                found(query::get_many_matching(&mut *conn, &ids, &one, Some(&f)).await?)
+            }
+            None => HashSet::new(),
+        };
+        errors.extend(
+            g.links
+                .into_iter()
+                .filter(|(_, id)| readable.contains(id) && !matched.contains(id))
+                .map(|(at, _)| missing(at)),
+        );
+    }
+    if errors.is_empty() {
+        Ok(())
+    } else {
+        Err(ApiError::Validation(errors))
+    }
+}
+
+/// Refuses every link in `next`, about to be published in `conn`'s transaction, to a
+/// document with no published copy the caller may read: a draft may link to drafts,
+/// what's published may not. A hidden target and a missing one get the same error. Then
+/// `filtered_links`, every field sent.
+///
+/// Whether a target is readable isn't held by a lock. A target trashed meanwhile can't
+/// slip through: `sync_relations` re-checks every target under `FOR KEY SHARE`, which
+/// blocks a delete. A target unpublished, or hidden by a rule change, meanwhile leaves what
+/// unpublishing it a moment later would anyway, which is allowed: published copies keep
+/// their links to it, shown as bare IDs. What `filterOptions` tests is held, `FOR SHARE`,
+/// by `filtered_links`, since a target's contents matter there and not only its existence.
+pub(crate) async fn published_links(
+    conn: &mut PgConnection,
+    state: &AppState,
+    access: &Access,
+    c: &Collection,
     next: &Prepared,
 ) -> Result<(), ApiError> {
     let mut ids: Vec<Uuid> = next.relations.iter().map(|r| r.id).collect();
@@ -301,25 +436,30 @@ pub(crate) async fn published_links(
     if let Some(users) = state.schemas.get(tachyon_db::auth::USERS) {
         linkable.insert(users.id, Readable::published(None));
     }
-    let vouched = get_many_readable(&state.pool, &ids, &linkable)
+    let vouched = query::get_many_matching(&mut *conn, &ids, &linkable, None)
         .await?
         .into_iter()
         .map(|(collection_id, doc)| (doc.id, collection_id))
         .collect();
-    vouched_links(next, &[], &vouched)
+    vouched_links(next, &Held::new(), &vouched)?;
+    filtered_links(conn, state, access, c, &next.data, Sent::All, &linkable).await
 }
 
 /// `check_links`' answer applied to the document as locked for the write: a link added
-/// since the check (relative to `before`) that it didn't vouch for is refused the same way.
+/// since the check (relative to `before`, the locked document's `link_ids`) that it didn't
+/// vouch for is refused the same way.
 pub(crate) fn vouched_links(
     next: &Prepared,
-    before: &[Uuid],
+    before: &Held,
     vouched: &Vouched,
 ) -> Result<(), ApiError> {
     let missing: Vec<FieldError> = next
         .relations
         .iter()
-        .filter(|r| !before.contains(&r.id) && !vouched.contains(&(r.id, r.collection_id)))
+        .filter(|r| {
+            !before.contains(&(r.field.clone(), r.id))
+                && !vouched.contains(&(r.id, r.collection_id))
+        })
         .map(|r| FieldError {
             path: r.at.clone(),
             message: MISSING_LINK.into(),
@@ -355,6 +495,7 @@ pub(crate) async fn fill_virtuals_each(
     items: &mut [(Value, Arc<Collection>)],
     selects: &[Option<&Select>],
 ) -> Result<(), ApiError> {
+    crate::files::fill_urls(state, access, items).await?;
     let wanted: Vec<Vec<VirtualField>> = items
         .iter()
         .zip(selects)
@@ -378,14 +519,19 @@ pub(crate) async fn fill_virtuals_each(
         return Ok(());
     }
     // Each linked document as the caller may read it, so a hidden field gives no value.
-    let linked: HashMap<Uuid, Value> = readable_docs(state, access, &ids)
-        .await?
+    let mut found = Vec::new();
+    for (collection_id, doc) in readable_docs(state, access, &ids).await? {
+        if let Some(c) = state.schemas.get_by_id(collection_id) {
+            let mut value = to_value(&doc)?;
+            access.strip(&c, &mut value);
+            found.push((value, c));
+        }
+    }
+    // A virtual may read a linked file's `url`, worked out like any read's.
+    crate::files::fill_urls(state, access, &mut found).await?;
+    let linked: HashMap<Uuid, Value> = found
         .into_iter()
-        .filter_map(|(collection_id, doc)| {
-            let mut value = Value::Object(doc.data.0);
-            access.strip(&*state.schemas.get_by_id(collection_id)?, &mut value);
-            Some((doc.id, value))
-        })
+        .filter_map(|(value, _)| Some((value.get("id")?.as_str()?.parse().ok()?, value)))
         .collect();
     for ((value, _), wanted) in items.iter_mut().zip(&wanted) {
         if let Some(doc) = value.as_object_mut() {
@@ -435,7 +581,8 @@ pub(crate) fn populate<'a>(
 
 /// Renders the rich text in `items` as `format` asks, in place. What it links to is read
 /// as the caller may read it, whatever the depth, in one query for all of `items`: a link
-/// to a document they can't read, or whose collection has no `url`, is its text alone.
+/// to a document they can't read, or whose collection has no `url`, is its text alone, and
+/// an upload node holding a file they can't read is left out.
 // ponytail: a second query per level beside populate's own, and it also reads the targets
 // of relationship fields inside block nodes, which render as IDs. Fold it into populate's
 // query if rendered reads show up in a profile.
@@ -449,7 +596,7 @@ async fn render(
         Format::Json => return Ok(()),
         Format::Html => |text, _, ctx| richtext::to_html(text, ctx),
         Format::Markdown => richtext::to_markdown,
-        Format::Text => |text, _, _| richtext::to_text(text),
+        Format::Text => |text, _, ctx| richtext::to_text(text, ctx),
     };
     // The links inside each rich text field, block nodes' fields included.
     let mut ids = Vec::new();
@@ -470,7 +617,7 @@ async fn render(
     }
     ids.sort_unstable();
     ids.dedup();
-    let mut targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = HashMap::new();
+    let (mut found, mut found_ids) = (Vec::new(), Vec::new());
     if !ids.is_empty() {
         for (collection_id, doc) in readable_docs(state, access, &ids).await? {
             let Some(c) = state.schemas.get_by_id(collection_id) else {
@@ -478,11 +625,20 @@ async fn render(
             };
             let mut value = to_value(&doc)?;
             access.strip(&c, &mut value);
-            if let Value::Object(fields) = value {
-                targets.insert(doc.id, (c, fields));
-            }
+            found.push((value, c));
+            found_ids.push(doc.id);
         }
     }
+    // An upload node shows its file's URLs, worked out as any read's are.
+    crate::files::fill_urls(state, access, &mut found).await?;
+    let targets: HashMap<Uuid, (Arc<Collection>, Map<String, Value>)> = found_ids
+        .into_iter()
+        .zip(found)
+        .filter_map(|(id, (value, c))| match value {
+            Value::Object(fields) => Some((id, (c, fields))),
+            _ => None,
+        })
+        .collect();
     // A link's target, if the caller read it and it's in the collection the link names.
     let target = |to: &str, value: &Value| {
         let (c, doc) = targets.get(&Uuid::try_parse(value.as_str()?).ok()?)?;
@@ -491,10 +647,16 @@ async fn render(
     let link_url = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.link_url(d));
     let title = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.title_of(d));
     let slug = |to: &str, v: &Value| target(to, v).and_then(|(c, d)| c.schema.slug_of(d));
+    let upload = |to: &str, v: &Value| {
+        target(to, v)
+            .filter(|(c, _)| c.schema.upload.is_some())
+            .and_then(|(_, d)| richtext::upload_view(d))
+    };
     let ctx = RenderCtx {
         link_url: &link_url,
         title: &title,
         slug: &slug,
+        upload: &upload,
     };
     for (v, c, _) in items.iter_mut() {
         if let Some(doc) = v.as_object_mut() {
@@ -630,6 +792,8 @@ mod tests {
             schemas: Arc::new(Schemas::load(&pool).await.unwrap()),
             auth: std::sync::Arc::new(crate::auth::AuthState::new(Default::default()).unwrap()),
             inline_rows: crate::collections::INLINE_ROWS,
+            media: Default::default(),
+            fetch: tachyon_media::fetch::SafeFetch::new(std::time::Duration::from_secs(1)).unwrap(),
         };
         let b = collections::create(&pool, &schema(json!({"slug": "b", "fields": []})))
             .await

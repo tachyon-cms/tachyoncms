@@ -25,7 +25,10 @@ use uuid::Uuid;
 use crate::access::{Access, both};
 use crate::documents::{collection, mode_for, parse_id, respond, shaped, unique_error};
 use crate::params::{no_params, trash_params};
-use crate::populate::{Vouched, check_links, link_targets, prepare, to_value, vouched_links};
+use crate::populate::{
+    Held, Sent, Vouched, check_links, filtered_links, link_targets, prepare, to_value,
+    vouched_links,
+};
 use crate::{ApiError, AppState};
 
 /// A page of the trashed documents of a collection the caller may delete, most recently
@@ -60,15 +63,21 @@ pub async fn list(
         owner: read.owner,
     };
     let found = query::list_trash(&state.pool, c.id, &q, p.oldest_first).await?;
-    let docs = found
+    let mut docs = found
         .docs
         .iter()
         .map(|d| {
             let mut v = to_value(d)?;
             access.strip(&c, &mut v);
-            Ok(shaped(v, p.select.as_ref()))
+            Ok((v, c.clone()))
         })
         .collect::<Result<Vec<_>, ApiError>>()?;
+    // So the trash can show what each file was; the route serves a trashed one to nobody.
+    crate::files::fill_urls(&state, &access, &mut docs).await?;
+    let docs: Vec<Value> = docs
+        .into_iter()
+        .map(|(v, _)| shaped(v, p.select.as_ref()))
+        .collect();
     let mut body = json!({
         "docs": docs,
         "limit": p.limit,
@@ -110,46 +119,97 @@ pub async fn restore(
     let mut vouched = Vouched::new();
     let mut errors = Errors::default();
     for (copy, p, _) in &stored {
-        match check_links(&state, &access, p, &[]).await {
+        match check_links(&state, &access, p, &Held::new()).await {
             Ok(v) => vouched.extend(v),
             Err(e) => errors.add(&c, *copy, e)?,
         }
     }
     errors.check()?;
-    let mut tx = state.pool.begin().await.map_err(DbError::from)?;
-    let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
-    for (copy, p, _) in &locked {
-        if let Err(e) = vouched_links(p, &[], &vouched) {
-            errors.add(&c, *copy, e)?;
+    // A restore that renames a file's sizes is rolled back, their objects copied to the new
+    // names with nothing locked, and tried again, until it commits with every name it
+    // renames already copied.
+    let mut copied = crate::media_jobs::Copied::default();
+    // A round whose names are the last round's, its new renames only sizes a job filled
+    // meanwhile, is progress: it's bounded on its own, by `SIZE_ROUNDS`.
+    let (mut tries, mut size_rounds, mut last_names) = (0, 0, None);
+    while tries < crate::media_jobs::RESTORE_TRIES && size_rounds < crate::media_jobs::SIZE_ROUNDS {
+        let mut tx = state.pool.begin().await.map_err(DbError::from)?;
+        // A folder comes back where it was, which must still fit: those above may have
+        // moved down meanwhile. The tree lock comes before any row's.
+        let folder = c.schema.slug == tachyon_core::FOLDERS;
+        if folder {
+            crate::folders::lock(&mut tx).await?;
         }
-    }
-    errors.check()?;
-    let by = access.user_id();
-    let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
-    let doc = documents::restore_in(&mut tx, &c, id, &copies, by)
-        .await
-        .map_err(|e| {
-            let e = match e {
-                // Only published copies are unique.
-                DbError::UniqueViolation(_) => match unique_error(&c, e.into()) {
-                    ApiError::Validation(v) => {
-                        ApiError::Validation(copy_errors(&c, DocCopy::Published, v))
-                    }
-                    e => e,
-                },
-                e => e.into(),
-            };
-            access.hide(&c, e, None)
-        })?;
-    if c.schema.versioned() {
-        for (copy, p, changed) in &locked {
-            if *changed {
-                record_version(&mut tx, id, &c, *copy, &p.data, by).await?;
+        let locked = stored_in(&mut tx, &access, &c, &read, &targets, id, true).await?;
+        for (copy, p, _) in &locked {
+            if let Err(e) = vouched_links(p, &Held::new(), &vouched) {
+                errors.add(&c, *copy, e)?;
+            } else if let Err(e) = filtered_links(
+                &mut tx,
+                &state,
+                &access,
+                &c,
+                &p.data,
+                Sent::All,
+                access.linked(),
+            )
+            .await
+            {
+                errors.add(&c, *copy, e)?;
             }
         }
+        errors.check()?;
+        let by = access.user_id();
+        let copies: Vec<_> = locked.iter().map(|(c, p, _)| (*c, p.clone())).collect();
+        let (doc, renamed) = documents::restore_in(&mut tx, &c, id, &copies, by)
+            .await
+            .map_err(|e| {
+                let e = match e {
+                    // Only published copies are unique.
+                    DbError::UniqueViolation(_) => match unique_error(&c, e.into()) {
+                        ApiError::Validation(v) => {
+                            ApiError::Validation(copy_errors(&c, DocCopy::Published, v))
+                        }
+                        e => e,
+                    },
+                    e => e.into(),
+                };
+                access.hide(&c, e, None)
+            })?;
+        if folder {
+            crate::folders::check_place(&mut tx, id).await?;
+        }
+        if !copied.covers(&renamed) {
+            drop(tx);
+            let names: Vec<(Uuid, String)> = renamed
+                .iter()
+                .map(|r| (r.file, r.filename.clone()))
+                .collect();
+            if last_names.as_ref() == Some(&names) {
+                size_rounds += 1;
+            } else {
+                tries += 1;
+            }
+            last_names = Some(names);
+            copied.copy(&state, &renamed).await?;
+            continue;
+        }
+        if c.schema.versioned() {
+            for (copy, p, changed) in &locked {
+                if *changed {
+                    record_version(&mut tx, id, &c, *copy, &p.data, by).await?;
+                }
+            }
+        }
+        // The old names' objects go once the new names are seen.
+        crate::media_jobs::forget_old_in(&mut tx, &renamed).await?;
+        // A failed commit leaves the copies to the cleanup queued before they were made.
+        tx.commit().await.map_err(DbError::from)?;
+        return respond(&state, &access, c, &doc, read.copy, 1).await;
     }
-    tx.commit().await.map_err(DbError::from)?;
-    respond(&state, &access, c, &doc, read.copy, 1).await
+    Err(ApiError::Conflict(
+        "its files were renamed while it was being restored; try again".into(),
+    ))
 }
 
 /// Each copy's 422 errors, gathered so a restore reports both copies at once.

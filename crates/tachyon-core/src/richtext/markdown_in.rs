@@ -15,6 +15,22 @@ use crate::validate::FieldError;
 
 const HTML: &str = "raw HTML isn't allowed; the only tags are <u>…</u> and <br>";
 
+const IMAGES: &str = "images must be media:<id>; local paths arrive with content push";
+
+const URLS: &str = "an image must be an upload, as media:<collection>/<id>, not a URL";
+
+/// `dest` names a URL: it starts `//` or with a scheme, which a one-letter drive isn't.
+fn is_url(dest: &str) -> bool {
+    dest.starts_with("//")
+        || dest.split_once(':').is_some_and(|(scheme, _)| {
+            scheme.len() > 1
+                && scheme.starts_with(|c: char| c.is_ascii_alphabetic())
+                && scheme
+                    .chars()
+                    .all(|c| c.is_ascii_alphanumeric() || matches!(c, '+' | '-' | '.'))
+        })
+}
+
 /// The ways a hard break may be written as HTML, where Markdown can't write `\` (W1-R36).
 const BR: [&str; 3] = ["<br>", "<br/>", "<br />"];
 
@@ -147,7 +163,7 @@ fn join(path: &str, rest: &str) -> String {
 }
 
 /// Calls `f` on `node` and every node inside it, each with its path as validation names
-/// it. Of a block node, only its own rich text fields are followed (and block nodes in
+/// it. Of a block or upload node, only its own rich text fields are followed (and nodes in
 /// those), not rich text inside its groups or lists. `kind` is the text's field; a json
 /// value shaped like rich text is data, never walked (W1-R44).
 fn each_node_at(
@@ -163,10 +179,10 @@ fn each_node_at(
             each_node_at(child, kind, &join(path, &format!("content.{i}")), f);
         }
     }
-    if obj.get("type").and_then(Value::as_str) == Some("block")
+    if let Some((upload, key)) = super::node_type_key(obj)
         && let Some(Value::Object(attrs)) = obj.get_mut("attrs")
     {
-        let defs = crate::validate::node_fields(kind, attrs);
+        let defs = kind.node_type(upload, &key).unwrap_or(&[]);
         if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
             for (name, text) in fields.iter_mut() {
                 if let Some(def) = defs.iter().find(|d| d.name == *name)
@@ -236,11 +252,16 @@ enum Open<'k> {
     Directive,
     /// An HTML block, which may only be a hard break.
     Html(String),
-    /// A block directive's text, until the line that closes it. `text` is the block's one
-    /// rich text field, which holds it.
+    /// An image's alt text, which isn't kept: its upload node is already in the paragraph.
+    /// How many images inside it are still open.
+    Image(usize),
+    /// A block or upload directive's text, until the line that closes it. `name` is as
+    /// written (`callout`, `media:media/<id>`); `file` the upload node's collection and ID;
+    /// `text` the node's one rich text field, which holds it.
     Body {
         colons: usize,
-        block_type: String,
+        name: String,
+        file: Option<(String, String)>,
         fields: Map<String, Value>,
         text: Option<&'k Field>,
     },
@@ -314,6 +335,15 @@ impl<'s, 'k> Reader<'s, 'k> {
         let patched = self.patch();
         for (event, range) in Parser::new_ext(&patched, options()).into_offset_iter() {
             let line = self.line(range.start);
+            if let Open::Image(open) = &mut self.top().open {
+                match event {
+                    Event::Start(Tag::Image { .. }) => *open += 1,
+                    Event::End(TagEnd::Image) if *open == 0 => drop(self.stack.pop()),
+                    Event::End(TagEnd::Image) => *open -= 1,
+                    _ => {}
+                }
+                continue;
+            }
             // A directive's line is read from the source, not as a heading's text.
             if matches!(self.top().open, Open::Directive)
                 && !matches!(event, Event::End(TagEnd::Heading(_)))
@@ -330,15 +360,13 @@ impl<'s, 'k> Reader<'s, 'k> {
         }
         if let Some(Frame {
             line,
-            open: Open::Body {
-                colons, block_type, ..
-            },
+            open: Open::Body { colons, name, .. },
             ..
         }) = self.stack.last()
         {
             return Err((
                 *line,
-                format!("`{}{block_type}` is never closed", ":".repeat(*colons)),
+                format!("`{}{name}` is never closed", ":".repeat(*colons)),
             ));
         }
         let root = self.stack.pop().expect("the document is never closed");
@@ -419,10 +447,25 @@ impl<'s, 'k> Reader<'s, 'k> {
         Ok(())
     }
 
-    /// A paragraph or heading: the end of the text `<u>` can mark.
+    /// A paragraph or heading: the end of the text `<u>` can mark. A paragraph that is
+    /// one image is its upload node.
     fn paragraph(&mut self, mut n: Map<String, Value>, frame: Frame<'k>) -> Result<(), Refusal> {
         if !self.marks.is_empty() {
             return Err((frame.line, "`<u>` is never closed".into()));
+        }
+        let image = |c: &Value| c["type"] == "upload";
+        if frame.children.iter().any(image) {
+            return match &frame.children[..] {
+                [upload] if n["type"] == "paragraph" => {
+                    self.finish(upload.as_object().expect("a node").clone());
+                    Ok(())
+                }
+                _ => Err((
+                    frame.line,
+                    "an image must stand alone in its paragraph, with a blank line around it"
+                        .into(),
+                )),
+            };
         }
         if !frame.children.is_empty() {
             n.insert("content".into(), frame.children.into());
@@ -555,9 +598,9 @@ impl<'s, 'k> Reader<'s, 'k> {
                 }
                 Some(json!({"type": "link", "attrs": link(*link_type, dest_url, line)?}))
             }
-            Tag::Image { .. } => {
-                return Err((line, "images arrive with the media library".into()));
-            }
+            Tag::Image {
+                dest_url, title, ..
+            } => return self.image(dest_url, title, line),
             _ => None,
         };
         if let Some(mark) = mark {
@@ -679,17 +722,77 @@ impl<'s, 'k> Reader<'s, 'k> {
                 self.nodes -= 1;
                 self.directive(line)?;
             }
-            Open::Body {
-                colons, block_type, ..
-            } => {
+            Open::Body { colons, name, .. } => {
                 return Err((
                     line,
-                    format!("`{}{block_type}` is never closed", ":".repeat(colons)),
+                    format!("`{}{name}` is never closed", ":".repeat(colons)),
                 ));
             }
-            Open::Doc | Open::Loose => unreachable!("never ended by the parser"),
+            Open::Doc | Open::Loose | Open::Image(_) => unreachable!("never ended by the parser"),
         }
         Ok(())
+    }
+
+    /// An image, `![alt](media:<collection>/<id>)` or `media:<id>` where the field holds
+    /// files from one collection only: an upload node, which its paragraph becomes. Its
+    /// alt text is the file's own, so what's written here is dropped.
+    fn image(&mut self, dest: &str, title: &str, line: usize) -> Result<(), Refusal> {
+        if !title.is_empty() {
+            return Err((
+                line,
+                "image titles aren't kept; leave out the quoted title".into(),
+            ));
+        }
+        if !self.marks.is_empty() {
+            return Err((
+                line,
+                "an image can't be linked or marked; give it a paragraph of its own".into(),
+            ));
+        }
+        if !dest.starts_with("media:") {
+            return Err((line, if is_url(dest) { URLS } else { IMAGES }.into()));
+        }
+        let (to, id) = self.file(dest, line)?;
+        self.inline(line)?;
+        let mut n = node("upload", line);
+        n.insert("attrs".into(), json!({"relationTo": to, "value": id}));
+        self.push(n)?;
+        // Not a node: it only reads the alt text past.
+        self.stack.push(Frame {
+            line,
+            open: Open::Image(0),
+            children: Vec::new(),
+        });
+        Ok(())
+    }
+
+    /// The file `dest` names, `media:<collection>/<id>` or `media:<id>` where the field
+    /// holds files from one collection only: its collection and ID.
+    fn file(&self, dest: &str, line: usize) -> Result<(String, String), Refusal> {
+        let rest = dest.strip_prefix("media:").unwrap_or(dest);
+        let (to, id) = match rest.split_once('/') {
+            Some((to, id)) => (to.to_owned(), id),
+            None => match self.kind().upload_targets()[..] {
+                [only] => (only.to_owned(), rest),
+                [] => return Err((line, "this field can't hold files".into())),
+                ref several => {
+                    return Err((
+                        line,
+                        format!(
+                            "name the collection, as media:<collection>/<id>; one of: {}",
+                            several.join(", ")
+                        ),
+                    ));
+                }
+            },
+        };
+        if to.is_empty() || id.is_empty() {
+            return Err((
+                line,
+                format!("expected media:<id> or media:<collection>/<id>, not `{dest}`"),
+            ));
+        }
+        Ok((to, id.to_owned()))
     }
 
     /// A directive's line: a block, a reference, or the end of a block's text.
@@ -702,9 +805,13 @@ impl<'s, 'k> Reader<'s, 'k> {
         let text = self.src[at..end].trim_end();
         let colons = text.len() - text.trim_start_matches(':').len();
         let rest = &text[colons..];
-        let name_end = rest
-            .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
-            .unwrap_or(rest.len());
+        // An upload node is named by its file, as an image is.
+        let name_end = match rest.starts_with("media:") {
+            true => rest.find('{').unwrap_or(rest.len()),
+            false => rest
+                .find(|c: char| !(c.is_ascii_alphanumeric() || c == '-' || c == '_'))
+                .unwrap_or(rest.len()),
+        };
         let (name, attrs) = rest.split_at(name_end);
         let malformed = || {
             (
@@ -737,15 +844,27 @@ impl<'s, 'k> Reader<'s, 'k> {
             );
             return self.push(n);
         }
-        let Some(block) = self.kind().block(name) else {
-            return Err((
-                line,
-                format!("unknown directive `{}{name}`", ":".repeat(colons)),
-            ));
+        let file = match name.starts_with("media:") {
+            true => Some(self.file(name, line)?),
+            false => None,
+        };
+        // A collection the field holds no files from is the validator's to refuse, as for
+        // an image; its attributes are read as text meanwhile.
+        let defs = match &file {
+            Some((to, _)) => self.kind().upload_node(to).map_or(&[][..], |n| &n.fields),
+            None => match self.kind().block(name) {
+                Some(block) => &block.fields,
+                None => {
+                    return Err((
+                        line,
+                        format!("unknown directive `{}{name}`", ":".repeat(colons)),
+                    ));
+                }
+            },
         };
         let mut fields = Map::new();
         for (key, value) in attrs {
-            let field = block.fields.iter().find(|f| f.name == key);
+            let field = defs.iter().find(|f| f.name == key);
             let value = match field {
                 // Written as JSON whatever it holds, so a string reads back as a string.
                 Some(f) if matches!(f.kind, FieldKind::Json) => {
@@ -769,12 +888,9 @@ impl<'s, 'k> Reader<'s, 'k> {
             fields.insert(key, value);
         }
         if colons == 2 {
-            let mut n = node("block", line);
-            n.insert("attrs".into(), block_attrs(name, fields));
-            return self.push(n);
+            return self.push(field_node(name, file, fields, line));
         }
-        let texts: Vec<&Field> = block
-            .fields
+        let texts: Vec<&Field> = defs
             .iter()
             .filter(|f| matches!(f.kind, FieldKind::RichText { .. }))
             .collect();
@@ -796,7 +912,8 @@ impl<'s, 'k> Reader<'s, 'k> {
             line,
             Open::Body {
                 colons,
-                block_type: name.to_owned(),
+                name: name.to_owned(),
+                file,
                 fields,
                 text,
             },
@@ -813,7 +930,8 @@ impl<'s, 'k> Reader<'s, 'k> {
             open:
                 Open::Body {
                     colons: wanted,
-                    block_type,
+                    name,
+                    file,
                     mut fields,
                     text,
                 },
@@ -826,7 +944,7 @@ impl<'s, 'k> Reader<'s, 'k> {
             return Err((
                 line,
                 format!(
-                    "`{shut}` doesn't close `{}{block_type}` from line {opened}",
+                    "`{shut}` doesn't close `{}{name}` from line {opened}",
                     ":".repeat(wanted)
                 ),
             ));
@@ -839,15 +957,13 @@ impl<'s, 'k> Reader<'s, 'k> {
                 return Err((
                     opened,
                     format!(
-                        "`{block_type}` has no single rich text field to hold text; write it as `::{block_type}{{…}}`"
+                        "`{name}` has no single rich text field to hold text; write it as `::{name}{{…}}`"
                     ),
                 ));
             }
             None => {}
         }
-        let mut n = node("block", opened);
-        n.insert("attrs".into(), block_attrs(&block_type, fields));
-        self.finish(n);
+        self.finish(field_node(&name, file, fields, opened));
         Ok(())
     }
 }
@@ -873,11 +989,22 @@ fn link(link_type: LinkType, dest: &str, line: usize) -> Result<Value, Refusal> 
     })
 }
 
-fn block_attrs(block_type: &str, fields: Map<String, Value>) -> Value {
-    match fields.is_empty() {
-        true => json!({ "blockType": block_type }),
-        false => json!({"blockType": block_type, "fields": fields}),
+/// A block node of type `name`, or the upload node of `file`, holding `fields`.
+fn field_node(
+    name: &str,
+    file: Option<(String, String)>,
+    fields: Map<String, Value>,
+    line: usize,
+) -> Map<String, Value> {
+    let (mut n, mut attrs) = match file {
+        Some((to, id)) => (node("upload", line), json!({"relationTo": to, "value": id})),
+        None => (node("block", line), json!({ "blockType": name })),
+    };
+    if !fields.is_empty() {
+        attrs["fields"] = fields.into();
     }
+    n.insert("attrs".into(), attrs);
+    n
 }
 
 /// What a node holding blocks needs at least: an empty paragraph, if nothing else.
@@ -1005,12 +1132,12 @@ fn attributes(s: &str) -> Option<Vec<(String, String)>> {
 /// other is read as the JSON `to_markdown` wrote (`30`, `true`, `{…}`).
 fn takes_text(kind: &FieldKind) -> bool {
     matches!(value_kind(kind), Some(ValueKind::Text | ValueKind::Date))
-        && !matches!(kind, FieldKind::Relationship { relation_to, .. } if relation_to.is_polymorphic())
+        && !kind.link().is_some_and(|l| l.relation_to.is_polymorphic())
 }
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{A1, P1};
+    use super::super::tests::{A1, P1, no_file};
     use super::super::{RenderCtx, to_markdown};
     use super::*;
     use crate::schema::Field;
@@ -1278,7 +1405,7 @@ mod tests {
                 &b,
                 "text\n\n![cat](/cat.png)",
                 "",
-                "line 3: images arrive with the media library".into(),
+                "line 3: images must be media:<id>; local paths arrive with content push".into(),
             ),
             (
                 &b,
@@ -1511,6 +1638,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &slug,
+            upload: &no_file,
         };
         let link = |s: &str, attrs: Value| marked(s, json!([{"type": "link", "attrs": attrs}]));
         let video = json!({"type": "block", "attrs": {"blockType": "video", "fields": {
@@ -1674,6 +1802,347 @@ mod tests {
         );
     }
 
+    /// A `body` holding files from `collections` (each of `media` and `docs` linkable),
+    /// with a `callout` whose text holds files from `media` alone.
+    fn files(collections: Value) -> Field {
+        serde_json::from_value(json!({"name": "body", "type": "richText",
+        "relationTo": ["posts", "media", "docs"], "upload": {"collections": collections},
+        "blocks": [{"slug": "callout", "fields": [
+            {"name": "body", "type": "richText", "relationTo": ["media"],
+             "upload": {"collections": {"media": {}}}}
+        ]}]}))
+        .unwrap()
+    }
+
+    fn upload(to: &str, id: &str) -> Value {
+        json!({"type": "upload", "attrs": {"relationTo": to, "value": id}})
+    }
+
+    #[test]
+    fn markdown_round_trips_upload_nodes() {
+        use super::super::tests::{M1, M2, media_file};
+        let kind = files(json!({"media": {"fields": [{"name": "caption", "type": "text"}]}})).kind;
+        let none = |_: &str, _: &Value| None;
+        let ctx = RenderCtx {
+            link_url: &none,
+            title: &none,
+            slug: &none,
+            upload: &media_file,
+        };
+        let callout = |body: Value| json!({"type": "block", "attrs": {"blockType": "callout", "fields": {"body": body}}});
+        let d = doc(json!([
+            upload("media", M1),
+            para(json!([t("between")])),
+            {"type": "bulletList", "content": [{"type": "listItem", "content": [upload("media", M2)]}]},
+            {"type": "blockquote", "content": [upload("media", M1)]},
+            callout(doc(json!([upload("media", M2)])))
+        ]));
+        let markdown = to_markdown(&d, &kind, &ctx);
+        assert_eq!(
+            markdown,
+            format!(
+                concat!(
+                    "![Cover](media:media/{m1})\n\n",
+                    "between\n\n",
+                    "- ![](media:media/{m2})\n\n",
+                    "> ![Cover](media:media/{m1})\n\n",
+                    ":::callout\n![](media:media/{m2})\n:::"
+                ),
+                m1 = M1,
+                m2 = M2
+            )
+        );
+        assert_eq!(from_markdown(&markdown, &kind), Ok(d));
+        // The alt text is the file's, so what Markdown says of it is dropped.
+        let read = from_markdown(&format!("![Anything *at* all](media:media/{M1})"), &kind);
+        assert_eq!(read, Ok(doc(json!([upload("media", M1)]))));
+
+        // A node with fields is a directive, named by its file; its one rich text field
+        // is the text inside, and a file the caller can't read is left out whole (W1-R24).
+        let kind = files(json!({"media": {"fields": [
+            {"name": "caption", "type": "text"},
+            {"name": "width", "type": "number"},
+            {"name": "note", "type": "richText", "relationTo": ["media"],
+             "upload": {"collections": {"media": {"fields": [{"name": "caption", "type": "text"}]}}}}
+        ]}}))
+        .kind;
+        let file = |id: &str, fields: Value| json!({"type": "upload", "attrs": {"relationTo": "media", "value": id, "fields": fields}});
+        let hidden = "0199d5c4-0000-7000-8000-0000000000ff";
+        let d = doc(json!([
+            file(M1, json!({"caption": "A \"quoted\"\nline", "width": 50})),
+            {"type": "bulletList", "content": [{"type": "listItem", "content": [
+                file(M2, json!({"note": doc(json!([
+                    para(json!([t("in")])),
+                    file(M1, json!({"caption": "inner"}))
+                ]))}))
+            ]}]},
+            file(hidden, json!({"caption": "secret"}))
+        ]));
+        let markdown = to_markdown(&d, &kind, &ctx);
+        assert_eq!(
+            markdown,
+            format!(
+                concat!(
+                    "::media:media/{m1}{{caption=\"A \\\"quoted\\\"\\nline\" width=\"50\"}}\n\n",
+                    "- :::media:media/{m2}\n",
+                    "  in\n\n",
+                    "  ::media:media/{m1}{{caption=\"inner\"}}\n",
+                    "  :::"
+                ),
+                m1 = M1,
+                m2 = M2
+            )
+        );
+        let mut seen = d.clone();
+        seen["content"].as_array_mut().unwrap().pop();
+        assert_eq!(from_markdown(&markdown, &kind), Ok(seen));
+
+        // A cell holds one line, where a directive can't go: an upload node alone in one is
+        // its image, and its fields drop; beside other blocks it's its text (W1-R37, R39).
+        let cell = |content: Value| {
+            doc(json!([{"type": "table", "content": [
+                {"type": "tableRow", "content": [{"type": "tableHeader", "content": [para(json!([t("h")]))]}]},
+                {"type": "tableRow", "content": [{"type": "tableCell", "content": content}]}
+            ]}]))
+        };
+        let captioned = cell(json!([file(M1, json!({"caption": "C"}))]));
+        let markdown = to_markdown(&captioned, &kind, &ctx);
+        assert_eq!(
+            markdown,
+            format!("| h |\n| --- |\n| ![Cover](media:media/{M1}) |")
+        );
+        assert_eq!(
+            from_markdown(&markdown, &kind),
+            Ok(cell(json!([upload("media", M1)])))
+        );
+        let beside = cell(json!([upload("media", M1), para(json!([t("x")]))]));
+        assert_eq!(
+            to_markdown(&beside, &kind, &ctx),
+            "| h |\n| --- |\n| Cover<br>x |"
+        );
+        assert_eq!(
+            to_markdown(&cell(json!([upload("media", hidden)])), &kind, &ctx),
+            "| h |\n| --- |\n|  |"
+        );
+    }
+
+    #[test]
+    fn markdown_images_resolve_media_ids() {
+        use super::super::tests::M1;
+        let media = files(json!({"media": {}}));
+        let both = files(json!({"media": {}, "docs": {}}));
+        let read = |f: &Field, src: &str| from_markdown(src, &f.kind);
+        // With one collection to hold files from, an ID alone names a file of it.
+        for src in [
+            format!("![x](media:{M1})"),
+            format!("![x](media:media/{M1})"),
+            format!("![a ![b](c) *d*](media:{M1})"),
+        ] {
+            assert_eq!(
+                read(&media, &src),
+                Ok(doc(json!([upload("media", M1)]))),
+                "{src}"
+            );
+        }
+        assert_eq!(
+            read(&both, &format!("![x](media:docs/{M1})")),
+            Ok(doc(json!([upload("docs", M1)])))
+        );
+        // A directive names its file as an image does.
+        let captioned = files(json!({"media": {"fields": [{"name": "caption", "type": "text"}]}}));
+        let with_caption = json!({"type": "upload", "attrs": {"relationTo": "media", "value": M1,
+            "fields": {"caption": "C"}}});
+        for src in [
+            format!("::media:{M1}{{caption=\"C\"}}"),
+            format!("- ::media:media/{M1}{{caption=\"C\"}}"),
+        ] {
+            let read = read(&captioned, &src).unwrap();
+            let node = read
+                .pointer("/content/0")
+                .and_then(|n| n.pointer("/content/0/content/0").or(Some(n)));
+            assert_eq!(node, Some(&with_caption), "{src}");
+        }
+        // A block's text holds files from its own field's collections.
+        assert_eq!(
+            read(&both, &format!(":::callout\n![x](media:{M1})\n:::"))
+                .unwrap()
+                .pointer("/content/0/attrs/fields/body/content/0"),
+            Some(&upload("media", M1))
+        );
+        // In a table cell, a list item or a quote, as in a paragraph of its own.
+        assert_eq!(
+            read(&media, &format!("| ![x](media:{M1}) |\n| --- |"))
+                .unwrap()
+                .pointer("/content/0/content/0/content/0/content/0"),
+            Some(&upload("media", M1))
+        );
+        let at = |path: &str, message: &str| {
+            Err(vec![FieldError {
+                path: path.into(),
+                message: message.into(),
+            }])
+        };
+        for (f, src, path, message) in [
+            (
+                &media,
+                "![x](./a.png)".to_owned(),
+                "",
+                format!("line 1: {IMAGES}"),
+            ),
+            // A URL is named as one: it's never fetched.
+            (
+                &media,
+                "a\n\n![x](https://x.example/a.png)".into(),
+                "",
+                format!("line 3: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](//x.example/a.png)".into(),
+                "",
+                format!("line 1: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](data:image/png;base64,AA==)".into(),
+                "",
+                format!("line 1: {URLS}"),
+            ),
+            (
+                &media,
+                "![x](C:/a.png)".into(),
+                "",
+                format!("line 1: {IMAGES}"),
+            ),
+            (
+                &media,
+                "![x](a.png)".into(),
+                "",
+                format!("line 1: {IMAGES}"),
+            ),
+            (
+                &both,
+                format!("![x](media:{M1})"),
+                "",
+                "line 1: name the collection, as media:<collection>/<id>; one of: docs, media"
+                    .into(),
+            ),
+            (
+                &body(),
+                format!("![x](media:{M1})"),
+                "",
+                "line 1: this field can't hold files".into(),
+            ),
+            (
+                &media,
+                "![x](media:)".into(),
+                "",
+                "line 1: expected media:<id> or media:<collection>/<id>, not `media:`".into(),
+            ),
+            (
+                &media,
+                "![x](media:media/)".into(),
+                "",
+                "line 1: expected media:<id> or media:<collection>/<id>, not `media:media/`".into(),
+            ),
+            (
+                &media,
+                format!("![x](media:{M1} \"Title\")"),
+                "",
+                "line 1: image titles aren't kept; leave out the quoted title".into(),
+            ),
+            (
+                &media,
+                format!("see ![x](media:{M1})"),
+                "",
+                "line 1: an image must stand alone in its paragraph, with a blank line around it"
+                    .into(),
+            ),
+            (
+                &media,
+                format!("![x](media:{M1})\n![y](media:{M1})"),
+                "",
+                "line 1: an image must stand alone in its paragraph, with a blank line around it"
+                    .into(),
+            ),
+            (
+                &media,
+                format!("# ![x](media:{M1})"),
+                "",
+                "line 1: an image must stand alone in its paragraph, with a blank line around it"
+                    .into(),
+            ),
+            (
+                &media,
+                format!("[![x](media:{M1})](/a)"),
+                "",
+                "line 1: an image can't be linked or marked; give it a paragraph of its own".into(),
+            ),
+            (
+                &captioned,
+                format!("::media:{M1}{{caption=C}}"),
+                "",
+                format!(
+                    "line 1: expected a directive like `::name{{key=\"value\"}}`, not `::media:{M1}{{caption=C}}`"
+                ),
+            ),
+            (
+                &captioned,
+                format!(":::media:media/{M1}\ntext\n:::"),
+                "",
+                format!(
+                    "line 1: `media:media/{M1}` has no single rich text field to hold text; write it as `::media:media/{M1}{{…}}`"
+                ),
+            ),
+            (
+                &captioned,
+                format!(":::media:media/{M1}\n"),
+                "",
+                format!("line 1: `:::media:media/{M1}` is never closed"),
+            ),
+            (
+                &both,
+                "::media:media{caption=\"C\"}".into(),
+                "",
+                "line 1: name the collection, as media:<collection>/<id>; one of: docs, media"
+                    .into(),
+            ),
+            // The validator's refusals, at the node.
+            (
+                &captioned,
+                format!("::media:media/{M1}{{nope=\"C\"}}"),
+                "content.0.attrs.fields.nope",
+                "line 1: unknown field".into(),
+            ),
+            (
+                &captioned,
+                format!("::media:posts/{M1}{{caption=\"C\"}}"),
+                "content.0.attrs.relationTo",
+                "line 1: can't hold files from `posts`; expected one of: media".into(),
+            ),
+            (
+                &media,
+                format!("![x](media:posts/{M1})"),
+                "content.0.attrs.relationTo",
+                "line 1: can't hold files from `posts`; expected one of: media".into(),
+            ),
+            (
+                &media,
+                format!("![x](media:pages/{M1})"),
+                "content.0.attrs.relationTo",
+                "line 1: can't link to `pages`; expected one of: posts, media, docs".into(),
+            ),
+            (
+                &media,
+                "a\n\n![x](media:nope)".into(),
+                "content.1.attrs.value",
+                "line 3: expected a document ID".into(),
+            ),
+        ] {
+            assert_eq!(read(f, &src), at(path, &message), "{src}");
+        }
+    }
+
     /// Spaces and tabs at a line's end stay text, and never make a hard break (W1-R31).
     #[test]
     fn markdown_line_ends_keep_their_spaces() {
@@ -1682,6 +2151,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         for end in [" ", "  ", "   ", "\t", " \t"] {
@@ -1718,6 +2188,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         let marks = [
@@ -1778,6 +2249,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         let sets = [
@@ -1864,6 +2336,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         let link = |href: &str| json!({"type": "link", "attrs": {"href": href}});
@@ -1977,6 +2450,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         let m = |types: &[&str]| -> Value {
@@ -2268,6 +2742,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         // A cell's blocks become one paragraph, with hard breaks between them.
@@ -2390,6 +2865,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &none,
+            upload: &no_file,
         };
         let kind = body().kind;
         let openers = [

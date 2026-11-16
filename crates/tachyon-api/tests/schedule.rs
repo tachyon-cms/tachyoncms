@@ -85,23 +85,28 @@ async fn worker(pool: &PgPool) -> Router {
         .unwrap()
 }
 
-/// Makes every queued job due now, then waits until none is queued or running.
+/// Makes every queued job due now, then waits until none is queued or running. The hourly
+/// file cleanup sweep is left to its hour: each run queues the next.
 async fn run_due(pool: &PgPool) {
-    sqlx::query("UPDATE jobs SET run_at = now() WHERE state = 'queued'")
-        .execute(pool)
-        .await
-        .unwrap();
+    sqlx::query(
+        "UPDATE jobs SET run_at = now() WHERE state = 'queued' AND kind <> 'file_cleanup_sweep'",
+    )
+    .execute(pool)
+    .await
+    .unwrap();
     for _ in 0..200 {
         // A run that's to try again later counts as due now too.
-        sqlx::query("UPDATE jobs SET run_at = now() WHERE state = 'queued'")
+        sqlx::query("UPDATE jobs SET run_at = now() WHERE state = 'queued' AND kind <> 'file_cleanup_sweep'")
             .execute(pool)
             .await
             .unwrap();
-        let pending: i64 =
-            sqlx::query_scalar("SELECT count(*) FROM jobs WHERE state IN ('queued', 'running')")
-                .fetch_one(pool)
-                .await
-                .unwrap();
+        let pending: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM jobs
+                 WHERE state IN ('queued', 'running') AND kind <> 'file_cleanup_sweep'",
+        )
+        .fetch_one(pool)
+        .await
+        .unwrap();
         if pending == 0 {
             return;
         }

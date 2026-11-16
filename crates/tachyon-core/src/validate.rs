@@ -7,7 +7,8 @@ use time::macros::format_description;
 use uuid::Uuid;
 
 use crate::schema::{
-    BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, RelationTo, SelectOption, data_fields,
+    BLOCK_ROW_KEYS, BlockSource, Field, FieldKind, Link, RelationTo, SelectOption, data_fields,
+    upload_node_key,
 };
 
 const DATE: &[BorrowedFormatItem<'_>] = format_description!("[year]-[month]-[day]");
@@ -188,6 +189,10 @@ pub fn merged(
 fn merge(fields: &[Field], doc: &mut Map<String, Value>, input: &Map<String, Value>) {
     for (key, value) in input {
         let field = fields.iter().find(|f| &f.name == key);
+        // Computed on read: what a caller sends back from a read isn't stored.
+        if field.is_some_and(|f| f.computed) {
+            continue;
+        }
         match (field.map(|f| &f.kind), value, doc.get_mut(key)) {
             (_, Value::Null, _) => {
                 doc.remove(key);
@@ -240,14 +245,11 @@ fn strip_nulls(f: &Field, value: &mut Value) {
                 }
             }
         }
-        (kind @ FieldKind::RichText { .. }, text) => {
-            crate::richtext::blocks_mut(text, &mut |attrs| {
-                let fields = node_fields(kind, attrs);
-                if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
-                    strip_object(fields, obj);
-                }
-            })
-        }
+        (kind @ FieldKind::RichText { .. }, text) => nodes_mut(kind, text, &mut |fields, attrs| {
+            if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                strip_object(fields, obj);
+            }
+        }),
         _ => {}
     }
 }
@@ -261,11 +263,36 @@ pub(crate) fn node_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -
         .map_or(&[], |b| &b.fields)
 }
 
-/// Fills defaults into the fields of every block node in rich text `text`.
+/// The fields an upload node's `attrs` carry, by the collection they name; none when the
+/// field holds no files from it.
+pub(crate) fn upload_fields<'a>(kind: &'a FieldKind, attrs: &Map<String, Value>) -> &'a [Field] {
+    attrs
+        .get("relationTo")
+        .and_then(Value::as_str)
+        .and_then(|c| kind.upload_node(c))
+        .map_or(&[], |n| &n.fields)
+}
+
+/// Calls `f` on the `attrs` of every block and upload node in rich text `text` of `kind`,
+/// with the fields its block type or collection gives its `fields`.
+pub(crate) fn nodes_mut<'k>(
+    kind: &'k FieldKind,
+    text: &mut Value,
+    f: &mut impl FnMut(&'k [Field], &mut Map<String, Value>),
+) {
+    crate::richtext::each_item_mut(text, &mut |_, item| match item {
+        crate::richtext::ItemMut::Block(attrs) => f(node_fields(kind, attrs), attrs),
+        crate::richtext::ItemMut::Upload(attrs) => f(upload_fields(kind, attrs), attrs),
+        crate::richtext::ItemMut::Link(_) => {}
+    })
+}
+
+/// Fills defaults into the fields of every block and upload node in rich text `text`.
 pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
-    crate::richtext::blocks_mut(text, &mut |attrs| {
-        let fields = node_fields(kind, attrs);
-        match attrs.get_mut("fields") {
+    nodes_mut(
+        kind,
+        text,
+        &mut |fields, attrs| match attrs.get_mut("fields") {
             Some(Value::Object(obj)) => apply_defaults(fields, obj),
             None => {
                 let filled = defaults(fields);
@@ -274,12 +301,12 @@ pub(crate) fn block_defaults(kind: &FieldKind, text: &mut Value) {
                 }
             }
             Some(_) => {}
-        }
-    })
+        },
+    )
 }
 
 fn strip_object(fields: &[Field], obj: &mut Map<String, Value>) {
-    obj.retain(|_, v| !v.is_null());
+    obj.retain(|k, v| !v.is_null() && !fields.iter().any(|f| f.computed && &f.name == k));
     for f in fields {
         if let Some(v) = obj.get_mut(&f.name) {
             strip_nulls(f, v);
@@ -375,15 +402,10 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                     *s = utc;
                 }
             }
-            (
-                FieldKind::Relationship {
-                    has_many: false, ..
-                },
-                link,
-            ) => canonical_link(link),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+            (kind, Value::Array(links)) if kind.link().is_some_and(|l| l.has_many) => {
                 links.iter_mut().for_each(canonical_link);
             }
+            (kind, link) if kind.link().is_some_and(|l| !l.has_many) => canonical_link(link),
             (FieldKind::Group { fields }, Value::Object(inner)) => normalize(fields, inner),
             (FieldKind::Array { fields, .. }, Value::Array(rows)) => {
                 for row in rows {
@@ -413,6 +435,15 @@ fn normalize(fields: &[Field], obj: &mut Map<String, Value>) {
                             normalize(fields, obj);
                         }
                         keep_or_give_id(attrs);
+                    }
+                    crate::richtext::ItemMut::Upload(attrs) => {
+                        let fields = upload_fields(kind, attrs);
+                        if let Some(Value::Object(obj)) = attrs.get_mut("fields") {
+                            normalize(fields, obj);
+                        }
+                        if let Some(Value::String(id)) = attrs.get_mut("value") {
+                            canonical_id(id);
+                        }
                     }
                 })
             }
@@ -511,6 +542,7 @@ fn is_list(kind: &FieldKind) -> bool {
         FieldKind::Text { has_many: true, .. }
             | FieldKind::Number { has_many: true, .. }
             | FieldKind::Relationship { has_many: true, .. }
+            | FieldKind::Upload { has_many: true, .. }
             | FieldKind::Select { multiple: true, .. }
             | FieldKind::Array { .. }
             | FieldKind::Blocks { .. }
@@ -552,6 +584,20 @@ pub(crate) fn check_value(
                 if let Some(message) = scalar_error(&f.kind, item) {
                     errors.push(error(format!("{path}.{i}"), &message));
                 }
+            }
+        }
+        (
+            FieldKind::Upload {
+                has_many: true,
+                min_rows,
+                max_rows,
+                ..
+            },
+            Value::Array(items),
+        ) => {
+            check_row_count(items.len(), *min_rows, *max_rows, path, errors);
+            if let Some(message) = scalar_error(&f.kind, v) {
+                errors.push(error(path.into(), &message));
             }
         }
         (FieldKind::Group { fields }, Value::Object(obj)) => {
@@ -671,6 +717,35 @@ pub(crate) fn check_value(
     }
 }
 
+fn link_error(relation_to: &RelationTo, has_many: bool, v: &Value) -> Option<String> {
+    match (relation_to, has_many) {
+        (RelationTo::One(_), false) => {
+            (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into())
+        }
+        (RelationTo::One(_), true) => {
+            let ok = v
+                .as_array()
+                .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
+            (!ok).then(|| "expected a list of document IDs".into())
+        }
+        (_, false) => (!is_link(v, relation_to)).then(|| {
+            format!(
+                "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
+            )
+        }),
+        (_, true) => {
+            let ok = v
+                .as_array()
+                .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
+            (!ok).then(|| {
+                format!(
+                    "expected a list of links like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to: {relation_to}"
+                )
+            })
+        }
+    }
+}
+
 fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
     match kind {
         FieldKind::Text {
@@ -749,35 +824,13 @@ fn scalar_error(kind: &FieldKind, v: &Value) -> Option<String> {
         FieldKind::Slug { .. } => (!v.as_str().is_some_and(is_slug)).then(|| {
             "expected lowercase letters, digits and single hyphens, like my-first-post".into()
         }),
-        FieldKind::Relationship {
-            relation_to: RelationTo::One(_),
-            has_many: false, .. } => (!v.as_str().is_some_and(is_uuid)).then(|| "expected a document ID".into()),
-        FieldKind::Relationship {
-            relation_to: RelationTo::One(_),
-            has_many: true, .. } => {
-            let ok = v
-                .as_array()
-                .is_some_and(|ids| ids.iter().all(|x| x.as_str().is_some_and(is_uuid)));
-            (!ok).then(|| "expected a list of document IDs".into())
-        }
-        FieldKind::Relationship {
-            relation_to,
-            has_many: false, .. } => (!is_link(v, relation_to)).then(|| {
-            format!(
-                "expected a link like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to one of: {relation_to}"
-            )
-        }),
-        FieldKind::Relationship {
-            relation_to,
-            has_many: true, .. } => {
-            let ok = v
-                .as_array()
-                .is_some_and(|links| links.iter().all(|l| is_link(l, relation_to)));
-            (!ok).then(|| {
-                format!(
-                    "expected a list of links like {{\"relationTo\": \"<collection>\", \"value\": \"<document ID>\"}} to: {relation_to}"
-                )
-            })
+        FieldKind::Relationship { .. } | FieldKind::Upload { .. } => {
+            let Link {
+                relation_to,
+                has_many,
+                ..
+            } = kind.link().expect("a link");
+            link_error(relation_to, has_many, v)
         }
         FieldKind::Json => None,
         // Never reached: `check_value` hands rich text to `richtext::validate`.
@@ -939,10 +992,17 @@ pub struct RelationRef {
     /// nodes (`body.content.0.content.1.marks.0.attrs.doc.value`) where `path` counts
     /// references (`body.0`).
     pub at: String,
+    /// The link's schema position, built from the schema rather than the data: list
+    /// indexes become `[]` (`rows.[].x.a`), a block row's index its `blockType`
+    /// (`layout.gallery.file`), and rich text's link nodes share their field's name. No
+    /// value a document holds can make two positions share one name.
+    pub field: String,
     pub relation_to: String,
     pub id: Uuid,
     /// The field's `maxDepth`, if it caps population.
     pub max_depth: Option<u8>,
+    /// The upload field's `filterOptions`: a `where` the linked document must match.
+    pub filter_options: Option<Map<String, Value>>,
 }
 
 /// Reads a `{relationTo, value}` link to any collection; rich text checked the collection.
@@ -952,11 +1012,13 @@ const ANY: RelationTo = RelationTo::Many(Vec::new());
 pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef> {
     let fields: &[Field] = &data_fields(fields);
     /// `at`: where validation names `obj`, which differs from `prefix` inside rich text.
+    /// `key`: the schema position of `obj` (`RelationRef::field`).
     fn walk(
         fields: &[Field],
         obj: &Map<String, Value>,
         prefix: &str,
         at: &str,
+        key: &str,
         out: &mut Vec<RelationRef>,
     ) {
         for f in fields {
@@ -965,8 +1027,10 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
             };
             let path = join(prefix, &f.name);
             let named = join(at, &f.name);
-            let max_depth = match f.kind {
-                FieldKind::Relationship { max_depth, .. } => max_depth,
+            let field = join(key, &f.name);
+            let max_depth = f.kind.link().and_then(|l| l.max_depth);
+            let filter_options = match &f.kind {
+                FieldKind::Upload { filter_options, .. } => filter_options.as_ref(),
                 _ => None,
             };
             // A link at `path` as stored for `relation_to`, if it is one.
@@ -982,28 +1046,20 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                 Some(RelationRef {
                     path,
                     at,
+                    field: field.clone(),
                     relation_to: slug.to_owned(),
                     id: Uuid::try_parse(id).ok()?,
                     max_depth,
+                    filter_options: filter_options.cloned(),
                 })
             };
+            let link = f.kind.link();
             match (&f.kind, value) {
-                (
-                    FieldKind::Relationship {
-                        relation_to,
-                        has_many: false,
-                        ..
-                    },
-                    id,
-                ) => out.extend(found(path, named, relation_to, id)),
-                (
-                    FieldKind::Relationship {
-                        relation_to,
-                        has_many: true,
-                        ..
-                    },
-                    Value::Array(ids),
-                ) => {
+                (_, id) if link.is_some_and(|l| !l.has_many) => {
+                    out.extend(found(path, named, link.expect("a link").relation_to, id))
+                }
+                (_, Value::Array(ids)) if link.is_some_and(|l| l.has_many) => {
+                    let relation_to = link.expect("a link").relation_to;
                     for (i, id) in ids.iter().enumerate() {
                         out.extend(found(
                             format!("{path}.{i}"),
@@ -1014,14 +1070,21 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                     }
                 }
                 (FieldKind::Group { fields }, Value::Object(inner)) => {
-                    walk(fields, inner, &path, &named, out)
+                    walk(fields, inner, &path, &named, &field, out)
                 }
                 (FieldKind::Array { .. } | FieldKind::Blocks { .. }, Value::Array(rows)) => {
                     for (i, row) in rows.iter().enumerate() {
                         if let Value::Object(inner) = row {
                             let row = format!("{path}.{i}");
                             let row_at = format!("{named}.{i}");
-                            walk(row_fields(&f.kind, inner), inner, &row, &row_at, out);
+                            // Only a blocks row's `blockType` picks its schema; an array
+                            // row's is a plain field, whatever its name.
+                            let row_key = match &f.kind {
+                                FieldKind::Blocks { .. } => join(&field, block_type(inner)),
+                                _ => format!("{field}.[]"),
+                            };
+                            let fields = row_fields(&f.kind, inner);
+                            walk(fields, inner, &row, &row_at, &row_key, out);
                         }
                     }
                 }
@@ -1037,11 +1100,33 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
                             crate::richtext::Item::Block(attrs) => {
                                 if let Some(Value::Object(inner)) = attrs.get("fields") {
                                     let fields_at = format!("{node}.fields");
+                                    let node_key = join(&field, block_type(attrs));
                                     walk(
                                         node_fields(&f.kind, attrs),
                                         inner,
                                         &here,
                                         &fields_at,
+                                        &node_key,
+                                        out,
+                                    );
+                                }
+                            }
+                            // The node is a link of the text's, keyed as the field; its
+                            // fields' links sit under its collection (`body.@media.credit`).
+                            crate::richtext::Item::Upload(attrs) => {
+                                let link =
+                                    found(here.clone(), format!("{node}.value"), &ANY, attrs);
+                                out.extend(link);
+                                if let (Some(Value::Object(inner)), Some(obj)) =
+                                    (attrs.get("fields"), attrs.as_object())
+                                {
+                                    let to = obj.get("relationTo").and_then(Value::as_str);
+                                    walk(
+                                        upload_fields(&f.kind, obj),
+                                        inner,
+                                        &here,
+                                        &format!("{node}.fields"),
+                                        &join(&field, &upload_node_key(to.unwrap_or(""))),
                                         out,
                                     );
                                 }
@@ -1054,8 +1139,13 @@ pub fn relations(fields: &[Field], doc: &Map<String, Value>) -> Vec<RelationRef>
         }
     }
     let mut out = Vec::new();
-    walk(fields, doc, "", "", &mut out);
+    walk(fields, doc, "", "", "", &mut out);
     out
+}
+
+/// The block type a validated block row or node names; `""` only before validation.
+fn block_type(row: &Map<String, Value>) -> &str {
+    row.get("blockType").and_then(Value::as_str).unwrap_or("")
 }
 
 /// Replaces each relationship ID with `f(path, id)` wherever `f` returns a value. Paths are
@@ -1079,14 +1169,12 @@ fn map_inner(
             continue;
         };
         let path = join(prefix, &field.name);
+        let link = field.kind.link();
         match (&field.kind, value) {
-            (
-                FieldKind::Relationship {
-                    has_many: false, ..
-                },
-                slot,
-            ) => replace_link(slot, &mut |id| f(&path, id)),
-            (FieldKind::Relationship { has_many: true, .. }, Value::Array(links)) => {
+            (_, slot) if link.is_some_and(|l| !l.has_many) => {
+                replace_link(slot, &mut |id| f(&path, id))
+            }
+            (_, Value::Array(links)) if link.is_some_and(|l| l.has_many) => {
                 for (i, slot) in links.iter_mut().enumerate() {
                     let here = format!("{path}.{i}");
                     replace_link(slot, &mut |id| f(&here, id));
@@ -1111,6 +1199,15 @@ fn map_inner(
                         }
                         crate::richtext::ItemMut::Block(attrs) => {
                             let fields = node_fields(kind, attrs);
+                            if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
+                                map_inner(fields, inner, &here, f);
+                            }
+                        }
+                        crate::richtext::ItemMut::Upload(attrs) => {
+                            if let Some(inner) = attrs.get_mut("value") {
+                                replace_id(inner, &mut |id| f(&here, id));
+                            }
+                            let fields = upload_fields(kind, attrs);
                             if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
                                 map_inner(fields, inner, &here, f);
                             }
@@ -1569,6 +1666,52 @@ mod tests {
     }
 
     #[test]
+    fn upload_fields_validate_and_link_like_relationships() {
+        let f = fields(json!([
+            {"name": "cover", "type": "upload", "relationTo": "media", "maxDepth": 2,
+             "filterOptions": {"mimeType": {"like": "image"}}},
+            {"name": "files", "type": "upload", "relationTo": ["media", "downloads"],
+             "hasMany": true, "maxRows": 2}
+        ]));
+        let a = "0199D5C4-0000-7000-8000-00000000000A";
+        let b = "0199d5c4-0000-7000-8000-00000000000b";
+        let doc = ok(
+            &f,
+            json!({"cover": a, "files": [{"relationTo": "downloads", "value": b}]}),
+        );
+        assert_eq!(doc["cover"], a.to_lowercase());
+        let found = relations(&f, &doc);
+        assert_eq!(found.len(), 2);
+        assert_eq!(found[0].max_depth, Some(2));
+        assert_eq!(
+            found[0].filter_options,
+            Some(
+                json!({"mimeType": {"like": "image"}})
+                    .as_object()
+                    .unwrap()
+                    .clone()
+            )
+        );
+        assert_eq!(
+            (
+                found[1].path.as_str(),
+                found[1].relation_to.as_str(),
+                found[1].filter_options.as_ref()
+            ),
+            ("files.0", "downloads", None)
+        );
+        let link = |id: &str| json!({"relationTo": "media", "value": id});
+        assert_eq!(
+            errs(&f, json!({"files": [link(a), link(b), link(a)]})),
+            vec![e("files", "must have at most 2 rows")]
+        );
+        assert_eq!(
+            errs(&f, json!({"cover": "nope"})),
+            vec![e("cover", "expected a document ID")]
+        );
+    }
+
+    #[test]
     fn relations_are_found_everywhere() {
         let f = fields(json!([
             {"name": "author", "type": "relationship", "relationTo": "authors"},
@@ -1605,6 +1748,67 @@ mod tests {
         assert_eq!(doc["author"], a, "unmatched IDs stay as they are");
         assert_eq!(doc["related"][1]["name"], "Bee");
         assert_eq!(doc["links"][1]["author"]["name"], "Bee");
+    }
+
+    #[test]
+    fn relations_name_their_schema_position() {
+        let up = |name: &str| json!({"name": name, "type": "upload", "relationTo": "media"});
+        let doc_block = json!({"slug": "doc", "fields": [up("file")]});
+        let f = fields(json!([
+            {"name": "rows", "type": "array", "fields": [
+                {"name": "blockType", "type": "text"},
+                up("a"),
+                {"name": "x", "type": "group", "fields": [up("a")]},
+                {"name": "nested", "type": "array", "fields": [up("a")]},
+                {"name": "parts", "type": "blocks", "blocks": [doc_block]}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [doc_block]},
+            // A collection may share a block type's slug: `doc` is both here.
+            {"name": "body", "type": "richText", "relationTo": ["media", "doc"], "blocks": [doc_block],
+             "upload": {"collections": {"doc": {"fields": [up("file")]}}}},
+            {"name": "attachments", "type": "upload", "relationTo": "media", "hasMany": true},
+            {"type": "tabs", "tabs": [{"name": "seo", "label": "SEO", "fields": [up("image")]}]}
+        ]));
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let body = json!({"type": "doc", "content": [
+            {"type": "relationship", "attrs": {"relationTo": "media", "value": id}},
+            {"type": "block", "attrs": {"blockType": "doc", "fields": {"file": id}}},
+            {"type": "upload", "attrs": {"relationTo": "doc", "value": id, "fields": {"file": id}}}
+        ]});
+        let doc = ok(
+            &f,
+            json!({
+                "rows": [{
+                    "blockType": "x", "a": id, "x": {"a": id}, "nested": [{"a": id}],
+                    "parts": [{"blockType": "doc", "file": id}]
+                }],
+                "layout": [{"blockType": "doc", "file": id}],
+                "body": body,
+                "attachments": [id, id],
+                "seo": {"image": id}
+            }),
+        );
+        let keys: Vec<String> = relations(&f, &doc).into_iter().map(|r| r.field).collect();
+        // A row's own `blockType` text field doesn't make it a block row. An upload node is
+        // one of its text's links; its fields sit under `@` and its collection, which no
+        // block slug can name.
+        assert_eq!(
+            keys,
+            [
+                "rows.[].a",
+                "rows.[].x.a",
+                "rows.[].nested.[].a",
+                "rows.[].parts.doc.file",
+                "layout.doc.file",
+                "body",
+                "body.doc.file",
+                "body",
+                "body.@doc.file",
+                "attachments",
+                "attachments",
+                "seo.image",
+            ]
+        );
     }
 
     #[test]

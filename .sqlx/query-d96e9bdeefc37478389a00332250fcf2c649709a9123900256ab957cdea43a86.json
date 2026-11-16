@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET state = 'queued', attempts = attempts - 1, locked_until = NULL,\n               run_at = now() + make_interval(secs => $3), last_error = $4,\n               payload = jsonb_set(payload, '{deferred}',\n                   to_jsonb(coalesce((payload->>'deferred')::int, 0) + 1))\n           WHERE id = $1 AND attempts = $2 AND state = 'running'\n             AND coalesce((payload->>'deferred')::int, 0) < $5",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4",
+        "Float8",
+        "Text",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "d96e9bdeefc37478389a00332250fcf2c649709a9123900256ab957cdea43a86"
+}

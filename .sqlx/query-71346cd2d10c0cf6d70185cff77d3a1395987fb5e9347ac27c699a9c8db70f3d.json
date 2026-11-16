@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM jobs\n           WHERE id IN (\n               SELECT id FROM jobs\n               WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')\n                 AND finished_at < now() - make_interval(days => $2)\n                 -- A failed cleanup is the only record of objects left in storage, so it's\n                 -- kept until the sweep gets it done: a file's while the file isn't live\n                 -- again, stale sizes' while it ran out of attempts (a refused payload never\n                 -- will be done).\n                 AND NOT (kind = 'file_cleanup' AND state = 'failed'\n                          AND CASE WHEN payload ? 'file' THEN EXISTS (\n                                       SELECT 1 FROM files f\n                                       WHERE f.id = CASE WHEN payload->>'file' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'\n                                                         THEN (payload->>'file')::uuid END\n                                         AND f.state <> 'live')\n                                   ELSE attempts >= max_attempts END)\n               LIMIT 100\n               FOR UPDATE SKIP LOCKED)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "71346cd2d10c0cf6d70185cff77d3a1395987fb5e9347ac27c699a9c8db70f3d"
+}

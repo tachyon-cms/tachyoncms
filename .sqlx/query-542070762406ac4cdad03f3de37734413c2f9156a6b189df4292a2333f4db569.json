@@ -1,0 +1,30 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "DELETE FROM versions WHERE id IN (\n                   SELECT id FROM (\n                       SELECT id, row_number() OVER (\n                           PARTITION BY document_id ORDER BY created_at DESC, id DESC) AS n\n                       FROM versions WHERE tenant_id = $1 AND collection_id = $2\n                   ) ranked\n                   WHERE n > $3 AND NOT EXISTS (\n                       SELECT 1 FROM jobs j\n                       WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')\n                         AND j.payload->>'version' = ranked.id::text))\n               RETURNING file_id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "file_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "versions",
+            "name": "file_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int8"
+      ]
+    },
+    "nullable": [
+      true
+    ]
+  },
+  "hash": "542070762406ac4cdad03f3de37734413c2f9156a6b189df4292a2333f4db569"
+}

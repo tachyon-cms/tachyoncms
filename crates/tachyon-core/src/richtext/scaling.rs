@@ -10,7 +10,8 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 
 use super::{
-    MAX_DEPTH, MAX_NODES, RenderCtx, from_markdown, to_html, to_markdown, to_text, validate,
+    MAX_DEPTH, MAX_NODES, RenderCtx, UploadView, from_markdown, to_html, to_markdown, to_text,
+    validate,
 };
 use crate::schema::{Field, FieldKind};
 
@@ -20,11 +21,13 @@ thread_local!(pub(super) static STEPS: Cell<usize> = const { Cell::new(0) });
 /// the step counts are the guard that a quadratic loop can't pass (W1-R47).
 const BOUND: Duration = Duration::from_secs(10);
 
-/// A field that turns every feature on, links to posts and offers a `cta` block.
+/// A field that turns every feature on, links to posts, offers a `cta` block and holds
+/// files from `media`.
 fn kind() -> FieldKind {
     let f: Field = serde_json::from_value(json!({"name": "body", "type": "richText",
-        "relationTo": ["posts"],
-        "blocks": [{"slug": "cta", "fields": [{"name": "label", "type": "text"}]}]}))
+        "relationTo": ["posts", "media"],
+        "blocks": [{"slug": "cta", "fields": [{"name": "label", "type": "text"}]}],
+        "upload": {"collections": {"media": {"fields": [{"name": "caption", "type": "text"}]}}}}))
     .unwrap();
     f.kind
 }
@@ -88,6 +91,16 @@ fn blocks(n: usize) -> Value {
         .collect())
 }
 
+/// `n` upload nodes, each with a caption.
+fn uploads(n: usize) -> Value {
+    doc((0..n)
+        .map(|i| {
+            let id = format!("0199d5c4-0000-7000-8000-{i:012x}");
+            json!({"type": "upload", "attrs": {"relationTo": "media", "value": id, "fields": {"caption": "C"}}})
+        })
+        .collect())
+}
+
 /// One paragraph of touching links, alternating between two places.
 fn links(n: usize) -> Value {
     let content: Vec<Value> = (0..n - 1)
@@ -129,6 +142,7 @@ const SHAPES: &[(&str, Shape)] = &[
     ("marked runs", marked_runs),
     ("deep nesting", deep),
     ("block nodes", blocks),
+    ("upload nodes", uploads),
     ("links", links),
     ("hard breaks", breaks),
     ("flank fixes", flanked),
@@ -145,12 +159,29 @@ fn corpus() -> &'static [(&'static str, Value)] {
     })
 }
 
+/// Every upload node's file is a readable image with two sizes, so each renders in full.
 fn render<T>(f: impl FnOnce(&RenderCtx) -> T) -> T {
     let none = |_: &str, _: &Value| None;
+    let file = |_: &str, _: &Value| {
+        Some(UploadView {
+            url: "/api/media/file/a.png".into(),
+            width: Some(800),
+            height: Some(600),
+            alt: Some("A *cover* [x]".into()),
+            mime_type: "image/png".into(),
+            filename: "a.png".into(),
+            srcset: vec![("/api/media/file/a-400x300.png".into(), 400)],
+            sources: vec![(
+                "image/webp".into(),
+                vec![("/api/media/file/a-400x300.webp".into(), 400)],
+            )],
+        })
+    };
     f(&RenderCtx {
         link_url: &none,
         title: &none,
         slug: &none,
+        upload: &file,
     })
 }
 
@@ -228,7 +259,7 @@ fn text_scales_with_its_input() {
         "to_text",
         |v| v.clone(),
         |v| {
-            to_text(v);
+            render(|ctx| to_text(v, ctx));
         },
     );
 }

@@ -18,9 +18,27 @@ pub enum ApiError {
     Unauthorized(String),
     /// Credentials that work, for someone who may not do this.
     Forbidden(String),
-    BodyTooLarge,
+    /// Says what was over which limit, in bytes.
+    BodyTooLarge(String),
+    /// A file of a type this collection doesn't take; says what it looked like.
+    UnsupportedMediaType(String),
     /// The request ran past its time limit.
     Timeout,
+    /// Something this needs, such as a storage's signer, is failing for now; says what.
+    Unavailable(String),
+    /// `Unavailable` for a moment: worth asking again after `retry_after` seconds.
+    Busy {
+        detail: String,
+        retry_after: u64,
+    },
+    /// Too much is waiting on this caller already; worth asking again after `retry_after`
+    /// seconds.
+    TooManyRequests {
+        detail: String,
+        retry_after: u64,
+    },
+    /// A `Range` that starts past the end of a file of this many bytes.
+    RangeNotSatisfiable(u64),
     Conflict(String),
     Validation(Vec<FieldError>),
     /// A unique index rejected the write; handlers turn this into a field error when they can.
@@ -95,10 +113,16 @@ impl ApiError {
             Self::BadRequest(d) => (StatusCode::BAD_REQUEST, "Bad request", Some(d), None),
             Self::Unauthorized(d) => (StatusCode::UNAUTHORIZED, "Unauthorized", Some(d), None),
             Self::Forbidden(d) => (StatusCode::FORBIDDEN, "Forbidden", Some(d), None),
-            Self::BodyTooLarge => (
+            Self::BodyTooLarge(d) => (
                 StatusCode::PAYLOAD_TOO_LARGE,
                 "Content too large",
-                Some("the request body is over 10 MB".to_owned()),
+                Some(d),
+                None,
+            ),
+            Self::UnsupportedMediaType(d) => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Unsupported media type",
+                Some(d),
                 None,
             ),
             Self::Timeout => (
@@ -107,7 +131,25 @@ impl ApiError {
                 Some("the request took too long; try again".to_owned()),
                 None,
             ),
+            Self::Unavailable(d) | Self::Busy { detail: d, .. } => (
+                StatusCode::SERVICE_UNAVAILABLE,
+                "Service unavailable",
+                Some(d),
+                None,
+            ),
+            Self::RangeNotSatisfiable(size) => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                "Range not satisfiable",
+                Some(format!("the file has {size} bytes")),
+                None,
+            ),
             Self::Conflict(d) => (StatusCode::CONFLICT, "Conflict", Some(d), None),
+            Self::TooManyRequests { detail, .. } => (
+                StatusCode::TOO_MANY_REQUESTS,
+                "Too many requests",
+                Some(detail),
+                None,
+            ),
             Self::Unique(_) => (
                 StatusCode::CONFLICT,
                 "Conflict",
@@ -151,13 +193,31 @@ impl ApiError {
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let range = match self {
+            Self::RangeNotSatisfiable(size) => Some(format!("bytes */{size}")),
+            _ => None,
+        };
+        let retry = match self {
+            Self::TooManyRequests { retry_after, .. } | Self::Busy { retry_after, .. } => {
+                Some(retry_after)
+            }
+            _ => None,
+        };
         let (status, body) = self.problem();
-        (
+        let mut res = (
             status,
             [(header::CONTENT_TYPE, "application/problem+json")],
             body.to_string(),
         )
-            .into_response()
+            .into_response();
+        if let Some(range) = range.and_then(|r| r.parse().ok()) {
+            res.headers_mut().insert(header::CONTENT_RANGE, range);
+        }
+        if let Some(secs) = retry {
+            res.headers_mut()
+                .insert(header::RETRY_AFTER, header::HeaderValue::from(secs));
+        }
+        res
     }
 }
 

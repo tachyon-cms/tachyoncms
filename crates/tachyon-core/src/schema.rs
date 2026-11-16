@@ -1,5 +1,5 @@
 use std::borrow::{Borrow, Cow};
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::OnceLock;
 
 use serde::{Deserialize, Serialize};
@@ -12,9 +12,21 @@ pub const DRAFTS_RESERVED_FIELD_NAME: &str = "publishedAt";
 
 /// Paths under `/api` that belong to the server rather than to a collection.
 pub const RESERVED_SLUGS: &[&str] = &[
-    "access", "admin", "auth", "blocks", "globals", "media", "search", "graphql", "plugins",
+    "access",
+    "admin",
+    "auth",
+    "blocks",
+    "globals",
+    "search",
+    "graphql",
+    "plugins",
     "setup",
+    "upload-instructions",
 ];
+
+/// The slug of the system collection folders live in. Not reserved: it's made at startup,
+/// and a schema can't create another (`tachyon_db::folders::check_folders_schema`).
+pub const FOLDERS: &str = "folders";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CollectionSchema {
@@ -39,6 +51,12 @@ pub struct CollectionSchema {
     /// the published one. `true` turns it on with the defaults.
     #[serde(default, deserialize_with = "versions_flag")]
     pub versions: Option<Versions>,
+    /// The collection holds files: `true` with the defaults, or upload options. See `uploads`.
+    #[serde(default, with = "upload_flag", skip_serializing_if = "Option::is_none")]
+    pub upload: Option<crate::uploads::Upload>,
+    /// Documents can be filed in folders.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub folders: bool,
     /// `data()`'s answer, worked out on first use. Schemas are built once and read many
     /// times; change `fields` only on a schema whose `data()` hasn't been asked for.
     #[serde(skip)]
@@ -56,6 +74,8 @@ impl PartialEq for CollectionSchema {
             &self.labels,
             &self.url,
             &self.versions,
+            &self.upload,
+            self.folders,
         ) == (
             &other.slug,
             other.kind,
@@ -65,7 +85,44 @@ impl PartialEq for CollectionSchema {
             &other.labels,
             &other.url,
             &other.versions,
+            &other.upload,
+            other.folders,
         )
+    }
+}
+
+/// The `folder` field `folders: true` adds: a link to one folder.
+fn folder_field() -> Field {
+    serde_json::from_value(serde_json::json!({
+        "name": "folder", "type": "relationship", "relationTo": FOLDERS
+    }))
+    .expect("the folder field is valid")
+}
+
+/// `upload` as a flag or as options. Options equal to the defaults are written back as
+/// `true`, which means the same.
+mod upload_flag {
+    use crate::uploads::Upload;
+    use serde::{Deserialize, Deserializer, Serialize, Serializer, de::Error};
+    use serde_json::Value;
+
+    pub fn serialize<S: Serializer>(u: &Option<Upload>, s: S) -> Result<S::Ok, S::Error> {
+        match u {
+            None => s.serialize_bool(false),
+            Some(u) if *u == Upload::default() => s.serialize_bool(true),
+            Some(u) => u.serialize(s),
+        }
+    }
+
+    pub fn deserialize<'de, D: Deserializer<'de>>(d: D) -> Result<Option<Upload>, D::Error> {
+        match Value::deserialize(d)? {
+            Value::Null | Value::Bool(false) => Ok(None),
+            Value::Bool(true) => Ok(Some(Upload::default())),
+            v @ Value::Object(_) => Upload::deserialize(v).map(Some).map_err(D::Error::custom),
+            _ => Err(D::Error::custom(
+                "upload is true, false or an object of upload options",
+            )),
+        }
     }
 }
 
@@ -188,6 +245,10 @@ pub struct Field {
     /// Read through a relationship instead of stored, such as `author.name`.
     #[serde(default, rename = "virtual")]
     pub virtual_path: Option<String>,
+    /// Filled on read by the server, such as an upload's `url`: never stored, and dropped
+    /// from what a write sends. Only built-in fields are; a schema can't ask for it.
+    #[serde(skip)]
+    pub computed: bool,
     /// Who may read and write this field; see `access`.
     #[serde(default)]
     pub access: Option<crate::access::FieldAccess>,
@@ -204,6 +265,19 @@ fn object_or_none<'de, D: serde::Deserializer<'de>>(
         Value::Object(o) => Ok(Some(o)),
         _ => Err(serde::de::Error::custom(
             "where must be an object like {\"draft\": {\"equals\": \"false\"}}",
+        )),
+    }
+}
+
+/// An upload field's `filterOptions`: an object of conditions, or nothing.
+fn filter_or_none<'de, D: serde::Deserializer<'de>>(
+    d: D,
+) -> Result<Option<Map<String, Value>>, D::Error> {
+    match Value::deserialize(d)? {
+        Value::Null => Ok(None),
+        Value::Object(o) => Ok(Some(o)),
+        _ => Err(serde::de::Error::custom(
+            "filterOptions must be an object like {\"mimeType\": {\"like\": \"image\"}}",
         )),
     }
 }
@@ -339,6 +413,25 @@ pub enum FieldKind {
         #[serde(default)]
         max_depth: Option<u8>,
     },
+    /// A relationship whose targets are upload collections.
+    Upload {
+        relation_to: RelationTo,
+        #[serde(default)]
+        has_many: bool,
+        #[serde(default)]
+        min_rows: Option<usize>,
+        #[serde(default)]
+        max_rows: Option<usize>,
+        /// A `where` each linked document must match, checked at write.
+        #[serde(default, deserialize_with = "filter_or_none")]
+        filter_options: Option<Map<String, Value>>,
+        /// For the admin only: whether to show a preview of the file.
+        #[serde(default)]
+        display_preview: Option<bool>,
+        /// Populate through this field at most this deep, whatever `depth` asks for.
+        #[serde(default)]
+        max_depth: Option<u8>,
+    },
     Json,
     /// The documents of `collection` whose `on` relationship links here. Read, not stored.
     Join {
@@ -383,6 +476,10 @@ pub enum FieldKind {
         /// Block types the text may hold as block nodes, inline or shared, like `blocks`.
         #[serde(default)]
         blocks: Vec<BlockSource>,
+        /// The upload collections whose files the text may hold as upload nodes, and the
+        /// fields each node carries: `{"collections": {"media": {"fields": [...]}}}`.
+        #[serde(default)]
+        upload: Option<RichUpload>,
     },
     /// Puts its fields side by side in the admin. No effect on data.
     Row {
@@ -432,6 +529,41 @@ impl SelectOption {
             Self::Value(v) | Self::Labeled { value: v, .. } => v,
         }
     }
+}
+
+/// Refuses `changed` holding no files while upload fields in `others` point at it,
+/// naming them. Its own fields are left to `check_upload_targets`.
+pub fn check_upload_referrers<'a>(
+    changed: &CollectionSchema,
+    others: impl IntoIterator<Item = &'a CollectionSchema>,
+) -> Result<(), SchemaError> {
+    if changed.upload.is_some() {
+        return Ok(());
+    }
+    let mut referrers = Vec::new();
+    for other in others.into_iter().filter(|o| o.slug != changed.slug) {
+        for (path, f) in other.upload_links() {
+            if f.kind.upload_targets().contains(&changed.slug.as_str()) {
+                referrers.push(format!("{}.{path}", other.slug));
+            }
+        }
+    }
+    if referrers.is_empty() {
+        return Ok(());
+    }
+    Err(SchemaError::Referenced(format!(
+        "{} can't stop holding files while these upload fields point at it: {}; change them first",
+        changed.slug,
+        referrers.join(", ")
+    )))
+}
+
+/// A `relationship` or `upload` field's link options; see `FieldKind::link`.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Link<'a> {
+    pub relation_to: &'a RelationTo,
+    pub has_many: bool,
+    pub max_depth: Option<u8>,
 }
 
 /// Which collections a relationship may link to.
@@ -541,6 +673,29 @@ impl<'de> Deserialize<'de> for BlockSource {
     }
 }
 
+/// A rich text field's upload nodes, by the collection they hold a file from. Each named
+/// collection must be one of the field's `relationTo` and hold files.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RichUpload {
+    pub collections: BTreeMap<String, UploadNodeFields>,
+}
+
+/// The fields an upload node of one collection carries beside its file, such as a caption.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct UploadNodeFields {
+    #[serde(default)]
+    pub fields: Vec<Field>,
+}
+
+/// Where the fields of an upload node of `collection` sit in a schema position
+/// (`RelationRef::field`): `@` can't start a field name or a block slug, so this never
+/// names a block type's fields.
+pub(crate) fn upload_node_key(collection: &str) -> String {
+    format!("@{collection}")
+}
+
 /// Keys every block row carries besides its block's fields.
 pub const BLOCK_ROW_KEYS: &[&str] = &["id", "blockType"];
 
@@ -560,10 +715,11 @@ pub fn data_fields(fields: &[Field]) -> Cow<'_, [Field]> {
     fn has_layout(fields: &[Field]) -> bool {
         fields.iter().any(|f| match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => has_layout(fields),
-            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks
+            FieldKind::Blocks { .. } | FieldKind::RichText { .. } => f
+                .kind
+                .node_types()
                 .iter()
-                .filter_map(BlockSource::def)
-                .any(|b| has_layout(&b.fields)),
+                .any(|(_, _, fields)| has_layout(fields)),
             kind => kind.is_layout(),
         })
     }
@@ -593,6 +749,7 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
                             filterable: false,
                             admin: Admin::default(),
                             virtual_path: None,
+                            computed: false,
                             access: None,
                             kind: FieldKind::Group {
                                 fields: flatten(&tab.fields),
@@ -622,12 +779,8 @@ fn flatten(fields: &[Field]) -> Vec<Field> {
             }),
             FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
                 let mut f = f.clone();
-                if let FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } =
-                    &mut f.kind
-                {
-                    for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                        b.fields = flatten(&b.fields);
-                    }
+                for (_, fields) in f.kind.node_types_mut() {
+                    *fields = flatten(fields);
                 }
                 out.push(f)
             }
@@ -661,6 +814,13 @@ fn compact_fields(fields: &mut Value) {
         }
         if let Some(inner) = f.get_mut("fields") {
             compact_fields(inner);
+        }
+        if let Some(Value::Object(nodes)) =
+            f.get_mut("upload").and_then(|u| u.get_mut("collections"))
+        {
+            for inner in nodes.values_mut().filter_map(|n| n.get_mut("fields")) {
+                compact_fields(inner);
+            }
         }
         for key in ["tabs", "blocks"] {
             if let Some(Value::Array(parts)) = f.get_mut(key) {
@@ -781,6 +941,7 @@ fn check_virtual(f: &Field, path: &str, root: &[Field], in_list: bool) -> Result
             | FieldKind::Blocks { .. }
             | FieldKind::RichText { .. }
             | FieldKind::Relationship { .. }
+            | FieldKind::Upload { .. }
             | FieldKind::Join { .. }
     ) || f.kind.is_layout()
     {
@@ -809,7 +970,7 @@ fn split_virtual<'a>(root: &'a [Field], path: &str) -> Option<(&'a Field, String
         let f = current.iter().find(|f| f.name == *segment)?;
         match &f.kind {
             FieldKind::Group { fields } => current = fields,
-            FieldKind::Relationship { .. } if i + 1 < segments.len() => {
+            kind if kind.link().is_some() && i + 1 < segments.len() => {
                 return Some((f, segments[..=i].join("."), segments[i + 1..].join(".")));
             }
             _ => return None,
@@ -948,6 +1109,20 @@ fn check_layout(
                         &path,
                         &enter(within, &path, &block.slug),
                     )?;
+                }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (c, node) in &u.collections {
+                        check_layout(
+                            &node.fields,
+                            root,
+                            &format!("{here}.upload.collections.{c}.fields"),
+                            &path,
+                            &enter(within, &path, &upload_node_key(c)),
+                        )?;
+                    }
                 }
             }
             FieldKind::Tabs { tabs } => {
@@ -1101,6 +1276,13 @@ pub enum SchemaError {
     UnknownOption { field: String, option: String },
     #[error("{0}")]
     InvalidOption(String),
+    /// The change would leave other collections pointing at it wrongly, such as upload
+    /// fields at a collection that no longer holds files. A conflict, not a bad request.
+    #[error("{0}")]
+    Referenced(String),
+    /// A problem at a path in the schema, such as `fields.cover.relationTo`.
+    #[error("{path}: {message}")]
+    At { path: String, message: String },
 }
 
 impl FieldKind {
@@ -1119,6 +1301,7 @@ impl FieldKind {
             Self::Point => "point",
             Self::Slug { .. } => "slug",
             Self::Relationship { .. } => "relationship",
+            Self::Upload { .. } => "upload",
             Self::Json => "json",
             Self::Join { .. } => "join",
             Self::Group { .. } => "group",
@@ -1131,6 +1314,28 @@ impl FieldKind {
         }
     }
 
+    /// Where a `relationship` or `upload` field links, read the same way for both.
+    pub fn link(&self) -> Option<Link<'_>> {
+        match self {
+            Self::Relationship {
+                relation_to,
+                has_many,
+                max_depth,
+            }
+            | Self::Upload {
+                relation_to,
+                has_many,
+                max_depth,
+                ..
+            } => Some(Link {
+                relation_to,
+                has_many: *has_many,
+                max_depth: *max_depth,
+            }),
+            _ => None,
+        }
+    }
+
     /// The block type a `blocks` field's row, or a rich text block node, names in its
     /// `blockType`.
     pub fn block(&self, slug: &str) -> Option<&BlockDef> {
@@ -1138,6 +1343,97 @@ impl FieldKind {
             .iter()
             .filter_map(BlockSource::def)
             .find(|b| b.slug == slug)
+    }
+
+    /// What a rich text upload node from `collection` carries; `None` when this isn't a
+    /// rich text field that may hold that collection's files.
+    pub fn upload_node(&self, collection: &str) -> Option<&UploadNodeFields> {
+        match self {
+            Self::RichText {
+                upload: Some(u), ..
+            } => u.collections.get(collection),
+            _ => None,
+        }
+    }
+
+    /// The kinds of row or node that hold fields of their own, each with whether it's an
+    /// upload node and its key: a `blocks` or rich text field's block types by slug, then a
+    /// rich text field's upload nodes by `upload_node_key` (`@media`). A shared block not
+    /// expanded has none.
+    pub fn node_types(&self) -> Vec<(bool, Cow<'_, str>, &[Field])> {
+        let blocks = self
+            .block_sources()
+            .iter()
+            .filter_map(BlockSource::def)
+            .map(|b| (false, Cow::Borrowed(b.slug.as_str()), b.fields.as_slice()));
+        let uploads = match self {
+            Self::RichText {
+                upload: Some(u), ..
+            } => Some(u.collections.iter()),
+            _ => None,
+        };
+        let uploads = uploads
+            .into_iter()
+            .flatten()
+            .map(|(c, n)| (true, Cow::Owned(upload_node_key(c)), n.fields.as_slice()));
+        blocks.chain(uploads).collect()
+    }
+
+    /// `node_types`, to change.
+    pub fn node_types_mut(&mut self) -> Vec<(String, &mut Vec<Field>)> {
+        match self {
+            Self::Blocks { blocks, .. } => blocks
+                .iter_mut()
+                .filter_map(BlockSource::def_mut)
+                .map(|b| (b.slug.clone(), &mut b.fields))
+                .collect(),
+            Self::RichText { blocks, upload, .. } => {
+                let blocks = blocks
+                    .iter_mut()
+                    .filter_map(BlockSource::def_mut)
+                    .map(|b| (b.slug.clone(), &mut b.fields));
+                let uploads = upload.iter_mut().flat_map(|u| {
+                    u.collections
+                        .iter_mut()
+                        .map(|(c, n)| (upload_node_key(c), &mut n.fields))
+                });
+                blocks.chain(uploads).collect()
+            }
+            _ => Vec::new(),
+        }
+    }
+
+    /// The fields of the node type `key` names, as `node_types` keys them, among the upload
+    /// nodes if `upload` and the block types if not. The node's kind decides, never its key.
+    pub fn node_type(&self, upload: bool, key: &str) -> Option<&[Field]> {
+        match upload {
+            true => key
+                .strip_prefix('@')
+                .and_then(|c| self.upload_node(c))
+                .map(|n| n.fields.as_slice()),
+            false => self.block(key).map(|b| b.fields.as_slice()),
+        }
+    }
+
+    /// The node type a schema path's segment `key` names (`layout.hero`, `body.@media`), with
+    /// whether it's an upload node. The schema's own keys decide, since no block slug can be
+    /// an upload node's key.
+    pub fn node_type_at(&self, key: &str) -> Option<(bool, &[Field])> {
+        [false, true]
+            .into_iter()
+            .find_map(|upload| self.node_type(upload, key).map(|f| (upload, f)))
+    }
+
+    /// The collections this field links to as upload links: an upload field's targets, or
+    /// the collections a rich text field's upload nodes hold files from.
+    pub fn upload_targets(&self) -> Vec<&str> {
+        match self {
+            Self::Upload { relation_to, .. } => relation_to.targets(),
+            Self::RichText {
+                upload: Some(u), ..
+            } => u.collections.keys().map(String::as_str).collect(),
+            _ => Vec::new(),
+        }
     }
 
     /// The block types a `blocks` or `richText` field offers; none for other kinds.
@@ -1159,11 +1455,10 @@ impl FieldKind {
     pub fn is_indexable(&self) -> bool {
         match self {
             Self::Select { multiple, .. } => !multiple,
-            Self::Relationship {
-                relation_to,
-                has_many,
-                ..
-            } => !has_many && !relation_to.is_polymorphic(),
+            Self::Relationship { .. } | Self::Upload { .. } => {
+                let l = self.link().expect("a link field");
+                !l.has_many && !l.relation_to.is_polymorphic()
+            }
             Self::Text { has_many, .. } | Self::Number { has_many, .. } => !has_many,
             Self::Json
             | Self::Join { .. }
@@ -1197,10 +1492,25 @@ impl CollectionSchema {
         self.versions.is_some()
     }
 
-    /// The data shape (see `data_fields`), worked out once per schema.
+    /// The upload options, when the collection holds files.
+    pub fn uploads(&self) -> Option<&crate::uploads::Upload> {
+        self.upload.as_ref()
+    }
+
+    /// The data shape (see `data_fields`), with the built-in upload fields when the
+    /// collection holds files, worked out once per schema.
     pub fn data(&self) -> &[Field] {
-        self.data
-            .get_or_init(|| data_fields(&self.fields).into_owned())
+        self.data.get_or_init(|| {
+            let data = data_fields(&self.fields);
+            let mut out = match &self.upload {
+                Some(u) => crate::uploads::upload_fields(u, &data),
+                None => data.into_owned(),
+            };
+            if self.folders {
+                crate::uploads::merge_built_ins(&mut out, vec![folder_field()]);
+            }
+            out
+        })
     }
 
     /// This schema with other fields, such as only those a caller may read.
@@ -1214,8 +1524,18 @@ impl CollectionSchema {
             labels: self.labels.clone(),
             url: self.url.clone(),
             versions: self.versions.clone(),
+            upload: self.upload.clone(),
+            folders: self.folders,
             data: OnceLock::new(),
         }
+    }
+
+    /// This schema with `data` as its data fields as they are, such as only those a caller
+    /// may read: built-in fields `data` leaves out stay out.
+    pub fn with_data(&self, data: Vec<Field>) -> Self {
+        let s = self.with_fields(data.clone());
+        s.data.set(data).expect("a new schema has no data yet");
+        s
     }
 
     /// Every join field, with how to find its documents.
@@ -1284,7 +1604,11 @@ impl CollectionSchema {
             let slug = &j.collection;
             // Inside blocks, several block types may have the path: any one linking here will do.
             let found = fields_at(target.data(), &j.on);
-            let links_here = |f: &&Field| matches!(&f.kind, FieldKind::Relationship { relation_to, .. } if relation_to.allows(&self.slug));
+            let links_here = |f: &&Field| {
+                f.kind
+                    .link()
+                    .is_some_and(|l| l.relation_to.allows(&self.slug))
+            };
             let Some(on) = found
                 .iter()
                 .copied()
@@ -1293,7 +1617,7 @@ impl CollectionSchema {
             else {
                 return Err(invalid(format!("{slug} has no field `{}`", j.on)));
             };
-            let FieldKind::Relationship { relation_to, .. } = &on.kind else {
+            let Some(Link { relation_to, .. }) = on.kind.link() else {
                 return Err(invalid(format!(
                     "{slug}.{} isn't a relationship field",
                     j.on
@@ -1346,7 +1670,7 @@ impl CollectionSchema {
                         path,
                         link: link_path,
                         read,
-                        many: matches!(link.kind, FieldKind::Relationship { has_many: true, .. }),
+                        many: link.kind.link().is_some_and(|l| l.has_many),
                     });
                 } else if let FieldKind::Group { fields } = &f.kind {
                     walk(fields, root, &path, out);
@@ -1370,8 +1694,8 @@ impl CollectionSchema {
                 field: field.name.clone(),
                 message,
             };
-            let Some(FieldKind::Relationship { relation_to, .. }) =
-                find_field(self.data(), &v.link).map(|f| &f.kind)
+            let Some(Link { relation_to, .. }) =
+                find_field(self.data(), &v.link).and_then(|f| f.kind.link())
             else {
                 continue;
             };
@@ -1445,9 +1769,8 @@ impl CollectionSchema {
         fn walk<'a>(fields: &'a [Field], out: &mut Vec<&'a str>) {
             for f in fields {
                 match &f.kind {
-                    FieldKind::Relationship { relation_to, .. } => {
-                        out.extend(relation_to.targets())
-                    }
+                    FieldKind::Relationship { relation_to, .. }
+                    | FieldKind::Upload { relation_to, .. } => out.extend(relation_to.targets()),
                     FieldKind::Group { fields }
                     | FieldKind::Array { fields, .. }
                     | FieldKind::Row { fields }
@@ -1465,11 +1788,15 @@ impl CollectionSchema {
                     FieldKind::RichText {
                         relation_to,
                         blocks,
+                        upload,
                         ..
                     } => {
                         out.extend(relation_to.iter().map(String::as_str));
                         for block in blocks.iter().filter_map(BlockSource::def) {
                             walk(&block.fields, out);
+                        }
+                        for node in upload.iter().flat_map(|u| u.collections.values()) {
+                            walk(&node.fields, out);
                         }
                     }
                     _ => {}
@@ -1478,18 +1805,116 @@ impl CollectionSchema {
         }
         let mut out = Vec::new();
         walk(&self.fields, &mut out);
+        if self.folders {
+            out.push(FOLDERS);
+        }
         out.sort_unstable();
         out.dedup();
         out
     }
 
+    /// Every upload field, and every rich text field with upload nodes, with its data path
+    /// (through groups, lists, block types and upload nodes, as `body.@media`).
+    pub fn upload_links(&self) -> Vec<(String, &Field)> {
+        fn walk<'a>(fields: &'a [Field], prefix: &str, out: &mut Vec<(String, &'a Field)>) {
+            for f in fields {
+                let path = join(prefix, &f.name);
+                if !f.kind.upload_targets().is_empty() {
+                    out.push((path.clone(), f));
+                }
+                match &f.kind {
+                    FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
+                        walk(fields, &path, out)
+                    }
+                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+                        for b in blocks.iter().filter_map(BlockSource::def) {
+                            walk(&b.fields, &join(&path, &b.slug), out);
+                        }
+                    }
+                    _ => {}
+                }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (slug, node) in &u.collections {
+                        walk(&node.fields, &join(&path, &upload_node_key(slug)), out);
+                    }
+                }
+            }
+        }
+        let mut out = Vec::new();
+        walk(self.data(), "", &mut out);
+        out
+    }
+
+    /// Checks every upload field's targets hold files, and its `filterOptions` fit each
+    /// one. `lookup` finds other collections; a target it can't find is left to the check
+    /// that every target exists.
+    pub fn check_upload_targets<S: Borrow<CollectionSchema>>(
+        &self,
+        lookup: impl Fn(&str) -> Option<S>,
+    ) -> Result<(), SchemaError> {
+        for (path, f) in self.upload_links() {
+            let (option, what, filter_options) = match &f.kind {
+                FieldKind::Upload { filter_options, .. } => {
+                    ("relationTo", "an upload field links", filter_options)
+                }
+                _ => ("upload.collections", "upload nodes link", &None),
+            };
+            for slug in f.kind.upload_targets() {
+                let found = if slug == self.slug {
+                    None
+                } else {
+                    lookup(slug)
+                };
+                let target: &CollectionSchema = match &found {
+                    Some(s) => s.borrow(),
+                    None if slug == self.slug => self,
+                    None => continue,
+                };
+                if target.upload.is_none() {
+                    return Err(SchemaError::At {
+                        path: format!("fields.{path}.{option}"),
+                        message: format!(
+                            "`{slug}` doesn't hold files; {what} only to collections with upload on"
+                        ),
+                    });
+                }
+                let Some(w) = filter_options else { continue };
+                let reach = |slug: &str| {
+                    if slug == self.slug {
+                        Some(self.clone())
+                    } else {
+                        lookup(slug)
+                            .map(|s| s.borrow().clone())
+                            .filter(|s| s.kind == CollectionKind::Collection)
+                    }
+                };
+                crate::query::parse_filter_with(target.data(), &Value::Object(w.clone()), &reach)
+                    .map_err(|e| SchemaError::At {
+                    path: format!("fields.{path}.filterOptions"),
+                    message: format!("in {slug}: {e}"),
+                })?;
+            }
+        }
+        Ok(())
+    }
+
     /// Checks the schema is usable before it's stored.
     pub fn check(&self) -> Result<(), SchemaError> {
+        // Reserved first: `upload-instructions` isn't a valid slug either, but reserved says why.
+        if RESERVED_SLUGS.contains(&self.slug.as_str()) {
+            return Err(SchemaError::ReservedSlug(self.slug.clone()));
+        }
         if !is_identifier(&self.slug, false) {
             return Err(SchemaError::InvalidSlug(self.slug.clone()));
         }
-        if RESERVED_SLUGS.contains(&self.slug.as_str()) {
-            return Err(SchemaError::ReservedSlug(self.slug.clone()));
+        if let Some(u) = &self.upload {
+            self.check_upload(u)?;
+        }
+        if self.folders {
+            self.check_folders()?;
         }
         if self.url.is_some() && self.kind != CollectionKind::Collection {
             return Err(SchemaError::InvalidOption(
@@ -1528,6 +1953,23 @@ impl CollectionSchema {
             ));
         }
         check_layout(&self.fields, data, "fields", "", &[])?;
+        // The system folders list the collections filed in them, which may be none yet.
+        let listed;
+        let data = match data
+            .iter()
+            .position(|f| self.slug == FOLDERS && f.name == "collections")
+        {
+            Some(i) if matches!(&data[i].kind, FieldKind::Select { options, .. } if options.is_empty()) =>
+            {
+                let mut with = data.to_vec();
+                if let FieldKind::Select { options, .. } = &mut with[i].kind {
+                    options.push(SelectOption::Value(FOLDERS.into()));
+                }
+                listed = with;
+                &listed[..]
+            }
+            _ => data,
+        };
         check_fields(data, Level::Top, data, "", false, &[])?;
         if self.kind == CollectionKind::Global
             && let Some(j) = self.join_fields().first()
@@ -1563,6 +2005,58 @@ impl CollectionSchema {
         Ok(())
     }
 
+    fn check_folders(&self) -> Result<(), SchemaError> {
+        if self.kind != CollectionKind::Collection {
+            return Err(SchemaError::UnknownOption {
+                field: String::new(),
+                option: "folders".into(),
+            });
+        }
+        if self.slug == FOLDERS {
+            return Err(SchemaError::InvalidOption(
+                "folders: folders nest through their own folder field, so they can't be filed in folders".into(),
+            ));
+        }
+        if let Some(f) = data_fields(&self.fields).iter().find(|f| {
+            f.name == "folder" && (f.kind.name() != "relationship" || f.virtual_path.is_some())
+        }) {
+            return Err(SchemaError::InvalidField {
+                field: f.name.clone(),
+                message: "is built in to collections with folders as a relationship to folders; it can take a label, admin options and access rules, not another type".into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn check_upload(&self, u: &crate::uploads::Upload) -> Result<(), SchemaError> {
+        let bad = |m: &str| Err(SchemaError::InvalidOption(format!("upload: {m}")));
+        match self.kind {
+            CollectionKind::Block => return bad("a shared block has no documents to hold files"),
+            CollectionKind::Global => return bad("only collections can hold files"),
+            CollectionKind::Collection if self.slug == "users" => {
+                return bad("users can't hold files; make an upload collection and link to it");
+            }
+            CollectionKind::Collection => {}
+        }
+        for f in data_fields(&self.fields).iter() {
+            // A write's `uploadEdits` edits the file, so no field can take it.
+            if f.name == crate::uploads::UPLOAD_EDITS {
+                return Err(SchemaError::ReservedFieldName(f.name.clone()));
+            }
+            if let Some(kind) = crate::uploads::built_in_kind(u, &f.name)
+                && (f.kind.name() != kind || f.virtual_path.is_some())
+            {
+                return Err(SchemaError::InvalidField {
+                    field: f.name.clone(),
+                    message: format!(
+                        "is built in to upload collections as a {kind} field; it can take a label, admin options and access rules, not another type"
+                    ),
+                });
+            }
+        }
+        crate::uploads::check(u, self.data()).map_err(SchemaError::InvalidOption)
+    }
+
     fn check_url(&self, url: &str) -> Result<(), SchemaError> {
         let bad = |m: String| Err(SchemaError::InvalidOption(format!("url: {m}")));
         let mut unknown = None;
@@ -1576,7 +2070,7 @@ impl CollectionSchema {
             let virtual_field = self
                 .data()
                 .iter()
-                .any(|f| f.name == name && f.virtual_path.is_some());
+                .any(|f| f.name == name && (f.virtual_path.is_some() || f.computed));
             return bad(match virtual_field {
                 true => format!("`{{{name}}}` is virtual; a url needs a stored text or slug field"),
                 false => format!("`{{{name}}}` must name a top-level text or slug field"),
@@ -1602,6 +2096,7 @@ impl CollectionSchema {
         self.data().iter().find(|f| {
             f.name == name
                 && f.virtual_path.is_none()
+                && !f.computed
                 && matches!(f.kind, FieldKind::Text { .. } | FieldKind::Slug { .. })
         })
     }
@@ -1619,10 +2114,9 @@ impl CollectionSchema {
 
     /// The text that names `doc`: its first stored top-level text field.
     pub fn title_of(&self, doc: &Map<String, Value>) -> Option<String> {
-        let f = self
-            .data()
-            .iter()
-            .find(|f| f.virtual_path.is_none() && matches!(f.kind, FieldKind::Text { .. }))?;
+        let f = self.data().iter().find(|f| {
+            f.virtual_path.is_none() && !f.computed && matches!(f.kind, FieldKind::Text { .. })
+        })?;
         Some(doc.get(&f.name)?.as_str()?.to_owned())
     }
 
@@ -1699,6 +2193,9 @@ impl CollectionSchema {
     /// before parsing `input`; unknown keys are left to `reject_unknown_options`.
     pub fn check_option_types(input: &Value) -> Result<(), SchemaError> {
         let bad = |m: &str| Err(SchemaError::InvalidOption(m.into()));
+        if let Some(u) = input.get("upload") {
+            crate::uploads::check_raw(u).map_err(SchemaError::InvalidOption)?;
+        }
         let versions = match input.get("versions") {
             None | Some(Value::Null | Value::Bool(_)) => return Ok(()),
             Some(Value::Object(v)) => v,
@@ -1736,10 +2233,18 @@ impl CollectionSchema {
     /// misspelt `maxLenght`. Every option this model understands survives a round trip,
     /// so anything missing after re-serialising is unknown.
     pub fn reject_unknown_options(&self, input: &Value) -> Result<(), SchemaError> {
-        let known = serde_json::to_value(self).expect("schemas always serialize");
+        let mut known = serde_json::to_value(self).expect("schemas always serialize");
+        // Written only when on, but `false` is a known value too.
+        known["upload"] = match &self.upload {
+            Some(u) => serde_json::to_value(u).expect("upload options always serialize"),
+            None => Value::Bool(false),
+        };
+        known["folders"] = Value::Bool(self.folders);
         unknown_key(input, &known, "")?;
-        if let Some(v) = input.get("versions") {
-            unknown_deep(v, &known["versions"], "versions")?;
+        for option in ["versions", "upload"] {
+            if let Some(v) = input.get(option) {
+                unknown_deep(v, &known[option], option)?;
+            }
         }
         unknown_in_fields(&self.fields, input.get("fields"), "fields")
     }
@@ -1761,6 +2266,12 @@ fn unknown_key(input: &Value, known: &Value, field: &str) -> Result<(), SchemaEr
 /// `path`. Where `known` holds a flag for an object given as input (`"drafts": true` for
 /// `{}`), that object's keys are all unknown.
 fn unknown_deep(input: &Value, known: &Value, path: &str) -> Result<(), SchemaError> {
+    if let (Value::Array(input), Value::Array(known)) = (input, known) {
+        for (i, (v, k)) in input.iter().zip(known).enumerate() {
+            unknown_deep(v, k, &format!("{path}.{i}"))?;
+        }
+        return Ok(());
+    }
     let Value::Object(input) = input else {
         return Ok(());
     };
@@ -1860,6 +2371,18 @@ fn unknown_in_fields(
                         }
                     }
                 }
+                if let FieldKind::RichText {
+                    upload: Some(u), ..
+                } = &f.kind
+                {
+                    for (slug, node) in &u.collections {
+                        unknown_in_fields(
+                            &node.fields,
+                            raw.pointer(&format!("/upload/collections/{slug}/fields")),
+                            &format!("{here}.upload.collections.{slug}.fields"),
+                        )?;
+                    }
+                }
             }
             FieldKind::Tabs { tabs } => {
                 if let (Some(Value::Array(raw_tabs)), Some(Value::Array(known_tabs))) =
@@ -1894,7 +2417,8 @@ fn unknown_in_fields(
 pub const MAX_BLOCK_NESTING: usize = 8;
 
 /// The one walk over a raw field tree. Calls `visit` on every field at any depth (inside
-/// groups, lists, layout fields and inline block types, not references) with the data path
+/// groups, lists, layout fields, inline block types, not references, and rich text's upload
+/// nodes) with the data path
 /// of the list it sits in (`layout`, block types not named) and its schema-change path
 /// (`layout.hero`, see `diff::Renames`). `visit` runs before a field's insides are walked,
 /// so it may replace them.
@@ -1925,13 +2449,12 @@ fn visit_fields(
                     visit_fields(&mut tab.fields, &d, &c, visit)?;
                 }
             }
-            FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
-                for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                    let c = join(&inner_change, &b.slug);
-                    visit_fields(&mut b.fields, &inner_data, &c, visit)?;
+            kind => {
+                for (key, fields) in kind.node_types_mut() {
+                    let c = join(&inner_change, &key);
+                    visit_fields(fields, &inner_data, &c, visit)?;
                 }
             }
-            _ => {}
         }
     }
     Ok(())
@@ -2037,13 +2560,12 @@ fn fields_at<'a>(fields: &'a [Field], path: &str) -> Vec<&'a Field> {
         (FieldKind::Group { fields } | FieldKind::Array { fields, .. }, Some(rest)) => {
             fields_at(fields, rest)
         }
-        (FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. }, Some(rest)) => {
-            blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .flat_map(|b| fields_at(&b.fields, rest))
-                .collect()
-        }
+        (FieldKind::Blocks { .. } | FieldKind::RichText { .. }, Some(rest)) => f
+            .kind
+            .node_types()
+            .into_iter()
+            .flat_map(|(_, _, fields)| fields_at(fields, rest))
+            .collect(),
         _ => Vec::new(),
     }
 }
@@ -2069,13 +2591,13 @@ fn field_steps<'a>(
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
             field_steps(fields, rest, &here, within)?
         }
-        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
+        FieldKind::Blocks { .. } | FieldKind::RichText { .. } => {
             let only = within.iter().find(|(p, _)| *p == here).map(|(_, s)| s);
-            blocks
-                .iter()
-                .filter_map(BlockSource::def)
-                .filter(|b| only.is_none_or(|slug| *slug == b.slug))
-                .find_map(|b| field_steps(&b.fields, rest, &here, within))?
+            f.kind
+                .node_types()
+                .into_iter()
+                .filter(|(_, key, _)| only.is_none_or(|k| k == key))
+                .find_map(|(_, _, fields)| field_steps(fields, rest, &here, within))?
         }
         _ => return None,
     };
@@ -2083,7 +2605,7 @@ fn field_steps<'a>(
     Some(steps)
 }
 
-fn is_identifier(s: &str, allow_upper: bool) -> bool {
+pub(crate) fn is_identifier(s: &str, allow_upper: bool) -> bool {
     let ok = |c: char| c.is_ascii_lowercase() || (allow_upper && c.is_ascii_uppercase());
     let mut chars = s.chars();
     s.len() <= 64
@@ -2136,11 +2658,12 @@ fn check_fields(
         }
         if (f.unique || f.filterable) && !f.kind.is_indexable() {
             let what = match &f.kind {
-                FieldKind::Relationship { relation_to, .. } if relation_to.is_polymorphic() => {
-                    "relationship fields with several targets".to_owned()
+                kind if kind.link().is_some_and(|l| l.relation_to.is_polymorphic()) => {
+                    format!("{} fields with several targets", f.kind.name())
                 }
                 FieldKind::Select { .. } => "select fields with multiple values".to_owned(),
                 FieldKind::Relationship { .. }
+                | FieldKind::Upload { .. }
                 | FieldKind::Text { .. }
                 | FieldKind::Number { .. } => {
                     format!("{} fields with multiple values", f.kind.name())
@@ -2238,12 +2761,24 @@ fn check_fields(
                     "from must name a top-level text field, not `{source}`"
                 )));
             }
-            FieldKind::Relationship {
-                max_depth: Some(d), ..
-            } if *d > 5 => {
+            FieldKind::Upload {
+                has_many,
+                min_rows,
+                max_rows,
+                ..
+            } if (min_rows.is_some() || max_rows.is_some())
+                && (!has_many || min_rows > max_rows && max_rows.is_some()) =>
+            {
+                return Err(invalid(if *has_many {
+                    "minRows is greater than maxRows".into()
+                } else {
+                    "minRows and maxRows only apply with hasMany".into()
+                }));
+            }
+            kind if kind.link().and_then(|l| l.max_depth).is_some_and(|d| d > 5) => {
                 return Err(invalid("maxDepth can be at most 5".into()));
             }
-            FieldKind::Relationship { relation_to, .. } => {
+            FieldKind::Relationship { relation_to, .. } | FieldKind::Upload { relation_to, .. } => {
                 let targets = relation_to.targets();
                 if targets.is_empty() {
                     return Err(invalid("relationTo needs at least one collection".into()));
@@ -2283,6 +2818,7 @@ fn check_fields(
                 features,
                 relation_to,
                 blocks,
+                upload,
             } => {
                 if let Some(features) = features {
                     let mut seen = HashSet::new();
@@ -2300,13 +2836,18 @@ fn check_fields(
                             "blocks needs `block` in features, or no features list".into(),
                         ));
                     }
+                    if upload.is_some() && !features.contains(&F::Upload) {
+                        return Err(invalid(
+                            "upload needs `upload` in features, or no features list".into(),
+                        ));
+                    }
                     if !relation_to.is_empty()
                         && !features
                             .iter()
-                            .any(|f| matches!(f, F::Link | F::Relationship))
+                            .any(|f| matches!(f, F::Link | F::Relationship | F::Upload))
                     {
                         return Err(invalid(
-                            "relationTo needs `link` or `relationship` in features, or no features list"
+                            "relationTo needs `link`, `relationship` or `upload` in features, or no features list"
                                 .into(),
                         ));
                     }
@@ -2320,6 +2861,25 @@ fn check_fields(
                     }
                     if !seen.insert(t) {
                         return Err(invalid(format!("relationTo lists `{t}` twice")));
+                    }
+                }
+                if let Some(u) = upload {
+                    if u.collections.is_empty() {
+                        return Err(invalid(
+                            "upload.collections needs at least one collection".into(),
+                        ));
+                    }
+                    for (slug, node) in &u.collections {
+                        if !relation_to.contains(slug) {
+                            return Err(invalid(format!(
+                                "upload.collections names `{slug}`, which relationTo doesn't list"
+                            )));
+                        }
+                        // As a block node's fields: named by the field's path, inside
+                        // the node's type.
+                        let path = join(prefix, &f.name);
+                        let within = enter(within, &path, &upload_node_key(slug));
+                        check_fields(&node.fields, Level::Nested, root, &path, true, &within)?;
                     }
                 }
             }
@@ -2632,7 +3192,7 @@ mod tests {
             ),
             (
                 json!({"name": "b", "type": "richText", "features": ["bold"], "relationTo": ["posts"]}),
-                "field `b`: relationTo needs `link` or `relationship` in features, or no features list",
+                "field `b`: relationTo needs `link`, `relationship` or `upload` in features, or no features list",
             ),
             (
                 json!({"name": "b", "type": "richText", "relationTo": ["Posts"]}),
@@ -2710,6 +3270,184 @@ mod tests {
             )
             .starts_with("field `b`: unknown variant `blink`")
         );
+    }
+
+    #[test]
+    fn rich_text_upload_nodes_parse_and_check() {
+        let pages = schema(json!({"slug": "pages", "fields": [
+            {"name": "body", "type": "richText", "features": ["bold", "upload"],
+             "relationTo": ["media", "docs"],
+             "upload": {"collections": {
+                "media": {"fields": [
+                    {"name": "caption", "type": "text", "required": true},
+                    {"name": "credit", "type": "relationship", "relationTo": "authors"},
+                    {"name": "more", "type": "upload", "relationTo": "docs"}
+                ]},
+                "docs": {}
+             }}}
+        ]}));
+        assert_eq!(pages.check(), Ok(()));
+        let compact = pages.to_compact_json();
+        assert_eq!(schema(compact.clone()), pages);
+        assert_eq!(pages.reject_unknown_options(&compact), Ok(()));
+        assert_eq!(
+            compact["fields"][0]["upload"]["collections"]["media"]["fields"][0],
+            json!({"name": "caption", "type": "text", "required": true})
+        );
+        // Node fields' links are targets, and their upload fields upload links.
+        assert_eq!(pages.relation_targets(), ["authors", "docs", "media"]);
+        let links: Vec<String> = pages.upload_links().into_iter().map(|(p, _)| p).collect();
+        assert_eq!(links, ["body", "body.@media.more"]);
+
+        // Every collection upload nodes name must hold files, and stay holding them.
+        let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        let docs = schema(json!({"slug": "docs", "upload": true, "fields": []}));
+        let plain = schema(json!({"slug": "docs", "fields": []}));
+        let world = [media.clone(), docs.clone()];
+        assert_eq!(
+            pages.check_upload_targets(|s: &str| world.iter().find(|c| c.slug == s)),
+            Ok(())
+        );
+        let world = [media.clone(), plain.clone()];
+        assert_eq!(
+            pages
+                .check_upload_targets(|s: &str| world.iter().find(|c| c.slug == s))
+                .unwrap_err()
+                .to_string(),
+            SchemaError::At {
+                path: "fields.body.upload.collections".into(),
+                message: "`docs` doesn't hold files; upload nodes link only to collections with upload on"
+                    .into(),
+            }
+            .to_string()
+        );
+        assert!(
+            check_upload_referrers(&plain, [&pages])
+                .unwrap_err()
+                .to_string()
+                .contains("pages.body, pages.body.@media.more")
+        );
+
+        let field = |upload: Value| json!({"name": "b", "type": "richText", "relationTo": ["media"], "upload": upload});
+        let node = |fields: Value| field(json!({"collections": {"media": {"fields": fields}}}));
+        for (f, message) in [
+            (
+                field(json!({"collections": {"posts": {}}})),
+                "field `b`: upload.collections names `posts`, which relationTo doesn't list",
+            ),
+            (
+                field(json!({"collections": {}})),
+                "field `b`: upload.collections needs at least one collection",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "features": ["bold", "link"],
+                    "relationTo": ["media"], "upload": {"collections": {"media": {}}}}),
+                "field `b`: upload needs `upload` in features, or no features list",
+            ),
+            (
+                node(json!([{"name": "Bad name", "type": "text"}])),
+                "field name `Bad name` must start with a letter and use only letters, digits and underscores (64 at most)",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "unique": true}])),
+                "field `t`: unique, filterable and slug fields must be at the top level",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "default": 3}])),
+                "field `t`: default: expected text",
+            ),
+            // Checked as a block node's fields are: a condition sees its own node's type,
+            // and a virtual field sits in a list.
+            (
+                node(json!([{"name": "g", "type": "group", "fields": [
+                    {"name": "t", "type": "text", "admin": {"condition": {"field": "x", "exists": true}}}
+                ]}])),
+                "field `t`: admin.condition refers to `x`, which isn't a field",
+            ),
+            (
+                json!({"name": "b", "type": "richText", "relationTo": ["media"],
+                "blocks": [{"slug": "quote", "fields": [{"name": "q", "type": "text"}]}],
+                "upload": {"collections": {"media": {"fields": [
+                    {"name": "t", "type": "text", "admin": {"condition": {"field": "b.q", "exists": true}}}
+                ]}}}}),
+                "field `t`: admin.condition refers to `b.q`, which isn't a field",
+            ),
+            (
+                node(
+                    json!([{"type": "row", "fields": [{"name": "t", "type": "text", "label": " "}]},
+                    {"type": "collapsible", "fields": []}]),
+                ),
+                "field `fields.0.upload.collections.media.fields.1`: collapsible fields need a label",
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "virtual": "x.y"}])),
+                "field `t`: virtual fields can't be inside a list yet",
+            ),
+        ] {
+            let s = schema(json!({"slug": "p", "fields": [f]}));
+            assert_eq!(s.check().unwrap_err().to_string(), message);
+        }
+        // What block nodes' fields hold, upload nodes' do: field rules, conditions on their
+        // own node's fields, layout fields, and shared blocks.
+        let rich = schema(json!({"slug": "p", "fields": [node(json!([
+            {"name": "caption", "type": "text", "access": {"read": {"roles": ["editor"]}}},
+            {"type": "row", "fields": [
+                {"name": "credit", "type": "text", "admin": {"condition": {"field": "b.caption", "exists": true}}}
+            ]},
+            {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
+        ]))]}));
+        assert_eq!(rich.check(), Ok(()));
+        assert_eq!(rich.block_refs(), ["cta"]);
+        let cta = schema(json!({"slug": "cta", "kind": "block", "fields": [
+            {"name": "label", "type": "text", "admin": {"condition": {"field": "style", "exists": true}}},
+            {"name": "style", "type": "text"}
+        ]}));
+        let (expanded, placed) = rich
+            .expand_placed(|s: &str| (s == "cta").then(|| cta.clone()))
+            .unwrap();
+        assert_eq!(placed, [("b.@media.layout".to_owned(), "cta".to_owned())]);
+        let data = expanded.data();
+        let fields = &data[0].kind.node_type(true, "@media").unwrap();
+        // The row dissolves; the shared block is in place, its condition named from the top.
+        assert_eq!(
+            fields.iter().map(|f| f.name.as_str()).collect::<Vec<_>>(),
+            ["caption", "credit", "layout"]
+        );
+        let label = &fields[2].kind.block("cta").unwrap().fields[0];
+        assert_eq!(
+            label.admin.condition.as_ref().unwrap().field,
+            "b.layout.style"
+        );
+        // Unknown options are named, inside the nodes' fields too.
+        for (raw, option) in [
+            (
+                field(json!({"collections": {"media": {}}, "extra": 1})),
+                None,
+            ),
+            (
+                field(json!({"collections": {"media": {"fieldz": []}}})),
+                None,
+            ),
+            (
+                node(json!([{"name": "t", "type": "text", "maxLenght": 3}])),
+                Some("maxLenght"),
+            ),
+        ] {
+            let raw = json!({"slug": "p", "fields": [raw]});
+            match option {
+                None => assert!(serde_json::from_value::<CollectionSchema>(raw).is_err()),
+                Some(option) => {
+                    let parsed = schema(raw.clone());
+                    assert_eq!(
+                        parsed.reject_unknown_options(&raw),
+                        Err(SchemaError::UnknownOption {
+                            field: "t".into(),
+                            option: option.into()
+                        })
+                    );
+                }
+            }
+        }
     }
 
     #[test]
@@ -2794,9 +3532,16 @@ mod tests {
                 json!({"slug": "blocks", "kind": "block", "fields": []}),
                 "collection slug `blocks` is reserved",
             ),
+            (
+                json!({"slug": "media", "upload": true, "fields": [{"name": "uploadEdits", "type": "json"}]}),
+                "field name `uploadEdits` is reserved",
+            ),
         ] {
             assert_eq!(schema(bad).check().unwrap_err().to_string(), message);
         }
+        // Only an upload collection reads `uploadEdits` from a write.
+        let plain = json!({"slug": "posts", "fields": [{"name": "uploadEdits", "type": "json"}]});
+        assert_eq!(schema(plain).check(), Ok(()));
         let extra = json!({"slug": "p", "fields": [{"name": "l", "type": "blocks", "blocks": [
             {"blockRef": "cta", "slug": "x"}
         ]}]});
@@ -3939,6 +4684,116 @@ mod tests {
     }
 
     #[test]
+    fn upload_fields_link_like_relationships() {
+        let s = schema(json!({"slug": "posts", "fields": [
+            {"name": "cover", "type": "upload", "relationTo": "media", "maxDepth": 1,
+             "filterOptions": {"mimeType": {"like": "image"}}, "displayPreview": true},
+            {"name": "files", "type": "upload", "relationTo": ["media", "downloads"],
+             "hasMany": true, "minRows": 1, "maxRows": 2}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let cover = s.fields[0].kind.link().unwrap();
+        assert_eq!(cover.relation_to, &RelationTo::One("media".into()));
+        assert_eq!((cover.has_many, cover.max_depth), (false, Some(1)));
+        assert!(s.fields[1].kind.link().unwrap().has_many);
+        assert_eq!(s.fields[0].kind.name(), "upload");
+        assert_eq!(s.relation_targets(), ["downloads", "media"]);
+        assert!(FieldKind::Json.link().is_none());
+        // Round trips through stored JSON, admin-only options included.
+        let back: CollectionSchema = serde_json::from_value(s.to_compact_json()).unwrap();
+        assert_eq!(back.fields, s.fields);
+
+        let refused = |field: Value| {
+            schema(json!({"slug": "posts", "fields": [field]}))
+                .check()
+                .unwrap_err()
+                .to_string()
+        };
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": "media", "maxRows": 2})),
+            "field `c`: minRows and maxRows only apply with hasMany"
+        );
+        assert_eq!(
+            refused(
+                json!({"name": "c", "type": "upload", "relationTo": "media", "hasMany": true,
+                           "minRows": 3, "maxRows": 2})
+            ),
+            "field `c`: minRows is greater than maxRows"
+        );
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": "media", "maxDepth": 6})),
+            "field `c`: maxDepth can be at most 5"
+        );
+        assert_eq!(
+            refused(json!({"name": "c", "type": "upload", "relationTo": ["media", "media"]})),
+            "field `c`: relationTo lists `media` twice"
+        );
+        let raw = json!({"slug": "posts", "fields": [
+            {"name": "c", "type": "upload", "relationTo": "media", "filterOptions": "image"}
+        ]});
+        let e = serde_json::from_value::<CollectionSchema>(raw.clone()).unwrap_err();
+        assert_eq!(
+            explain_parse_error(&raw, &e),
+            "field `c`: filterOptions must be an object like {\"mimeType\": {\"like\": \"image\"}}"
+        );
+    }
+
+    #[test]
+    fn turning_upload_off_is_refused_while_upload_fields_point_here() {
+        let off = schema(json!({"slug": "media", "fields": []}));
+        let posts = schema(json!({"slug": "posts", "fields": [
+            {"name": "g", "type": "group", "fields": [
+                {"name": "cover", "type": "upload", "relationTo": ["media", "files"]}
+            ]}
+        ]}));
+        let tags = schema(json!({"slug": "tags", "fields": [
+            {"name": "m", "type": "relationship", "relationTo": "media"}
+        ]}));
+        assert_eq!(
+            check_upload_referrers(&off, [&posts, &tags, &off]),
+            Err(SchemaError::Referenced(
+                "media can't stop holding files while these upload fields point at it: posts.g.cover; change them first".into()
+            ))
+        );
+        assert_eq!(check_upload_referrers(&off, [&tags]), Ok(()));
+        let on = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        assert_eq!(check_upload_referrers(&on, [&posts]), Ok(()));
+    }
+
+    #[test]
+    fn upload_targets_must_hold_files_and_fit_the_filter() {
+        let media = schema(json!({"slug": "media", "upload": true, "fields": []}));
+        let tags = schema(json!({"slug": "tags", "fields": []}));
+        let lookup = |slug: &str| [&media, &tags].into_iter().find(|s| s.slug == slug);
+        let with = |field: Value| schema(json!({"slug": "posts", "fields": [field]}));
+        let at = |s: CollectionSchema| match s.check_upload_targets(lookup) {
+            Err(SchemaError::At { path, message }) => (path, message),
+            other => panic!("{other:?}"),
+        };
+        assert_eq!(
+            with(json!({"name": "c", "type": "upload", "relationTo": "media",
+                        "filterOptions": {"mimeType": {"like": "image"}}}))
+            .check_upload_targets(lookup),
+            Ok(())
+        );
+        let (path, message) = at(with(
+            json!({"name": "c", "type": "upload", "relationTo": ["media", "tags"]}),
+        ));
+        assert_eq!(path, "fields.c.relationTo");
+        assert!(message.contains("`tags`"), "{message}");
+        let (path, message) = at(with(json!({"name": "g", "type": "group", "fields": [
+            {"name": "c", "type": "upload", "relationTo": "media", "filterOptions": {"nope": {"equals": "x"}}}
+        ]})));
+        assert_eq!(path, "fields.g.c.filterOptions");
+        assert!(message.starts_with("in media: "), "{message}");
+        // An upload collection may link to itself.
+        let own = schema(json!({"slug": "media", "upload": true, "fields": [
+            {"name": "poster", "type": "upload", "relationTo": "media"}
+        ]}));
+        assert_eq!(own.check_upload_targets(lookup), Ok(()));
+    }
+
+    #[test]
     fn versions_option_parses_and_round_trips() {
         let on = json!({"slug": "posts", "versions": {"drafts": true}, "fields": []});
         let s = schema(on.clone());
@@ -4053,5 +4908,523 @@ mod tests {
         assert!(!s.versioned());
         assert_eq!(s.reject_unknown_options(&off), Ok(()));
         assert_eq!(schema(serde_json::to_value(&s).unwrap()), s);
+    }
+
+    #[test]
+    fn upload_option_parses_and_round_trips() {
+        use crate::uploads::{
+            Fit, ImageFormat, PasteUrl, Position as Crop, SkipSafeFetch, Upload, UrlPattern,
+        };
+        let on = json!({"slug": "media", "upload": true, "fields": []});
+        let s = schema(on.clone());
+        assert_eq!(s.uploads(), Some(&Upload::default()));
+        assert_eq!(s.reject_unknown_options(&on), Ok(()));
+        assert_eq!(CollectionSchema::check_option_types(&on), Ok(()));
+        assert_eq!(s.check(), Ok(()));
+        assert_eq!(serde_json::to_value(&s).unwrap()["upload"], json!(true));
+        assert_eq!(s.to_compact_json()["upload"], json!(true));
+        assert_eq!(schema(s.to_compact_json()), s);
+        // Off is written back as nothing.
+        let plain = schema(json!({"slug": "posts", "upload": false, "fields": []}));
+        assert_eq!(plain.uploads(), None);
+        let compact = plain.to_compact_json();
+        assert!(compact.get("upload").is_none() && compact.get("folders").is_none());
+        assert_ne!(plain, s);
+
+        let every = json!({"slug": "media", "folders": true, "fields": [
+            {"name": "alt", "type": "text"}
+        ], "upload": {
+            "storage": "s3", "mimeTypes": ["image/*", "application/pdf"],
+            "filesizeLimit": 5_000_000,
+            "imageSizes": [
+                {"name": "thumbnail", "width": 400, "height": 300, "fit": "inside",
+                 "position": "center", "withoutEnlargement": true,
+                 "formatOptions": {"format": "webp", "options": {"quality": 80}},
+                 "crop": "left top"},
+                {"name": "card", "width": 768}
+            ],
+            "adminThumbnail": "thumbnail", "crop": false, "focalPoint": false,
+            "formatOptions": {"format": "jpg", "options": {"quality": 90, "progressive": true}},
+            "resizeOptions": {"width": 2000, "fit": "contain", "position": "north"},
+            "trimOptions": {"background": "#fff", "threshold": 10},
+            "withMetadata": true,
+            "constructorOptions": {"limitInputPixels": 1_000_000, "failOn": "error"},
+            "staticDir": "media", "disableLocalStorage": true,
+            "filesRequiredOnCreate": false, "filenameCompoundIndex": ["filename", "alt"],
+            "pasteURL": {"allowList": [{"protocol": "https", "hostname": "example.com",
+                "port": "443", "pathname": "/img/*", "search": ""}]},
+            "skipSafeFetch": [{"hostname": "localhost"}],
+            "allowRestrictedFileTypes": true, "bulkUpload": true, "displayPreview": true,
+            "hideFileInputOnCreate": true, "hideRemoveFile": true, "cacheTags": true,
+            "modifyResponseHeaders": {"X-Robots-Tag": "noindex"}
+        }});
+        assert_eq!(CollectionSchema::check_option_types(&every), Ok(()));
+        let s = schema(every.clone());
+        assert_eq!(s.reject_unknown_options(&every), Ok(()));
+        assert_eq!(s.check(), Ok(()));
+        assert!(s.folders);
+        let u = s.uploads().unwrap();
+        assert_eq!(u.storage, "s3");
+        assert_eq!(u.image_sizes[0].fit, Fit::Inside);
+        assert_eq!(u.image_sizes[0].position, Some(Crop::Centre));
+        assert_eq!(u.image_sizes[1].position, None);
+        assert_eq!(u.image_sizes[0].crop, Some(Crop::LeftTop));
+        assert_eq!(u.image_sizes[1].fit, Fit::Cover);
+        assert_eq!(u.format_options.as_ref().unwrap().format, ImageFormat::Jpeg);
+        assert_eq!(u.resize_options.as_ref().unwrap().position, Crop::Top);
+        assert_eq!(
+            u.skip_safe_fetch,
+            SkipSafeFetch::AllowList(vec![UrlPattern {
+                protocol: None,
+                hostname: "localhost".into(),
+                port: None,
+                pathname: None,
+                search: None,
+            }])
+        );
+        assert!(matches!(&u.paste_url, PasteUrl::AllowList(l) if l[0].hostname == "example.com"));
+        let again = schema(s.to_compact_json());
+        assert_eq!(again, s);
+        assert_eq!(again.reject_unknown_options(&s.to_compact_json()), Ok(()));
+
+        let off = schema(json!({"slug": "media", "upload": {"pasteURL": false}, "fields": []}));
+        assert_eq!(off.uploads().unwrap().paste_url, PasteUrl::Off);
+        assert_eq!(off.to_compact_json()["upload"]["pasteURL"], json!(false));
+        assert_eq!(schema(off.to_compact_json()), off);
+
+        // Unknown keys are named by their path, at any depth.
+        for (upload, want) in [
+            (json!({"sizesx": []}), "upload: unknown option `sizesx`"),
+            (
+                json!({"imageSizes": [{"name": "t", "width": 1, "kernel": "x"}]}),
+                "upload.imageSizes.0: unknown option `kernel`",
+            ),
+            (
+                json!({"constructorOptions": {"sequentialRead": true}}),
+                "upload.constructorOptions: unknown option `sequentialRead`",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "a.com", "x": 1}]}}),
+                "upload.pasteURL.allowList.0: unknown option `x`",
+            ),
+        ] {
+            let input = json!({"slug": "media", "fields": [], "upload": upload});
+            assert_eq!(
+                CollectionSchema::check_option_types(&input),
+                Ok(()),
+                "{input}"
+            );
+            assert_eq!(
+                schema(input.clone())
+                    .reject_unknown_options(&input)
+                    .unwrap_err()
+                    .to_string(),
+                want
+            );
+        }
+        // Sharp-only values and bad shapes are refused by path, before parsing.
+        for (upload, want) in [
+            (
+                json!({"constructorOptions": {"limitInputPixels": false}}),
+                "upload.constructorOptions.limitInputPixels: ",
+            ),
+            (
+                json!({"imageSizes": [{"name": "t", "width": 1, "position": "attention"}]}),
+                "upload.imageSizes.0.position: `attention`",
+            ),
+            (
+                json!({"resizeOptions": {"position": "entropy"}}),
+                "upload.resizeOptions.position: ",
+            ),
+            (
+                json!({"imageSizes": [{"name": "t", "fit": "squash"}]}),
+                "upload.imageSizes.0.fit: unknown value `squash`",
+            ),
+            (
+                json!({"imageSizes": [{"width": 1}]}),
+                "upload.imageSizes.0.name: is required",
+            ),
+            (
+                json!({"formatOptions": {"format": "bmp"}}),
+                "upload.formatOptions.format: unknown value `bmp`",
+            ),
+            (
+                json!({"formatOptions": {"format": "png", "options": {"quality": 300}}}),
+                "upload.formatOptions.options.quality: ",
+            ),
+            (json!({"filesizeLimit": -1}), "upload.filesizeLimit: "),
+            (json!({"crop": "yes"}), "upload.crop: "),
+            (
+                json!({"constructorOptions": {"failOn": "never"}}),
+                "upload.constructorOptions.failOn: unknown value `never`",
+            ),
+            (
+                json!({"constructorOptions": {"limitInputPixels": 0}}),
+                "upload.constructorOptions.limitInputPixels: 0 ",
+            ),
+            (
+                json!({"constructorOptions": {"limitInputPixels": true}}),
+                "upload.constructorOptions.limitInputPixels: `true`",
+            ),
+            (
+                json!({"pasteURL": "yes"}),
+                "upload.pasteURL: must be true, false or",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"port": "1"}]}}),
+                "upload.pasteURL.allowList.0.hostname: is required",
+            ),
+            (
+                json!({"pasteURL": {"allowList": "a.com"}}),
+                "upload.pasteURL.allowList: ",
+            ),
+            (
+                json!({"skipSafeFetch": "x"}),
+                "upload.skipSafeFetch: must be true, false or a list",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": 1}]}),
+                "upload.skipSafeFetch.0.hostname: ",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "exa mple.com"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `exa mple.com` isn't a hostname",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "*.a/b"}]}),
+                "upload.skipSafeFetch.0.hostname: `*.a/b` isn't a hostname",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "[::1"}]}),
+                "upload.skipSafeFetch.0.hostname: `[::1` isn't a hostname",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "*.10.0.0.1"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `*.10.0.0.1` puts a wildcard before an IP address, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "**.[::1]"}]}),
+                "upload.skipSafeFetch.0.hostname: `**.[::1]` puts a wildcard before an IP address, which can never match",
+            ),
+            (
+                json!({"pasteURL": {"allowList": [{"hostname": "*"}]}}),
+                "upload.pasteURL.allowList.0.hostname: `*` is a wildcard without a domain, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "**"}]}),
+                "upload.skipSafeFetch.0.hostname: `**` is a wildcard without a domain, which can never match",
+            ),
+            (
+                json!({"skipSafeFetch": [{"hostname": "*.*.example.com"}]}),
+                "upload.skipSafeFetch.0.hostname: `*.*.example.com` is a wildcard without a domain, which can never match",
+            ),
+            (
+                json!({"modifyResponseHeaders": {"X-A": 1}}),
+                "upload.modifyResponseHeaders.X-A: ",
+            ),
+            (json!("yes"), "upload: must be true, false or an object"),
+        ] {
+            let input = json!({"slug": "media", "fields": [], "upload": upload});
+            let err = CollectionSchema::check_option_types(&input)
+                .unwrap_err()
+                .to_string();
+            assert!(err.starts_with(want), "{err}");
+            for internal in ["Shape", "untagged", "variant", "u32", "u64", "u8"] {
+                assert!(!err.contains(internal), "{err}");
+            }
+        }
+
+        // Rules `check` applies.
+        let refused = |v: Value| schema(v).check().unwrap_err().to_string();
+        for (v, want) in [
+            (
+                json!({"slug": "site", "kind": "global", "upload": true, "fields": []}),
+                "upload: only collections",
+            ),
+            (
+                json!({"slug": "cta", "kind": "block", "upload": true, "fields": []}),
+                "upload: a shared block",
+            ),
+            (
+                json!({"slug": "users", "upload": true, "fields": []}),
+                "upload: users can't",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "width": 1}, {"name": "a", "height": 1}]}, "fields": []}),
+                "upload.imageSizes.1.name: `a` is used by another size",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a-b", "width": 1}]}, "fields": []}),
+                "upload.imageSizes.0.name: `a-b` must start",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a"}]}, "fields": []}),
+                "upload.imageSizes.0: needs a width",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "width": 0, "height": 10}]}, "fields": []}),
+                "upload.imageSizes.0.width: must be at least 1",
+            ),
+            (
+                json!({"slug": "media", "upload": {"imageSizes": [{"name": "a", "height": 0}]}, "fields": []}),
+                "upload.imageSizes.0.height: must be at least 1",
+            ),
+            (
+                json!({"slug": "media", "upload": {"adminThumbnail": "thumb"}, "fields": []}),
+                "upload.adminThumbnail: `thumb`",
+            ),
+            (
+                json!({"slug": "media", "upload": {"filenameCompoundIndex": ["url"]}, "fields": []}),
+                "upload.filenameCompoundIndex.0: `url`",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"Content-Type": "text/html"}}, "fields": []}),
+                "upload.modifyResponseHeaders.Content-Type: the server sets",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"SET-COOKIE": "a=b"}}, "fields": []}),
+                "upload.modifyResponseHeaders.SET-COOKIE: the server sets",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"X-A": "a\r\nSet-Cookie: b"}}, "fields": []}),
+                "upload.modifyResponseHeaders.X-A: a header value",
+            ),
+            (
+                json!({"slug": "media", "upload": {"modifyResponseHeaders": {"X A": "a"}}, "fields": []}),
+                "upload.modifyResponseHeaders.X A: isn't a valid header name",
+            ),
+        ] {
+            let err = refused(v);
+            assert!(err.starts_with(want), "{err}");
+        }
+    }
+
+    #[test]
+    fn built_in_fields_merge_and_cant_be_retyped() {
+        let s = schema(json!({"slug": "media",
+        "upload": {"imageSizes": [{"name": "thumbnail", "width": 400}]},
+        "fields": [
+            {"name": "alt", "type": "text", "required": true},
+            {"type": "row", "fields": [
+                {"name": "filename", "type": "text", "label": "File name", "maxLength": 3}
+            ]}
+        ]}));
+        assert_eq!(s.check(), Ok(()));
+        let names: Vec<&str> = s.data().iter().map(|f| f.name.as_str()).collect();
+        assert_eq!(
+            names,
+            [
+                "alt",
+                "filename",
+                "mimeType",
+                "filesize",
+                "width",
+                "height",
+                "focalX",
+                "focalY",
+                "url",
+                "thumbnailURL",
+                "sizes",
+                "blurhash"
+            ]
+        );
+        let filename = &s.data()[1];
+        assert_eq!(filename.label.as_deref(), Some("File name"));
+        assert_eq!(filename.kind.name(), "text");
+        assert!(filename.admin.read_only && !filename.computed);
+        // The built-in's own options win: a filename isn't cut to 3 characters.
+        assert!(matches!(
+            filename.kind,
+            FieldKind::Text {
+                max_length: None,
+                ..
+            }
+        ));
+        let at = |path: &str| find_field(s.data(), path).unwrap_or_else(|| panic!("{path}"));
+        assert!(at("url").computed && at("thumbnailURL").computed);
+        assert!(at("sizes.thumbnail.url").computed);
+        assert!(at("sizes.thumbnail.formats.webp.url").computed);
+        assert!(!at("sizes.thumbnail.formats.avif.filesize").computed);
+        assert_eq!(at("focalX").default, Some(json!(50)));
+        assert!(matches!(
+            at("focalY").kind,
+            FieldKind::Number {
+                min: Some(0.0),
+                max: Some(100.0),
+                ..
+            }
+        ));
+        // Readable data that leaves a built-in out keeps it out.
+        let cut: Vec<Field> = s
+            .data()
+            .iter()
+            .filter(|f| f.name != "filename")
+            .cloned()
+            .collect();
+        assert!(s.with_data(cut).data().iter().all(|f| f.name != "filename"));
+
+        // Computed values are dropped from a write, at any depth, and never filtered on.
+        let stored = crate::validate_document(
+            s.data(),
+            &json!({
+                "alt": "A cat", "url": "/x", "thumbnailURL": "/y", "filename": "cat.png",
+                "sizes": {"thumbnail": {"url": "/z", "width": 400,
+                    "formats": {"webp": {"url": "/w", "width": 400}}}}
+            }),
+            None,
+        )
+        .unwrap();
+        assert_eq!(
+            Value::Object(stored),
+            json!({
+                "alt": "A cat", "filename": "cat.png", "focalX": 50, "focalY": 50,
+                "sizes": {"thumbnail": {"width": 400, "formats": {"webp": {"width": 400}}}}
+            })
+        );
+        let migrated = crate::diff::migrate_document(
+            s.data(),
+            &Default::default(),
+            json!({"alt": "a", "url": "/x"}).as_object().unwrap(),
+        );
+        assert!(!migrated.contains_key("url"));
+        for path in ["url", "sizes.thumbnail.url"] {
+            let filter = crate::query::parse_filter(s.data(), &json!({path: {"equals": "/x"}}));
+            assert!(
+                filter
+                    .unwrap_err()
+                    .to_string()
+                    .contains("worked out when it's read"),
+                "{path}"
+            );
+            assert!(crate::query::parse_sort(s.data(), path).is_err(), "{path}");
+        }
+        // A PATCH never stores them either: not in a whole `sizes` group the document
+        // didn't have, nor merged into one it did.
+        let existing = crate::validate_document(s.data(), &json!({"alt": "A cat"}), None).unwrap();
+        let patch = json!({"url": "/x", "thumbnailURL": "/y", "sizes": {"thumbnail": {
+            "url": "/z", "width": 400, "formats": {"avif": {"url": "/a", "width": 400}}}}});
+        let want = json!({"alt": "A cat", "focalX": 50, "focalY": 50, "sizes": {"thumbnail": {
+            "width": 400, "formats": {"avif": {"width": 400}}}}});
+        let patched = crate::validate_document(s.data(), &patch, Some(&existing)).unwrap();
+        assert_eq!(Value::Object(patched.clone()), want);
+        assert_eq!(
+            Value::Object(crate::merged(s.data(), &patch, Some(&existing))),
+            want
+        );
+        let again = crate::validate_document(s.data(), &patch, Some(&patched)).unwrap();
+        assert_eq!(Value::Object(again), want);
+        // A read's own values sent back unchanged still save.
+        let mut round_trip = want.clone();
+        round_trip["url"] = json!("/media/file/cat.png");
+        round_trip["sizes"]["thumbnail"]["url"] = json!("/media/file/cat-400x300.png");
+        let saved = crate::validate_document(s.data(), &round_trip, Some(&patched)).unwrap();
+        assert_eq!(Value::Object(saved), want);
+        // A `url` placed first still isn't the title: it isn't stored.
+        let url_first = schema(json!({"slug": "media", "upload": true, "fields": [
+            {"name": "url", "type": "text", "label": "Link"}]}));
+        assert!(url_first.data()[0].computed);
+        assert_eq!(
+            url_first.title_of(
+                json!({"url": "/x", "filename": "a.png"})
+                    .as_object()
+                    .unwrap()
+            ),
+            Some("a.png".into())
+        );
+
+        // A built-in field keeps its type.
+        for f in [
+            json!({"name": "filename", "type": "number"}),
+            json!({"name": "sizes", "type": "json"}),
+            json!({"name": "url", "type": "text", "virtual": "author.name"}),
+        ] {
+            let name = f["name"].as_str().unwrap().to_owned();
+            let err = schema(json!({"slug": "media", "upload": true, "fields": [f]}))
+                .check()
+                .unwrap_err();
+            assert!(
+                matches!(&err, SchemaError::InvalidField { field, message }
+                if *field == name && message.contains("built in to upload collections")),
+                "{err}"
+            );
+        }
+        // Without `upload`, those names are a collection's own.
+        assert_eq!(
+            schema(json!({"slug": "posts", "fields": [
+            {"name": "filename", "type": "number"}]}))
+            .check(),
+            Ok(())
+        );
+    }
+
+    #[test]
+    fn reserved_slugs_moved() {
+        assert_eq!(
+            schema(json!({"slug": "media", "fields": []})).check(),
+            Ok(())
+        );
+        assert_eq!(
+            schema(json!({"slug": "upload-instructions", "fields": []})).check(),
+            Err(SchemaError::ReservedSlug("upload-instructions".into()))
+        );
+        assert!(!RESERVED_SLUGS.contains(&"folders"));
+    }
+
+    #[test]
+    fn folders_add_a_folder_field() {
+        // Any collection, upload or not, users too, gets a `folder` link to the folders.
+        for on in [
+            json!({"slug": "posts", "folders": true, "fields": [{"name": "title", "type": "text"}]}),
+            json!({"slug": "media", "folders": true, "upload": true, "fields": []}),
+            json!({"slug": "users", "folders": true, "fields": [{"name": "name", "type": "text"}]}),
+        ] {
+            let s = schema(on);
+            assert_eq!(s.check(), Ok(()), "{}", s.slug);
+            let folder = s.data().iter().find(|f| f.name == "folder").unwrap();
+            let link = folder.kind.link().expect("a relationship");
+            assert!(!link.has_many && link.relation_to.targets() == [FOLDERS]);
+            assert!(s.relation_targets().contains(&FOLDERS));
+        }
+        let off = schema(json!({"slug": "posts", "fields": []}));
+        assert!(off.data().iter().all(|f| f.name != "folder"));
+        // A field of its own called `folder` keeps its label, not its type.
+        let labelled = schema(json!({"slug": "posts", "folders": true, "fields": [
+            {"name": "folder", "type": "relationship", "relationTo": "folders", "label": "Where"}]}));
+        assert_eq!(labelled.check(), Ok(()));
+        let f = labelled.data().iter().find(|f| f.name == "folder").unwrap();
+        assert_eq!(f.label.as_deref(), Some("Where"));
+        assert_eq!(labelled.data().len(), 1);
+        let retyped = schema(json!({"slug": "posts", "folders": true, "fields": [
+            {"name": "folder", "type": "text"}]}));
+        assert!(
+            matches!(retyped.check(), Err(SchemaError::InvalidField { ref field, .. }) if field == "folder"),
+            "{:?}",
+            retyped.check()
+        );
+        // Globals and shared blocks hold no documents to file, and folders nest by `folder`.
+        for kind in ["global", "block"] {
+            let s = schema(
+                json!({"slug": "site", "kind": kind, "folders": true, "fields": [
+                {"name": "title", "type": "text"}]}),
+            );
+            assert_eq!(
+                s.check(),
+                Err(SchemaError::UnknownOption {
+                    field: String::new(),
+                    option: "folders".into()
+                })
+            );
+        }
+        let own = schema(json!({"slug": FOLDERS, "folders": true, "fields": [
+            {"name": "name", "type": "text"}]}));
+        assert!(matches!(own.check(), Err(SchemaError::InvalidOption(_))));
+        // The system folders' `collections` may list none yet; any other select needs one.
+        let system = schema(json!({"slug": FOLDERS, "fields": [
+            {"name": "name", "type": "text"},
+            {"name": "collections", "type": "select", "options": [], "multiple": true}]}));
+        assert_eq!(system.check(), Ok(()));
+        let other = schema(json!({"slug": "posts", "fields": [
+            {"name": "collections", "type": "select", "options": [], "multiple": true}]}));
+        assert!(other.check().is_err());
     }
 }

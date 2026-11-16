@@ -1,5 +1,7 @@
 #![allow(dead_code)] // each test binary uses a different subset of these helpers
 
+pub mod fixtures;
+
 use axum::Router;
 use axum::body::Body;
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -28,6 +30,11 @@ pub async fn send_with(
         req = req.header("content-type", "application/json");
     }
     let body = body.map_or_else(Body::empty, |b| Body::from(b.to_owned()));
+    send_body(app, req, body).await
+}
+
+/// `req` with `body` as it is, headers and all left to the caller.
+pub async fn send_body(app: &Router, req: axum::http::request::Builder, body: Body) -> Res {
     let res = app.clone().oneshot(req.body(body).unwrap()).await.unwrap();
     let status = res.status();
     let headers = res.headers().clone();
@@ -141,4 +148,107 @@ pub fn with_key(app: Router, key: &str) -> Router {
             }
         },
     ))
+}
+
+/// The boundary `multipart` separates its parts with.
+pub const BOUNDARY: &str = "tachyon-test-boundary";
+
+/// A `multipart/form-data` body and its content type: `file` (its bytes, sent as
+/// `image/png` whatever they are, under `name`) and `_payload` (JSON), each when given.
+pub fn multipart(file: Option<&[u8]>, name: &str, payload: Option<&Value>) -> (String, Vec<u8>) {
+    let mut body = Vec::new();
+    if let Some(bytes) = file {
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"file\"; filename=\"{name}\"\r\nContent-Type: image/png\r\n\r\n"
+            )
+            .as_bytes(),
+        );
+        body.extend_from_slice(bytes);
+        body.extend_from_slice(b"\r\n");
+    }
+    if let Some(payload) = payload {
+        body.extend_from_slice(
+            format!(
+                "--{BOUNDARY}\r\nContent-Disposition: form-data; name=\"_payload\"\r\n\r\n{payload}\r\n"
+            )
+            .as_bytes(),
+        );
+    }
+    body.extend_from_slice(format!("--{BOUNDARY}--\r\n").as_bytes());
+    (format!("multipart/form-data; boundary={BOUNDARY}"), body)
+}
+
+/// Sends `multipart`'s body to `uri`.
+pub async fn upload(
+    app: &Router,
+    method: &str,
+    uri: &str,
+    file: Option<&[u8]>,
+    name: &str,
+    payload: Option<&Value>,
+) -> Res {
+    let (kind, body) = multipart(file, name, payload);
+    let req = Request::builder()
+        .method(method)
+        .uri(uri)
+        .header("content-type", kind);
+    send_body(app, req, Body::from(body)).await
+}
+
+/// A valid `w`×`h` grey PNG, its pixel data stored without compression.
+pub fn png(w: u32, h: u32) -> Vec<u8> {
+    fn crc(bytes: &[u8]) -> u32 {
+        let mut c = !0u32;
+        for &b in bytes {
+            c ^= u32::from(b);
+            for _ in 0..8 {
+                c = if c & 1 == 1 {
+                    0xEDB8_8320 ^ (c >> 1)
+                } else {
+                    c >> 1
+                };
+            }
+        }
+        !c
+    }
+    fn chunk(out: &mut Vec<u8>, kind: &[u8], data: &[u8]) {
+        out.extend_from_slice(&(data.len() as u32).to_be_bytes());
+        let start = out.len();
+        out.extend_from_slice(kind);
+        out.extend_from_slice(data);
+        let sum = crc(&out[start..]);
+        out.extend_from_slice(&sum.to_be_bytes());
+    }
+    // Each row: filter 0, then one grey byte per pixel.
+    let mut raw = Vec::new();
+    for _ in 0..h {
+        raw.push(0);
+        raw.extend(std::iter::repeat_n(0x80, w as usize));
+    }
+    // zlib with stored deflate blocks of at most 65,535 bytes.
+    let mut z = vec![0x78, 0x01];
+    let blocks: Vec<&[u8]> = raw.chunks(65_535).collect();
+    for (i, block) in blocks.iter().enumerate() {
+        z.push(u8::from(i + 1 == blocks.len()));
+        let len = block.len() as u16;
+        z.extend_from_slice(&len.to_le_bytes());
+        z.extend_from_slice(&(!len).to_le_bytes());
+        z.extend_from_slice(block);
+    }
+    let (mut a, mut b) = (1u32, 0u32);
+    for &x in &raw {
+        a = (a + u32::from(x)) % 65_521;
+        b = (b + a) % 65_521;
+    }
+    z.extend_from_slice(&((b << 16) | a).to_be_bytes());
+    let mut ihdr = Vec::new();
+    ihdr.extend_from_slice(&w.to_be_bytes());
+    ihdr.extend_from_slice(&h.to_be_bytes());
+    ihdr.extend_from_slice(&[8, 0, 0, 0, 0]);
+    let mut out = b"\x89PNG\r\n\x1a\n".to_vec();
+    chunk(&mut out, b"IHDR", &ihdr);
+    chunk(&mut out, b"IDAT", &z);
+    chunk(&mut out, b"IEND", &[]);
+    out
 }

@@ -10,7 +10,8 @@ use super::{RenderCtx, attr, children, code_language, field_text, heading_ids, k
 /// it's written (stored data can outlive a rule), and an internal link the context can't
 /// give a URL for is its text alone. Block nodes are `<div data-block="…">` with their
 /// fields as `data-*` attributes; relationship nodes are `<div data-relationship>` around
-/// the linked document's title.
+/// the linked document's title; upload nodes are an `<img>`, in a `<picture>` when its
+/// sizes come in other types, or a link to the file, with their fields as `data-*`.
 pub fn to_html(doc: &Value, ctx: &RenderCtx) -> String {
     let mut out = String::new();
     let mut ids = heading_ids(doc).into_iter();
@@ -143,16 +144,91 @@ fn node_html(
         "block" => {
             let block_type = attr(node, "blockType").and_then(Value::as_str);
             let _ = write!(out, "<div data-block=\"{}\"", esc(block_type.unwrap_or("")));
-            let fields = attr(node, "fields").and_then(Value::as_object);
-            for (name, value) in fields.into_iter().flatten() {
-                if let (Some(name), Some(text)) = (data_name(name), field_text(value)) {
-                    let _ = write!(out, " {name}=\"{}\"", esc(&text));
-                }
-            }
+            data_fields(node, out);
             out.push_str("></div>");
         }
+        "upload" => upload_html(node, ctx, out),
         // Validation lets nothing else in; anything else is left out rather than guessed at.
         _ => {}
+    }
+}
+
+/// A node's own fields as `data-*` attributes.
+fn data_fields(node: &Value, out: &mut String) {
+    let fields = attr(node, "fields").and_then(Value::as_object);
+    for (name, value) in fields.into_iter().flatten() {
+        if let (Some(name), Some(text)) = (data_name(name), field_text(value)) {
+            let _ = write!(out, " {name}=\"{}\"", esc(&text));
+        }
+    }
+}
+
+/// An upload node: an image as `<img>` with its sizes in its own type as `srcset`, inside
+/// a `<picture>` with a `<source>` per other type its sizes are made in; a TIFF, BMP or
+/// icon as its widest PNG size; any other file, or one of those with no size, as a link
+/// to it by its name. The node's fields are `data-*` attributes on the outermost
+/// element. One the caller can't read, or whose URL fails the scheme check, is left out
+/// (W1-R24).
+fn upload_html(node: &Value, ctx: &RenderCtx, out: &mut String) {
+    let Some(file) = super::upload_of(node, ctx).filter(|f| safe_href(&f.url)) else {
+        return;
+    };
+    // An image a browser can't show is its widest size, made as PNG; with none, a link.
+    let src = match super::shown(&file.mime_type) {
+        true => Some(&file.url),
+        false => file
+            .srcset
+            .last()
+            .map(|(url, _)| url)
+            .filter(|u| safe_href(u)),
+    };
+    let Some(src) = src.filter(|_| file.mime_type.starts_with("image/")) else {
+        let _ = write!(out, "<a href=\"{}\"", esc(&file.url));
+        data_fields(node, out);
+        let _ = write!(out, ">{}</a>", esc(&file.filename));
+        return;
+    };
+    // A comma or space would split a candidate in two.
+    let srcset = |set: &[(String, u32)]| {
+        let set: Vec<String> = set
+            .iter()
+            .filter(|(url, _)| safe_href(url) && !url.contains(','))
+            .map(|(url, w)| format!("{url} {w}w"))
+            .collect();
+        let sizes = file
+            .width
+            .map(|w| format!(" sizes=\"(max-width: {w}px) 100vw, {w}px\""))
+            .unwrap_or_default();
+        (!set.is_empty()).then(|| format!(" srcset=\"{}\"{sizes}", esc(&set.join(", "))))
+    };
+    let sources: Vec<(&String, String)> = file
+        .sources
+        .iter()
+        .filter_map(|(t, set)| Some((t, srcset(set)?)))
+        .collect();
+    let picture = !sources.is_empty();
+    if picture {
+        out.push_str("<picture");
+        data_fields(node, out);
+        out.push('>');
+        for (t, set) in sources {
+            let _ = write!(out, "<source type=\"{}\"{set}>", esc(t));
+        }
+    }
+    let _ = write!(out, "<img src=\"{}\"", esc(src));
+    for (name, n) in [("width", file.width), ("height", file.height)] {
+        if let Some(n) = n {
+            let _ = write!(out, " {name}=\"{n}\"");
+        }
+    }
+    // Always there: with no alt text, `alt=""` is better than a screen reader's file name.
+    let _ = write!(out, " alt=\"{}\"", esc(file.alt.as_deref().unwrap_or("")));
+    out.push_str(&srcset(&file.srcset).unwrap_or_default());
+    if picture {
+        out.push_str("></picture>");
+    } else {
+        data_fields(node, out);
+        out.push('>');
     }
 }
 
@@ -209,12 +285,13 @@ fn link_href(mark: &Value, ctx: &RenderCtx) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{A1, P1, P2, doc, full, linked, para, text};
+    use super::super::tests::{A1, M1, M2, P1, P2, doc, full, linked, media_file, para, text};
     use super::*;
     use serde_json::json;
 
     /// Post `P1` lives at `/blog/hello`; post `P2`'s URL is hostile. Author `A1` is
-    /// "Ann <b>". Nothing else is readable.
+    /// "Ann <b>". Media `M1` is an image and `M2` a PDF (`media_file`). Nothing else is
+    /// readable.
     fn ctx_for(test: impl FnOnce(&RenderCtx)) {
         let link_url = |to: &str, v: &Value| match (to, v.as_str()?) {
             ("posts", P1) => Some("/blog/hello".to_owned()),
@@ -229,6 +306,7 @@ mod tests {
             link_url: &link_url,
             title: &title,
             slug: &slug,
+            upload: &media_file,
         })
     }
 
@@ -260,6 +338,9 @@ mod tests {
         "sub",
         "sup",
         "a",
+        "img",
+        "picture",
+        "source",
     ];
 
     /// Fails unless `html` is inert: no `<script` or `javascript:` anywhere; only the tags
@@ -368,6 +449,219 @@ mod tests {
                 );
             }
         });
+    }
+
+    #[test]
+    fn upload_nodes_show_what_a_browser_can() {
+        // A TIFF shows as its widest PNG size, with the PNG sizes as its srcset; with no
+        // size it's a link to the file, never an image a browser can't show.
+        let tiff = |sizes: Vec<(String, u32)>| {
+            move |_: &str, _: &Value| {
+                Some(super::super::UploadView {
+                    url: "/api/media/file/a.tif".into(),
+                    width: Some(800),
+                    height: Some(600),
+                    alt: None,
+                    mime_type: "image/tiff".into(),
+                    filename: "a.tif".into(),
+                    srcset: sizes.clone(),
+                    sources: Vec::new(),
+                })
+            }
+        };
+        let none = |_: &str, _: &Value| None;
+        let html = |upload: &dyn Fn(&str, &Value) -> Option<super::super::UploadView>| {
+            let node = json!({"type": "upload", "attrs": {"relationTo": "media", "value": M1,
+                "fields": {"caption": "c"}}});
+            to_html(
+                &doc(json!([node])),
+                &RenderCtx {
+                    link_url: &none,
+                    title: &none,
+                    slug: &none,
+                    upload,
+                },
+            )
+        };
+        let sized = tiff(vec![
+            ("/api/media/file/a-100.png".into(), 100),
+            ("/api/media/file/a-400.png".into(), 400),
+        ]);
+        assert_eq!(
+            html(&sized),
+            concat!(
+                "<img src=\"/api/media/file/a-400.png\" width=\"800\" height=\"600\" alt=\"\" ",
+                "srcset=\"/api/media/file/a-100.png 100w, /api/media/file/a-400.png 400w\" ",
+                "sizes=\"(max-width: 800px) 100vw, 800px\" data-caption=\"c\">"
+            )
+        );
+        assert_eq!(
+            html(&tiff(Vec::new())),
+            "<a href=\"/api/media/file/a.tif\" data-caption=\"c\">a.tif</a>"
+        );
+        // One whose only size fails the scheme check is a link too.
+        assert_eq!(
+            html(&tiff(vec![("javascript:alert(1)".into(), 4)])),
+            "<a href=\"/api/media/file/a.tif\" data-caption=\"c\">a.tif</a>"
+        );
+    }
+
+    #[test]
+    fn upload_node_fields_are_data_attributes() {
+        ctx_for(|ctx| {
+            // The node's own fields are `data-*` attributes, as a block node's are, on the
+            // outermost element.
+            let with = |id: &str| {
+                json!({"type": "upload", "attrs": {"relationTo": "media", "value": id,
+                    "fields": {"caption": "A \"b\" <c>", "credit": A1, "count": 3,
+                        "none": null, "bad name\" onclick": "y"}}})
+            };
+            let html = to_html(&doc(json!([with(M1), with(M2)])), ctx);
+            assert_inert(&html);
+            let data = concat!(
+                " data-caption=\"A &quot;b&quot; &lt;c&gt;\" data-count=\"3\"",
+                " data-credit=\"0199d5c4-0000-7000-8000-0000000000b1\""
+            );
+            assert!(
+                html.starts_with(&format!("<picture{data}><source ")),
+                "{html}"
+            );
+            assert_eq!(html.matches("data-caption").count(), 2, "{html}");
+            assert!(
+                html.ends_with(&format!(
+                    "<a href=\"/api/media/file/terms.pdf\"{data}>terms.pdf</a>"
+                )),
+                "{html}"
+            );
+        });
+    }
+
+    #[test]
+    fn upload_node_renders() {
+        let node =
+            |id: &str| json!({"type": "upload", "attrs": {"relationTo": "media", "value": id}});
+        let u = "https://cms.example/api/media/file";
+        ctx_for(|ctx| {
+            // An image with its sizes; a PDF as a link; a file the caller can't read, and one
+            // named by a collection it isn't in, not at all (W1-R24).
+            let d = doc(json!([
+                node(M1),
+                node(M2),
+                node(P1),
+                {"type": "upload", "attrs": {"relationTo": "posts", "value": M1}}
+            ]));
+            assert_eq!(
+                to_html(&d, ctx),
+                format!(
+                    concat!(
+                        // One source per other type, the best first; the original's type
+                        // in the image itself. No srcset repeats a width.
+                        "<picture>",
+                        "<source type=\"image/avif\" ",
+                        "srcset=\"{u}/a-400x300.avif 400w\" ",
+                        "sizes=\"(max-width: 800px) 100vw, 800px\">",
+                        "<source type=\"image/webp\" ",
+                        "srcset=\"{u}/a-40x30.webp 40w, {u}/a-400x300.webp 400w\" ",
+                        "sizes=\"(max-width: 800px) 100vw, 800px\">",
+                        "<img src=\"{u}/a.png\" width=\"800\" height=\"600\" alt=\"Cover\" ",
+                        "srcset=\"{u}/a-400x300.png 400w, {u}/a.png 800w\" ",
+                        "sizes=\"(max-width: 800px) 100vw, 800px\">",
+                        "</picture>",
+                        "<a href=\"/api/media/file/terms.pdf\">terms.pdf</a>"
+                    ),
+                    u = u
+                )
+            );
+            let none = |_: &str, _: &Value| None;
+            let text = |d: &Value| {
+                crate::richtext::to_text(
+                    d,
+                    &RenderCtx {
+                        link_url: &none,
+                        title: &none,
+                        slug: &none,
+                        upload: &media_file,
+                    },
+                )
+            };
+            assert_eq!(text(&doc(json!([node(M1)]))), "Cover");
+            assert_eq!(text(&doc(json!([node(M2), node(P1)]))), "terms.pdf");
+        });
+        // What the file says is escaped, and a URL that fails the scheme check isn't shown.
+        let evil = "\"><script>alert(1)</script>";
+        let file = |to: &str, _: &Value| {
+            Some(super::super::UploadView {
+                url: format!("/a.png?{evil}"),
+                width: None,
+                height: None,
+                alt: Some(evil.into()),
+                mime_type: if to == "media" {
+                    "image/png"
+                } else {
+                    "text/html"
+                }
+                .into(),
+                filename: evil.into(),
+                srcset: vec![
+                    ("javascript:alert(1)".into(), 1),
+                    ("/a,b.png".into(), 2),
+                    (format!("/c.png?{evil}"), 3),
+                ],
+                sources: vec![
+                    (evil.into(), vec![("/d.webp".into(), 4)]),
+                    ("image/avif".into(), vec![("javascript:alert(1)".into(), 5)]),
+                ],
+            })
+        };
+        let bad = |_: &str, _: &Value| {
+            Some(super::super::UploadView {
+                url: "JavaScript:alert(1)".into(),
+                width: None,
+                height: None,
+                alt: None,
+                mime_type: "image/png".into(),
+                filename: "x".into(),
+                srcset: Vec::new(),
+                sources: Vec::new(),
+            })
+        };
+        let none = |_: &str, _: &Value| None;
+        let d = doc(
+            json!([node(M1), {"type": "upload", "attrs": {"relationTo": "pages", "value": M1}}]),
+        );
+        let html = to_html(
+            &d,
+            &RenderCtx {
+                link_url: &none,
+                title: &none,
+                slug: &none,
+                upload: &file,
+            },
+        );
+        assert_inert(&html);
+        assert_eq!(
+            html,
+            concat!(
+                // A source with no candidate left isn't written.
+                "<picture><source type=\"&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" ",
+                "srcset=\"/d.webp 4w\">",
+                "<img src=\"/a.png?&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" ",
+                "alt=\"&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\" ",
+                "srcset=\"/c.png?&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt; 3w\"></picture>",
+                "<a href=\"/a.png?&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;\">",
+                "&quot;&gt;&lt;script&gt;alert(1)&lt;/script&gt;</a>"
+            )
+        );
+        let html = to_html(
+            &doc(json!([node(M1)])),
+            &RenderCtx {
+                link_url: &none,
+                title: &none,
+                slug: &none,
+                upload: &bad,
+            },
+        );
+        assert_eq!(html, "");
     }
 
     #[test]

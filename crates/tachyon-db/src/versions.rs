@@ -13,7 +13,8 @@ use crate::{DEFAULT_TENANT, DbError, DocCopy};
 /// Records `data` as a version of document `doc` of `collection`, `kind` saying which copy
 /// it was, then drops the oldest past the collection's `maxVersions` (0 keeps every one).
 /// A version a queued or running job holds, such as a scheduled publish's, is never
-/// dropped. The version's collection is the document's own, read from its row.
+/// dropped. The version's collection is the document's own, read from its row, and it holds
+/// the copy's stored file, released when the version is dropped and nothing else holds it.
 pub async fn record_version(
     conn: &mut PgConnection,
     doc: Uuid,
@@ -23,8 +24,10 @@ pub async fn record_version(
     by: Option<Uuid>,
 ) -> Result<Uuid, DbError> {
     let id = sqlx::query_scalar!(
-        r#"INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data, created_by)
-           SELECT $1, tenant_id, collection_id, id, $4, $5, $6 FROM documents
+        r#"INSERT INTO versions (id, tenant_id, collection_id, document_id, kind, data, created_by, file_id)
+           SELECT $1, tenant_id, collection_id, id, $4, $5, $6,
+                  CASE WHEN $4 = 'draft' THEN draft_file ELSE published_file END
+           FROM documents
            WHERE tenant_id = $2 AND id = $3 AND collection_id = $7
            RETURNING id"#,
         Uuid::now_v7(),
@@ -44,7 +47,7 @@ pub async fn record_version(
         .as_ref()
         .map_or(0, |v| v.max_versions);
     if keep > 0 {
-        sqlx::query!(
+        let dropped: Vec<Option<Uuid>> = sqlx::query_scalar!(
             r#"DELETE FROM versions WHERE id IN (
                    SELECT id FROM versions
                    WHERE tenant_id = $1 AND document_id = $2
@@ -52,13 +55,16 @@ pub async fn record_version(
                ) AND NOT EXISTS (
                    SELECT 1 FROM jobs j
                    WHERE j.tenant_id = $1 AND j.state IN ('queued', 'running')
-                     AND j.payload->>'version' = versions.id::text)"#,
+                     AND j.payload->>'version' = versions.id::text)
+               RETURNING file_id"#,
             DEFAULT_TENANT,
             doc,
             i64::from(keep),
         )
-        .execute(&mut *conn)
+        .fetch_all(&mut *conn)
         .await?;
+        let dropped: Vec<Uuid> = dropped.into_iter().flatten().collect();
+        crate::files::release_in(conn, &dropped).await?;
     }
     Ok(id)
 }
@@ -73,6 +79,9 @@ pub struct Version {
     #[serde(with = "time::serde::rfc3339")]
     pub created_at: OffsetDateTime,
     pub created_by: Option<Uuid>,
+    /// The stored file the copy held then.
+    #[serde(skip)]
+    pub file_id: Option<Uuid>,
     /// Left out of lists.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub data: Option<Map<String, Value>>,
@@ -88,7 +97,7 @@ pub async fn list(
     offset: i64,
 ) -> Result<Vec<Version>, DbError> {
     let rows = sqlx::query!(
-        r#"SELECT v.id, v.kind, v.created_at, v.created_by FROM versions v
+        r#"SELECT v.id, v.kind, v.created_at, v.created_by, v.file_id FROM versions v
            JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id
            WHERE v.tenant_id = $1 AND v.document_id = $2 AND d.deleted_at IS NULL
              AND ($5 OR v.kind = 'published')
@@ -109,6 +118,7 @@ pub async fn list(
             kind: r.kind,
             created_at: r.created_at,
             created_by: r.created_by,
+            file_id: r.file_id,
             data: None,
         })
         .collect())
@@ -117,7 +127,7 @@ pub async fn list(
 /// Version `id` of live document `doc`, with its data.
 pub async fn get(pool: &PgPool, doc: Uuid, id: Uuid) -> Result<Version, DbError> {
     let r = sqlx::query!(
-        r#"SELECT v.id, v.kind, v.created_at, v.created_by,
+        r#"SELECT v.id, v.kind, v.created_at, v.created_by, v.file_id,
                   v.data AS "data!: Json<Map<String, Value>>"
            FROM versions v
            JOIN documents d ON d.id = v.document_id AND d.collection_id = v.collection_id
@@ -135,6 +145,7 @@ pub async fn get(pool: &PgPool, doc: Uuid, id: Uuid) -> Result<Version, DbError>
         kind: r.kind,
         created_at: r.created_at,
         created_by: r.created_by,
+        file_id: r.file_id,
         data: Some(r.data.0),
     })
 }

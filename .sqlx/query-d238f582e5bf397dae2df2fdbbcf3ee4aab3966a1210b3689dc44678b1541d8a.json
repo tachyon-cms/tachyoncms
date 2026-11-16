@@ -1,0 +1,53 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT filename, names, sizes AS \"sizes: Json<Map<String, Value>>\"\n           FROM files WHERE tenant_id = $1 AND id = $2",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "filename",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "filename"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "names"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "sizes: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "sizes"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "d238f582e5bf397dae2df2fdbbcf3ee4aab3966a1210b3689dc44678b1541d8a"
+}

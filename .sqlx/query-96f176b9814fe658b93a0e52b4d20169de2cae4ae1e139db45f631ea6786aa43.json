@@ -1,0 +1,17 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE documents SET\n                   published = CASE WHEN published_file = $2 AND published ? 'filename'\n                                    THEN jsonb_set(published, '{filename}', to_jsonb($3::text))\n                                         || CASE WHEN jsonb_typeof(published->'sizes') = 'object'\n                                                 THEN jsonb_build_object('sizes', published->'sizes' || $4::jsonb)\n                                                 ELSE '{}' END\n                                    ELSE published END,\n                   draft = CASE WHEN draft_file = $2 AND draft ? 'filename'\n                                THEN jsonb_set(draft, '{filename}', to_jsonb($3::text))\n                                     || CASE WHEN jsonb_typeof(draft->'sizes') = 'object'\n                                             THEN jsonb_build_object('sizes', draft->'sizes' || $4::jsonb)\n                                             ELSE '{}' END\n                                ELSE draft END\n               WHERE tenant_id = $1 AND (published_file = $2 OR draft_file = $2)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "96f176b9814fe658b93a0e52b4d20169de2cae4ae1e139db45f631ea6786aa43"
+}

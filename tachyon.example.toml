@@ -16,3 +16,56 @@ lockout_duration = "15m"    # ...lock the account for this long
 argon2_memory_kib = 19456   # password hashing memory (OWASP baseline)
 breach_check = true         # refuse passwords known from data breaches
 allowed_origins = []        # other sites allowed to send cookie-signed changes
+
+[uploads]
+max_file_size = "25MB"          # per file, unless a collection sets filesizeLimit; MB = 1,000,000 bytes, MiB = 1,048,576
+max_pixels = 50_000_000         # the most an image may decode to, all its frames counted
+temp_dir = "/var/tmp/tachyon"   # where uploads wait while they're checked
+timeout = "10m"                 # how long one upload request may take; under 1h
+
+# Where files go. A collection picks one with upload.storage; `default` is used otherwise,
+# and is ./uploads on this machine unless you set it here.
+# [storage.default]
+# adapter = "local"
+# root = "./uploads"
+
+# A bucket on S3, R2, MinIO or another S3-compatible store. Its keys come only from the
+# environment, never this file: TACHYON_STORAGE__R2__ACCESS_KEY_ID and
+# TACHYON_STORAGE__R2__SECRET_ACCESS_KEY for [storage.r2] (and ..._SESSION_TOKEN for
+# temporary keys). A bucket with an endpoint needs both keys; on AWS without them the
+# server uses its instance role.
+# [storage.r2]
+# adapter = "s3"
+# bucket = "media"
+# endpoint = "https://<account>.r2.cloudflarestorage.com"
+# region = "auto"
+# prefix = "cms"                              # before every key, to share a bucket
+# public_url = "https://files.example.com"    # where browsers reach the bucket
+# client_uploads = false                      # clients put files here themselves (buckets only)
+# signed_downloads = false                    # or true, or { mime_types = ["application/pdf"], expires_in = "2h" }
+#                                             # (buckets only; a link lasts 7 days at most)
+
+# An Azure blob container. Set the account key in TACHYON_STORAGE__AZURE__ACCESS_KEY, or a
+# SAS token in ..._SAS_TOKEN. With neither, the server uses its own identity: a managed
+# identity (a user-assigned one picked by AZURE_CLIENT_ID), or workload identity when
+# AZURE_CLIENT_ID, AZURE_TENANT_ID and AZURE_FEDERATED_TOKEN_FILE are set, as AKS sets them.
+# Signed links (client_uploads, signed_downloads) need the account key, or that identity
+# with sign_with_identity = true, a role with generateUserDelegationKey such as Storage Blob
+# Delegator, and links of 2 h at most; the server signs one link at startup to check.
+# account is 3 to 24 lowercase letters and digits. For Azurite, set endpoint to the
+# account's URL, like "http://127.0.0.1:10000/devstoreaccount1"; a custom domain can't sign.
+# [storage.azure]
+# adapter = "azure"
+# account = "mystorageaccount"
+# container = "media"
+
+# A Google Cloud Storage bucket. Point TACHYON_STORAGE__GCS__SERVICE_ACCOUNT_PATH at a
+# service account key file; without one the server uses its own Google credentials (the
+# gcloud application-default file, then the metadata server). Signed links need the key
+# file, or those credentials with sign_with_identity = true and iam.serviceAccounts.signBlob,
+# such as Service Account Token Creator; the server signs one link at startup to check.
+# For fake-gcs-server, set endpoint, like "http://127.0.0.1:4443". A key file's own
+# gcs_base_url has to match endpoint.
+# [storage.gcs]
+# adapter = "gcs"
+# bucket = "media"

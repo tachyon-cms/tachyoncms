@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "WITH RECURSIVE down(id, depth) AS (\n               SELECT $1::uuid, 0\n               UNION ALL\n               SELECT r.from_doc, down.depth + 1 FROM down\n               JOIN relations r ON r.to_doc = down.id AND r.tenant_id = $2\n                 AND r.copy = 'published' AND r.field_path = 'folder'\n               JOIN documents d ON d.id = r.from_doc AND d.deleted_at IS NULL\n                 AND d.collection_id = (SELECT collection_id FROM documents WHERE id = $1)\n               WHERE down.depth <= $3\n           )\n           SELECT max(depth) AS \"height!\" FROM down",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "height!",
+        "type_info": "Int4",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Int4"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "09dcd5c07c22544d9ec05971985c8c8a41a4f4311dc65ba2de2fe2498ca734c7"
+}

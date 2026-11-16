@@ -7,9 +7,9 @@ use serde::Serialize;
 use serde_json::{Map, Value};
 
 use crate::schema::{
-    BLOCK_ROW_KEYS, BlockDef, BlockSource, CollectionSchema, Field, FieldKind, RelationTo,
-    SchemaError, data_fields,
+    BLOCK_ROW_KEYS, CollectionSchema, Field, FieldKind, RelationTo, SchemaError, data_fields,
 };
+use crate::uploads::Upload;
 
 /// Field renames: old dotted path to new name, such as `{"seo.title": "headline"}`. A path
 /// into a `blocks` field names the block type: `{"layout.hero.heading": "title"}`.
@@ -51,6 +51,16 @@ pub enum Change {
     VersionsChanged {
         drafts: (bool, bool),
         max_versions: (u32, u32),
+    },
+    /// An upload collection's files change: what its sizes are made with (`sizes`: its
+    /// `imageSizes`, `withMetadata` or `constructorOptions.limitInputPixels`), whether it
+    /// has a focal point, or it stops holding files (`removed`). Any but the last makes
+    /// every file's sizes again. Options that only shape the original at upload don't:
+    /// sizes are made from the original as stored.
+    UploadChanged {
+        sizes: bool,
+        focal_point: bool,
+        removed: bool,
     },
     /// A virtual field went. It stored nothing, so nothing is lost.
     VirtualRemoved {
@@ -128,10 +138,9 @@ pub fn diff(
         )));
     }
     // Compare what's stored, not how the admin arranges it.
-    let old_data = data_fields(&old.fields);
-    let new_data = data_fields(&new.fields);
+    let (old_data, new_data) = (old.data(), new.data());
     for from in renames.keys() {
-        if field_at(&old_data, from).is_none() {
+        if field_at(old_data, from).is_none() {
             return Err(invalid(format!(
                 "can't rename `{from}`: there's no such field"
             )));
@@ -140,8 +149,8 @@ pub fn diff(
     let mut changes = Vec::new();
     let mut links = Vec::new();
     compare(
-        &old_data,
-        &new_data,
+        old_data,
+        new_data,
         "",
         "",
         renames,
@@ -151,9 +160,14 @@ pub fn diff(
     if changes.is_empty() && old.fields != new.fields {
         changes.push(Change::LayoutChanged);
     }
+    let upload = upload_change(old.uploads(), new.uploads());
+    let upload_options = upload.is_none() && old.upload != new.upload;
+    changes.extend(upload);
     if old.default_populate != new.default_populate
         || old.access != new.access
         || old.labels != new.labels
+        || old.folders != new.folders
+        || upload_options
     {
         changes.push(Change::CollectionOptionsChanged);
     }
@@ -165,6 +179,34 @@ pub fn diff(
         });
     }
     Ok(SchemaDiff { changes, links })
+}
+
+/// What changes for the files an upload collection holds, if anything does.
+fn upload_change(old: Option<&Upload>, new: Option<&Upload>) -> Option<Change> {
+    let old = old?;
+    let (sizes, focal_point, removed) = match new {
+        None => (!old.image_sizes.is_empty(), old.focal_point, true),
+        Some(new) => (
+            old.image_sizes != new.image_sizes
+                || old.with_metadata != new.with_metadata
+                || pixel_limit(old) != pixel_limit(new),
+            old.focal_point != new.focal_point,
+            false,
+        ),
+    };
+    (sizes || focal_point || removed).then_some(Change::UploadChanged {
+        sizes,
+        focal_point,
+        removed,
+    })
+}
+
+/// `constructorOptions.limitInputPixels`, the one constructor option a size is made with
+/// (its decode cap); `failOn` only judges an upload.
+fn pixel_limit(u: &Upload) -> Option<u64> {
+    u.constructor_options
+        .as_ref()
+        .and_then(|c| c.limit_input_pixels)
 }
 
 fn compare(
@@ -211,7 +253,10 @@ fn compare(
                 )));
             }
             out.push(
-                if o.virtual_path.is_some() || matches!(o.kind, FieldKind::Join { .. }) {
+                if o.virtual_path.is_some()
+                    || o.computed
+                    || matches!(o.kind, FieldKind::Join { .. })
+                {
                     Change::VirtualRemoved { path: old_path }
                 } else {
                     Change::Removed {
@@ -240,7 +285,7 @@ fn compare(
             continue;
         }
         // A stored field turned virtual: what it stored goes.
-        if o.virtual_path.is_none() && n.virtual_path.is_some() {
+        if o.virtual_path.is_none() && !o.computed && (n.virtual_path.is_some() || n.computed) {
             out.push(Change::TypeChanged {
                 path: new_path,
                 from: o.kind.name(),
@@ -259,64 +304,65 @@ fn compare(
                 compare(a, b, &old_path, &new_path, renames, out, links)?;
             }
             // Block types are matched by slug, and their paths name it: `layout.hero.heading`.
-            // A rich text field's block types are matched the same way.
-            (
-                FieldKind::Blocks { blocks: a, .. } | FieldKind::RichText { blocks: a, .. },
-                FieldKind::Blocks { blocks: b, .. } | FieldKind::RichText { blocks: b, .. },
-            ) if o.kind.name() == n.kind.name() => {
-                let a: Vec<&BlockDef> = a.iter().filter_map(BlockSource::def).collect();
-                let b: Vec<&BlockDef> = b.iter().filter_map(BlockSource::def).collect();
+            // A rich text field's block types are matched the same way, and its upload
+            // nodes by collection (`body.@media.caption`).
+            (FieldKind::Blocks { .. }, FieldKind::Blocks { .. })
+            | (FieldKind::RichText { .. }, FieldKind::RichText { .. }) => {
                 if options(o) != options(n) {
                     out.push(Change::OptionsChanged {
                         path: new_path.clone(),
                     });
                 }
-                for old_block in &a {
-                    let old_block_path = join(&old_path, &old_block.slug);
-                    let new_block_path = join(&new_path, &old_block.slug);
-                    let Some(new_block) = b.iter().find(|nb| nb.slug == old_block.slug) else {
+                let (a, b) = (o.kind.node_types(), n.kind.node_types());
+                let what = |upload: bool| if upload { "upload" } else { "block" };
+                for (upload, key, old_fields) in &a {
+                    let old_type_path = join(&old_path, key);
+                    let new_type_path = join(&new_path, key);
+                    let Some((_, _, new_fields)) =
+                        b.iter().find(|(u, k, _)| u == upload && k == key)
+                    else {
                         // Rows of this type are kept as they are, so validation counts the
                         // documents still using it.
                         out.push(Change::Removed {
-                            path: old_block_path,
-                            kind: "block",
+                            path: old_type_path,
+                            kind: what(*upload),
                         });
                         continue;
                     };
-                    if old_block.labels != new_block.labels {
+                    let labels = |kind: &FieldKind| kind.block(key).map(|b| b.labels.clone());
+                    if labels(&o.kind) != labels(&n.kind) {
                         out.push(Change::OptionsChanged {
-                            path: new_block_path.clone(),
+                            path: new_type_path.clone(),
                         });
                     }
                     compare(
-                        &old_block.fields,
-                        &new_block.fields,
-                        &old_block_path,
-                        &new_block_path,
+                        old_fields,
+                        new_fields,
+                        &old_type_path,
+                        &new_type_path,
                         renames,
                         out,
                         links,
                     )?;
                 }
-                for new_block in b.iter().filter(|nb| !a.iter().any(|ob| ob.slug == nb.slug)) {
+                for (upload, key, _) in b
+                    .iter()
+                    .filter(|(u, k, _)| !a.iter().any(|(ou, ok, _)| ou == u && ok == k))
+                {
                     out.push(Change::Added {
-                        path: join(&new_path, &new_block.slug),
-                        kind: "block",
+                        path: join(&new_path, key),
+                        kind: what(*upload),
                     });
                 }
             }
-            (
-                FieldKind::Relationship {
-                    relation_to: from,
-                    has_many: h1,
-                    ..
-                },
-                FieldKind::Relationship {
-                    relation_to: to,
-                    has_many: h2,
-                    ..
-                },
-            ) if from != to || h1 != h2 => {
+            // Relationship and upload store links alike, so a change between them keeps them.
+            (a, b)
+                if a.link().zip(b.link()).is_some_and(|(x, y)| {
+                    x.relation_to != y.relation_to || x.has_many != y.has_many
+                }) =>
+            {
+                let (x, y) = (a.link().expect("a link"), b.link().expect("a link"));
+                let (from, to, h1, h2) = (x.relation_to, y.relation_to, &x.has_many, &y.has_many);
                 let keeps_every_target = from.targets().iter().all(|t| to.allows(t));
                 let shrinks_to_one = *h1 && !*h2;
                 // Several → more, with the same single/list shape: every stored link already fits.
@@ -386,14 +432,20 @@ fn options(f: &Field) -> Field {
     f.name.clear();
     match &mut f.kind {
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields.clear(),
-        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks.clear(),
+        FieldKind::Blocks { blocks, .. } => blocks.clear(),
+        // Its block types and upload nodes are compared one by one.
+        FieldKind::RichText { blocks, upload, .. } => {
+            blocks.clear();
+            *upload = None;
+        }
         _ => {}
     }
     f
 }
 
 /// The field at a rename path, where a path into blocks names the block type
-/// (`layout.hero.heading`). A block type itself isn't a field, so it can't be renamed.
+/// (`layout.hero.heading`), and one into rich text's upload nodes their collection
+/// (`body.@media.caption`). A block type itself isn't a field, so it can't be renamed.
 fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     let mut segments = path.split('.');
     let mut current = fields;
@@ -404,9 +456,9 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
         current = match &f.kind {
             FieldKind::Group { fields } | FieldKind::Array { fields, .. } => fields,
             FieldKind::Blocks { .. } | FieldKind::RichText { .. } => match segments.next() {
-                Some(slug) => {
+                Some(key) => {
                     found = None;
-                    &f.kind.block(slug)?.fields
+                    f.kind.node_type_at(key)?.1
                 }
                 None => &[],
             },
@@ -416,10 +468,17 @@ fn field_at<'a>(fields: &'a [Field], path: &str) -> Option<&'a Field> {
     found
 }
 
-/// Calls `f` on the fields of each block node of type `slug` in rich text `text`.
-fn for_nodes_of(text: &mut Value, slug: &str, f: &mut impl FnMut(&mut Map<String, Value>)) {
-    crate::richtext::blocks_mut(text, &mut |attrs| {
-        if attrs.get("blockType").and_then(Value::as_str) == Some(slug)
+/// Calls `f` on the fields of each block or upload node (`upload`) of type `key`
+/// (`node_types`) in rich text `text`.
+fn for_nodes_of(
+    text: &mut Value,
+    upload: bool,
+    key: &str,
+    f: &mut impl FnMut(&mut Map<String, Value>),
+) {
+    crate::richtext::field_nodes_mut(text, &mut |u, k, attrs| {
+        if u == upload
+            && k == key
             && let Some(Value::Object(fields)) = attrs.get_mut("fields")
         {
             f(fields);
@@ -442,6 +501,11 @@ fn rows_of<'a>(
 fn options_ignoring_targets(f: &Field) -> Field {
     let mut f = options(f);
     if let FieldKind::Relationship {
+        relation_to,
+        has_many,
+        ..
+    }
+    | FieldKind::Upload {
         relation_to,
         has_many,
         ..
@@ -484,6 +548,10 @@ pub(crate) fn same_type(a: &FieldKind, b: &FieldKind) -> bool {
         ) => true,
         (FieldKind::Select { multiple: x, .. }, FieldKind::Select { multiple: y, .. }) => x == y,
         (FieldKind::Date { date_only: x }, FieldKind::Date { date_only: y }) => x == y,
+        // The same stored links; `hasMany` changes the shape.
+        _ if a.link().is_some() && b.link().is_some() => {
+            a.link().map(|l| l.has_many) == b.link().map(|l| l.has_many)
+        }
         _ => a.name() == b.name(),
     }
 }
@@ -592,13 +660,13 @@ fn rename_batch(
                     }
                 }
                 (kind @ FieldKind::RichText { .. }, Some(text)) => {
-                    let [slug, rest @ ..] = rest else { return };
-                    let Some(block) = kind.block(slug) else {
+                    let [key, rest @ ..] = rest else { return };
+                    let Some((upload, fields)) = kind.node_type_at(key) else {
                         return;
                     };
-                    let block_path = join(&old_path, slug);
-                    for_nodes_of(text, slug, &mut |inner| {
-                        rename_batch(inner, &block.fields, rest, &block_path, renames, batch)
+                    let type_path = join(&old_path, key);
+                    for_nodes_of(text, upload, key, &mut |inner| {
+                        rename_batch(inner, fields, rest, &type_path, renames, batch)
                     });
                 }
                 _ => {}
@@ -687,15 +755,15 @@ fn relink_at(
                     })
                 }
                 (Some(kind @ FieldKind::RichText { .. }), Some(text)) => {
-                    let [slug, rest @ ..] = rest else {
+                    let [key, rest @ ..] = rest else {
                         return false;
                     };
-                    let Some(block) = kind.block(slug) else {
+                    let Some((upload, fields)) = kind.node_type_at(key) else {
                         return false;
                     };
                     let mut dropped = false;
-                    for_nodes_of(text, slug, &mut |inner| {
-                        dropped |= relink_at(&block.fields, inner, rest, change)
+                    for_nodes_of(text, upload, key, &mut |inner| {
+                        dropped |= relink_at(fields, inner, rest, change)
                     });
                     dropped
                 }
@@ -742,7 +810,10 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
     // Virtual values are read on the way out, never stored.
     obj.retain(|key, _| {
         fields.iter().any(|f| {
-            &f.name == key && f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. })
+            &f.name == key
+                && f.virtual_path.is_none()
+                && !f.computed
+                && !matches!(f.kind, FieldKind::Join { .. })
         })
     });
     for f in fields {
@@ -773,15 +844,14 @@ fn prune(fields: &[Field], obj: &mut Map<String, Value>) {
                     inner.extend(keys);
                 }
             }
-            // So is a block node; its fields are pruned like a row's.
+            // So is a block or upload node; its fields are pruned like a row's.
             (kind @ FieldKind::RichText { .. }, Some(text)) => {
-                crate::richtext::blocks_mut(text, &mut |attrs| {
-                    let slug = attrs.get("blockType").and_then(Value::as_str);
-                    let Some(block) = slug.and_then(|s| kind.block(s)) else {
+                crate::richtext::field_nodes_mut(text, &mut |upload, key, attrs| {
+                    let Some(fields) = kind.node_type(upload, key) else {
                         return;
                     };
                     if let Some(Value::Object(inner)) = attrs.get_mut("fields") {
-                        prune(&block.fields, inner);
+                        prune(fields, inner);
                     }
                 })
             }
@@ -1173,6 +1243,38 @@ mod tests {
             d.changes
         );
     }
+    #[test]
+    fn switching_between_relationship_and_upload_keeps_links() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let field = |kind: &str, to: Value| {
+            schema(json!({"slug": "m", "fields": [{"name": "l", "type": kind, "relationTo": to}]}))
+        };
+        let rel = field("relationship", json!("media"));
+        let up = field("upload", json!("media"));
+        for (a, b) in [(&rel, &up), (&up, &rel)] {
+            let d = diff(a, b, &Renames::new()).unwrap();
+            assert_eq!(d.changes, vec![Change::OptionsChanged { path: "l".into() }]);
+            assert!(!d.is_destructive());
+        }
+        // A kind change that also changes targets reshapes links as a same-kind change does.
+        let both = field("upload", json!(["media", "files"]));
+        let d = diff(&rel, &both, &Renames::new()).unwrap();
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Relinked {
+                    path: "l".into(),
+                    from: "media".into(),
+                    to: "media, files".into()
+                },
+                Change::OptionsChanged { path: "l".into() }
+            ]
+        );
+        let mut doc = json!({"l": id}).as_object().unwrap().clone();
+        assert!(!relink(&[], &mut doc, &d.links));
+        assert_eq!(doc["l"], json!({"relationTo": "media", "value": id}));
+    }
+
     #[test]
     fn relationship_target_changes_carry_links_across() {
         let id = "0199d5c4-0000-7000-8000-00000000000a";
@@ -1675,6 +1777,86 @@ mod tests {
     }
 
     #[test]
+    fn upload_node_fields_change_by_collection() {
+        let id = "0199d5c4-0000-7000-8000-00000000000a";
+        let page = |collections: Value| {
+            schema(
+                json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+                "relationTo": ["media", "docs"], "upload": {"collections": collections}}]}),
+            )
+        };
+        let old = page(json!({
+            "media": {"fields": [
+                {"name": "caption", "type": "text"},
+                {"name": "gone", "type": "text"},
+                {"name": "by", "type": "relationship", "relationTo": "posts"}
+            ]},
+            "docs": {"fields": [{"name": "caption", "type": "text"}]}
+        }));
+        let new = page(json!({"media": {"fields": [
+            {"name": "alt_text", "type": "text"},
+            {"name": "by", "type": "relationship", "relationTo": ["posts", "pages"]},
+            {"name": "added", "type": "text", "default": "a"}
+        ]}}));
+        let r = renames(&[("body.@media.caption", "alt_text")]);
+        let d = diff(&old, &new, &r).unwrap();
+        // Each collection's node fields are compared on their own, not as the field's options.
+        assert_eq!(
+            d.changes,
+            vec![
+                Change::Removed {
+                    path: "body.@docs".into(),
+                    kind: "upload"
+                },
+                Change::Renamed {
+                    from: "body.@media.caption".into(),
+                    to: "body.@media.alt_text".into()
+                },
+                Change::Removed {
+                    path: "body.@media.gone".into(),
+                    kind: "text"
+                },
+                Change::Relinked {
+                    path: "body.@media.by".into(),
+                    from: "posts".into(),
+                    to: "posts, pages".into()
+                },
+                Change::Added {
+                    path: "body.@media.added".into(),
+                    kind: "text"
+                },
+            ]
+        );
+        assert!(
+            diff(&new, &old, &Renames::new())
+                .unwrap()
+                .changes
+                .contains(&Change::Added {
+                    path: "body.@docs".into(),
+                    kind: "upload"
+                })
+        );
+        let file = |to: &str, fields: Value| json!({"type": "upload", "attrs": {"relationTo": to, "value": id, "fields": fields}});
+        // A block node of a type named like a collection is left alone.
+        let doc = json!({"body": {"type": "doc", "content": [
+            {"type": "blockquote", "content": [file("media", json!({"caption": "c", "gone": "g", "by": id}))]},
+            file("docs", json!({"caption": "d"})),
+            {"type": "block", "attrs": {"blockType": "media", "fields": {"caption": "b"}}}
+        ]}});
+        let mut migrated = migrate_document(&new.fields, &r, doc.as_object().unwrap());
+        assert!(!relink(&new.fields, &mut migrated, &d.links));
+        assert_eq!(
+            Value::Object(migrated),
+            json!({"body": {"type": "doc", "content": [
+                {"type": "blockquote", "content": [file("media", json!({"alt_text": "c",
+                    "by": {"relationTo": "posts", "value": id}, "added": "a"}))]},
+                file("docs", json!({"caption": "d"})),
+                {"type": "block", "attrs": {"blockType": "media", "fields": {"caption": "b"}}}
+            ]}})
+        );
+    }
+
+    #[test]
     fn has_many_toggles_and_option_changes_on_relationships() {
         let id = "0199d5c4-0000-7000-8000-00000000000a";
         let id2 = "0199d5c4-0000-7000-8000-00000000000b";
@@ -1748,5 +1930,128 @@ mod tests {
         .unwrap();
         let mut doc = json!({"l": null}).as_object().unwrap().clone();
         assert!(!relink(&[], &mut doc, &d.links), "null isn't a link");
+    }
+
+    #[test]
+    fn upload_change_is_reported() {
+        let media = |upload: Value| {
+            schema(json!({"slug": "media", "upload": upload, "fields": [
+                {"name": "alt", "type": "text"}]}))
+        };
+        let changes = |old: &CollectionSchema, new: &CollectionSchema| {
+            diff(old, new, &Renames::new()).unwrap().changes
+        };
+        let one = media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}]}));
+        let two = media(json!({"imageSizes": [{"name": "thumbnail", "width": 400},
+            {"name": "card", "width": 768}]}));
+        let c = changes(&one, &two);
+        assert!(
+            c.contains(&Change::UploadChanged {
+                sizes: true,
+                focal_point: false,
+                removed: false
+            }),
+            "{c:?}"
+        );
+        assert!(
+            c.contains(&Change::Added {
+                path: "sizes.card".into(),
+                kind: "group"
+            }),
+            "{c:?}"
+        );
+        let c = changes(
+            &one,
+            &media(json!({"imageSizes": [{"name": "thumbnail", "width": 400}],
+            "focalPoint": false})),
+        );
+        // Turning the focal point off takes its fields, and their values, with it.
+        assert_eq!(
+            c,
+            [
+                Change::Removed {
+                    path: "focalX".into(),
+                    kind: "number"
+                },
+                Change::Removed {
+                    path: "focalY".into(),
+                    kind: "number"
+                },
+                Change::UploadChanged {
+                    sizes: false,
+                    focal_point: true,
+                    removed: false
+                }
+            ]
+        );
+        // Every option sizes are made with remakes them.
+        for option in [
+            json!({"withMetadata": true}),
+            json!({"constructorOptions": {"limitInputPixels": 1000}}),
+        ] {
+            let mut upload = json!({"imageSizes": [{"name": "thumbnail", "width": 400}]});
+            upload
+                .as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            assert_eq!(
+                changes(&one, &media(upload)),
+                [Change::UploadChanged {
+                    sizes: true,
+                    focal_point: false,
+                    removed: false
+                }],
+                "{option}"
+            );
+        }
+        // Other upload options change no stored data. Those shaping the original at upload
+        // change no size either: sizes are made from the original as stored.
+        for option in [
+            json!({"mimeTypes": ["image/*"], "staticDir": "pictures"}),
+            json!({"formatOptions": {"format": "webp"}}),
+            json!({"resizeOptions": {"width": 100}}),
+            json!({"trimOptions": {"threshold": 10}}),
+            json!({"constructorOptions": {"failOn": "none"}}),
+        ] {
+            let mut upload = json!({"imageSizes": [{"name": "thumbnail", "width": 400}]});
+            upload
+                .as_object_mut()
+                .unwrap()
+                .extend(option.as_object().unwrap().clone());
+            assert_eq!(
+                changes(&one, &media(upload)),
+                [Change::CollectionOptionsChanged],
+                "{option}"
+            );
+        }
+        // Turning uploads off removes the built-in fields too.
+        let off = media(Value::Bool(false));
+        let d = diff(&one, &off, &Renames::new()).unwrap();
+        assert!(d.changes.contains(&Change::UploadChanged {
+            sizes: true,
+            focal_point: true,
+            removed: true
+        }));
+        assert!(d.changes.contains(&Change::Removed {
+            path: "filename".into(),
+            kind: "text"
+        }));
+        assert!(
+            d.changes
+                .contains(&Change::VirtualRemoved { path: "url".into() })
+        );
+        assert!(d.is_destructive());
+        // A stored `url` that becomes the built-in one loses what it stored.
+        let own_url = schema(json!({"slug": "media", "fields": [{"name": "url", "type": "text"}]}));
+        let with_upload = schema(json!({"slug": "media", "upload": true,
+            "fields": [{"name": "url", "type": "text"}]}));
+        assert!(
+            changes(&own_url, &with_upload).contains(&Change::TypeChanged {
+                path: "url".into(),
+                from: "text",
+                to: "virtual"
+            })
+        );
+        assert_eq!(changes(&one, &one), []);
     }
 }

@@ -7,7 +7,7 @@ use std::collections::HashMap;
 
 use serde_json::{Value, json};
 use sqlx::types::Json;
-use sqlx::{PgPool, Postgres, QueryBuilder};
+use sqlx::{PgConnection, PgPool, Postgres, QueryBuilder};
 pub use tachyon_core::query::Readable;
 use tachyon_core::query::{
     Cond, Cursor, DocCopy, Filter, Op, Operand, Scalar, Sort, Target, ValueKind,
@@ -933,6 +933,31 @@ pub async fn get_many_readable(
     ids: &[Uuid],
     read: &HashMap<Uuid, Readable>,
 ) -> Result<Vec<(Uuid, Document)>, DbError> {
+    get_many_matching(pool, ids, read, None).await
+}
+
+/// Locks the live documents with these IDs `FOR SHARE`, in ID order, until the
+/// transaction ends: what a write checks them against can't change under it.
+pub async fn lock_shared(conn: &mut PgConnection, ids: &[Uuid]) -> Result<(), DbError> {
+    sqlx::query_scalar!(
+        "SELECT id FROM documents WHERE tenant_id = $1 AND id = ANY($2) AND deleted_at IS NULL
+         ORDER BY id FOR SHARE",
+        DEFAULT_TENANT,
+        ids
+    )
+    .fetch_all(conn)
+    .await?;
+    Ok(())
+}
+
+/// `get_many_readable`, keeping only documents whose copy read matches `filter` as well,
+/// read through `db`: the pool, or a transaction's connection.
+pub async fn get_many_matching(
+    db: impl sqlx::PgExecutor<'_>,
+    ids: &[Uuid],
+    read: &HashMap<Uuid, Readable>,
+    filter: Option<&Filter>,
+) -> Result<Vec<(Uuid, Document)>, DbError> {
     // Sorted, so the same map always builds the same SQL text (and reuses its statement).
     let mut read: Vec<_> = read.iter().collect();
     read.sort_unstable_by_key(|(id, _)| **id);
@@ -960,12 +985,16 @@ pub async fn get_many_readable(
                     push_unreadable(&mut qb, "", 0, first);
                 }
                 push_readable(&mut qb, "", 0, way);
+                if let Some(f) = filter {
+                    qb.push(" AND ");
+                    push_filter_in(&mut qb, f, &copy_base("", 0, copy));
+                }
                 qb.push(")");
             }
         }
         qb.push(")");
     }
-    let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(pool).await?;
+    let rows: Vec<ReadableRow> = qb.build_query_as().fetch_all(db).await?;
     Ok(rows.into_iter().map(|r| (r.collection_id, r.doc)).collect())
 }
 
@@ -1009,7 +1038,7 @@ pub async fn by_slug(
     Ok(out)
 }
 
-/// Whether live document `id`'s `copy` matches `filter`. Run after locking the row, this
+/// Whether document `id`'s `copy` matches `filter`. Run after locking the row, this
 /// judges the version the rest of the transaction writes over.
 pub(crate) async fn matches(
     conn: &mut sqlx::PgConnection,
@@ -1019,8 +1048,9 @@ pub(crate) async fn matches(
 ) -> Result<bool, DbError> {
     let mut qb =
         QueryBuilder::<Postgres>::new("SELECT EXISTS (SELECT 1 FROM documents WHERE tenant_id = ");
+    // The caller has locked the row, live or in the trash, so only the filter is judged.
     qb.push_bind(DEFAULT_TENANT)
-        .push(" AND deleted_at IS NULL AND id = ")
+        .push(" AND id = ")
         .push_bind(id);
     push_copy(&mut qb, "", copy, None);
     qb.push(" AND ");

@@ -1,0 +1,24 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,\n                             state, dedupe_key, created_by, key_id, max_attempts)\n           SELECT id, $1, kind, document_id, collection_id, payload, run_at, 'queued',\n                  dedupe_key, created_by, key_id, max_attempts\n           FROM unnest($2::uuid[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[],\n                       $7::timestamptz[], $8::text[], $9::uuid[], $10::uuid[], $11::int[])\n                AS t(id, kind, document_id, collection_id, payload, run_at, dedupe_key,\n                     created_by, key_id, max_attempts)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "UuidArray",
+        "TextArray",
+        "UuidArray",
+        "UuidArray",
+        "JsonbArray",
+        "TimestamptzArray",
+        "TextArray",
+        "UuidArray",
+        "UuidArray",
+        "Int4Array"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "e3882ea9da039495476454bcb4fc87dc9edf013e2392cb8cbe998dd71505b4a5"
+}

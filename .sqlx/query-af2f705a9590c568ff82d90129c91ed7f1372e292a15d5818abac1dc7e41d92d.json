@@ -1,0 +1,255 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT f.id, f.collection_id, f.storage, f.key, f.filename, f.mime_type,\n                  f.filesize, f.width, f.height, f.focal_x, f.focal_y, f.blurhash,\n                  f.sizes AS \"sizes: Json<Map<String, Value>>\", f.names, f.state,\n                  f.created_at, f.issued_to, f.issued_key,\n                  COALESCE(h.docs, '{}') AS \"docs!: Vec<Uuid>\",\n                  COALESCE(h.published, '{}') AS \"published!: Vec<bool>\",\n                  COALESCE(h.drafts, '{}') AS \"drafts!: Vec<bool>\"\n           FROM files f\n           LEFT JOIN LATERAL (\n               SELECT array_agg(d.id ORDER BY d.id) AS docs,\n                      array_agg(d.published_file IS NOT DISTINCT FROM f.id ORDER BY d.id)\n                          AS published,\n                      array_agg(d.draft_file IS NOT DISTINCT FROM f.id ORDER BY d.id)\n                          AS drafts\n               FROM documents d\n               WHERE d.tenant_id = $1 AND d.deleted_at IS NULL\n                 AND (d.published_file = f.id OR d.draft_file = f.id)\n           ) h ON true\n           WHERE f.tenant_id = $1 AND f.collection_id = $2 AND f.names @> ARRAY[$3]\n             AND f.state = 'live'\n           ORDER BY f.id",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "ordinal": 1,
+        "name": "collection_id",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "collection_id"
+          }
+        }
+      },
+      {
+        "ordinal": 2,
+        "name": "storage",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "storage"
+          }
+        }
+      },
+      {
+        "ordinal": 3,
+        "name": "key",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "key"
+          }
+        }
+      },
+      {
+        "ordinal": 4,
+        "name": "filename",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "filename"
+          }
+        }
+      },
+      {
+        "ordinal": 5,
+        "name": "mime_type",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "mime_type"
+          }
+        }
+      },
+      {
+        "ordinal": 6,
+        "name": "filesize",
+        "type_info": "Int8",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "filesize"
+          }
+        }
+      },
+      {
+        "ordinal": 7,
+        "name": "width",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "width"
+          }
+        }
+      },
+      {
+        "ordinal": 8,
+        "name": "height",
+        "type_info": "Int4",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "height"
+          }
+        }
+      },
+      {
+        "ordinal": 9,
+        "name": "focal_x",
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "focal_x"
+          }
+        }
+      },
+      {
+        "ordinal": 10,
+        "name": "focal_y",
+        "type_info": "Float4",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "focal_y"
+          }
+        }
+      },
+      {
+        "ordinal": 11,
+        "name": "blurhash",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "blurhash"
+          }
+        }
+      },
+      {
+        "ordinal": 12,
+        "name": "sizes: Json<Map<String, Value>>",
+        "type_info": "Jsonb",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "sizes"
+          }
+        }
+      },
+      {
+        "ordinal": 13,
+        "name": "names",
+        "type_info": "TextArray",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "names"
+          }
+        }
+      },
+      {
+        "ordinal": 14,
+        "name": "state",
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "state"
+          }
+        }
+      },
+      {
+        "ordinal": 15,
+        "name": "created_at",
+        "type_info": "Timestamptz",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "ordinal": 16,
+        "name": "issued_to",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "issued_to"
+          }
+        }
+      },
+      {
+        "ordinal": 17,
+        "name": "issued_key",
+        "type_info": "Uuid",
+        "origin": {
+          "Table": {
+            "table": "files",
+            "name": "issued_key"
+          }
+        }
+      },
+      {
+        "ordinal": 18,
+        "name": "docs!: Vec<Uuid>",
+        "type_info": "UuidArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 19,
+        "name": "published!: Vec<bool>",
+        "type_info": "BoolArray",
+        "origin": "Expression"
+      },
+      {
+        "ordinal": 20,
+        "name": "drafts!: Vec<bool>",
+        "type_info": "BoolArray",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      true,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      null,
+      null,
+      null
+    ]
+  },
+  "hash": "af2f705a9590c568ff82d90129c91ed7f1372e292a15d5818abac1dc7e41d92d"
+}

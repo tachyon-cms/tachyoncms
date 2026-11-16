@@ -6,10 +6,12 @@ use anyhow::{Context, anyhow, bail};
 use serde::Deserialize;
 use serde_json::{Value, json};
 use sqlx::PgPool;
+use tachyon_api::{UploadLimits, check_upload};
 use tachyon_core::access::check_rules;
 use tachyon_core::diff::{Change, Renames};
 use tachyon_core::{CollectionKind, CollectionSchema, explain_parse_error};
 use tachyon_db::auth::{USERS, check_users_schema};
+use tachyon_db::folders::{FOLDERS, check_folders_schema, listable, system_schema};
 use tachyon_db::schema_change::{self, ChangeError, ConfirmationScope, Preview, Save};
 use tachyon_db::{collections, indexes};
 
@@ -87,6 +89,19 @@ fn changes(p: &Preview) -> String {
             Change::CollectionOptionsChanged => "update collection options".to_owned(),
             Change::VersionsChanged { .. } => "update versions and drafts".to_owned(),
             Change::VirtualRemoved { path } => format!("remove {path} (it stored nothing)"),
+            Change::UploadChanged { removed: true, .. } => {
+                "stop holding files, deleting every file's details".to_owned()
+            }
+            Change::UploadChanged {
+                sizes, focal_point, ..
+            } => {
+                let what = match (sizes, focal_point) {
+                    (true, true) => "image sizes and focal point",
+                    (true, false) => "image sizes",
+                    _ => "focal point",
+                };
+                format!("change the {what} of uploaded files")
+            }
             Change::Relinked { path, from, to } => {
                 format!("change what {path} links to from {from} to {to}, keeping its links")
             }
@@ -136,13 +151,25 @@ fn describe(slug: &str, p: &Preview) -> String {
 /// refusing destructive changes unless `yes`. Collections missing from the file are left alone.
 pub async fn run(
     pool: &PgPool,
+    uploads: &UploadLimits,
     text: &str,
     renames: &BTreeMap<String, Renames>,
     apply: Option<bool>,
 ) -> anyhow::Result<String> {
     let wanted = parse_bundle(text)?;
-    let existing = collections::list(pool).await?;
-    let is_new = |slug: &str| !existing.iter().any(|c| c.schema.0.slug == slug);
+    let mut existing: Vec<CollectionSchema> = collections::list(pool)
+        .await?
+        .into_iter()
+        .map(|c| c.schema.0)
+        .collect();
+    // The folders are the system's, made when a server starts. A file using them may come
+    // first: the change makes them, and until then they're checked as they'll be made.
+    let makes_folders = wanted.iter().any(|s| s.folders || s.slug == FOLDERS)
+        && !existing.iter().any(|c| c.slug == FOLDERS);
+    if makes_folders {
+        existing.push(system_schema(listable(existing.iter().chain(&wanted))));
+    }
+    let is_new = |slug: &str| !existing.iter().any(|c| c.slug == slug);
 
     for slug in renames.keys() {
         if !wanted.iter().any(|s| &s.slug == slug) {
@@ -153,8 +180,10 @@ pub async fn run(
         }
     }
     for s in &wanted {
+        // What the API checks at save against this server's storages and limits.
+        check_upload(uploads, s).map_err(|e| anyhow!("{}: {}: {}", s.slug, e.path, e.message))?;
         for target in s.relation_targets() {
-            let mut known = wanted.iter().chain(existing.iter().map(|c| &c.schema.0));
+            let mut known = wanted.iter().chain(&existing);
             if !known.any(|o| o.slug == target && o.kind == CollectionKind::Collection) {
                 bail!(
                     "{}: relationTo `{target}` doesn't match a collection in the file or the database",
@@ -169,12 +198,10 @@ pub async fn run(
     // access rules filter through them or read `$user` fields from `users`. Each sees its
     // shared blocks as the file leaves them.
     let raw = |slug: &str| {
-        wanted.iter().find(|o| o.slug == slug).or_else(|| {
-            existing
-                .iter()
-                .map(|c| &c.schema.0)
-                .find(|o| o.slug == slug)
-        })
+        wanted
+            .iter()
+            .find(|o| o.slug == slug)
+            .or_else(|| existing.iter().find(|o| o.slug == slug))
     };
     let mut world = Vec::new();
     for s in &wanted {
@@ -182,8 +209,7 @@ pub async fn run(
         expanded.check().with_context(|| s.slug.clone())?;
         world.push(expanded);
     }
-    for c in &existing {
-        let other = &c.schema.0;
+    for other in &existing {
         if !wanted.iter().any(|s| s.slug == other.slug) {
             world.push(
                 other
@@ -199,13 +225,18 @@ pub async fn run(
     let works = |s: &CollectionSchema| {
         s.check_virtual_targets(lookup)
             .and_then(|()| s.check_join_targets(lookup))
+            .and_then(|()| s.check_upload_targets(lookup))
             .and_then(|()| check_rules(s, &users, &roles, &lookup))
     };
+    for s in &wanted {
+        tachyon_core::check_upload_referrers(s, &world)?;
+    }
     for s in &world {
         // `check_users_schema` here too for a `users` the file creates, which skips the
         // change's own check.
         if wanted.iter().any(|w| w.slug == s.slug) {
             check_users_schema(s)
+                .and_then(|()| check_folders_schema(s, is_new(&s.slug)))
                 .and_then(|()| works(s))
                 .with_context(|| s.slug.clone())?;
         } else {
@@ -254,12 +285,12 @@ pub async fn run(
             describe(slug, &o.preview)
         });
     }
+    if makes_folders {
+        report.push(format!("+ create {FOLDERS} (built in, for folders)"));
+    }
     for c in &existing {
-        if !wanted.iter().any(|s| s.slug == c.schema.0.slug) {
-            report.push(format!(
-                "  {} isn't in the file; left as it is",
-                c.schema.0.slug
-            ));
+        if !wanted.iter().any(|s| s.slug == c.slug) && !(makes_folders && c.slug == FOLDERS) {
+            report.push(format!("  {} isn't in the file; left as it is", c.slug));
         }
     }
     let report = report.join("\n");
@@ -299,6 +330,14 @@ mod tests {
     use super::*;
     use serde_json::json;
 
+    /// What a server with only `default` local storage checks uploads against.
+    fn limits() -> UploadLimits {
+        UploadLimits {
+            storages: BTreeMap::from([("default".to_owned(), true)]),
+            max_pixels: 50_000_000,
+        }
+    }
+
     fn posts(fields: Value) -> CollectionSchema {
         serde_json::from_value(json!({"slug": "posts", "fields": fields})).unwrap()
     }
@@ -323,10 +362,47 @@ mod tests {
             .unwrap();
         let file = export(&pool).await.unwrap();
         assert!(!file.contains("false") && !file.contains("null"), "{file}");
-        let out = run(&pool, &file, &BTreeMap::new(), Some(false))
+        let out = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
         assert!(out.contains("= posts unchanged"), "{out}");
+    }
+
+    /// A file can turn folders on before any server has made the folders collection, and
+    /// the folders then list it.
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn a_file_files_into_folders(pool: PgPool) {
+        let file = json!({"collections": [{"slug": "posts", "folders": true, "fields": [
+            {"name": "title", "type": "text"}]}]})
+        .to_string();
+        // A diff only says what it would do.
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), None)
+            .await
+            .unwrap();
+        assert!(plan.contains("+ create folders"), "{plan}");
+        assert!(collections::list(&pool).await.unwrap().is_empty(), "{plan}");
+        run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        let folders = collections::get_by_slug(&pool, FOLDERS).await.unwrap();
+        let listed = folders
+            .schema
+            .0
+            .fields
+            .iter()
+            .find(|f| f.name == "collections");
+        assert!(
+            matches!(&listed.unwrap().kind, tachyon_core::FieldKind::Select { options, .. }
+                if options.iter().map(|o| o.value()).eq(["posts"])),
+            "{:?}",
+            folders.schema.0
+        );
+        // Exported and applied again, the folders are a change like any other.
+        let file = export(&pool).await.unwrap();
+        let out = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
+            .await
+            .unwrap();
+        assert!(out.contains("= folders unchanged"), "{out}");
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -344,7 +420,7 @@ mod tests {
         .to_string();
         let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
 
-        let plan = run(&pool, &file, &renames, None).await.unwrap();
+        let plan = run(&pool, &limits(), &file, &renames, None).await.unwrap();
         assert!(
             plan.contains("~ change posts: rename title to headline; add author (relationship)"),
             "{plan}"
@@ -356,7 +432,9 @@ mod tests {
             "diff changes nothing"
         );
 
-        run(&pool, &file, &renames, Some(false)).await.unwrap();
+        run(&pool, &limits(), &file, &renames, Some(false))
+            .await
+            .unwrap();
         let slugs: Vec<String> = collections::list(&pool)
             .await
             .unwrap()
@@ -380,7 +458,7 @@ mod tests {
         .unwrap();
         let file = json!({"collections": [{"slug": "posts", "fields": [{"name": "title", "type": "text"}]}]}).to_string();
 
-        let err = run(&pool, &file, &BTreeMap::new(), Some(false))
+        let err = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap_err()
             .to_string();
@@ -399,7 +477,7 @@ mod tests {
             2
         );
 
-        run(&pool, &file, &BTreeMap::new(), Some(true))
+        run(&pool, &limits(), &file, &BTreeMap::new(), Some(true))
             .await
             .unwrap();
         assert_eq!(
@@ -423,7 +501,9 @@ mod tests {
             {"name": "title", "type": "text", "unique": true}
         ]}]})
         .to_string();
-        let plan = run(&pool, &file, &BTreeMap::new(), None).await.unwrap();
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), None)
+            .await
+            .unwrap();
         assert!(
             plan.contains("\n  indexes: create title (unique)"),
             "{plan}"
@@ -448,7 +528,7 @@ mod tests {
             {"slug": "posts", "fields": []}, {"slug": "posts", "fields": []}
         ]})
         .to_string();
-        let err = run(&pool, &twice, &BTreeMap::new(), None)
+        let err = run(&pool, &limits(), &twice, &BTreeMap::new(), None)
             .await
             .unwrap_err()
             .to_string();
@@ -459,7 +539,7 @@ mod tests {
         ]}]})
         .to_string();
         let renames = parse_renames(&["posts:title=headline".into()]).unwrap();
-        let err = run(&pool, &new, &renames, None)
+        let err = run(&pool, &limits(), &new, &renames, None)
             .await
             .unwrap_err()
             .to_string();
@@ -481,16 +561,28 @@ mod tests {
             ]})
             .to_string()
         };
-        let err = run(&pool, &file("author.nope"), &BTreeMap::new(), None)
-            .await
-            .unwrap_err();
+        let err = run(
+            &pool,
+            &limits(),
+            &file("author.nope"),
+            &BTreeMap::new(),
+            None,
+        )
+        .await
+        .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "posts: field `authorName`: authors has no field `nope` to read"
         );
-        run(&pool, &file("author.name"), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        run(
+            &pool,
+            &limits(),
+            &file("author.name"),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -507,16 +599,22 @@ mod tests {
             ]})
             .to_string()
         };
-        let err = run(&pool, &file("title"), &BTreeMap::new(), None)
+        let err = run(&pool, &limits(), &file("title"), &BTreeMap::new(), None)
             .await
             .unwrap_err();
         assert_eq!(
             format!("{err:#}"),
             "categories: field `posts`: posts.title isn't a relationship field"
         );
-        run(&pool, &file("category"), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        run(
+            &pool,
+            &limits(),
+            &file("category"),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
     }
 
     #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
@@ -530,14 +628,14 @@ mod tests {
             ]}
         ]})
         .to_string();
-        run(&pool, &both, &BTreeMap::new(), Some(false))
+        run(&pool, &limits(), &both, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
         let only_posts = json!({"collections": [{"slug": "posts", "fields": [
             {"name": "title", "type": "text"}
         ]}]})
         .to_string();
-        let err = run(&pool, &only_posts, &BTreeMap::new(), None)
+        let err = run(&pool, &limits(), &only_posts, &BTreeMap::new(), None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -546,6 +644,7 @@ mod tests {
         );
         let plan = run(
             &pool,
+            &limits(),
             &json!({"collections": [{"slug": "categories", "fields": []}]}).to_string(),
             &BTreeMap::new(),
             None,
@@ -580,9 +679,15 @@ mod tests {
         ]});
         let read = json!({"or": [{"author.team": "$user.team"}, {"title": {"like": "public"}}]});
         let file = json!({"collections": [users, posts(read)]});
-        run(&pool, &file.to_string(), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        run(
+            &pool,
+            &limits(),
+            &file.to_string(),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
 
         let exported: Value = serde_json::from_str(&export(&pool).await.unwrap()).unwrap();
         let saved = exported["collections"]
@@ -600,9 +705,15 @@ mod tests {
             saved["fields"][2]["fields"][0]["access"],
             json!({"read": {"or": [{"signedIn": true}, false]}})
         );
-        let out = run(&pool, &exported.to_string(), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        let out = run(
+            &pool,
+            &limits(),
+            &exported.to_string(),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
         assert!(out.contains("= posts unchanged"), "{out}");
 
         for (read, message) in [
@@ -620,7 +731,7 @@ mod tests {
             ),
         ] {
             let file = json!({"collections": [posts(read)]}).to_string();
-            let err = run(&pool, &file, &BTreeMap::new(), Some(false))
+            let err = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
                 .await
                 .unwrap_err();
             assert_eq!(format!("{err:#}"), message);
@@ -630,9 +741,15 @@ mod tests {
         let no_team = json!({"collections": [{"slug": "users", "fields": [
             {"name": "name", "type": "text", "required": true}
         ]}]});
-        let err = run(&pool, &no_team.to_string(), &BTreeMap::new(), Some(true))
-            .await
-            .unwrap_err();
+        let err = run(
+            &pool,
+            &limits(),
+            &no_team.to_string(),
+            &BTreeMap::new(),
+            Some(true),
+        )
+        .await
+        .unwrap_err();
         assert!(
             format!("{err:#}").starts_with("posts (not in the file) would break: access.read: "),
             "{err:#}"
@@ -643,6 +760,7 @@ mod tests {
         ruled["access"] = json!({"read": true});
         let err = run(
             &pool,
+            &limits(),
             &json!({"collections": [ruled]}).to_string(),
             &BTreeMap::new(),
             Some(false),
@@ -664,7 +782,7 @@ mod tests {
         let label = json!([{"name": "label", "type": "text"}]);
         // The block comes after the collection in the file, and is still applied first.
         let file = json!({"collections": [pages, cta(label.clone())]}).to_string();
-        let plan = run(&pool, &file, &BTreeMap::new(), Some(false))
+        let plan = run(&pool, &limits(), &file, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
         assert!(
@@ -687,9 +805,15 @@ mod tests {
             saved("pages")["fields"][0]["blocks"],
             json!([{"blockRef": "cta"}])
         );
-        let out = run(&pool, &exported.to_string(), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        let out = run(
+            &pool,
+            &limits(),
+            &exported.to_string(),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
         assert!(
             out.contains("= cta unchanged") && out.contains("= pages unchanged"),
             "{out}"
@@ -700,7 +824,7 @@ mod tests {
             {"name": "label", "type": "text"}, {"name": "url", "type": "text"}
         ]))]})
         .to_string();
-        let plan = run(&pool, &changed, &BTreeMap::new(), Some(false))
+        let plan = run(&pool, &limits(), &changed, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
         assert!(plan.contains("~ change cta: add url (text)"), "{plan}");
@@ -715,7 +839,7 @@ mod tests {
         ]))]})
         .to_string();
         let r = parse_renames(&["cta:label=text".into()]).unwrap();
-        let plan = run(&pool, &renamed, &r, None).await.unwrap();
+        let plan = run(&pool, &limits(), &renamed, &r, None).await.unwrap();
         assert!(
             plan.contains("in pages: rename layout.cta.label to layout.cta.text"),
             "{plan}"
@@ -726,7 +850,7 @@ mod tests {
             {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "nope"}]}
         ]}]})
         .to_string();
-        let err = run(&pool, &missing, &BTreeMap::new(), None)
+        let err = run(&pool, &limits(), &missing, &BTreeMap::new(), None)
             .await
             .unwrap_err();
         assert_eq!(
@@ -742,9 +866,15 @@ mod tests {
         let first = json!({"collections": [cta(both.clone()), {"slug": "pages", "fields": [
             {"name": "layout", "type": "blocks", "blocks": [{"blockRef": "cta"}]}
         ]}]});
-        run(&pool, &first.to_string(), &BTreeMap::new(), Some(false))
-            .await
-            .unwrap();
+        run(
+            &pool,
+            &limits(),
+            &first.to_string(),
+            &BTreeMap::new(),
+            Some(false),
+        )
+        .await
+        .unwrap();
 
         // `cta` drops `note`, but `pages` keeps it in an inline block of its own: against
         // the file's `pages` nothing is lost, so no --yes.
@@ -755,7 +885,7 @@ mod tests {
             ]}]}
         ]})
         .to_string();
-        let out = run(&pool, &second, &BTreeMap::new(), Some(false))
+        let out = run(&pool, &limits(), &second, &BTreeMap::new(), Some(false))
             .await
             .unwrap();
         assert!(out.contains("~ change cta: remove note"), "{out}");
@@ -774,12 +904,89 @@ mod tests {
         ]})
         .to_string();
         assert!(
-            run(&pool, &broken, &BTreeMap::new(), Some(true))
+            run(&pool, &limits(), &broken, &BTreeMap::new(), Some(true))
                 .await
                 .is_err()
         );
         let cta_now = collections::get_by_slug(&pool, "cta").await.unwrap();
         assert_eq!(cta_now.schema.fields.len(), 1);
         assert!(collections::get_by_slug(&pool, "posts").await.is_err());
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn upload_stays_on_while_upload_fields_point_here(pool: PgPool) {
+        let apply = |file: Value| {
+            let pool = pool.clone();
+            async move {
+                run(
+                    &pool,
+                    &limits(),
+                    &file.to_string(),
+                    &BTreeMap::new(),
+                    Some(true),
+                )
+                .await
+            }
+        };
+        apply(json!({"collections": [
+            {"slug": "media", "upload": true, "fields": []},
+            {"slug": "posts", "fields": [{"name": "cover", "type": "upload", "relationTo": "media"}]}
+        ]}))
+        .await
+        .unwrap();
+        let err = apply(json!({"collections": [{"slug": "media", "fields": []}]}))
+            .await
+            .unwrap_err();
+        assert_eq!(
+            format!("{err:#}"),
+            "media can't stop holding files while these upload fields point at it: posts.cover; change them first"
+        );
+    }
+
+    #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+    async fn upload_options_are_checked_against_this_server(pool: PgPool) {
+        for (upload, error) in [
+            (
+                json!({"storage": "nope"}),
+                "images: upload.storage: no storage named `nope` is configured; this server has default",
+            ),
+            (
+                json!({"staticDir": "../x"}),
+                "images: upload.staticDir: `../x` has to be a relative path of plain names, like media/images: no empty, `.` or `..` parts, no leading or trailing /, and no backslash",
+            ),
+            (
+                json!({"constructorOptions": {"limitInputPixels": 50_000_001}}),
+                "images: upload.constructorOptions.limitInputPixels: 50000001 is above this server's limit of 50000000 (`[uploads] max_pixels`)",
+            ),
+        ] {
+            let file = json!({"collections": [{"slug": "images", "upload": upload, "fields": []}]});
+            let err = run(
+                &pool,
+                &limits(),
+                &file.to_string(),
+                &BTreeMap::new(),
+                Some(true),
+            )
+            .await
+            .unwrap_err();
+            assert_eq!(format!("{err:#}"), error);
+        }
+        assert!(
+            collections::list(&pool)
+                .await
+                .unwrap()
+                .iter()
+                .all(|c| c.schema.0.slug != "images")
+        );
+        let ok = json!({"collections": [{"slug": "images", "upload": {"staticDir": "media"}, "fields": []}]});
+        run(
+            &pool,
+            &limits(),
+            &ok.to_string(),
+            &BTreeMap::new(),
+            Some(true),
+        )
+        .await
+        .unwrap();
     }
 }

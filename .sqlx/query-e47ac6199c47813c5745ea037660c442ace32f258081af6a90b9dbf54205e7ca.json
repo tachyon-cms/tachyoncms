@@ -1,0 +1,25 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "SELECT f AS \"f!\" FROM documents d,\n                  unnest(ARRAY[d.published_file, d.draft_file]\n                         || ARRAY(SELECT v.file_id FROM versions v WHERE v.document_id = d.id)) AS f\n           WHERE d.tenant_id = $1 AND d.collection_id = $2 AND d.id = ANY($3)\n             AND d.deleted_at IS NOT NULL AND f IS NOT NULL",
+  "describe": {
+    "columns": [
+      {
+        "ordinal": 0,
+        "name": "f!",
+        "type_info": "Uuid",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "UuidArray"
+      ]
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "e47ac6199c47813c5745ea037660c442ace32f258081af6a90b9dbf54205e7ca"
+}

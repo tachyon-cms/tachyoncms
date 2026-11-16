@@ -3,6 +3,8 @@
 pub mod auth;
 pub mod collections;
 pub mod documents;
+pub mod files;
+pub mod folders;
 pub mod indexes;
 pub mod jobs;
 pub mod query;

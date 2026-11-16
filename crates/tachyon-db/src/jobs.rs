@@ -31,6 +31,10 @@ use crate::{DEFAULT_TENANT, DbError, map_unique};
 /// into, before `claim` sweeps it away (Ruling F-3). A finished job holds no version.
 pub const KEEP_FINISHED_DAYS: i32 = 30;
 
+/// How many runs a job gets unless it says otherwise; the `jobs.max_attempts` column's
+/// default too, which a test holds to this.
+pub const DEFAULT_ATTEMPTS: i32 = 5;
+
 /// A job to add. `dedupe_key` names what it's for, such as `publish:<document id>`; a new
 /// one replaces the pending job of the same key.
 pub struct NewJob<'a> {
@@ -43,6 +47,8 @@ pub struct NewJob<'a> {
     pub dedupe_key: Option<String>,
     pub created_by: Option<Uuid>,
     pub key_id: Option<Uuid>,
+    /// How many runs it gets; `None` is `DEFAULT_ATTEMPTS`.
+    pub max_attempts: Option<i32>,
 }
 
 /// A queued or running job. `attempts` counts this run, once claimed.
@@ -99,8 +105,9 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
     let id = Uuid::now_v7();
     sqlx::query!(
         r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
-                             state, dedupe_key, created_by, key_id)
-           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10)"#,
+                             state, dedupe_key, created_by, key_id, max_attempts)
+           VALUES ($1, $2, $3, $4, $5, $6, $7, 'queued', $8, $9, $10,
+                   $11)"#,
         id,
         DEFAULT_TENANT,
         job.kind,
@@ -111,11 +118,71 @@ pub async fn add(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<Uuid, DbEr
         job.dedupe_key,
         job.created_by,
         job.key_id,
+        job.max_attempts.unwrap_or(DEFAULT_ATTEMPTS),
     )
     .execute(&mut *conn)
     .await
     .map_err(map_unique)?;
     Ok(id)
+}
+
+/// `enqueue` for every one of `jobs` at once: the pending jobs of their dedupe keys
+/// cancelled in one statement, then all of them added in one, without a savepoint per job
+/// (each would take a subtransaction, and past 64 in one transaction Postgres's cache of
+/// them overflows for every snapshot taken meanwhile). A key a concurrent caller adds in
+/// between fails the statement, and with it the caller's transaction: only for keys
+/// nothing else adds at once, such as those of rows the caller holds locked.
+pub async fn enqueue_all(conn: &mut PgConnection, jobs: &[NewJob<'_>]) -> Result<(), DbError> {
+    if jobs.is_empty() {
+        return Ok(());
+    }
+    let keys: Vec<String> = jobs.iter().filter_map(|j| j.dedupe_key.clone()).collect();
+    sqlx::query!(
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+           WHERE tenant_id = $1 AND dedupe_key = ANY($2) AND state IN ('queued', 'running')"#,
+        DEFAULT_TENANT,
+        &keys,
+    )
+    .execute(&mut *conn)
+    .await?;
+    let ids: Vec<Uuid> = jobs.iter().map(|_| Uuid::now_v7()).collect();
+    let kinds: Vec<String> = jobs.iter().map(|j| j.kind.to_owned()).collect();
+    let documents: Vec<Option<Uuid>> = jobs.iter().map(|j| j.document_id).collect();
+    let collections: Vec<Option<Uuid>> = jobs.iter().map(|j| j.collection_id).collect();
+    let payloads: Vec<Value> = jobs.iter().map(|j| j.payload.clone()).collect();
+    let run_at: Vec<OffsetDateTime> = jobs.iter().map(|j| j.run_at).collect();
+    let dedupe: Vec<Option<String>> = jobs.iter().map(|j| j.dedupe_key.clone()).collect();
+    let created_by: Vec<Option<Uuid>> = jobs.iter().map(|j| j.created_by).collect();
+    let key_ids: Vec<Option<Uuid>> = jobs.iter().map(|j| j.key_id).collect();
+    let attempts: Vec<i32> = jobs
+        .iter()
+        .map(|j| j.max_attempts.unwrap_or(DEFAULT_ATTEMPTS))
+        .collect();
+    sqlx::query!(
+        r#"INSERT INTO jobs (id, tenant_id, kind, document_id, collection_id, payload, run_at,
+                             state, dedupe_key, created_by, key_id, max_attempts)
+           SELECT id, $1, kind, document_id, collection_id, payload, run_at, 'queued',
+                  dedupe_key, created_by, key_id, max_attempts
+           FROM unnest($2::uuid[], $3::text[], $4::uuid[], $5::uuid[], $6::jsonb[],
+                       $7::timestamptz[], $8::text[], $9::uuid[], $10::uuid[], $11::int[])
+                AS t(id, kind, document_id, collection_id, payload, run_at, dedupe_key,
+                     created_by, key_id, max_attempts)"#,
+        DEFAULT_TENANT,
+        &ids,
+        &kinds,
+        &documents as &[Option<Uuid>],
+        &collections as &[Option<Uuid>],
+        &payloads,
+        &run_at,
+        &dedupe as &[Option<String>],
+        &created_by as &[Option<Uuid>],
+        &key_ids as &[Option<Uuid>],
+        &attempts,
+    )
+    .execute(&mut *conn)
+    .await
+    .map_err(map_unique)?;
+    Ok(())
 }
 
 /// Cancels the pending (queued or running) job with `dedupe_key`. False when there was none.
@@ -131,11 +198,38 @@ pub async fn cancel(conn: &mut PgConnection, dedupe_key: &str) -> Result<bool, D
     Ok(done.rows_affected() > 0)
 }
 
+/// Adds `job` in place of a queued job with its `dedupe_key`, leaving a running one be:
+/// then nothing is added, and it's false.
+pub async fn replace_queued(conn: &mut PgConnection, job: &NewJob<'_>) -> Result<bool, DbError> {
+    // A savepoint (or a transaction, outside one), so a clash leaves the caller's open.
+    let mut tx = sqlx::Connection::begin(&mut *conn).await?;
+    sqlx::query!(
+        r#"UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()
+           WHERE tenant_id = $1 AND dedupe_key = $2 AND state = 'queued'"#,
+        DEFAULT_TENANT,
+        job.dedupe_key,
+    )
+    .execute(&mut *tx)
+    .await?;
+    match add(&mut tx, job).await {
+        Ok(_) => {
+            tx.commit().await?;
+            Ok(true)
+        }
+        Err(DbError::UniqueViolation(c)) if c == "jobs_one_pending" => {
+            tx.rollback().await?;
+            Ok(false)
+        }
+        Err(e) => Err(e),
+    }
+}
+
 /// Leases one job for `lease`: a queued one that's due, or a running one whose lease ran
 /// out. Rows another worker holds are skipped, not waited for. A job that lost its lease
 /// on its last attempt fails here instead, so one that kills its worker every time stops
 /// being retried; one whose run still holds its row is left to that run.
-/// Finished jobs older than `KEEP_FINISHED_DAYS` are deleted here too, a batch at a time.
+/// Finished jobs older than `KEEP_FINISHED_DAYS` are deleted here too, a batch at a time,
+/// except failed file cleanups whose objects are still in storage.
 pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbError> {
     sqlx::query!(
         r#"UPDATE jobs SET state = 'failed', locked_until = NULL, finished_at = clock_timestamp(),
@@ -155,6 +249,17 @@ pub async fn claim(pool: &PgPool, lease: Duration) -> Result<Option<Job>, DbErro
                SELECT id FROM jobs
                WHERE tenant_id = $1 AND state IN ('done', 'cancelled', 'failed')
                  AND finished_at < now() - make_interval(days => $2)
+                 -- A failed cleanup is the only record of objects left in storage, so it's
+                 -- kept until the sweep gets it done: a file's while the file isn't live
+                 -- again, stale sizes' while it ran out of attempts (a refused payload never
+                 -- will be done).
+                 AND NOT (kind = 'file_cleanup' AND state = 'failed'
+                          AND CASE WHEN payload ? 'file' THEN EXISTS (
+                                       SELECT 1 FROM files f
+                                       WHERE f.id = CASE WHEN payload->>'file' ~ '^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$'
+                                                         THEN (payload->>'file')::uuid END
+                                         AND f.state <> 'live')
+                                   ELSE attempts >= max_attempts END)
                LIMIT 100
                FOR UPDATE SKIP LOCKED)"#,
         DEFAULT_TENANT,
@@ -237,7 +342,8 @@ pub async fn complete_with(
 }
 
 /// Records that `job`'s run failed with `error`. With `retry`, and attempts left, it's
-/// queued again after 10 s × attempts²; otherwise it fails for good. Does nothing when this
+/// queued again after 10 s × attempts², an hour at most, so a job that never runs out of
+/// attempts still tries hourly after a long outage; otherwise it fails for good. Does nothing when this
 /// run no longer holds the job.
 pub async fn fail(pool: &PgPool, job: &Job, error: &str, retry: bool) -> Result<(), DbError> {
     fail_with(pool, job, error, retry, None).await
@@ -255,7 +361,7 @@ pub async fn fail_with(
         r#"UPDATE jobs SET
                state = CASE WHEN $4 AND attempts < max_attempts THEN 'queued' ELSE 'failed' END,
                run_at = CASE WHEN $4 AND attempts < max_attempts
-                             THEN now() + make_interval(secs => 10 * attempts * attempts)
+                             THEN now() + make_interval(secs => least(10 * attempts::bigint * attempts, 3600))
                              ELSE run_at END,
                finished_at = CASE WHEN $4 AND attempts < max_attempts THEN NULL ELSE clock_timestamp() END,
                locked_until = NULL,
@@ -271,6 +377,32 @@ pub async fn fail_with(
     .execute(pool)
     .await?;
     Ok(())
+}
+
+/// How often `defer` puts a job back before it must spend its attempts.
+pub const MAX_DEFERRALS: i32 = 20;
+
+/// Queues `job` again, due after `after`, without spending the attempt this run took:
+/// it was held off by other work (a schema change, a user's write), not failing. Counted in
+/// the payload's `deferred`; false, and nothing done, once that reaches `MAX_DEFERRALS`
+/// or when this run no longer holds the job.
+pub async fn defer(pool: &PgPool, job: &Job, after: Duration, why: &str) -> Result<bool, DbError> {
+    let done = sqlx::query!(
+        r#"UPDATE jobs SET state = 'queued', attempts = attempts - 1, locked_until = NULL,
+               run_at = now() + make_interval(secs => $3), last_error = $4,
+               payload = jsonb_set(payload, '{deferred}',
+                   to_jsonb(coalesce((payload->>'deferred')::int, 0) + 1))
+           WHERE id = $1 AND attempts = $2 AND state = 'running'
+             AND coalesce((payload->>'deferred')::int, 0) < $5"#,
+        job.id,
+        job.attempts,
+        after.as_secs_f64(),
+        why,
+        MAX_DEFERRALS,
+    )
+    .execute(pool)
+    .await?;
+    Ok(done.rows_affected() == 1)
 }
 
 /// `document_id`'s queued and running jobs, soonest first.

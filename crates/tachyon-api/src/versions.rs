@@ -15,17 +15,20 @@ use tachyon_core::{CollectionKind, validate_document_in};
 use tachyon_db::DbError;
 use tachyon_db::DocCopy;
 use tachyon_db::collections::Collection;
-use tachyon_db::documents::{self, Document};
-use tachyon_db::versions;
+use tachyon_db::documents::{self, Document, FileChange, Prepared};
+use tachyon_db::{files, versions};
 use uuid::Uuid;
 
 use crate::access::Access;
 use crate::documents::{collection, mode_for, parse_id, record, unique_error};
+use crate::files::{direct_urls, fill_upload_urls};
 use crate::globals::global;
 use crate::params::{diff_params, no_params, page_params};
 use crate::populate::{
-    check_links, link_ids, link_targets, prepare, published_links, vouched_links,
+    Sent, check_links, filtered_links, link_ids, link_targets, prepare, published_links,
+    vouched_links,
 };
+use crate::uploads::keep_server_set;
 use crate::{ApiError, AppState};
 
 /// The document a route names: one of a collection, or a global's own.
@@ -115,7 +118,7 @@ async fn publish_doc(
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
-    published_links(state, access, &prepared)
+    published_links(&mut tx, state, access, c, &prepared)
         .await
         .map_err(|e| access.hide(c, e, Some(&draft)))?;
     let doc = documents::publish_in(&mut tx, c, d.id, Some(&prepared), access.user_id())
@@ -206,7 +209,19 @@ async fn version(
 ) -> Result<versions::Version, ApiError> {
     let mut v = stored_version(state, d, vid, drafts).await?;
     if let Some(data) = v.data.take() {
-        v.data = Some(stripped(access, &d.c, data));
+        let mut data = stripped(access, &d.c, data);
+        // A bucket link only while the document still holds the version's file; an old one
+        // links to the route, which serves a version-only file to nobody.
+        let key = match (v.file_id, direct_urls(state, access, &d.c)) {
+            (Some(file), true) => {
+                let key = files::get(&state.pool, file).await?.key;
+                let now = files::published_keys(&state.pool, &[d.id]).await?;
+                now.get(&d.id).is_some_and(|k| *k == key).then_some(key)
+            }
+            _ => None,
+        };
+        fill_upload_urls(state, access, &d.c, d.id, &mut data, key.as_deref());
+        v.data = Some(data);
     }
     Ok(v)
 }
@@ -274,10 +289,10 @@ async fn restore_version(
     }
     no_params(raw.as_deref())?;
     let drafts = access.versions_of(&state.pool, c, d.id).await?;
-    let data = stored_version(state, &d, &vid, drafts)
-        .await?
-        .data
-        .unwrap_or_default();
+    let v = stored_version(state, &d, &vid, drafts).await?;
+    // The copy gets the version's stored file back too.
+    let file = v.file_id.map_or(FileChange::Clear, FileChange::Set);
+    let data = v.data.unwrap_or_default();
     let copy = access.write_copy(c)?;
     let guard = match d.global() {
         true => access.global_guard(c)?,
@@ -298,6 +313,11 @@ async fn restore_version(
         )
         .map_err(ApiError::Validation)
         .and_then(|data| prepare(&targets, c, data))
+        .map(|mut p| {
+            // The version's file comes back, so what describes it does too, as stored.
+            keep_server_set(c, &data, &mut p.data);
+            Prepared { file, ..p }
+        })
         .map_err(|e| access.hide(c, e, Some(&next)))
     };
     let vouched = check_links(state, access, &apply(&stored)?, &link_ids(c, &stored)).await?;
@@ -319,6 +339,16 @@ async fn restore_version(
     )
     .await
     .map_err(|e| access.hide(c, unique_error(c, e), None))?;
+    filtered_links(
+        &mut tx,
+        state,
+        access,
+        c,
+        &doc.data.0,
+        Sent::All,
+        access.linked(),
+    )
+    .await?;
     record(&mut tx, c, &doc, copy, actor.map(|a| a.id), false).await?;
     tx.commit().await.map_err(DbError::from)?;
     answer(state, access, &d, &doc, copy).await

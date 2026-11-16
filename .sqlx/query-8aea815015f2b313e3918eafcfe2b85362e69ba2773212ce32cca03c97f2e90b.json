@@ -1,0 +1,15 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE jobs SET state = 'cancelled', locked_until = NULL, finished_at = clock_timestamp()\n           WHERE tenant_id = $1 AND dedupe_key = $2 AND state = 'queued'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Text"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "8aea815015f2b313e3918eafcfe2b85362e69ba2773212ce32cca03c97f2e90b"
+}

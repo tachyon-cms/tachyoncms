@@ -490,8 +490,10 @@ impl Checker<'_> {
                     FieldKind::Text { has_many: true, .. }
                         | FieldKind::Number { has_many: true, .. }
                         | FieldKind::Select { multiple: true, .. }
-                ) || matches!(&f.kind, FieldKind::Relationship { has_many: true, relation_to, .. }
-                    if !relation_to.is_polymorphic());
+                ) || f
+                    .kind
+                    .link()
+                    .is_some_and(|l| l.has_many && !l.relation_to.is_polymorphic());
                 if list && !matches!(op, "in" | "not_in") {
                     return Err(format!(
                         "`$user.{}` holds a list, so it works only with in or not_in",
@@ -558,7 +560,9 @@ impl Checker<'_> {
                             .into(),
                     ));
                 }
-                let written = f.virtual_path.is_none() && !matches!(f.kind, FieldKind::Join { .. });
+                let written = f.virtual_path.is_none()
+                    && !f.computed
+                    && !matches!(f.kind, FieldKind::Join { .. });
                 for (action, rule) in [
                     ("read", &a.read),
                     ("create", &a.create),
@@ -585,11 +589,20 @@ impl Checker<'_> {
                     self.fields(fields, prefix, &format!("{here}.fields"))?
                 }
                 // A block's fields are named like a list's, without the block type; so are
-                // a rich text block node's.
+                // a rich text block or upload node's.
                 FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
                     for (b, block) in blocks.iter().enumerate() {
                         let Some(block) = block.def() else { continue };
                         self.fields(&block.fields, &path, &format!("{here}.blocks.{b}.fields"))?;
+                    }
+                    if let FieldKind::RichText {
+                        upload: Some(u), ..
+                    } = &f.kind
+                    {
+                        for (c, node) in &u.collections {
+                            let loc = format!("{here}.upload.collections.{c}.fields");
+                            self.fields(&node.fields, &path, &loc)?;
+                        }
                     }
                 }
                 FieldKind::Tabs { tabs } => {
@@ -634,16 +647,15 @@ pub fn field_allows(f: &Field, action: Action, caller: &Caller) -> bool {
 }
 
 /// The fields directly inside `f`: a group's or a list's, or each block type's (of a
-/// blocks field or of rich text's block nodes).
+/// blocks field or of rich text's block nodes) and each of rich text's upload nodes'.
 fn inside(f: &Field) -> Vec<&[Field]> {
     match &f.kind {
         FieldKind::Group { fields } | FieldKind::Array { fields, .. } => vec![fields],
-        FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => blocks
-            .iter()
-            .filter_map(BlockSource::def)
-            .map(|b| b.fields.as_slice())
+        kind => kind
+            .node_types()
+            .into_iter()
+            .map(|(_, _, fields)| fields)
             .collect(),
-        _ => Vec::new(),
     }
 }
 
@@ -725,10 +737,9 @@ pub fn field_answers(fields: &[Field], caller: &Caller) -> Vec<(String, [bool; 3
             if peers.iter().any(|f| is_list(f)) {
                 answer[2] = answer[2] && updatable(&next, caller);
             }
-            if peers
-                .iter()
-                .any(|f| matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some())
-            {
+            if peers.iter().any(|f| {
+                matches!(f.kind, FieldKind::Join { .. }) || f.virtual_path.is_some() || f.computed
+            }) {
                 (answer[1], answer[2]) = (false, false);
             }
             out.push((path.clone(), answer));
@@ -768,12 +779,11 @@ pub fn readable_fields<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Fie
                     FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                         *fields = prune(fields, &next, caller)
                     }
-                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
-                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                            b.fields = prune(&b.fields, &next, caller);
+                    kind => {
+                        for (_, fields) in kind.node_types_mut() {
+                            *fields = prune(fields, &next, caller);
                         }
                     }
-                    _ => {}
                 }
                 Some(f)
             })
@@ -802,12 +812,11 @@ pub fn readable_rows<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field
                     FieldKind::Group { fields } | FieldKind::Array { fields, .. } => {
                         *fields = readable_rows(fields, caller).into_owned()
                     }
-                    FieldKind::Blocks { blocks, .. } | FieldKind::RichText { blocks, .. } => {
-                        for b in blocks.iter_mut().filter_map(BlockSource::def_mut) {
-                            b.fields = readable_rows(&b.fields, caller).into_owned();
+                    kind => {
+                        for (_, fields) in kind.node_types_mut() {
+                            *fields = readable_rows(fields, caller).into_owned();
                         }
                     }
-                    _ => {}
                 }
                 f
             })
@@ -815,19 +824,20 @@ pub fn readable_rows<'f>(fields: &'f [Field], caller: &Caller) -> Cow<'f, [Field
     )
 }
 
-/// Whether `fields` hold a blocks field, or rich text with block types, at any depth, whose
-/// rows or nodes of a removed block type every read cuts down.
+/// Whether `fields` hold a blocks field, or rich text with block types or upload nodes, at
+/// any depth, whose rows or nodes of a removed type every read cuts down.
 pub fn has_blocks(fields: &[Field]) -> bool {
     fields.iter().any(|f| {
         matches!(f.kind, FieldKind::Blocks { .. })
             || !f.kind.block_sources().is_empty()
+            || !f.kind.node_types().is_empty()
             || inside(f).iter().any(|i| has_blocks(i))
     })
 }
 
 /// `schema` with only the fields the caller can read.
 pub fn readable_schema(schema: &CollectionSchema, caller: &Caller) -> CollectionSchema {
-    schema.with_fields(readable_fields(schema.data(), caller).into_owned())
+    schema.with_data(readable_fields(schema.data(), caller).into_owned())
 }
 
 /// Removes every field the caller can't read from `doc` of `fields` (data fields), at any
@@ -853,17 +863,22 @@ pub fn strip_to(fields: &[Field], visible: &[Field], doc: &mut Map<String, Value
         if inside(f).is_empty() {
             continue;
         }
-        // Block nodes, wherever they sit in the text, are stripped as block rows are.
+        // Block and upload nodes, wherever they sit in the text, are stripped as block
+        // rows are.
         if let (FieldKind::RichText { .. }, Some(text)) = (&v.kind, doc.get_mut(&f.name)) {
-            crate::richtext::blocks_mut(text, &mut |attrs| {
-                let slug = attrs.get("blockType").and_then(Value::as_str);
-                match slug.and_then(|s| Some((f.kind.block(s)?, v.kind.block(s)?))) {
-                    Some((all, kept)) => {
-                        if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
-                            strip_to(&all.fields, &kept.fields, fields)
-                        }
+            crate::richtext::field_nodes_mut(text, &mut |upload, key, attrs| match f
+                .kind
+                .node_type(upload, key)
+                .zip(v.kind.node_type(upload, key))
+            {
+                Some((all, kept)) => {
+                    if let Some(Value::Object(fields)) = attrs.get_mut("fields") {
+                        strip_to(all, kept, fields)
                     }
-                    None => attrs.retain(|k, _| BLOCK_ROW_KEYS.contains(&k.as_str())),
+                }
+                None => {
+                    let own = crate::richtext::node_own_keys(upload);
+                    attrs.retain(|k, _| own.contains(&k.as_str()))
                 }
             });
             continue;
@@ -971,13 +986,22 @@ fn walk(
                 return Some(true);
             };
             rest = tail;
-            let attrs = found
+            here = found
                 .and_then(|v| v.get("attrs"))
-                .and_then(Value::as_object);
-            here = attrs
                 .and_then(|a| a.get("fields"))
                 .and_then(Value::as_object);
-            level = peers.iter().flat_map(|f| inside_row(f, attrs)).collect();
+            let key = found
+                .and_then(Value::as_object)
+                .and_then(crate::richtext::node_type_key);
+            level = peers
+                .iter()
+                .flat_map(
+                    |f| match key.as_ref().and_then(|(u, k)| f.kind.node_type(*u, k)) {
+                        Some(fields) => vec![fields],
+                        None => inside(f),
+                    },
+                )
+                .collect();
             value = (false, false);
             if rest.is_empty() {
                 return Some(true);
@@ -1166,39 +1190,37 @@ pub fn unwritable(
                     replaced(&b.fields, &mine, held.as_deref(), path, action, caller, out);
                 }
             }
-            // Block nodes, wherever they sit, as block rows.
-            FieldKind::RichText { blocks, .. } => {
-                let nodes = |values: &[&'v Value]| -> Vec<&'v Value> {
+            // Block and upload nodes, wherever they sit, as block rows.
+            FieldKind::RichText { .. } => {
+                type Nodes<'v> = Vec<(bool, String, &'v Map<String, Value>)>;
+                let nodes = |values: &[&'v Value]| -> Nodes<'v> {
                     values
                         .iter()
-                        .flat_map(|v| crate::richtext::block_attrs(v))
+                        .flat_map(|v| crate::richtext::field_nodes(v))
                         .collect()
                 };
-                let fields = |nodes: Vec<&'v Value>| -> Vec<&'v Value> {
-                    nodes.iter().filter_map(|n| n.get("fields")).collect()
+                // The `fields` of the nodes of type `key`, upload nodes if `upload`.
+                let of_key = |nodes: &Nodes<'v>, upload: bool, key: &str| {
+                    nodes
+                        .iter()
+                        .filter(|(u, k, _)| *u == upload && k == key)
+                        .filter_map(|(_, _, attrs)| attrs.get("fields"))
+                        .collect::<Vec<&'v Value>>()
                 };
                 let (sent, stored) = (nodes(sent), stored.map(nodes));
-                for b in blocks.iter().filter_map(BlockSource::def) {
+                for (upload, key, fields) in f.kind.node_types() {
                     let (mine, held) = (
-                        of_type(&sent, &b.slug),
-                        stored.as_deref().map(|s| of_type(s, &b.slug)),
+                        of_key(&sent, upload, &key),
+                        stored.as_ref().map(|s| of_key(s, upload, &key)),
                     );
-                    if held
-                        .as_ref()
-                        .is_some_and(|h| h.is_empty() && mine.is_empty())
-                    {
+                    // Counted by node, not by `fields`: a node holding none still replaces
+                    // what one of its type held.
+                    let none =
+                        |nodes: &Nodes| !nodes.iter().any(|(u, k, _)| *u == upload && *k == key);
+                    if stored.as_ref().is_some_and(none) && none(&sent) {
                         continue;
                     }
-                    let held = held.map(fields);
-                    replaced(
-                        &b.fields,
-                        &fields(mine),
-                        held.as_deref(),
-                        path,
-                        action,
-                        caller,
-                        out,
-                    );
+                    replaced(fields, &mine, held.as_deref(), path, action, caller, out);
                 }
             }
             _ => {}
@@ -1259,8 +1281,8 @@ pub fn unwritable(
                     }
                 }
                 (FieldKind::RichText { .. }, text) => {
-                    for attrs in crate::richtext::blocks(text) {
-                        let fields = crate::validate::node_fields(&f.kind, attrs);
+                    for (upload, key, attrs) in crate::richtext::field_nodes(text) {
+                        let fields = f.kind.node_type(upload, &key).unwrap_or(&[]);
                         if let Some(Value::Object(sent)) = attrs.get("fields") {
                             walk(fields, sent, None, &path, action, caller, out);
                         }
@@ -1823,6 +1845,177 @@ mod tests {
                 .iter()
                 .all(|(_, a)| *a == [true; 3])
         );
+    }
+
+    #[test]
+    fn rich_text_upload_nodes_answer_to_field_rules() {
+        let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media", "docs"],
+            "blocks": [{"slug": "hero", "fields": [{"name": "secret", "type": "text", "access": ed}]}],
+            "upload": {"collections": {
+                "media": {"fields": [
+                    {"type": "row", "fields": [{"name": "caption", "type": "text", "access": ed}]},
+                    {"name": "credit", "type": "text"},
+                    {"name": "meta", "type": "group", "fields": [{"name": "x", "type": "text", "access": ed}]}
+                ]},
+                // The same name with no rule: a docs node's `caption` is anyone's to read.
+                "docs": {"fields": [{"name": "caption", "type": "text"}]}
+            }}}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let bad = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media"], "upload": {"collections": {"media": {"fields": [
+                {"name": "s", "type": "text", "access": {"read": {"title": "x"}}}
+            ]}}}}]}),
+        );
+        assert_eq!(
+            check(&bad),
+            Err("field `body.s`: access.read: field rules can use only roles, signedIn, true and false".into())
+        );
+
+        let (viewer, editor) = (signed_in("viewer"), signed_in("editor"));
+        let file = |to: &str, fields: Value| {
+            json!({"type": "upload", "attrs": {"relationTo": to,
+            "value": "0199d5c4-0000-7000-8000-0000000000c1", "fields": fields}})
+        };
+        let text = |content: Value| json!({"type": "doc", "content": content});
+        // In a list, at the top, and one of a collection the field no longer holds.
+        let doc = json!({"body": text(json!([
+            {"type": "bulletList", "content": [{"type": "listItem", "content": [
+                file("media", json!({"caption": "c", "credit": "ann", "meta": {"x": "x"}}))
+            ]}]},
+            file("docs", json!({"caption": "c"})),
+            file("gone", json!({"caption": "c"}))
+        ]))});
+        let doc = doc.as_object().unwrap();
+        let mut whole = Value::Object(doc.clone());
+        whole["body"]["content"][2]["attrs"]
+            .as_object_mut()
+            .unwrap()
+            .remove("fields");
+        let mut hidden = whole.clone();
+        hidden["body"]["content"][0]["content"][0]["content"][0]["attrs"]["fields"] =
+            json!({"credit": "ann", "meta": {}});
+        for (caller, want) in [(&viewer, &hidden), (&editor, &whole)] {
+            let mut by_rule = doc.clone();
+            strip_unreadable(s.data(), &mut by_rule, caller);
+            assert_eq!(&Value::Object(by_rule), want);
+        }
+        let only_files = schema(
+            json!({"slug": "p", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media"], "upload": {"collections": {"media": {}}}}]}),
+        );
+        assert!(has_blocks(only_files.data()));
+
+        // Without the document no path names its node, so `caption` answers for both
+        // collections; with it, a validation path answers to its own node's (below).
+        let media_at = "body.content.0.content.0.content.0.attrs.fields";
+        for (path, readable) in [
+            ("body.0.credit", true),
+            ("body.0.caption", false),
+            ("body.0.meta.x", false),
+            (&format!("{media_at}.credit"), true),
+            (&format!("{media_at}.caption"), false),
+            ("body.content.1.attrs.fields.caption", false),
+        ] {
+            assert_eq!(path_readable(s.data(), path, &viewer), readable, "{path}");
+            assert!(path_readable(s.data(), path, &editor), "{path}");
+        }
+        let e = |path: &str| FieldError {
+            path: path.into(),
+            message: "is required".into(),
+        };
+        let generic = FieldError {
+            path: String::new(),
+            message: "a field you can't see needs fixing; ask someone who can see it".into(),
+        };
+        let errors = || {
+            vec![
+                e(&format!("{media_at}.caption")),
+                e("body.content.1.attrs.fields.caption"),
+            ]
+        };
+        assert_eq!(
+            visible_errors(s.data(), errors(), &viewer, Some(doc)),
+            [e("body.content.1.attrs.fields.caption"), generic]
+        );
+        let answers = field_answers(s.data(), &viewer);
+        assert!(answers.contains(&("body.caption".to_owned(), [false; 3])));
+        assert!(answers.contains(&("body.credit".to_owned(), [true, true, false])));
+
+        // Writes: each node answers to its own collection's fields, sent or replaced.
+        let refused = |input: Value, action: Action, existing: Option<&Value>| {
+            let existing = existing.map(|v| v.as_object().unwrap());
+            unwritable(
+                &s.fields,
+                input.as_object().unwrap(),
+                action,
+                &viewer,
+                existing,
+            )
+        };
+        let docs_only = json!({"body": text(json!([file("docs", json!({"caption": "c"}))]))});
+        assert!(refused(docs_only.clone(), Action::Create, None).is_empty());
+        assert!(refused(docs_only.clone(), Action::Update, Some(&docs_only)).is_empty());
+        let all_hidden = ["body.secret", "body.caption", "body.meta.x"];
+        assert_eq!(refused(docs_only.clone(), Action::Update, None), all_hidden);
+        assert_eq!(
+            refused(docs_only, Action::Update, Some(&Value::Object(doc.clone()))),
+            ["body.caption", "body.meta.x"]
+        );
+        let created = |fields: Value| {
+            refused(
+                json!({"body": text(json!([file("media", fields)]))}),
+                Action::Create,
+                None,
+            )
+        };
+        assert_eq!(created(json!({"caption": "c"})), ["body.caption"]);
+        assert_eq!(created(json!({"meta": {"x": "x"}})), ["body.meta.x"]);
+        assert!(created(json!({"credit": "c"})).is_empty());
+    }
+
+    #[test]
+    fn a_block_type_starting_with_at_is_no_upload_node() {
+        let ed = json!({"read": {"role": "editor"}, "create": {"role": "editor"}, "update": {"role": "editor"}});
+        let s = schema(
+            json!({"slug": "pages", "fields": [{"name": "body", "type": "richText",
+            "relationTo": ["media"],
+            "blocks": [{"slug": "hero", "fields": [{"name": "credit", "type": "text", "access": ed}]}],
+            "upload": {"collections": {"media": {"fields": [
+                {"name": "caption", "type": "text", "access": ed},
+                {"name": "credit", "type": "text"}
+            ]}}}}]}),
+        );
+        assert_eq!(check(&s), Ok(()));
+        let viewer = signed_in("viewer");
+        // The node's type says block, so `@media` is an unknown block type, whatever it reads.
+        let doc = json!({"body": {"type": "doc", "content": [{"type": "block", "attrs": {
+            "id": "b1", "blockType": "@media", "fields": {"caption": "c", "credit": "ann"}}}]}});
+        let doc = doc.as_object().unwrap();
+
+        let mut read = doc.clone();
+        strip_unreadable(s.data(), &mut read, &viewer);
+        assert_eq!(
+            read["body"]["content"][0]["attrs"],
+            json!({"id": "b1", "blockType": "@media"})
+        );
+
+        // Unknown, so every node type's `credit` answers, and hero's is hidden.
+        let hidden = FieldError {
+            path: "body.content.0.attrs.fields.credit".into(),
+            message: "is required".into(),
+        };
+        let errors = visible_errors(s.data(), vec![hidden], &viewer, Some(doc));
+        assert_eq!(errors.len(), 1);
+        assert_eq!(errors[0].path, "");
+
+        // No node type's fields, so not media's `caption`, sent or replaced.
+        assert!(unwritable(&s.fields, doc, Action::Create, &viewer, None).is_empty());
+        assert!(unwritable(&s.fields, doc, Action::Update, &viewer, Some(doc)).is_empty());
     }
 
     #[test]

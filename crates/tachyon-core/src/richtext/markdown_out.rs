@@ -7,7 +7,7 @@ use std::collections::BinaryHeap;
 use serde_json::Value;
 
 use super::{RenderCtx, attr, children, code_language, field_text, kind, safe_href};
-use crate::schema::FieldKind;
+use crate::schema::{Field, FieldKind};
 
 /// `doc` as Markdown. Text is escaped so it reads back as text. What Markdown can't say is
 /// left out: subscript and superscript are plain text, table cells don't span, and a
@@ -24,6 +24,10 @@ use crate::schema::FieldKind;
 /// one, and a cell keeps its own as R37 says (W1-R39, W1-R41).
 /// A table's first row is its header, as GFM has no table without one (W1-R39).
 /// An ordered list's `start: 1` and a block's empty `fields` aren't written (W1-R39).
+/// An upload node is `![alt](media:<collection>/<id>)`, its alt text the file's; one with
+/// `fields` is a directive, `::media:<collection>/<id>{key="value" …}`, written as a block
+/// node's. One the caller can't read is left out (W1-R24). A cell holding only an upload
+/// node holds its image, but not its fields: a directive can't sit in a cell (W1-R39).
 /// A task item with no `checked` is written unchecked, and reads back so (W1-R42).
 pub fn to_markdown(doc: &Value, kind: &FieldKind, ctx: &RenderCtx) -> String {
     blocks(children(doc), Some(kind), ctx)
@@ -152,7 +156,11 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> S
             for (i, row) in children(node).iter().enumerate() {
                 let cells: Vec<String> = children(row)
                     .iter()
-                    .map(|cell| line_start(inline(&cell_inline(cell), ctx, Where::Cell)))
+                    .map(|cell| match children(cell) {
+                        // Its fields drop: a directive can't sit in a cell (W1-R39).
+                        [only] if kind(only) == "upload" => image(only, ctx).unwrap_or_default(),
+                        _ => line_start(inline(&cell_inline(cell, ctx), ctx, Where::Cell)),
+                    })
                     .collect();
                 lines.push(format!("| {} |", cells.join(" | ")));
                 if i == 0 {
@@ -175,9 +183,45 @@ fn block(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx, other: bool) -> S
                 None => String::new(),
             }
         }
-        "block" => directive(node, k, ctx),
+        "block" => {
+            let block_type = attr(node, "blockType")
+                .and_then(Value::as_str)
+                .unwrap_or("");
+            let defs = k.and_then(|k| k.block(block_type)).map(|b| &b.fields[..]);
+            directive(block_type, defs, node, ctx)
+        }
+        // Its fields as a block node's, named by the file; an image without them.
+        "upload" => match (
+            image(node, ctx),
+            attr(node, "fields").and_then(Value::as_object),
+        ) {
+            (Some(_), Some(fields)) if !fields.is_empty() => {
+                let to = attr(node, "relationTo")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                let id = attr(node, "value").and_then(Value::as_str).unwrap_or("");
+                let defs = k.and_then(|k| k.upload_node(to)).map(|n| &n.fields[..]);
+                directive(&format!("media:{to}/{id}"), defs, node, ctx)
+            }
+            (image, _) => image.unwrap_or_default(),
+        },
         _ => String::new(),
     }
+}
+
+/// An upload node as an image, `![alt](media:<collection>/<id>)`: by ID, as a URL can't be
+/// read back (W1-R23). The alt text is the file's, so it's written to be read but not read
+/// back. `None` when the caller can't read the file (W1-R24).
+fn image(node: &Value, ctx: &RenderCtx) -> Option<String> {
+    let file = super::upload_of(node, ctx)?;
+    let id = attr(node, "value")?.as_str()?;
+    let to = attr(node, "relationTo")?.as_str()?;
+    let alt = file.alt.unwrap_or_default();
+    Some(format!(
+        "![{}]({})",
+        escape(&alt),
+        destination(&format!("media:{to}/{id}"))
+    ))
 }
 
 /// A list: each item's marker from `marker(index, item)`, its later lines indented to match.
@@ -258,14 +302,11 @@ fn list(
     out.join("\n")
 }
 
-/// A block node: `::type{key="value" …}`, or, when exactly one of its fields is rich text,
-/// `:::type{…}` around that text, with enough colons to hold any directive inside.
-fn directive(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
-    let block_type = attr(node, "blockType")
-        .and_then(Value::as_str)
-        .unwrap_or("");
-    let def = k.and_then(|k| k.block(block_type));
-    let field = |name: &str| def.and_then(|d| d.fields.iter().find(|f| f.name == name));
+/// A block or upload node's fields: `::<name>{key="value" …}`, or, when exactly one of them
+/// is rich text, `:::<name>{…}` around that text, with enough colons to hold any directive
+/// inside. `defs` are its fields' definitions, when the schema has them.
+fn directive(type_name: &str, defs: Option<&[Field]>, node: &Value, ctx: &RenderCtx) -> String {
+    let field = |name: &str| defs.and_then(|d| d.iter().find(|f| f.name == name));
     let fields = attr(node, "fields").and_then(Value::as_object);
     let fields: Vec<(&String, &Value)> = fields.into_iter().flatten().collect();
     // Rich text by its field, or by its shape where the block type isn't known; a json
@@ -298,8 +339,8 @@ fn directive(node: &Value, k: Option<&FieldKind>, ctx: &RenderCtx) -> String {
         })
         .collect();
     let head = match attrs.is_empty() {
-        true => block_type.to_owned(),
-        false => format!("{block_type}{{{}}}", attrs.join(" ")),
+        true => type_name.to_owned(),
+        false => format!("{type_name}{{{}}}", attrs.join(" ")),
     };
     let Some(body) = body else {
         return format!("::{head}");
@@ -451,7 +492,7 @@ fn inline(nodes: &[Value], ctx: &RenderCtx, at: Where) -> String {
 
 /// A table cell's blocks as one line of inline nodes, hard breaks between them: a cell is
 /// one line of Markdown (W1-R37).
-fn cell_inline(cell: &Value) -> Vec<Value> {
+fn cell_inline(cell: &Value, ctx: &RenderCtx) -> Vec<Value> {
     let mut out = Vec::new();
     for (i, block) in children(cell).iter().enumerate() {
         if i > 0 {
@@ -461,7 +502,7 @@ fn cell_inline(cell: &Value) -> Vec<Value> {
             "paragraph" | "heading" => out.extend(children(block).iter().cloned()),
             _ => {
                 let doc = serde_json::json!({"type": "doc", "content": [block]});
-                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc)}));
+                out.push(serde_json::json!({"type": "text", "text": super::to_text(&doc, ctx)}));
             }
         }
     }
@@ -786,7 +827,7 @@ fn link_destination(mark: &Value, ctx: &RenderCtx) -> Option<String> {
 
 #[cfg(test)]
 mod tests {
-    use super::super::tests::{A1, P1, doc, full, para, text};
+    use super::super::tests::{A1, P1, doc, full, media_file, para, text};
     use super::*;
     use serde_json::json;
 
@@ -797,7 +838,8 @@ mod tests {
         f.kind
     }
 
-    /// Post `P1`'s slug is `hello` and author `A1`'s is `ann`; nothing else is readable.
+    /// Post `P1`'s slug is `hello` and author `A1`'s is `ann`; media `M1` and `M2` are
+    /// files (`media_file`); nothing else is readable.
     fn ctx_for(test: impl FnOnce(&RenderCtx)) {
         let none = |_: &str, _: &Value| None;
         let slug = |to: &str, v: &Value| match (to, v.as_str()?) {
@@ -809,6 +851,7 @@ mod tests {
             link_url: &none,
             title: &none,
             slug: &slug,
+            upload: &media_file,
         })
     }
 

@@ -1,0 +1,18 @@
+{
+  "db_name": "PostgreSQL",
+  "query": "UPDATE files SET filename = $3, names = $4, sizes = $5 WHERE tenant_id = $1 AND id = $2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Left": [
+        "Uuid",
+        "Uuid",
+        "Text",
+        "TextArray",
+        "Jsonb"
+      ]
+    },
+    "nullable": []
+  },
+  "hash": "348fe797e05fd23d5d6b44aad8140725400fa0c00408befce46df42ad3e4b499"
+}

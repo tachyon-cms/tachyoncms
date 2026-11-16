@@ -140,10 +140,11 @@ async fn a_change_at_the_threshold_runs_inline(pool: PgPool) {
     let res = call(&app, "PUT", "/api/admin/collections/posts", rename("posts")).await;
     assert_eq!(res.status, 200, "{}", res.json);
     assert_eq!(res.json["collection"]["schemaVersion"], 2);
-    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM jobs")
-        .fetch_one(&pool)
-        .await
-        .unwrap();
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM jobs WHERE kind <> 'file_cleanup_sweep'")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
     assert_eq!(jobs, 0);
 }
 
@@ -369,6 +370,7 @@ async fn the_job_route_shows_only_schema_jobs_to_schema_admins(pool: PgPool) {
         dedupe_key: None,
         created_by: None,
         key_id: None,
+        max_attempts: None,
     };
     let other = jobs::enqueue(&mut pool.acquire().await.unwrap(), &schedule)
         .await
@@ -467,6 +469,7 @@ async fn a_job_that_failed_without_an_answer_still_has_one(pool: PgPool) {
         dedupe_key: None,
         created_by: None,
         key_id: None,
+        max_attempts: None,
     };
     let mut conn = pool.acquire().await.unwrap();
     // Nobody queued it, so it fails on its first run.
