@@ -923,6 +923,10 @@ async fn access_answers_writes_by_the_draft_they_change(pool: PgPool) {
         json!({"slug": "settings", "kind": "global", "versions": {"drafts": true},
                "access": {"readDrafts": {"role": "admin"}}, "fields": title}),
         json!({"slug": "home", "kind": "global", "versions": {"drafts": true}, "fields": title}),
+        // Role defaults: an Author's `readDrafts` is own-only.
+        json!({"slug": "notes", "versions": {"drafts": true}, "fields": title}),
+        json!({"slug": "banner", "kind": "global", "versions": {"drafts": true},
+               "access": {"update": true}, "fields": title}),
     ] {
         collection(&admin, schema).await;
     }
@@ -960,7 +964,77 @@ async fn access_answers_writes_by_the_draft_they_change(pool: PgPool) {
             a["collections"]["plain"][right], c,
             "author {right} plain: {a}"
         );
+        // Own-only drafts: conditional, their own draft yes and anyone else's no.
+        assert_eq!(
+            a["collections"]["notes"][right], c,
+            "author {right} notes: {a}"
+        );
     }
+    let note = |app: Router| async move {
+        let res = call(&app, "POST", "/api/notes", Some(json!({"title": "N"}))).await;
+        assert_eq!(res.status, 201, "{}", res.json);
+        format!("/api/notes/{}", id_of(&res.json))
+    };
+    let (own, theirs) = (note(author.clone()).await, note(admin.clone()).await);
+    ok(&author, "PATCH", &own, Some(json!({"title": "M"}))).await;
+    assert_problem(
+        &call(&author, "PATCH", &theirs, Some(json!({"title": "M"}))).await,
+        404,
+    );
+    // Own-only drafts reach no global, since nobody created one: false, even where the
+    // rules let anyone update.
+    assert_eq!(a["globals"]["banner"]["update"], f, "{a}");
+    assert_eq!(
+        a["globals"]["banner"]["fields"]["title"]["update"], f,
+        "{a}"
+    );
+    assert_problem(
+        &call(
+            &author,
+            "PATCH",
+            "/api/globals/banner",
+            Some(json!({"title": "x"})),
+        )
+        .await,
+        403,
+    );
+    // History without drafts is still history: an Author who may read no draft of `posts`
+    // sees the published versions of what they created, and no one else's. Conditional.
+    assert_eq!(a["collections"]["posts"]["readVersions"], c, "{a}");
+    let others = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "O"}))).await);
+    for id in [&mine, &others] {
+        ok(&admin, "POST", &format!("/api/posts/{id}/publish"), None).await;
+    }
+    let history = ok(&author, "GET", &format!("/api/posts/{mine}/versions"), None).await;
+    let kinds: Vec<&str> = history["docs"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v["kind"].as_str().unwrap())
+        .collect();
+    assert!(
+        !kinds.is_empty() && kinds.iter().all(|k| *k != "draft"),
+        "{history}"
+    );
+    let all = ok(&admin, "GET", &format!("/api/posts/{mine}/versions"), None).await;
+    assert!(
+        all["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|v| v["kind"] == "draft"),
+        "drafts were hidden, not missing: {all}"
+    );
+    assert_problem(
+        &call(
+            &author,
+            "GET",
+            &format!("/api/posts/{others}/versions"),
+            None,
+        )
+        .await,
+        404,
+    );
 
     // An Editor reads every draft of `posts`, and those of `pages` that a filter allows.
     let e = ok(&editor, "GET", "/api/access", None).await;
