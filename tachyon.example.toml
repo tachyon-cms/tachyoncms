@@ -2,6 +2,7 @@
 # TACHYON_LISTEN, TACHYON_PUBLIC_URL, TACHYON_AUTH__SESSION_IDLE and so on.
 
 database_url = "postgres://tachyon:tachyon@127.0.0.1:54329/tachyon"
+database_pool = 10            # most connections to Postgres, 1 to 1000; workers need 2 each, plus 1
 listen = "127.0.0.1:3000"
 
 # Where browsers reach the admin and API. Required when listening beyond this machine.
@@ -16,6 +17,10 @@ lockout_duration = "15m"    # ...lock the account for this long
 argon2_memory_kib = 19456   # password hashing memory (OWASP baseline)
 breach_check = true         # refuse passwords known from data breaches
 allowed_origins = []        # other sites allowed to send cookie-signed changes
+
+[jobs]
+workers = 2                 # run schedules and big schema changes; 0 to 16, and database_pool
+                            # needs 2 * workers + 1, so 16 workers take database_pool = 33
 
 [uploads]
 max_file_size = "25MB"          # per file, unless a collection sets filesizeLimit; MB = 1,000,000 bytes, MiB = 1,048,576

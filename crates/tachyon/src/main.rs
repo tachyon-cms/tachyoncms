@@ -9,7 +9,6 @@ use std::time::Duration;
 use anyhow::Context;
 
 use clap::{Parser, Subcommand};
-use sqlx::PgPool;
 use tracing_subscriber::EnvFilter;
 
 use config::Config;
@@ -86,7 +85,9 @@ async fn main() -> anyhow::Result<()> {
         } => Some((read_schema(file)?, schema_cmd::parse_renames(renames)?)),
         _ => None,
     };
-    let pool = PgPool::connect(&config.database_url)
+    let pool = config
+        .pool_options()
+        .connect(&config.database_url)
         .await
         .with_context(|| {
             format!(

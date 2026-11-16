@@ -7,6 +7,7 @@ use std::time::Duration;
 use figment::Figment;
 use figment::providers::{Env, Format, Serialized, Toml};
 use serde::Deserialize;
+use sqlx::postgres::PgPoolOptions;
 use tachyon_api::auth::AuthConfig;
 use tachyon_api::{JobsConfig, UploadLimits, UploadsConfig};
 use tachyon_db::files::PENDING_GRACE;
@@ -15,6 +16,9 @@ use tachyon_media::storage::{Adapter, SignedDownloads, StorageConfig, Storages, 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database_url: String,
+    /// The most connections the server opens to Postgres.
+    #[serde(default = "default_pool")]
+    pub database_pool: u32,
     pub listen: SocketAddr,
     /// Where the admin and API are reached from browsers, such as `https://cms.example.com`.
     #[serde(default)]
@@ -323,6 +327,13 @@ impl StorageSettings {
 /// More workers than this would mostly wait on each other's database connections.
 const MAX_WORKERS: usize = 16;
 
+fn default_pool() -> u32 {
+    10
+}
+
+/// Ten times Postgres's default `max_connections`: a bigger pool is a typo, not a plan.
+const MAX_POOL: u32 = 1000;
+
 /// `15m`, `12h`, `7d`: a whole number and a unit.
 fn duration(name: &str, text: &str) -> Result<Duration, String> {
     let bad = || {
@@ -557,14 +568,20 @@ impl Config {
         }
         if workers > 0 && 2 * workers + 1 > pool_connections as usize {
             let most = (pool_connections as usize).saturating_sub(1) / 2;
+            let needed = 2 * workers + 1;
             return Err(format!(
-                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; each worker can hold two and requests need one, so use at most {most}"
+                "jobs.workers is {workers}, but the database pool has {pool_connections} connections; each worker can hold two and requests need one, so use at most {most} or raise database_pool to {needed}"
             ));
         }
         Ok(JobsConfig {
             workers,
             ..JobsConfig::default()
         })
+    }
+
+    /// The database pool, `database_pool` connections at most.
+    pub fn pool_options(&self) -> PgPoolOptions {
+        PgPoolOptions::new().max_connections(self.database_pool)
     }
 
     /// Where people reach the CMS: `public_url`, else this machine on the listening port.
@@ -733,6 +750,17 @@ impl Config {
             .map_err(settable_only)?;
         if config.database_url.trim().is_empty() {
             return Err("database_url is empty".to_owned().into());
+        }
+        match config.database_pool {
+            0 => {
+                return Err("database_pool is 0; the server needs at least 1 connection"
+                    .to_owned()
+                    .into());
+            }
+            n if n > MAX_POOL => {
+                return Err(format!("database_pool is {n}; it can be at most {MAX_POOL}").into());
+            }
+            _ => {}
         }
         Ok(config)
     }
@@ -973,7 +1001,7 @@ mod tests {
             let err = Config::load(None).unwrap_err();
             assert_eq!(
                 err.to_string(),
-                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, listen, public_url, auth, jobs, uploads, storage"
+                "unknown key `publc_url` in tachyon.toml; the top-level keys are database_url, database_pool, listen, public_url, auth, jobs, uploads, storage"
             );
             // A variable that isn't a setting, such as one for another tool, is left alone.
             jail.create_file(
@@ -1018,13 +1046,63 @@ mod tests {
         assert_eq!(at(4, 10).unwrap().workers, 4);
         assert_eq!(
             at(5, 10).unwrap_err(),
-            "jobs.workers is 5, but the database pool has 10 connections; each worker can hold two and requests need one, so use at most 4"
+            "jobs.workers is 5, but the database pool has 10 connections; each worker can hold two and requests need one, so use at most 4 or raise database_pool to 11"
         );
         assert_eq!(
             at(1, 2).unwrap_err(),
-            "jobs.workers is 1, but the database pool has 2 connections; each worker can hold two and requests need one, so use at most 0"
+            "jobs.workers is 1, but the database pool has 2 connections; each worker can hold two and requests need one, so use at most 0 or raise database_pool to 3"
         );
         assert!(at(0, 1).is_ok(), "no workers fit any pool");
+    }
+
+    #[test]
+    fn the_pool_is_ten_unless_set_and_the_workers_fit_it() {
+        let config = load("");
+        assert_eq!(config.pool_options().get_max_connections(), 10);
+        assert_eq!(
+            config.jobs_config(10).unwrap().workers,
+            2,
+            "the default workers fit the default pool"
+        );
+        let config = load("database_pool = 33\n[jobs]\nworkers = 16");
+        let pool = config.pool_options().get_max_connections();
+        assert_eq!(pool, 33);
+        assert_eq!(config.jobs_config(pool).unwrap().workers, 16);
+        let config = load("database_pool = 32\n[jobs]\nworkers = 16");
+        assert_eq!(
+            config
+                .jobs_config(config.pool_options().get_max_connections())
+                .unwrap_err(),
+            "jobs.workers is 16, but the database pool has 32 connections; each worker can hold two and requests need one, so use at most 15 or raise database_pool to 33"
+        );
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            jail.set_env("TACHYON_DATABASE_POOL", "33");
+            assert_eq!(Config::load(None)?.pool_options().get_max_connections(), 33);
+            Ok(())
+        });
+    }
+
+    #[test]
+    fn the_pool_needs_one_connection_and_at_most_a_thousand() {
+        Jail::expect_with(|jail| {
+            jail.set_env("TACHYON_DATABASE_URL", "postgres://env");
+            for (pool, err) in [
+                (
+                    "0",
+                    "database_pool is 0; the server needs at least 1 connection",
+                ),
+                ("1001", "database_pool is 1001; it can be at most 1000"),
+            ] {
+                jail.set_env("TACHYON_DATABASE_POOL", pool);
+                assert_eq!(Config::load(None).unwrap_err().to_string(), err);
+            }
+            jail.set_env("TACHYON_DATABASE_POOL", "-1");
+            assert!(Config::load(None).is_err(), "a negative size");
+            jail.set_env("TACHYON_DATABASE_POOL", "1000");
+            assert_eq!(Config::load(None)?.database_pool, 1000);
+            Ok(())
+        });
     }
 
     #[test]
