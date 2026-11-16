@@ -16,7 +16,8 @@ use tachyon_media::storage::{Adapter, SignedDownloads, StorageConfig, Storages, 
 #[derive(Debug, Deserialize)]
 pub struct Config {
     pub database_url: String,
-    /// The most connections the server opens to Postgres.
+    /// The most connections in the server's pool. The schema listener takes one more,
+    /// outside it.
     #[serde(default = "default_pool")]
     pub database_pool: u32,
     pub listen: SocketAddr,

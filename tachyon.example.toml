@@ -2,7 +2,8 @@
 # TACHYON_LISTEN, TACHYON_PUBLIC_URL, TACHYON_AUTH__SESSION_IDLE and so on.
 
 database_url = "postgres://tachyon:tachyon@127.0.0.1:54329/tachyon"
-database_pool = 10            # most connections to Postgres, 1 to 1000; workers need 2 each, plus 1
+database_pool = 10            # connections in the server's pool, 1 to 1000; workers need 2 each, plus 1
+                              # (the schema listener takes one more, outside the pool)
 listen = "127.0.0.1:3000"
 
 # Where browsers reach the admin and API. Required when listening beyond this machine.

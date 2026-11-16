@@ -85,6 +85,16 @@ async fn main() -> anyhow::Result<()> {
         } => Some((read_schema(file)?, schema_cmd::parse_renames(renames)?)),
         _ => None,
     };
+    // What `serve` can judge from the config alone is refused before anything connects or
+    // migrates. The pool is built from `database_pool`, so the workers are measured by it.
+    let jobs = match cli.command {
+        Command::Serve => {
+            config.check_serve().map_err(anyhow::Error::msg)?;
+            let jobs = config.jobs_config(config.database_pool);
+            Some(jobs.map_err(anyhow::Error::msg)?)
+        }
+        _ => None,
+    };
     let pool = config
         .pool_options()
         .connect(&config.database_url)
@@ -99,10 +109,7 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve => {
-            config.check_serve().map_err(anyhow::Error::msg)?;
-            let jobs = config
-                .jobs_config(pool.options().get_max_connections())
-                .map_err(anyhow::Error::msg)?;
+            let jobs = jobs.expect("checked before connecting");
             let running = jobs.running.clone();
             let options = tachyon_api::Options {
                 auth: config.auth_config().map_err(anyhow::Error::msg)?,
