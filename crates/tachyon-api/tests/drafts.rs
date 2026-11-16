@@ -905,3 +905,101 @@ async fn a_draft_save_never_moves_the_published_updated_at(pool: PgPool) {
     let after = shown(&ok(&viewer, "GET", &format!("/api/notes/{note}"), None).await);
     assert!(after > before, "{before} then {after}");
 }
+
+/// `/api/access` answers writes in a collection or global with drafts as the routes judge
+/// them: every write changes the draft, so a caller who may read no drafts there gets
+/// `false`, the 403 that PATCH and DELETE give them; one who may read some gets
+/// `"conditional"`.
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn access_answers_writes_by_the_draft_they_change(pool: PgPool) {
+    let admin = admin_app(pool.clone()).await;
+    let title = json!([{"name": "title", "type": "text"}]);
+    for schema in [
+        json!({"slug": "posts", "versions": {"drafts": true},
+               "access": {"readDrafts": {"role": "editor"}}, "fields": title}),
+        json!({"slug": "pages", "versions": {"drafts": true},
+               "access": {"readDrafts": {"title": "open"}}, "fields": title}),
+        json!({"slug": "plain", "fields": title}),
+        json!({"slug": "settings", "kind": "global", "versions": {"drafts": true},
+               "access": {"readDrafts": {"role": "admin"}}, "fields": title}),
+        json!({"slug": "home", "kind": "global", "versions": {"drafts": true}, "fields": title}),
+    ] {
+        collection(&admin, schema).await;
+    }
+    let author_id = common::add_user(&pool, "author@example.com", "author").await;
+    let author = common::signed_in(
+        tachyon_api::router(pool.clone()).await.unwrap(),
+        "author@example.com",
+    )
+    .await;
+    let editor = app_as(&pool, "editor@example.com", "editor").await;
+    let (t, f, c) = (json!(true), json!(false), json!("conditional"));
+
+    // An Author may read no draft of `posts`, so every write there is a 403, even to the
+    // one they wrote, and the answer says so.
+    let mine = id_of(&ok(&admin, "POST", "/api/posts", Some(json!({"title": "A"}))).await);
+    sqlx::query("UPDATE documents SET created_by = $1 WHERE id = $2")
+        .bind(author_id)
+        .bind(mine.parse::<Uuid>().unwrap())
+        .execute(&pool)
+        .await
+        .unwrap();
+    let a = ok(&author, "GET", "/api/access", None).await;
+    for (method, right, body) in [
+        ("PATCH", "update", Some(json!({"title": "B"}))),
+        ("DELETE", "delete", None),
+    ] {
+        assert_eq!(
+            a["collections"]["posts"][right], f,
+            "author {right} posts: {a}"
+        );
+        let res = call(&author, method, &format!("/api/posts/{mine}"), body).await;
+        assert_problem(&res, 403);
+        // Own-only without drafts: still conditional.
+        assert_eq!(
+            a["collections"]["plain"][right], c,
+            "author {right} plain: {a}"
+        );
+    }
+
+    // An Editor reads every draft of `posts`, and those of `pages` that a filter allows.
+    let e = ok(&editor, "GET", "/api/access", None).await;
+    for right in ["update", "delete"] {
+        assert_eq!(
+            e["collections"]["posts"][right], t,
+            "editor {right} posts: {e}"
+        );
+        assert_eq!(
+            e["collections"]["pages"][right], c,
+            "editor {right} pages: {e}"
+        );
+        assert_eq!(
+            e["collections"]["plain"][right], t,
+            "editor {right} plain: {e}"
+        );
+    }
+    let mut pages = vec![];
+    for title in ["open", "shut"] {
+        let id = id_of(&ok(&admin, "POST", "/api/pages", Some(json!({"title": title}))).await);
+        pages.push(format!("/api/pages/{id}"));
+    }
+    let [open, shut] = [&pages[0], &pages[1]];
+    ok(&editor, "PATCH", open, Some(json!({"title": "open"}))).await;
+    assert_problem(
+        &call(&editor, "PATCH", shut, Some(json!({"title": "x"}))).await,
+        404,
+    );
+
+    // A global's update goes by its draft too.
+    let (settings, home) = ("/api/globals/settings", "/api/globals/home");
+    assert_eq!(e["globals"]["settings"]["update"], f, "{e}");
+    assert_problem(
+        &call(&editor, "PATCH", settings, Some(json!({"title": "x"}))).await,
+        403,
+    );
+    assert_eq!(e["globals"]["home"]["update"], t, "{e}");
+    ok(&editor, "PATCH", home, Some(json!({"title": "x"}))).await;
+    let admins = ok(&admin, "GET", "/api/access", None).await;
+    assert_eq!(admins["globals"]["settings"]["update"], t, "{admins}");
+    ok(&admin, "PATCH", settings, Some(json!({"title": "x"}))).await;
+}

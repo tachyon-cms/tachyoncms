@@ -798,13 +798,22 @@ impl Access {
     }
 
     /// `/api/access`'s answer for `action` (update or delete) on `c`: conditional when either
-    /// rule is a filter or the role default is own-only.
+    /// rule is a filter or the role default is own-only. With drafts, every write changes the
+    /// draft, so it's judged as `guard_rules` and `global_guard` judge it: false when the
+    /// caller may read no drafts there, conditional when only some.
     fn write_answer(&self, action: Action, c: &Collection) -> Value {
         let own_only = self.actor(action, c).is_some_and(|a| a.own_only);
-        match self.write_rules(action, c) {
-            Err(_) => false.into(),
-            Ok((None, None)) if !own_only => true.into(),
-            Ok(_) => "conditional".into(),
+        let Ok((read, write)) = self.write_rules(action, c) else {
+            return false.into();
+        };
+        let read = match self.draft_readable(c, read.clone()) {
+            Some(r) => r,
+            None if c.schema.drafts() => return false.into(),
+            None => Readable::published(read),
+        };
+        match (read.filter, read.owner, write) {
+            (None, None, None) if !own_only => true.into(),
+            _ => "conditional".into(),
         }
     }
 
@@ -1367,7 +1376,7 @@ fn field_map(c: &Collection, caller: &Caller, gate: [bool; 3]) -> Value {
 /// - `"conditional"` means the answer depends on the document, even when every stored one
 ///   happens to pass, and for a global with a filter rule that hasn't been saved yet.
 /// - Answers agree with what the routes enforce: update and delete are false where the
-///   caller can't read at all; a field allows no more than its collection or global does;
+///   caller can't read at all, or with drafts, where they may read no drafts; a field allows no more than its collection or global does;
 ///   a list (and everything in it) is updatable only when all of it is; join and virtual
 ///   fields are never written; a create rule shaped like a filter is false; a global's
 ///   fields have no create.
