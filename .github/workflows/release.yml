@@ -30,6 +30,8 @@ env:
 jobs:
   tag:
     runs-on: ubuntu-24.04
+    # Real releases wait on the release environment's rules; PR dry runs skip it.
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'release' || '' }}
     permissions:
       contents: write
     outputs:
@@ -133,6 +135,8 @@ jobs:
   publish:
     needs: [tag, build]
     runs-on: ubuntu-24.04
+    # Real releases wait on the release environment's rules; PR dry runs skip it.
+    environment: ${{ github.event_name == 'workflow_dispatch' && 'release' || '' }}
     permissions:
       contents: write
       packages: write
