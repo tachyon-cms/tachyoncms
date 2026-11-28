@@ -337,7 +337,9 @@ async fn cookie_writes_need_a_matching_origin(pool: PgPool) {
     let app = tachyon_api::router(pool).await.unwrap();
     setup(&app).await;
     let session = cookie(&login(&app, "admin@example.com", PASSWORD, false).await);
-    for origin in [Some("https://evil.example"), None] {
+    // Deeply nested `blob:` origins once overflowed the stack in the URL parser.
+    let nested = format!("{}http://localhost:3000", "blob:".repeat(100_000));
+    for origin in [Some("https://evil.example"), Some(nested.as_str()), None] {
         let mut req = Request::builder()
             .method("POST")
             .uri("/api/auth/logout")
