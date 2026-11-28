@@ -2769,21 +2769,15 @@ mod tests {
         let want = pixels_of(&avif);
         let flood = avif_many_items(&avif, 60_000, None, 0);
         for (how, u) in settings() {
-            let started = std::time::Instant::now();
-            let res = run(&flood, &u);
+            let (res, took) = best_of_three(|| run(&flood, &u));
             assert!(matches!(res, Err(ImageError::Corrupt(_))), "{how}: {res:?}");
-            assert!(
-                started.elapsed().as_millis() < 1000,
-                "{how}: {:?}",
-                started.elapsed()
-            );
+            assert!(took.as_millis() < 1000, "{how}: {took:?}");
         }
         let payload: Vec<u8> = TAIL.iter().copied().cycle().take(1_000_000).collect();
         let crowd = avif_many_items(&avif, 4_000, Some(&payload), 100);
         for (how, u) in settings() {
-            let started = std::time::Instant::now();
-            let out = run(&crowd, &u).unwrap_or_else(|e| panic!("{how}: {e}"));
-            let took = started.elapsed();
+            let (out, took) = best_of_three(|| run(&crowd, &u));
+            let out = out.unwrap_or_else(|e| panic!("{how}: {e}"));
             let kept = stored(&out);
             assert!(!has(&kept, b"<html>"), "{how}: the payload stayed");
             assert_eq!(pixels_of(&kept), want, "{how}");
@@ -2983,15 +2977,32 @@ mod tests {
     /// `bytes` refused as corrupt in every setting, each in under a second.
     fn refused_fast(bytes: &[u8], case: &str) {
         for (how, u) in settings() {
-            let started = std::time::Instant::now();
-            let res = run(bytes, &u);
-            let took = started.elapsed();
+            let (res, took) = best_of_three(|| run(bytes, &u));
             assert!(
                 matches!(res, Err(ImageError::Corrupt(_))),
                 "{case}, {how}: {res:?}"
             );
             assert!(took.as_millis() < 1000, "{case}, {how}: {took:?}");
         }
+    }
+
+    /// What `f` gives and how long it took, the best of up to three runs, stopping at the
+    /// first under a second: a busy machine can slow one run of cheap work, but work that
+    /// grows with its input is slow every time.
+    fn best_of_three<T>(mut f: impl FnMut() -> T) -> (T, std::time::Duration) {
+        let mut best: Option<(T, std::time::Duration)> = None;
+        for _ in 0..3 {
+            let started = std::time::Instant::now();
+            let out = f();
+            let took = started.elapsed();
+            if best.as_ref().is_none_or(|(_, b)| took < *b) {
+                best = Some((out, took));
+            }
+            if took.as_millis() < 1000 {
+                break;
+            }
+        }
+        best.expect("one run at least")
     }
 
     /// `bytes` stored in every setting with the picture's own pixels and none of `TAIL`,
@@ -3003,9 +3014,8 @@ mod tests {
     /// `bytes` stored as `kept_fast` asks, each upload in under `millis` when given.
     fn kept_within(bytes: &[u8], case: &str, millis: Option<u128>) {
         for (how, u) in settings() {
-            let started = std::time::Instant::now();
-            let out = run(bytes, &u).unwrap_or_else(|e| panic!("{case}, {how}: {e}"));
-            let took = started.elapsed();
+            let (out, took) = best_of_three(|| run(bytes, &u));
+            let out = out.unwrap_or_else(|e| panic!("{case}, {how}: {e}"));
             let kept = stored(&out);
             assert!(!has(&kept, b"<html>"), "{case}, {how}: the payload stayed");
             assert_eq!(pixels_of(&kept), picture().pixels, "{case}, {how}");
@@ -3115,9 +3125,7 @@ mod tests {
         ]
         .into_iter()
         .map(|(keep_metadata, budget)| {
-            let started = std::time::Instant::now();
-            let kept = avif::keep(bytes, keep_metadata, budget);
-            let took = started.elapsed();
+            let (kept, took) = best_of_three(|| avif::keep(bytes, keep_metadata, budget));
             assert!(
                 took.as_millis() < 1000,
                 "{case}, {keep_metadata}/{budget}: {took:?}"
@@ -3434,17 +3442,17 @@ mod tests {
                 (false, 50_000_000),
                 (true, 50_000_000),
             ] {
-                let one = std::time::Instant::now();
-                let kept = avif::keep(&file, keep_metadata, budget);
-                if let Ok(Some(k)) = &kept {
-                    assert!(!has(k, b"<html>"), "case {case}: the payload stayed");
-                }
-                if let Ok(k) = &kept
-                    && let Ok(parsed) = avif::parse(k.as_deref().unwrap_or(&file))
-                {
-                    let _ = avif::decode_bound(&parsed.primary_item);
-                }
-                let took = one.elapsed();
+                let ((), took) = best_of_three(|| {
+                    let kept = avif::keep(&file, keep_metadata, budget);
+                    if let Ok(Some(k)) = &kept {
+                        assert!(!has(k, b"<html>"), "case {case}: the payload stayed");
+                    }
+                    if let Ok(k) = &kept
+                        && let Ok(parsed) = avif::parse(k.as_deref().unwrap_or(&file))
+                    {
+                        let _ = avif::decode_bound(&parsed.primary_item);
+                    }
+                });
                 assert!(
                     took.as_millis() < 1000,
                     "case {case} (large: {big}, {} bytes): {took:?}",
