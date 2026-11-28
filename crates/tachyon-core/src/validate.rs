@@ -892,13 +892,24 @@ const DATE_TIME_UTC: &[BorrowedFormatItem<'_>] =
 /// so stored values sort correctly as text.
 /// Years outside 0–9999 are rejected: they'd break fixed-width text ordering.
 pub fn normalize_date_time(s: &str) -> Option<String> {
+    utc_date_time(s)?.format(DATE_TIME_UTC).ok()
+}
+
+/// Parses an RFC 3339 date-time for `createdAt` or `updatedAt`, which Postgres keeps to the
+/// microsecond: anything finer is dropped, since the column can't hold it.
+pub(crate) fn normalize_timestamp(s: &str) -> Option<String> {
+    let utc = utc_date_time(s)?;
+    utc.replace_nanosecond(utc.nanosecond() / 1_000 * 1_000)
+        .ok()?
+        .format(&Rfc3339)
+        .ok()
+}
+
+fn utc_date_time(s: &str) -> Option<time::OffsetDateTime> {
     let utc = time::OffsetDateTime::parse(s, &Rfc3339)
         .ok()?
         .checked_to_offset(time::UtcOffset::UTC)?;
-    if !(0..=9999).contains(&utc.year()) {
-        return None;
-    }
-    utc.format(DATE_TIME_UTC).ok()
+    (0..=9999).contains(&utc.year()).then_some(utc)
 }
 
 pub(crate) fn is_date(s: &str) -> bool {
@@ -1822,6 +1833,20 @@ mod tests {
             Some("2026-10-12T07:30:00.123Z")
         );
         assert_eq!(normalize_date_time("yesterday"), None);
+    }
+
+    #[test]
+    fn normalize_timestamp_keeps_microseconds_and_drops_the_rest() {
+        assert_eq!(
+            normalize_timestamp("2026-11-09T03:29:04.052529123+02:00").as_deref(),
+            Some("2026-11-09T01:29:04.052529Z")
+        );
+        assert_eq!(
+            normalize_timestamp("2026-11-09T01:29:04Z").as_deref(),
+            Some("2026-11-09T01:29:04Z")
+        );
+        assert_eq!(normalize_timestamp("9999-12-31T23:00:00-02:00"), None);
+        assert_eq!(normalize_timestamp("yesterday"), None);
     }
 
     #[test]

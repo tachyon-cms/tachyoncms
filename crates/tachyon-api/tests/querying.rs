@@ -81,6 +81,89 @@ async fn cursor_pagination(pool: PgPool) {
 }
 
 #[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
+async fn system_timestamps_filter_at_full_precision(pool: PgPool) {
+    let app = app(pool).await;
+    let doc = send(&app, "GET", "/api/items?where[title][equals]=b", None)
+        .await
+        .json["docs"][0]
+        .clone();
+    let id = doc["id"].as_str().unwrap();
+    let ids = |json: &serde_json::Value| -> Vec<String> {
+        json["docs"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|d| d["id"].as_str().unwrap().to_owned())
+            .collect()
+    };
+    use time::format_description::well_known::Rfc3339;
+    let rfc = |t: time::OffsetDateTime| t.format(&Rfc3339).unwrap();
+    for target in ["createdAt", "updatedAt"] {
+        let at = doc[target].as_str().unwrap();
+        let t = time::OffsetDateTime::parse(at, &Rfc3339).unwrap();
+        // Digits past the microsecond are accepted and dropped: Postgres can't hold them.
+        let nanos = rfc(t.replace_nanosecond(t.nanosecond() + 999).unwrap());
+        let west = rfc(t.to_offset(time::UtcOffset::from_hms(-7, 0, 0).unwrap()));
+        let east = rfc(t.to_offset(time::UtcOffset::from_hms(5, 30, 0).unwrap()));
+        // Whether each filter, given the same instant, finds the document.
+        for (op, value, finds) in [
+            ("equals", at.to_owned(), true),
+            ("not_equals", at.to_owned(), false),
+            ("gt", at.to_owned(), false),
+            ("gte", at.to_owned(), true),
+            ("lt", at.to_owned(), false),
+            ("lte", at.to_owned(), true),
+            ("in", format!("{at},2001-01-01T00:00:00Z"), true),
+            ("not_in", at.to_owned(), false),
+            ("equals", nanos, true),
+            ("equals", west, true),
+            ("equals", east.replace('+', "%2B"), true),
+        ] {
+            let res = send(
+                &app,
+                "GET",
+                &format!("/api/items?where[{target}][{op}]={value}"),
+                None,
+            )
+            .await;
+            assert_eq!(res.status, 200, "{target} {op} {value}: {}", res.json);
+            assert_eq!(
+                ids(&res.json).iter().any(|d| d == id),
+                finds,
+                "{target} {op} {value}: {}",
+                res.json
+            );
+        }
+    }
+    // A `+` left raw in a URL reads as a space; the 400 says how to send it if it came that way.
+    for target in ["createdAt", "updatedAt"] {
+        let qs = format!("where[{target}][gt]=2026-10-12T09:30:00+02:00");
+        let res = send(&app, "GET", &format!("/api/items?{qs}"), None).await;
+        assert_problem(&res, 400);
+        assert_eq!(
+            res.json["detail"],
+            format!(
+                "where[{target}][gt]: expected a date-time like 2026-10-12T09:30:00Z; if you sent this in a URL, a `+` there reads as a space, so write it as %2B"
+            ),
+            "{qs}"
+        );
+    }
+    // A cursor on updatedAt carries the full value and pages without a gap or a repeat.
+    let first = send(&app, "GET", "/api/items?sort=updatedAt&limit=2", None).await;
+    assert_eq!(titles(&first.json), ["a", "b"]);
+    let cursor = first.json["nextCursor"].as_str().unwrap().to_owned();
+    let second = send(
+        &app,
+        "GET",
+        &format!("/api/items?sort=updatedAt&limit=2&after={cursor}"),
+        None,
+    )
+    .await;
+    assert_eq!(second.status, 200, "{}", second.json);
+    assert_eq!(titles(&second.json), ["c"]);
+}
+
+#[sqlx::test(migrator = "tachyon_db::MIGRATOR")]
 async fn bad_parameters_are_400(pool: PgPool) {
     let app = app(pool).await;
     let number_cursor = {
