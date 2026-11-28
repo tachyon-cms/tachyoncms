@@ -3293,6 +3293,7 @@ dependencies = [
  "tachyon-core",
  "tachyon-db",
  "tachyon-media",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",

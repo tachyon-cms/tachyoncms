@@ -6,10 +6,17 @@ use std::process::Command;
 /// connection or migration: the database here doesn't exist, and it's never asked.
 #[test]
 fn too_many_workers_for_the_pool_refuse_before_connecting() {
-    let out = Command::new(env!("CARGO_BIN_EXE_tachyon"))
+    // A fresh, empty directory and no inherited TACHYON_* settings, so only these count.
+    let dir = tempfile::tempdir().unwrap();
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_tachyon"));
+    for (k, _) in std::env::vars_os() {
+        if k.to_string_lossy().starts_with("TACHYON_") {
+            cmd.env_remove(k);
+        }
+    }
+    let out = cmd
         .arg("serve")
-        // No tachyon.toml here, so only these settings count.
-        .current_dir(std::env::temp_dir())
+        .current_dir(dir.path())
         .env(
             "TACHYON_DATABASE_URL",
             "postgres://tachyon:tachyon@127.0.0.1:1/nowhere",
