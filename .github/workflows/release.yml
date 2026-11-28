@@ -28,12 +28,9 @@ env:
   IMAGE: ghcr.io/tachyon-cms/tachyoncms
 
 jobs:
-  tag:
+  # Read-only, so a pull request's own copy of this file never holds a write token.
+  version:
     runs-on: ubuntu-24.04
-    # Real releases wait on the release environment's rules; PR dry runs skip it.
-    environment: ${{ github.event_name == 'workflow_dispatch' && 'release' || '' }}
-    permissions:
-      contents: write
     outputs:
       version: ${{ steps.version.outputs.version }}
     steps:
@@ -59,15 +56,27 @@ jobs:
           [ "$INPUT" = "$crate" ] \
             || { echo "Cargo.toml says $crate; bump it in a PR first" >&2; exit 1; }
           echo "version=$INPUT" >> "$GITHUB_OUTPUT"
+
+  tag:
+    needs: version
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-24.04
+    environment: release
+    permissions:
+      contents: write
+    steps:
       - name: Tag
-        if: github.event_name == 'workflow_dispatch'
         env:
           GH_TOKEN: ${{ github.token }}
-          VERSION: ${{ steps.version.outputs.version }}
+          VERSION: ${{ needs.version.outputs.version }}
         run: gh api "repos/$GITHUB_REPOSITORY/git/refs" -f ref="refs/tags/v$VERSION" -f sha="$GITHUB_SHA"
 
   build:
-    needs: tag
+    needs: [version, tag]
+    # A real release builds once tagged; a pull request, where tag is skipped, builds anyway.
+    if: >-
+      !cancelled() && needs.version.result == 'success'
+      && (github.event_name != 'workflow_dispatch' || needs.tag.result == 'success')
     strategy:
       fail-fast: false
       matrix:
@@ -78,7 +87,7 @@ jobs:
           - { target: aarch64-apple-darwin, os: macos-15 }
     runs-on: ${{ matrix.os }}
     env:
-      VERSION: ${{ needs.tag.outputs.version }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -133,18 +142,17 @@ jobs:
           if-no-files-found: error
 
   publish:
-    needs: [tag, build]
+    needs: [version, tag, build]
+    if: github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-24.04
-    # Real releases wait on the release environment's rules; PR dry runs skip it.
-    environment: ${{ github.event_name == 'workflow_dispatch' && 'release' || '' }}
+    environment: release
     permissions:
       contents: write
       packages: write
       id-token: write
       attestations: write
     env:
-      VERSION: ${{ needs.tag.outputs.version }}
-      PUBLISH: ${{ github.event_name == 'workflow_dispatch' }}
+      VERSION: ${{ needs.version.outputs.version }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
         with:
@@ -167,11 +175,9 @@ jobs:
           sha256sum -- *.tar.gz *.sbom.json > checksums.txt
           cat checksums.txt
       - name: Sign the checksums
-        if: env.PUBLISH == 'true'
         working-directory: dist
         run: cosign sign-blob --yes --bundle checksums.txt.sigstore.json checksums.txt
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        if: env.PUBLISH == 'true'
         with:
           subject-path: |
             dist/*.tar.gz
@@ -179,7 +185,6 @@ jobs:
       - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
       - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
       - uses: docker/login-action@8aa5831fb8d48d8f76594c7ddde61ae58019f550 # v4.8.0
-        if: env.PUBLISH == 'true'
         with:
           registry: ghcr.io
           username: ${{ github.actor }}
@@ -206,24 +211,19 @@ jobs:
             docker buildx build --platform "$p" -f release.Containerfile "${labels[@]}" -t smoke --load image
             docker run --rm --platform "$p" smoke --version | grep -Fx "tachyon $VERSION"
           done
-          if [ "$PUBLISH" = true ]; then
-            docker buildx build --platform linux/amd64,linux/arm64 -f release.Containerfile \
-              "${labels[@]}" "${tags[@]}" --metadata-file meta.json --push image
-            echo "digest=$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_OUTPUT"
-          fi
+          docker buildx build --platform linux/amd64,linux/arm64 -f release.Containerfile \
+            "${labels[@]}" "${tags[@]}" --metadata-file meta.json --push image
+          echo "digest=$(jq -r '."containerimage.digest"' meta.json)" >> "$GITHUB_OUTPUT"
       - name: Sign the image
-        if: env.PUBLISH == 'true'
         env:
           DIGEST: ${{ steps.image.outputs.digest }}
         run: cosign sign --yes "$IMAGE@$DIGEST"
       - uses: actions/attest-build-provenance@4d101475d8b20a2381f78447822ac1eab6504dd8 # v4.2.2
-        if: env.PUBLISH == 'true'
         with:
           subject-name: ${{ env.IMAGE }}
           subject-digest: ${{ steps.image.outputs.digest }}
           push-to-registry: true
       - name: Draft the release
-        if: env.PUBLISH == 'true'
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
@@ -245,3 +245,41 @@ jobs:
           gh release create "v$VERSION" --draft --verify-tag "${prerelease[@]}" \
             --title "v$VERSION" --notes-file notes.md \
             dist/*.tar.gz dist/*.sbom.json dist/checksums.txt dist/checksums.txt.sigstore.json
+
+  # The pull request half of publish: SBOMs, checksums and the image smoke test, with
+  # nothing signed or pushed and a read-only token.
+  dry-run:
+    needs: [version, build]
+    if: >-
+      !cancelled() && github.event_name == 'pull_request'
+      && needs.version.result == 'success' && needs.build.result == 'success'
+    runs-on: ubuntu-24.04
+    env:
+      VERSION: ${{ needs.version.outputs.version }}
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: build-*
+          merge-multiple: true
+      - uses: anchore/sbom-action/download-syft@66cbf4bc1f1c0d2edc94016e65bc221b6bb0ad6c # v0.24.3
+      - name: SBOMs and checksums
+        working-directory: dist
+        run: |
+          for f in *.tar.gz; do
+            syft scan "dir:${f%.tar.gz}" -o "spdx-json=$f.sbom.json"
+            jq -e '[.packages[] | select(.name == "axum")] | length > 0' "$f.sbom.json" >/dev/null \
+              || { echo "$f.sbom.json lists no Rust crates" >&2; exit 1; }
+          done
+          sha256sum -- *.tar.gz *.sbom.json
+      - uses: docker/setup-qemu-action@99012661954931238ded8c8b007157a8430204e1 # v4.4.0
+      - uses: docker/setup-buildx-action@f87e5991a6d7451dcb8d9637bfbc97413f497069 # v4.4.1
+      - name: Each platform's image runs
+        run: |
+          chmod +x image/linux/*/tachyon
+          for p in linux/amd64 linux/arm64; do
+            docker buildx build --platform "$p" -f release.Containerfile -t smoke --load image
+            docker run --rm --platform "$p" smoke --version | grep -Fx "tachyon $VERSION"
+          done
