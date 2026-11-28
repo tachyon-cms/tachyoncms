@@ -27,6 +27,15 @@ jobs:
       - run: cargo fmt --all --check
       - run: cargo clippy --workspace --all-targets -- -D warnings
 
+  # vendor/avif-decode is the published crate plus vendor/avif-decode.patch, and nothing else.
+  vendor:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+      - run: bash scripts/check-vendor.sh
+
   test:
     runs-on: ubuntu-latest
     strategy:
