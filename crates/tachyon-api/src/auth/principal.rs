@@ -135,6 +135,10 @@ fn same_site(state: &AppState, headers: &HeaderMap) -> bool {
     let Some(origin) = headers.get(ORIGIN).and_then(|v| v.to_str().ok()) else {
         return false;
     };
+    // A browser's Origin is always http(s) here; anything else isn't parsed at all.
+    if !(origin.starts_with("https://") || origin.starts_with("http://")) {
+        return false;
+    }
     let config = &state.auth.config;
     // Compared as origins (scheme, host, port), so a public URL with a path still matches.
     let normal = |s: &str| {

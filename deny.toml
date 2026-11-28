@@ -1,0 +1,12 @@
+# `cargo deny check advisories` runs in CI. A vulnerability always fails the build; the
+# entries below are "unmaintained" notices with no fix and no known flaw, each reached
+# only through a dependency we can't swap today. Review them when those crates move.
+[advisories]
+ignore = [
+    # chrono, through object_store's storage clients.
+    { id = "RUSTSEC-2026-0543", reason = "unmaintained, no vulnerability; only via object_store" },
+    # humantime wraps chrono, also through object_store.
+    { id = "RUSTSEC-2026-0542", reason = "unmaintained, no vulnerability; only via object_store" },
+    # paste, a build-time macro crate inside rav1d, the AVIF decoder.
+    { id = "RUSTSEC-2024-0436", reason = "unmaintained proc-macro, no vulnerability; only via rav1d" },
+]
