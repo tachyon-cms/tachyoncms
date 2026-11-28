@@ -1007,7 +1007,9 @@ fn not_a_date_time(v: &Value) -> String {
     const EXPECTED: &str = "expected a date-time like 2026-10-12T09:30:00Z";
     match v.as_str() {
         Some(s) if s.contains(' ') && normalize_date_time(&s.replace(' ', "+")).is_some() => {
-            format!("{EXPECTED}; a `+` in a URL reads as a space, so write it as %2B")
+            format!(
+                "{EXPECTED}; if you sent this in a URL, a `+` there reads as a space, so write it as %2B"
+            )
         }
         _ => EXPECTED.into(),
     }
@@ -1393,7 +1395,7 @@ mod tests {
             // A raw `+` arrives as a space; the hint only when a `+` there would parse.
             (
                 "where[at][gt]=2026-10-12T09:30:00+02:00",
-                "where[at][gt]: expected a date-time like 2026-10-12T09:30:00Z; a `+` in a URL reads as a space, so write it as %2B",
+                "where[at][gt]: expected a date-time like 2026-10-12T09:30:00Z; if you sent this in a URL, a `+` there reads as a space, so write it as %2B",
             ),
             (
                 "where[at][gt]=next+week",

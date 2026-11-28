@@ -135,7 +135,7 @@ async fn system_timestamps_filter_at_full_precision(pool: PgPool) {
             );
         }
     }
-    // A `+` left raw in a URL reads as a space; the 400 says how to send it.
+    // A `+` left raw in a URL reads as a space; the 400 says how to send it if it came that way.
     for target in ["createdAt", "updatedAt"] {
         let qs = format!("where[{target}][gt]=2026-10-12T09:30:00+02:00");
         let res = send(&app, "GET", &format!("/api/items?{qs}"), None).await;
@@ -143,7 +143,7 @@ async fn system_timestamps_filter_at_full_precision(pool: PgPool) {
         assert_eq!(
             res.json["detail"],
             format!(
-                "where[{target}][gt]: expected a date-time like 2026-10-12T09:30:00Z; a `+` in a URL reads as a space, so write it as %2B"
+                "where[{target}][gt]: expected a date-time like 2026-10-12T09:30:00Z; if you sent this in a URL, a `+` there reads as a space, so write it as %2B"
             ),
             "{qs}"
         );
