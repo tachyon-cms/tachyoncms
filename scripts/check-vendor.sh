@@ -19,6 +19,8 @@ curl -sSfL -o "$work/crate.tar.gz" "https://static.crates.io/crates/avif-decode/
 echo "$sha256  $work/crate.tar.gz" | sha256sum -c --quiet -
 tar -xzf "$work/crate.tar.gz" -C "$work"
 published=$work/avif-decode-$version
+# A ceiling at $work keeps git from finding an enclosing repository if TMPDIR sits in one.
+export GIT_CEILING_DIRECTORIES=$work
 g() { git -C "$published" -c user.name=x -c user.email=x@x -c commit.gpgsign=false -c core.hooksPath=/dev/null "$@"; }
 
 if [ "${1:-}" = --update ]; then
@@ -32,7 +34,10 @@ if [ "${1:-}" = --update ]; then
 fi
 
 git -C "$published" apply --binary "$root/vendor/avif-decode.patch"
-if ! diff -r "$published" "$root/vendor/avif-decode"; then
+# diff -r compares contents only, so compare which files are executable as well.
+modes() { (cd "$1" && find . -path ./.git -prune -o -type f -perm -u+x -print | sort); }
+if ! diff -r "$published" "$root/vendor/avif-decode" ||
+  ! diff <(modes "$published") <(modes "$root/vendor/avif-decode"); then
   echo
   echo "vendor/avif-decode differs from avif-decode $version plus vendor/avif-decode.patch."
   echo "See vendor/README.md."

@@ -5,7 +5,8 @@
 `avif-decode/` is the crates.io release of avif-decode 3.0.0 with one
 change: `Decoder::from_avif_limited` decodes on the calling thread, so a
 rav1d panic can't escape from a worker thread, and holds rav1d to a frame
-size limit. Its CLI, tests and lockfile are left out. The workspace `Cargo.toml` points `[patch.crates-io]` at it.
+size limit. Its CLI, tests and lockfile are left out. The workspace
+`Cargo.toml` points `[patch.crates-io]` at it.
 
 `avif-decode.patch` is the whole difference from the published crate. CI
 runs `scripts/check-vendor.sh`, which downloads the crate, checks its

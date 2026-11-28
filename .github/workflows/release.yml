@@ -141,6 +141,7 @@ jobs:
             image/
           if-no-files-found: error
 
+  # Its SBOM and smoke-test steps are copied in dry-run; change both together.
   publish:
     needs: [version, tag, build]
     if: github.event_name == 'workflow_dispatch'
